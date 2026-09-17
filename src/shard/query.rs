@@ -804,7 +804,7 @@ impl GraphShard {
                 let mut filtered = Vec::with_capacity(bindings.len());
                 for row in bindings {
                     budget.check("cypher_where")?;
-                    if row_predicate_matches(&row, predicate)? {
+                    if row_predicate_matches(&row, predicate)?.unwrap_or(false) {
                         filtered.push(row);
                     }
                 }
@@ -964,7 +964,7 @@ impl GraphShard {
                     continue;
                 };
                 row.metadata.insert(binding.to_string(), metadata);
-                if !row_matches_node(&row, node)? || !row_predicate_matches(&row, predicate)? {
+                if !row_matches_node(&row, node)? || !row_predicate_matches(&row, predicate)?.unwrap_or(false) {
                     continue;
                 }
                 let result_row = project_binding_row(&row, &query.projections)?;
@@ -1326,7 +1326,7 @@ impl GraphShard {
             let mut filtered = Vec::with_capacity(bindings.len());
             for row in bindings {
                 budget.check("cypher_mutation_where")?;
-                if row_predicate_matches(&row, predicate)? {
+                if row_predicate_matches(&row, predicate)?.unwrap_or(false) {
                     filtered.push(row);
                 }
             }
@@ -3083,7 +3083,7 @@ impl GraphShard {
                     let mut filtered = Vec::with_capacity(matches.len());
                     for matched in matches {
                         budget.check("cypher_group_where")?;
-                        if row_predicate_matches(&matched, predicate)? {
+                        if row_predicate_matches(&matched, predicate)?.unwrap_or(false) {
                             filtered.push(matched);
                         }
                     }
@@ -8051,7 +8051,7 @@ fn vertex_metadata_matches(metadata: &VertexMetadata, node: &RowNodePattern) -> 
 }
 
 #[cfg(feature = "opencypher")]
-fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<bool> {
+fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<Option<bool>> {
     Ok(match predicate {
         RowPredicate::Compare { left, op, right } => compare_row_values(
             eval_row_expression(row, left)?,
@@ -8061,18 +8061,39 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
         RowPredicate::StartsWith { expression, prefix } => {
             match eval_row_expression(row, expression)? {
                 RowScalarValue::Value(VertexPropertyValue::String(value)) => {
-                    value.starts_with(prefix)
+                    Some(value.starts_with(prefix))
                 }
-                RowScalarValue::Value(_) | RowScalarValue::Missing => false,
+                RowScalarValue::Value(_) => Some(false),
+                RowScalarValue::Missing => None,
             }
         }
         RowPredicate::And(left, right) => {
-            row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
+            let l = row_predicate_matches(row, left)?;
+            if l == Some(false) {
+                Some(false)
+            } else {
+                let r = row_predicate_matches(row, right)?;
+                match (l, r) {
+                    (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
         }
         RowPredicate::Or(left, right) => {
-            row_predicate_matches(row, left)? || row_predicate_matches(row, right)?
+            let l = row_predicate_matches(row, left)?;
+            if l == Some(true) {
+                Some(true)
+            } else {
+                let r = row_predicate_matches(row, right)?;
+                match (l, r) {
+                    (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
         }
-        RowPredicate::Not(inner) => !row_predicate_matches(row, inner)?,
+        RowPredicate::Not(inner) => row_predicate_matches(row, inner)?.map(|v| !v),
     })
 }
 
@@ -8240,11 +8261,11 @@ fn compare_row_values(
     left: RowScalarValue,
     op: RowComparisonOp,
     right: RowScalarValue,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     let (RowScalarValue::Value(left), RowScalarValue::Value(right)) = (left, right) else {
-        return Ok(false);
+        return Ok(None);
     };
-    compare_vertex_property_values(&left, op, &right)
+    compare_vertex_property_values(&left, op, &right).map(Some)
 }
 
 #[cfg(feature = "opencypher")]
