@@ -190,7 +190,7 @@ impl From<&str> for QueryTransportSecret {
 #[cfg(feature = "query-transport")]
 impl QueryTransportClientConfig {
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self.bearer_token = Some(QueryTransportSecret::new(token));
         self
     }
 
@@ -259,6 +259,11 @@ impl QueryTransportClientConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(token) = &self.bearer_token {
+            if !token.is_valid() {
+                return transport_config_error("bearer token cannot be empty");
+            }
+        }
         if self.max_frame_bytes < 2 {
             return transport_config_error("max_frame_bytes must be at least 2");
         }
@@ -1791,7 +1796,7 @@ impl TcpQueryCellClient {
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.config.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self.config = self.config.with_bearer_token(token);
         self
     }
 

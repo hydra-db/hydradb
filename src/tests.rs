@@ -6110,8 +6110,8 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("unauthorized"));
-    assert!(server.metrics().auth_failures >= 1);
+    assert!(err.to_string().contains("bearer token cannot be empty"));
+    assert_eq!(server.metrics().auth_failures, 0);
     server.stop().await.unwrap();
 }
 
