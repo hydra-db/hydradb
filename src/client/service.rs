@@ -1482,6 +1482,14 @@ impl ClientQueryService {
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
                         self.refresh_strong_read(&request, action, &cancellation_token)
                             .await?;
+                        if batch_operation.is_none() {
+                            if let Some(page) = self
+                                .read_single_engine_page(&request, &context, page_size)
+                                .await?
+                            {
+                                return Ok(page);
+                            }
+                        }
                         let result = match batch_operation {
                             Some(operation) => {
                                 self.inner.client.execute_batch(context, operation).await?
@@ -1636,6 +1644,63 @@ impl ClientQueryService {
             Ordering::Relaxed,
         );
         Ok(prepared)
+    }
+
+    /// Serves a read from one engine-side page instead of materialising the
+    /// whole result and slicing it, but only when that single page *is* the
+    /// whole result.
+    ///
+    /// Paging a read any further in the engine would need the same storage
+    /// snapshot on the next request, and a snapshot cannot be re-pinned once
+    /// dropped (`GraphShard::snapshot_at` rejects any epoch that is no longer
+    /// current). Serving page two from a fresh snapshot would break the
+    /// guarantee that a query runs against one pinned snapshot, so anything
+    /// that does not fit in one page falls back to the buffered cursor.
+    ///
+    /// Returns `None` when the engine declined, when the page carries no
+    /// snapshot watermark (an older shard, which cannot supply the pair that
+    /// `bookmark_after` needs), or when more rows remain.
+    ///
+    /// A current shard declines on query shape, before executing anything. An
+    /// older one ignores the flag and answers as it always did, so during a
+    /// rolling upgrade a read executes twice — bounded by `max_result_bytes`,
+    /// and only until the shard is upgraded.
+    ///
+    // ponytail: first page only; lifting this needs shard-side snapshot
+    // retention so later pages can re-enter the same snapshot, plus a cursor
+    // token that says whose namespace its id belongs to.
+    async fn read_single_engine_page(
+        &self,
+        request: &ClientQueryRequest,
+        context: &QueryContext,
+        page_size: usize,
+    ) -> Result<Option<ClientQueryPage>> {
+        let page = self
+            .inner
+            .client
+            .execute_cypher_rows_page(
+                context.clone().with_snapshot_pinned_page_only(),
+                &request.query,
+                None,
+                page_size,
+            )
+            .await?;
+        if page.next_cursor.is_some() {
+            return Ok(None);
+        }
+        let (Some(read_epoch), Some(storage_sequence)) = (page.read_epoch, page.storage_sequence)
+        else {
+            return Ok(None);
+        };
+        let bookmark = self
+            .bookmark_after(request, QueryTransportAction::Read, Some(storage_sequence))
+            .await?;
+        Ok(Some(ClientQueryPage {
+            query_id: request.query_id.clone(),
+            page,
+            read_epoch: Some(read_epoch),
+            bookmark,
+        }))
     }
 
     async fn start_server_cursor(

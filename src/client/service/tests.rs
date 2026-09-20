@@ -29,6 +29,135 @@ struct CursorTestClient {
     executions: Arc<AtomicU64>,
 }
 
+/// A shard that can serve a snapshot-pinned page from the engine, so the read
+/// never materialises the whole result.
+struct EnginePageTestClient {
+    rows: usize,
+    materialisations: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl QueryCellClient for EnginePageTestClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        self.materialisations.fetch_add(1, Ordering::Relaxed);
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("value")],
+            (1..=self.rows as u64)
+                .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
+                .collect(),
+        )
+        .with_read_epoch(7)
+        .with_storage_sequence(7))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+        _cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let window = self.rows.min(page_size);
+        let next_cursor = (self.rows > page_size).then(|| QueryCursorToken::new(page_size as u64));
+        Ok(QueryResultPage::new(
+            vec![QueryColumn::new("value")],
+            (1..=window as u64)
+                .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
+                .collect(),
+            next_cursor,
+        )
+        .with_read_epoch(7)
+        .with_storage_sequence(7))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(7))
+    }
+}
+
+fn engine_page_service(rows: usize, materialisations: Arc<AtomicU64>) -> ClientQueryService {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    ClientQueryService::new(
+        Arc::new(EnginePageTestClient {
+            rows,
+            materialisations,
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn read_that_fits_one_engine_page_never_materialises_the_result() {
+    let materialisations = Arc::new(AtomicU64::new(0));
+    let service = engine_page_service(3, Arc::clone(&materialisations));
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-engine-page",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+
+    let page = service
+        .execute_page(&session, request.clone(), None, 4)
+        .await
+        .unwrap();
+
+    assert_eq!(page.page.rows.len(), 3);
+    assert!(page.page.next_cursor.is_none());
+    assert_eq!(page.read_epoch, Some(7));
+    assert_eq!(materialisations.load(Ordering::Relaxed), 0);
+    // No server cursor was opened, so there is nothing to release.
+    assert!(
+        !service
+            .release_server_cursor(&session, &request, QueryCursorToken::new(1))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn read_larger_than_one_engine_page_falls_back_to_the_buffered_cursor() {
+    let materialisations = Arc::new(AtomicU64::new(0));
+    let service = engine_page_service(5, Arc::clone(&materialisations));
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-engine-page-overflow",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+
+    let first = service
+        .execute_page(&session, request.clone(), None, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(first.page.rows.len(), 2);
+    let cursor = first.page.next_cursor.expect("remaining rows use a cursor");
+    assert_eq!(materialisations.load(Ordering::Relaxed), 1);
+
+    let second = service
+        .execute_page(&session, request, Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.page.rows.len(), 2);
+    assert_eq!(materialisations.load(Ordering::Relaxed), 1);
+}
+
 #[test]
 fn hierarchical_database_resolver_maps_each_collection_to_a_native_scope() {
     let root = GraphScope::new(
@@ -331,6 +460,11 @@ impl QueryCellClient for CursorTestClient {
         _cursor: Option<QueryCursorToken>,
         _page_size: usize,
     ) -> Result<QueryResultPage> {
+        if context.requires_snapshot_pinned_page() {
+            // Stands in for a shard whose streaming strategies all decline: an
+            // unstamped page, and no execution charged for it.
+            return Ok(QueryResultPage::new(Vec::new(), Vec::new(), None));
+        }
         let result = self.execute_cypher_rows(context, query).await?;
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }

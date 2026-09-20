@@ -621,6 +621,10 @@ struct PendingBoltResult {
     bookmark: Option<ClientBookmark>,
 }
 
+// One of these is moved per PULL and dropped immediately; it is control flow,
+// not storage. Boxing the payload to get under the lint's 200-byte threshold
+// would buy an allocation per page and nothing else.
+#[allow(clippy::large_enum_variant)]
 enum PageAwaitResult {
     Complete(Result<ClientQueryPage>),
     Reset,

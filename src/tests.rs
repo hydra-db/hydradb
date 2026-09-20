@@ -678,6 +678,202 @@ async fn cypher_single_hop_page_slices_cached_multigraph_rows_with_wal_tail() {
     writer.close().await.unwrap();
 }
 
+/// A page encoded by a shard that predates the watermark fields still decodes, with
+/// both reading as `None`, which is what lets `read_single_engine_page` fall back
+/// during a rolling upgrade instead of failing the read outright.
+///
+/// No `#[serde(default)]` is involved. Serde routes a missing field through
+/// `missing_field`, whose deserializer answers `deserialize_option` with
+/// `visit_none`, so an absent `Option` field is `None` while an absent `bool` is an
+/// error. That is the whole reason `QueryContext::refreshed_reader` needed the
+/// attribute and the `Option` fields beside it did not.
+#[cfg(feature = "query-transport")]
+#[test]
+fn a_page_from_a_shard_without_watermarks_decodes_with_both_absent() {
+    let legacy = serde_json::json!({
+        "columns": [{"name": "value"}],
+        "rows": [{"values": [{"Count": 1}]}],
+        "next_cursor": null,
+    });
+    let page: QueryResultPage = serde_json::from_value(legacy)
+        .expect("a page without the watermark fields must still decode");
+    assert!(page.read_epoch.is_none());
+    assert!(page.storage_sequence.is_none());
+    assert_eq!(page.rows.len(), 1);
+
+    // A round trip of a stamped page keeps both, so a current shard is unaffected.
+    let stamped = QueryResultPage::new(page.columns.clone(), page.rows.clone(), None)
+        .with_read_epoch(11)
+        .with_storage_sequence(11);
+    let encoded = serde_json::to_string(&stamped).unwrap();
+    let decoded: QueryResultPage = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.read_epoch, Some(11));
+    assert_eq!(decoded.storage_sequence, Some(11));
+}
+
+/// The snapshot-pinned page is refused unless the query's own `LIMIT` proves the
+/// result cannot exceed one page. Speculating instead - running a page and
+/// discarding it when a continuation turns up - would charge duplicate scan or
+/// traversal work to the caller's single runtime deadline.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn a_snapshot_pinned_page_is_refused_unless_the_query_limit_proves_one_page() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/pinned-page-limit-gate", object_store).await;
+    for dst in [10, 20, 30, 40] {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("pinned-gate-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let pinned = |handle: &str| {
+        QueryContext::new("cell-a", handle).with_snapshot_pinned_page_only()
+    };
+
+    // No LIMIT: nothing proves this is one page, so the shard declines without
+    // executing and the caller keeps its own path.
+    let unbounded = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-unbounded"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert!(unbounded.rows.is_empty());
+    assert!(unbounded.next_cursor.is_none());
+    assert!(
+        unbounded.read_epoch.is_none(),
+        "a declined page must not claim a snapshot"
+    );
+
+    // A LIMIT above the page size proves nothing either.
+    let over_page = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-over-page"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id LIMIT 3",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert!(over_page.read_epoch.is_none());
+
+    // A LIMIT at or under the page size does, so the page is served and stamped.
+    let bounded = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-bounded"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id LIMIT 2",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+            QueryRow::new(vec![QueryValue::VertexId(20)]),
+        ]
+    );
+    assert!(bounded.next_cursor.is_none());
+    assert!(bounded.read_epoch.is_some());
+    assert!(bounded.storage_sequence.is_some());
+
+    shard.close().await.unwrap();
+}
+
+/// Two pages of one read do not come from one snapshot, because nothing keeps the
+/// first page's snapshot alive across calls. `execute_opencypher_rows_page` takes a
+/// fresh snapshot per call and scopes it to that call, and `snapshot_at` refuses any
+/// epoch that is no longer current, so the second page sees whatever landed in between
+/// and the row offset it resumes from now means something else.
+///
+/// This is why `ClientQueryService` materialises a read before paging it, and why the
+/// engine-page fast path only serves a page that is the whole result. It is a
+/// characterisation test: it asserts the anomaly, so that a future change which makes
+/// paged reads snapshot-stable fails here and gets read rather than merged.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn engine_paging_across_requests_repeats_and_drops_rows_when_a_write_lands() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/paged-read-snapshot-drift", object_store).await;
+    for dst in [10, 20, 30, 40] {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("paged-drift-base-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let query = "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id";
+    let first = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "paged-drift-page-1"),
+        query,
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        first.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+            QueryRow::new(vec![QueryValue::VertexId(20)]),
+        ]
+    );
+    let cursor = first.next_cursor.expect("four rows do not fit in one page");
+
+    // A row that sorts *before* the page boundary the cursor recorded.
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 5, "paged-drift-insert"))
+        .await
+        .unwrap();
+
+    let second = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "paged-drift-page-2"),
+        query,
+        Some(cursor),
+        2,
+    ))
+    .await
+    .unwrap();
+
+    // Resuming at row 2 of the *new* ordering: 20 comes back a second time and 40 is
+    // never returned at all. Under one pinned snapshot this would be [30, 40].
+    assert_eq!(
+        second.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(20)]),
+            QueryRow::new(vec![QueryValue::VertexId(30)]),
+        ]
+    );
+    let seen: Vec<_> = first.rows.iter().chain(second.rows.iter()).collect();
+    assert_eq!(
+        seen.iter().filter(|row| ***row
+            == QueryRow::new(vec![QueryValue::VertexId(20)]))
+        .count(),
+        2,
+        "a row that was already returned comes back on the next page"
+    );
+    assert!(
+        !seen.contains(&&QueryRow::new(vec![QueryValue::VertexId(40)])),
+        "a row present in both snapshots is never returned"
+    );
+
+    shard.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_variable_length_pages_cache_reachable_sets_by_hops_and_epoch() {

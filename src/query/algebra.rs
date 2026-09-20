@@ -294,6 +294,13 @@ pub struct QueryContext {
     pub max_result_bytes: Option<u64>,
     #[cfg_attr(feature = "query-transport", serde(default))]
     refreshed_reader: bool,
+    /// The caller can only use a page pinned to a storage snapshot, so the
+    /// engine must decline rather than fall back to materialising the whole
+    /// result and slicing it. Added after `QUERY_TRANSPORT_VERSION = 1`, so it
+    /// needs `serde(default)`: an older shard simply ignores it and answers as
+    /// before, which the caller detects from the missing `read_epoch`.
+    #[cfg_attr(feature = "query-transport", serde(default))]
+    snapshot_pinned_page_only: bool,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
     #[cfg(feature = "opencypher")]
@@ -313,6 +320,7 @@ impl QueryContext {
             max_runtime_ms: None,
             max_result_bytes: None,
             refreshed_reader: false,
+            snapshot_pinned_page_only: false,
             cancellation_token: None,
             #[cfg(feature = "opencypher")]
             validated_read: None,
@@ -362,6 +370,18 @@ impl QueryContext {
     pub(crate) fn with_refreshed_reader(mut self) -> Self {
         self.refreshed_reader = true;
         self
+    }
+
+    #[cfg(any(feature = "client-api", test))]
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn with_snapshot_pinned_page_only(mut self) -> Self {
+        self.snapshot_pinned_page_only = true;
+        self
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn requires_snapshot_pinned_page(&self) -> bool {
+        self.snapshot_pinned_page_only
     }
 
     #[cfg(feature = "opencypher")]
@@ -830,12 +850,29 @@ impl QueryCursorToken {
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct QueryResultPage {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
     pub next_cursor: Option<QueryCursorToken>,
+    /// Absent when the page was not produced under a pinned storage snapshot —
+    /// an older shard, or a caller that asked for a snapshot-pinned page the
+    /// engine could not serve. A read cannot be served from such a page.
+    pub read_epoch: Option<StorageSequence>,
+    pub storage_sequence: Option<crate::StorageSequence>,
 }
+
+impl PartialEq for QueryResultPage {
+    fn eq(&self, other: &Self) -> bool {
+        // Same rule as `QueryResultSet`: a snapshot watermark describes
+        // execution, not the logical page.
+        self.columns == other.columns
+            && self.rows == other.rows
+            && self.next_cursor == other.next_cursor
+    }
+}
+
+impl Eq for QueryResultPage {}
 
 impl QueryResultPage {
     pub fn new(
@@ -847,7 +884,19 @@ impl QueryResultPage {
             columns,
             rows,
             next_cursor,
+            read_epoch: None,
+            storage_sequence: None,
         }
+    }
+
+    pub fn with_read_epoch(mut self, read_epoch: StorageSequence) -> Self {
+        self.read_epoch = Some(read_epoch);
+        self
+    }
+
+    pub fn with_storage_sequence(mut self, storage_sequence: crate::StorageSequence) -> Self {
+        self.storage_sequence = Some(storage_sequence);
+        self
     }
 }
 

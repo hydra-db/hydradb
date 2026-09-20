@@ -38,6 +38,12 @@ impl QueryCellClient for HttpTestClient {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
+        if context.requires_snapshot_pinned_page() {
+            // A property-filtered match is none of the shard's streaming page
+            // shapes, so a real shard declines this without executing it. The
+            // read then takes the buffered-cursor path below.
+            return Ok(QueryResultPage::new(Vec::new(), Vec::new(), None));
+        }
         self.observed_epochs.lock().await.push(context.read_epoch);
         let offset = cursor.map_or(0, |cursor| cursor.offset as usize);
         let all_rows: Vec<_> = (1..=3)
