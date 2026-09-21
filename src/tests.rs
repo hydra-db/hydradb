@@ -11153,6 +11153,143 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_executes_numeric_scalar_functions_and_aggregates() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-numeric-functions", object_store).await;
+
+    for (idx, (edge_type, src, dst)) in [
+        ("HAS_METRIC", 1, 100),
+        ("HAS_METRIC", 1, 101),
+        ("HAS_METRIC", 1, 102),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-numeric-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    for (id, delta, temp, rate) in [
+        (100, -15i64, 25.4f64, 3.2f64),
+        (101, 4i64, -10.8f64, 5.7f64),
+        (102, -20i64, 0.0f64, -1.5f64),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                id,
+                VertexMetadata::default()
+                    .with_label("Metric")
+                    .with_property(
+                        "delta",
+                        if delta >= 0 {
+                            VertexPropertyValue::Integer(delta as u64)
+                        } else {
+                            VertexPropertyValue::SignedInteger(delta)
+                        },
+                    )
+                    .with_property("temp", VertexPropertyValue::Float(QueryFloat(temp)))
+                    .with_property("rate", VertexPropertyValue::Float(QueryFloat(rate))),
+            )
+            .await
+            .unwrap();
+    }
+
+    // 1. WHERE predicate with abs
+    let res = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "cypher-numeric-where-abs"),
+            "MATCH (r {id: 1})-[:HAS_METRIC]->(m:Metric) WHERE abs(m.delta) > 10 RETURN m.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(100)]),
+                QueryRow::new(vec![QueryValue::VertexId(102)]),
+            ],
+        )
+    );
+
+    // 2. WHERE predicate with round, ceil
+    let res2 = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "cypher-numeric-where-scalars"),
+            "MATCH (r {id: 1})-[:HAS_METRIC]->(m:Metric) WHERE round(m.temp) = 25 AND ceil(m.rate) = 4.0 RETURN m.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res2,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(100)])],
+        )
+    );
+
+    // 3. RETURN with collect(abs(...)) and count(round(...))
+    let res3 = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "cypher-numeric-aggregates"),
+            "MATCH (r {id: 1})-[:HAS_METRIC]->(m:Metric) RETURN count(round(m.temp)) AS cnt, collect(abs(m.delta)) AS deltas",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res3,
+        QueryResultSet::new(
+            vec![QueryColumn::new("cnt"), QueryColumn::new("deltas")],
+            vec![QueryRow::new(vec![
+                QueryValue::Count(3),
+                QueryValue::List(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(15)),
+                    QueryValue::Property(VertexPropertyValue::Integer(4)),
+                    QueryValue::Property(VertexPropertyValue::Integer(20)),
+                ]),
+            ])],
+        )
+    );
+
+    // 4. sum and avg reject numeric scalar functions with clear error
+    let sum_err = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "cypher-numeric-sum-err"),
+            "MATCH (r {id: 1})-[:HAS_METRIC]->(m:Metric) RETURN sum(abs(m.delta))",
+        )
+        .await;
+    assert!(sum_err.is_err());
+    assert!(sum_err
+        .unwrap_err()
+        .to_string()
+        .contains("sum aggregate currently requires a direct property or integer literal"));
+
+    let avg_err = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "cypher-numeric-avg-err"),
+            "MATCH (r {id: 1})-[:HAS_METRIC]->(m:Metric) RETURN avg(round(m.temp))",
+        )
+        .await;
+    assert!(avg_err.is_err());
+    assert!(avg_err
+        .unwrap_err()
+        .to_string()
+        .contains("avg aggregate currently requires a direct property or integer literal"));
+}
+
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_executes_set_remove_delete_and_merge_mutations() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-mutations", object_store).await;

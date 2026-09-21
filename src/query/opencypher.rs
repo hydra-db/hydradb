@@ -257,6 +257,11 @@ pub enum RowExpression {
     NodeId { binding: String },
     Property { binding: String, property: String },
     Literal(VertexPropertyValue),
+    Abs(Box<RowExpression>),
+    Ceil(Box<RowExpression>),
+    Floor(Box<RowExpression>),
+    Round(Box<RowExpression>),
+    Sign(Box<RowExpression>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2828,6 +2833,64 @@ fn lower_row_expression(
     expression: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<RowExpression> {
+    unsafe {
+        if is_instance(expression, sys::CYPHER_AST_APPLY_OPERATOR) {
+            if sys::cypher_ast_apply_operator_get_distinct(expression) {
+                return unsupported(
+                    "DISTINCT function arguments are not executable in Query engine",
+                );
+            }
+            let function_node =
+                checked_node(sys::cypher_ast_apply_operator_get_func_name(expression))?;
+            let function_name = function_name(function_node)?;
+            let argument_count = sys::cypher_ast_apply_operator_narguments(expression);
+            if function_name.eq_ignore_ascii_case("abs") {
+                if argument_count != 1 {
+                    return unsupported("abs function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::Abs(Box::new(inner)));
+            }
+            if function_name.eq_ignore_ascii_case("ceil") {
+                if argument_count != 1 {
+                    return unsupported("ceil function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::Ceil(Box::new(inner)));
+            }
+            if function_name.eq_ignore_ascii_case("floor") {
+                if argument_count != 1 {
+                    return unsupported("floor function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::Floor(Box::new(inner)));
+            }
+            if function_name.eq_ignore_ascii_case("round") {
+                if argument_count != 1 {
+                    return unsupported("round function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::Round(Box::new(inner)));
+            }
+            if function_name.eq_ignore_ascii_case("sign") {
+                if argument_count != 1 {
+                    return unsupported("sign function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::Sign(Box::new(inner)));
+            }
+        }
+    }
     if let Some(binding) = node_id_expression_binding(expression)? {
         return Ok(RowExpression::NodeId { binding });
     }
@@ -2864,6 +2927,21 @@ fn lower_row_aggregate_expression(
         }
         let argument = checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
         let expression = lower_row_expression(argument, parameters)?;
+        if matches!(function, RowAggregateFunction::Sum | RowAggregateFunction::Avg)
+            && matches!(
+                expression,
+                RowExpression::Abs(_)
+                    | RowExpression::Ceil(_)
+                    | RowExpression::Floor(_)
+                    | RowExpression::Round(_)
+                    | RowExpression::Sign(_)
+            )
+        {
+            return unsupported(format!(
+                "{} aggregate currently requires a direct property or integer literal; numeric functions are supported under collect and count",
+                aggregate_function_name(function)
+            ));
+        }
         let fallback_name = format!(
             "{}({})",
             aggregate_function_name(function),
@@ -2905,6 +2983,11 @@ fn row_expression_name(expression: &RowExpression) -> String {
         RowExpression::Literal(VertexPropertyValue::Bool(value)) => value.to_string(),
         RowExpression::Literal(VertexPropertyValue::Float(value)) => value.0.to_string(),
         RowExpression::Literal(VertexPropertyValue::String(value)) => format!("'{value}'"),
+        RowExpression::Abs(inner) => format!("abs({})", row_expression_name(inner)),
+        RowExpression::Ceil(inner) => format!("ceil({})", row_expression_name(inner)),
+        RowExpression::Floor(inner) => format!("floor({})", row_expression_name(inner)),
+        RowExpression::Round(inner) => format!("round({})", row_expression_name(inner)),
+        RowExpression::Sign(inner) => format!("sign({})", row_expression_name(inner)),
     }
 }
 
@@ -4601,5 +4684,78 @@ mod tests {
             opencypher_query_fingerprint("MATCH ((("),
             query_shape_fingerprint("MATCH ((("),
         );
+    }
+
+    #[test]
+    fn lowers_numeric_scalar_function_expressions() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (n:Item) WHERE abs(n.delta) > 5 AND round(n.temp) = 25 AND ceil(n.rate) >= 4.0 AND floor(n.score) = 3 AND sign(n.balance) = -1 RETURN n.id",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.predicate,
+            Some(RowPredicate::And(
+                Box::new(RowPredicate::And(
+                    Box::new(RowPredicate::And(
+                        Box::new(RowPredicate::And(
+                            Box::new(RowPredicate::Compare {
+                                left: RowExpression::Abs(Box::new(RowExpression::Property {
+                                    binding: "n".to_string(),
+                                    property: "delta".to_string(),
+                                })),
+                                op: RowComparisonOp::Gt,
+                                right: RowExpression::Literal(VertexPropertyValue::Integer(5)),
+                            }),
+                            Box::new(RowPredicate::Compare {
+                                left: RowExpression::Round(Box::new(RowExpression::Property {
+                                    binding: "n".to_string(),
+                                    property: "temp".to_string(),
+                                })),
+                                op: RowComparisonOp::Eq,
+                                right: RowExpression::Literal(VertexPropertyValue::Integer(25)),
+                            })
+                        )),
+                        Box::new(RowPredicate::Compare {
+                            left: RowExpression::Ceil(Box::new(RowExpression::Property {
+                                binding: "n".to_string(),
+                                property: "rate".to_string(),
+                            })),
+                            op: RowComparisonOp::Gte,
+                            right: RowExpression::Literal(VertexPropertyValue::Float(QueryFloat(
+                                4.0
+                            ))),
+                        })
+                    )),
+                    Box::new(RowPredicate::Compare {
+                        left: RowExpression::Floor(Box::new(RowExpression::Property {
+                            binding: "n".to_string(),
+                            property: "score".to_string(),
+                        })),
+                        op: RowComparisonOp::Eq,
+                        right: RowExpression::Literal(VertexPropertyValue::Integer(3)),
+                    })
+                )),
+                Box::new(RowPredicate::Compare {
+                    left: RowExpression::Sign(Box::new(RowExpression::Property {
+                        binding: "n".to_string(),
+                        property: "balance".to_string(),
+                    })),
+                    op: RowComparisonOp::Eq,
+                    right: RowExpression::Literal(VertexPropertyValue::SignedInteger(-1)),
+                })
+            ))
+        );
+
+        // collect and count accept numeric functions
+        let collect_parsed = parse_opencypher_row_query(
+            "MATCH (n:Item) RETURN collect(abs(n.delta)) AS deltas, count(round(n.temp)) AS cnt",
+        )
+        .unwrap();
+        assert_eq!(collect_parsed.projections.len(), 2);
+
+        // sum and avg reject numeric functions with clear message
+        assert!(parse_opencypher_row_query("MATCH (n:Item) RETURN sum(abs(n.delta))").is_err());
+        assert!(parse_opencypher_row_query("MATCH (n:Item) RETURN avg(round(n.temp))").is_err());
     }
 }

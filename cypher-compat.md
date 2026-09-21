@@ -76,6 +76,17 @@ MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id
 
 `STARTS WITH` needs a string literal or a parameter on the right.
 
+Numeric scalar functions `abs`, `ceil`, `floor`, `round`, and `sign` are supported in comparisons and aggregate arguments:
+
+```cypher
+MATCH (s:Score) WHERE abs(s.delta) > 5 RETURN s.id
+MATCH (s:Score) WHERE round(s.temp) = 25 RETURN s.id
+MATCH (s:Score) WHERE ceil(s.rate) >= 4.0 RETURN s.id
+MATCH (s:Score) WHERE floor(s.score) = 3 RETURN s.id
+MATCH (s:Score) WHERE sign(s.balance) = -1 RETURN s.id
+MATCH (s:Score) RETURN collect(abs(s.delta)) AS deltas
+```
+
 `IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` are not supported. All four are
 rejected with the same message, that `WHERE` supports boolean combinations of
 property comparisons.
@@ -86,6 +97,7 @@ Projections are `<binding>.<property>` or an aggregate. `RETURN *` is not
 executable, so name what you want.
 
 Aggregates: `count`, `sum`, `avg`, `collect`. `count(*)` is supported.
+Numeric scalar functions can also be evaluated inside aggregate arguments for `collect` and `count` (e.g. `collect(abs(s.delta))`, `count(round(s.temp))`). `sum` and `avg` require direct integer properties or literals.
 `DISTINCT` inside an aggregate argument is not, and neither is `count(DISTINCT *)`.
 
 `ORDER BY` accepts a projected alias, `<binding>.id`, or `count(*)`, ascending

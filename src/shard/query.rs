@@ -8232,6 +8232,82 @@ fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<R
             })
         }
         RowExpression::Literal(value) => Ok(RowScalarValue::Value(value.clone())),
+        RowExpression::Abs(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::Integer(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(v.unsigned_abs())))
+            }
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v))) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v.abs()))))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
+        RowExpression::Ceil(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::Integer(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v))) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v.ceil()))))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
+        RowExpression::Floor(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::Integer(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v))) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v.floor()))))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
+        RowExpression::Round(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::Integer(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v))) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v.round()))))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
+        RowExpression::Sign(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::Integer(0)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(0)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::Integer(_)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::Integer(1)))
+            }
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(v)) => {
+                if v < 0 {
+                    Ok(RowScalarValue::Value(VertexPropertyValue::SignedInteger(-1)))
+                } else if v == 0 {
+                    Ok(RowScalarValue::Value(VertexPropertyValue::Integer(0)))
+                } else {
+                    Ok(RowScalarValue::Value(VertexPropertyValue::Integer(1)))
+                }
+            }
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(v))) => {
+                let sign = if v == 0.0 {
+                    0.0
+                } else if v > 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                Ok(RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(sign))))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
     }
 }
 
@@ -8767,6 +8843,82 @@ fn expression_query_value(
             binding_property(row, binding, property)?.map(QueryValue::Property)
         }
         RowExpression::Literal(value) => Some(QueryValue::Property(value.clone())),
+        RowExpression::Abs(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::Integer(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(v.unsigned_abs())))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v)))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v.abs()))))
+            }
+            _ => None,
+        },
+        RowExpression::Ceil(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::Integer(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v)))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v.ceil()))))
+            }
+            _ => None,
+        },
+        RowExpression::Floor(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::Integer(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v)))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v.floor()))))
+            }
+            _ => None,
+        },
+        RowExpression::Round(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::Integer(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v))) => {
+                Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v)))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v.round()))))
+            }
+            _ => None,
+        },
+        RowExpression::Sign(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::Integer(0))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(0)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Integer(_))) => {
+                Some(QueryValue::Property(VertexPropertyValue::Integer(1)))
+            }
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(v))) => {
+                if v < 0 {
+                    Some(QueryValue::Property(VertexPropertyValue::SignedInteger(-1)))
+                } else if v == 0 {
+                    Some(QueryValue::Property(VertexPropertyValue::Integer(0)))
+                } else {
+                    Some(QueryValue::Property(VertexPropertyValue::Integer(1)))
+                }
+            }
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(v)))) => {
+                let sign = if v == 0.0 {
+                    0.0
+                } else if v > 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(sign))))
+            }
+            _ => None,
+        },
     })
 }
 
@@ -9100,3 +9252,267 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         ordering => ordering,
     }
 }
+
+#[cfg(all(test, feature = "opencypher"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eval_row_expression_numeric_scalar_functions() {
+        let mut row = BindingRow::default();
+        row.bind(Some("n"), 1);
+        let mut metadata = VertexMetadata::default();
+        metadata
+            .properties
+            .insert("pos_int".to_string(), VertexPropertyValue::Integer(10));
+        metadata
+            .properties
+            .insert("neg_int".to_string(), VertexPropertyValue::SignedInteger(-15));
+        metadata
+            .properties
+            .insert("float_val".to_string(), VertexPropertyValue::Float(QueryFloat(-3.7)));
+        metadata
+            .properties
+            .insert("zero_int".to_string(), VertexPropertyValue::Integer(0));
+        metadata
+            .properties
+            .insert("text".to_string(), VertexPropertyValue::String("hello".to_string()));
+        row.metadata.insert("n".to_string(), metadata);
+
+        // abs
+        let expr_abs_pos = RowExpression::Abs(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "pos_int".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_abs_pos).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Integer(10))
+        );
+        let expr_abs_neg = RowExpression::Abs(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "neg_int".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_abs_neg).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Integer(15))
+        );
+        let expr_abs_float = RowExpression::Abs(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "float_val".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_abs_float).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat(3.7)))
+        );
+
+        // ceil
+        let expr_ceil = RowExpression::Ceil(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "float_val".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_ceil).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat((-3.7_f64).ceil())))
+        );
+
+        // floor
+        let expr_floor = RowExpression::Floor(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "float_val".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_floor).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat((-3.7_f64).floor())))
+        );
+
+        // round
+        let expr_round = RowExpression::Round(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "float_val".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_round).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Float(QueryFloat((-3.7_f64).round())))
+        );
+
+        // sign
+        let expr_sign_pos = RowExpression::Sign(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "pos_int".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_sign_pos).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Integer(1))
+        );
+        let expr_sign_neg = RowExpression::Sign(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "neg_int".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_sign_neg).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::SignedInteger(-1))
+        );
+        let expr_sign_zero = RowExpression::Sign(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "zero_int".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_sign_zero).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::Integer(0))
+        );
+
+        // Non-numeric and missing propagation
+        let expr_abs_text = RowExpression::Abs(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "text".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_abs_text).unwrap(),
+            RowScalarValue::Missing
+        );
+        let expr_abs_missing = RowExpression::Abs(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "nonexistent".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_abs_missing).unwrap(),
+            RowScalarValue::Missing
+        );
+
+        // expression_query_value for all scalar functions
+        assert_eq!(
+            expression_query_value(&row, &expr_abs_pos).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Integer(10)))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_abs_neg).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Integer(15)))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_abs_float).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat(3.7))))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_ceil).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat((-3.7_f64).ceil()))))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_floor).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat((-3.7_f64).floor()))))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_round).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Float(QueryFloat((-3.7_f64).round()))))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_sign_pos).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Integer(1)))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_sign_neg).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::SignedInteger(-1)))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_sign_zero).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::Integer(0)))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_abs_missing).unwrap(),
+            None
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_abs_text).unwrap(),
+            None
+        );
+        let expr_ceil_missing = RowExpression::Ceil(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "missing".to_string(),
+        }));
+        assert_eq!(
+            expression_query_value(&row, &expr_ceil_missing).unwrap(),
+            None
+        );
+        let expr_floor_missing = RowExpression::Floor(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "missing".to_string(),
+        }));
+        assert_eq!(
+            expression_query_value(&row, &expr_floor_missing).unwrap(),
+            None
+        );
+        let expr_round_missing = RowExpression::Round(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "missing".to_string(),
+        }));
+        assert_eq!(
+            expression_query_value(&row, &expr_round_missing).unwrap(),
+            None
+        );
+        let expr_sign_missing = RowExpression::Sign(Box::new(RowExpression::Property {
+            binding: "n".to_string(),
+            property: "missing".to_string(),
+        }));
+        assert_eq!(
+            expression_query_value(&row, &expr_sign_missing).unwrap(),
+            None
+        );
+
+        // Aggregate accumulation with numeric functions
+        let mut collect_acc = AggregateAccumulator::Collect(Vec::new());
+        let collect_proj = RowProjection::Aggregate {
+            function: RowAggregateFunction::Collect,
+            expression: expr_ceil.clone(),
+        };
+        update_aggregate_projection(&mut collect_acc, &collect_proj, &row).unwrap();
+        assert_eq!(
+            finalize_aggregate(&collect_acc).unwrap(),
+            QueryValue::List(vec![QueryValue::Property(VertexPropertyValue::Float(
+                QueryFloat((-3.7_f64).ceil())
+            ))])
+        );
+
+        let mut count_acc = AggregateAccumulator::CountExpression(0);
+        let count_proj = RowProjection::Aggregate {
+            function: RowAggregateFunction::Count,
+            expression: expr_round.clone(),
+        };
+        update_aggregate_projection(&mut count_acc, &count_proj, &row).unwrap();
+        assert_eq!(
+            finalize_aggregate(&count_acc).unwrap(),
+            QueryValue::Count(1)
+        );
+
+        // Predicate matching
+        let pred_abs = RowPredicate::Compare {
+            left: expr_abs_neg,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Integer(15)),
+        };
+        assert!(row_predicate_matches(&row, &pred_abs).unwrap());
+        let pred_ceil = RowPredicate::Compare {
+            left: expr_ceil,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Float(QueryFloat(-3.0))),
+        };
+        assert!(row_predicate_matches(&row, &pred_ceil).unwrap());
+        let pred_floor = RowPredicate::Compare {
+            left: expr_floor,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Float(QueryFloat(-4.0))),
+        };
+        assert!(row_predicate_matches(&row, &pred_floor).unwrap());
+        let pred_round = RowPredicate::Compare {
+            left: expr_round,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Float(QueryFloat(-4.0))),
+        };
+        assert!(row_predicate_matches(&row, &pred_round).unwrap());
+        let pred_sign = RowPredicate::Compare {
+            left: expr_sign_neg,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::SignedInteger(-1)),
+        };
+        assert!(row_predicate_matches(&row, &pred_sign).unwrap());
+    }
+}
+
