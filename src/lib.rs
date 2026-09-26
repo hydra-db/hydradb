@@ -72,10 +72,10 @@ pub use core::model::{
     BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult, CommitResult, DeleteResult,
     EdgeDeleteBatchResult, EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult,
     EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeRecord, GraphCellDropResult,
-    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, NeighborBatchEntry, QueryFloat,
-    RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
-    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
-    VertexPropertyValue,
+    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, MergeBranchMetadata,
+    NeighborBatchEntry, QueryFloat, RelationshipCreateResult, RelationshipId,
+    RelationshipImportResult, RelationshipMutation, RelationshipRecord, SegmentCompactionResult,
+    VertexDeleteResult, VertexMetadata, VertexPropertyValue,
 };
 pub use core::namespace::{
     GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
