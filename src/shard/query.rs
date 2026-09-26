@@ -1797,6 +1797,8 @@ impl GraphShard {
                 src_metadata,
                 dst_metadata,
                 edge_metadata,
+                on_create,
+                on_match,
             } = action
             else {
                 return Err(GraphError::UnsupportedQuery {
@@ -1814,7 +1816,17 @@ impl GraphShard {
                     context.idempotency_key, edge_type, src, dst
                 ),
             };
-            let commit = if src_metadata.labels.is_empty()
+            let commit = if !on_create.is_empty() || !on_match.is_empty() {
+                self.merge_edge_with_branches(
+                    mutation,
+                    src_metadata.clone(),
+                    dst_metadata.clone(),
+                    edge_metadata.clone(),
+                    on_create.as_ref().clone(),
+                    on_match.as_ref().clone(),
+                )
+                .await?
+            } else if src_metadata.labels.is_empty()
                 && src_metadata.properties.is_empty()
                 && dst_metadata.labels.is_empty()
                 && dst_metadata.properties.is_empty()

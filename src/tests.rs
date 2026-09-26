@@ -11262,6 +11262,98 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
 }
 
 #[cfg(feature = "opencypher")]
+async fn read_merge_branch_row(shard: &GraphShard, key: &str) -> Vec<QueryRow> {
+    shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", key),
+            "MATCH (u:User {id: 1})-[r:FOLLOWS]->(v:Fresh {id: 2}) \
+             RETURN u.created, u.seen, r.since",
+        )
+        .await
+        .unwrap()
+        .rows
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_merge_runs_exactly_one_of_on_create_and_on_match() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-merge-branches", object_store).await;
+    let merge = |created: i64, seen: i64| {
+        format!(
+            "MERGE (u:User {{id: 1}})-[r:FOLLOWS]->(v {{id: 2}}) \
+             ON CREATE SET u.created = {created}, r.since = {created}, v:Fresh \
+             ON MATCH SET u.seen = {seen}"
+        )
+    };
+    let created = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-merge-branch-create"),
+            &merge(10, 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created,
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        read_merge_branch_row(&shard, "cypher-merge-branch-read-create").await,
+        vec![QueryRow::new(vec![
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+            QueryValue::Null,
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+        ])]
+    );
+
+    // The edge now exists: ON MATCH runs, and ON CREATE's new values do not.
+    let matched = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-merge-branch-match"),
+            &merge(20, 2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        matched,
+        QueryOutput::Mutation(QueryMutationResult {
+            noops: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        read_merge_branch_row(&shard, "cypher-merge-branch-read-match").await,
+        vec![QueryRow::new(vec![
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+            QueryValue::Property(VertexPropertyValue::Integer(2)),
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+        ])]
+    );
+
+    // Replaying the first request returns its recorded outcome and runs
+    // neither branch again, so ON MATCH does not overwrite `seen` with 1.
+    let replay = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-merge-branch-create"),
+            &merge(10, 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, created);
+    assert_eq!(
+        read_merge_branch_row(&shard, "cypher-merge-branch-read-replay").await,
+        vec![QueryRow::new(vec![
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+            QueryValue::Property(VertexPropertyValue::Integer(2)),
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+        ])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

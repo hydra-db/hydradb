@@ -22,7 +22,7 @@ accepted.
 | `RETURN` | Yes, property projections and aggregates, with alias, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT` |
 | `WITH` | Pass-through only, no aliases and no filtering |
 | `CREATE` | Yes, one or more relationship paths |
-| `MERGE` | Yes, matched on id, no `ON CREATE` or `ON MATCH` |
+| `MERGE` | Yes, matched on id, with `ON CREATE SET` and `ON MATCH SET` on the standalone form |
 | `SET` | Yes, properties and labels, after a `MATCH` |
 | `REMOVE` | Yes, properties and labels, after a `MATCH` |
 | `DELETE`, `DETACH DELETE` | Yes, after a `MATCH` |
@@ -128,9 +128,7 @@ relationship, and `CREATE UNIQUE` is not supported.
 
 ### MERGE
 
-Matches on id and creates when absent. `ON CREATE` and `ON MATCH` are not
-supported, so apply properties with a following `SET` on a matched pattern
-instead.
+Matches on id and creates when absent.
 
 ```cypher
 MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2})
@@ -139,6 +137,23 @@ MERGE (u:User {id: 1, name: 'alice'})-[:FOLLOWS]->(v:User {id: 2})
 
 A `MERGE` that changes nothing still commits, so an idempotent retry costs the
 same as the original write.
+
+`ON CREATE SET` runs only when the relationship did not exist, and
+`ON MATCH SET` only when it did. Either can set properties on the two endpoints
+and the relationship, and labels on the endpoints, through the variables the
+pattern binds.
+
+```cypher
+MERGE (u:User {id: 1})-[r:FOLLOWS]->(v {id: 2})
+  ON CREATE SET u.created_at = $now, r.since = $now
+  ON MATCH SET u.last_seen = $now
+```
+
+The branch is chosen inside the transaction that writes the relationship, so
+exactly one of them applies even under concurrent writers, and an idempotent
+retry returns the original outcome without running either branch again. Pattern
+properties apply on both branches, and a branch `SET` wins where both name the
+same property. The `UNWIND` batch form of `MERGE` still rejects both actions.
 
 ### SET, REMOVE, DELETE
 
@@ -257,7 +272,7 @@ accepted as `UNWIND` input, and only through the client transport.
 Rejected at parse time, with the reason in the error:
 
 - `RETURN *`, and projections other than `<binding>.<property>` or an aggregate
-- `CREATE UNIQUE`, and `ON CREATE` or `ON MATCH` on `MERGE`
+- `CREATE UNIQUE`, and `ON CREATE` or `ON MATCH` on an `UNWIND` batch `MERGE`
 - Undirected relationship patterns, and patterns with more than one type
 - Unbounded variable-length traversal, `*` or `*1..`
 - `WITH` that aliases, filters, orders, or drops a binding

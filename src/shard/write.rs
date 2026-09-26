@@ -2808,6 +2808,7 @@ impl GraphShard {
             &[],
             &EdgeMetadata::default(),
             "write_edge",
+            None,
         )
         .await
     }
@@ -2884,6 +2885,7 @@ impl GraphShard {
                 metadata_updates,
                 &EdgeMetadata::default(),
                 "write_edge_with_vertex_metadata",
+                None,
             )
             .await;
         finish_local_write(lock, result).await
@@ -2964,6 +2966,110 @@ impl GraphShard {
                 metadata_updates,
                 edge_metadata,
                 "write_edge_with_full_metadata",
+                None,
+            )
+            .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// `MERGE ... ON CREATE SET ... ON MATCH SET ...` for one edge.
+    ///
+    /// The pattern metadata is written on both branches, exactly as
+    /// `write_edge_with_full_metadata` writes it; `on_create` is folded on top
+    /// when this transaction finds no edge, `on_match` when it finds one. The
+    /// choice is made against the same snapshot that commits, so it is atomic
+    /// with the edge write, and an idempotent replay returns the recorded
+    /// result without re-running either branch.
+    pub async fn merge_edge_with_branches(
+        &self,
+        mutation: EdgeMutation,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
+        on_create: MergeBranchMetadata,
+        on_match: MergeBranchMetadata,
+    ) -> Result<CommitResult> {
+        validate_component("cell_id", &mutation.cell_id)?;
+        validate_component("edge_type", &mutation.edge_type)?;
+        validate_component("idempotency_key", &mutation.idempotency_key)?;
+        validate_vertex_metadata(&src_metadata)?;
+        validate_vertex_metadata(&dst_metadata)?;
+        validate_edge_metadata(&edge_metadata)?;
+        validate_edge_metadata(&on_create.edge)?;
+        validate_edge_metadata(&on_match.edge)?;
+        self.ensure_write_authority(&mutation.cell_id, "merge_edge_with_branches")?;
+
+        let metadata_updates = coalesce_vertex_metadata_updates([
+            (mutation.src, src_metadata),
+            (mutation.dst, dst_metadata),
+        ])?;
+        let branches = MergeBranchUpdates {
+            on_create: MergeBranchUpdate::resolve(&mutation, on_create)?,
+            on_match: MergeBranchUpdate::resolve(&mutation, on_match)?,
+        };
+        let _permit = self
+            .acquire_graph_write_permit("merge_edge_with_branches")
+            .instrument(
+                tracing::info_span!("shard.write_permit", hydradb.cell_id = %mutation.cell_id),
+            )
+            .await?;
+        let _writer = self
+            .writer_lane(&mutation.cell_id)
+            .lock()
+            .instrument(
+                tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id),
+            )
+            .await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .merge_edge_with_branches_txn(
+                    &mutation,
+                    &metadata_updates,
+                    &edge_metadata,
+                    &branches,
+                )
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
+    async fn merge_edge_with_branches_txn(
+        &self,
+        mutation: &EdgeMutation,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+        edge_metadata: &EdgeMetadata,
+        branches: &MergeBranchUpdates,
+    ) -> Result<CommitResult> {
+        let lock = self
+            .acquire_local_write_guard(&mutation.cell_id, "merge_edge_with_branches")
+            .await?;
+        let result = self
+            .write_edge_txn_locked_with_metadata(
+                mutation,
+                metadata_updates,
+                edge_metadata,
+                "merge_edge_with_branches",
+                Some(branches),
             )
             .await;
         finish_local_write(lock, result).await
@@ -2975,6 +3081,7 @@ impl GraphShard {
         metadata_updates: &[(VertexId, VertexMetadata)],
         edge_metadata: &EdgeMetadata,
         operation: &'static str,
+        branches: Option<&MergeBranchUpdates>,
     ) -> Result<CommitResult> {
         let txn = self
             .db
@@ -3002,6 +3109,22 @@ impl GraphShard {
             current_epoch,
         )
         .await?;
+
+        // A MERGE branch is picked from the edge read above and folded over the
+        // pattern metadata, so `SET` wins where both name the same property.
+        let folded;
+        let (metadata_updates, edge_metadata) = match branches {
+            None => (metadata_updates, edge_metadata),
+            Some(branches) => {
+                let branch = if existing_edge_epoch.is_some() {
+                    &branches.on_match
+                } else {
+                    &branches.on_create
+                };
+                folded = branch.fold_over(metadata_updates, edge_metadata);
+                (folded.0.as_slice(), &folded.1)
+            }
+        };
 
         let mut changed_metadata = Vec::new();
         for (vertex_id, requested) in metadata_updates {
@@ -5421,6 +5544,49 @@ mod guarded_metadata_patch_tests {
             .unwrap();
         assert!(!patch.contains_key("created_at"));
         assert!(patch.contains_key("updated_at"));
+    }
+}
+
+/// The two branches of a `MERGE ... ON CREATE / ON MATCH`, resolved to vertex
+/// ids once before the retry loop.
+struct MergeBranchUpdates {
+    on_create: MergeBranchUpdate,
+    on_match: MergeBranchUpdate,
+}
+
+struct MergeBranchUpdate {
+    vertex_updates: Vec<(VertexId, VertexMetadata)>,
+    edge: EdgeMetadata,
+}
+
+impl MergeBranchUpdate {
+    fn resolve(mutation: &EdgeMutation, branch: MergeBranchMetadata) -> Result<Self> {
+        Ok(Self {
+            vertex_updates: coalesce_vertex_metadata_updates([
+                (mutation.src, branch.src),
+                (mutation.dst, branch.dst),
+            ])?,
+            edge: branch.edge,
+        })
+    }
+
+    fn fold_over(
+        &self,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+        edge_metadata: &EdgeMetadata,
+    ) -> (Vec<(VertexId, VertexMetadata)>, EdgeMetadata) {
+        let mut by_vertex = metadata_updates
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<VertexId, VertexMetadata>>();
+        for (vertex_id, branch) in &self.vertex_updates {
+            let entry = by_vertex.entry(*vertex_id).or_default();
+            *entry = merge_vertex_metadata(entry, branch);
+        }
+        (
+            by_vertex.into_iter().collect(),
+            merge_edge_metadata(edge_metadata, &self.edge),
+        )
     }
 }
 

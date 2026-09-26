@@ -244,6 +244,28 @@ pub struct EdgeMetadata {
     pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
+/// Metadata one branch of a `MERGE` writes: `ON CREATE SET` when the edge is
+/// new, `ON MATCH SET` when it already existed. Which branch applies is decided
+/// inside the write transaction that reads the edge, so a concurrent `MERGE` of
+/// the same edge cannot make both branches fire, and an idempotent replay
+/// re-runs the branch the original commit chose.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergeBranchMetadata {
+    pub src: VertexMetadata,
+    pub dst: VertexMetadata,
+    pub edge: EdgeMetadata,
+}
+
+impl MergeBranchMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.src.labels.is_empty()
+            && self.src.properties.is_empty()
+            && self.dst.labels.is_empty()
+            && self.dst.properties.is_empty()
+            && self.edge.properties.is_empty()
+    }
+}
+
 impl EdgeMetadata {
     pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
         self.properties.insert(name.into(), value);

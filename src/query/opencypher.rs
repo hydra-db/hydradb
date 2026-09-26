@@ -6,8 +6,8 @@ use std::ptr::null_mut;
 use libcypher_parser_sys as sys;
 
 use crate::{
-    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryFloat, QueryWindow, Result,
-    VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, EdgeMetadata, GraphError, MergeBranchMetadata, QueryColumn, QueryFloat,
+    QueryWindow, Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 type AstNode = sys::cypher_astnode_t;
@@ -219,6 +219,10 @@ pub enum RowMutationAction {
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
         edge_metadata: EdgeMetadata,
+        // Boxed: two metadata maps per branch would otherwise make this the
+        // largest variant by far, and every other action pays for it.
+        on_create: Box<MergeBranchMetadata>,
+        on_match: Box<MergeBranchMetadata>,
     },
 }
 
@@ -2385,11 +2389,6 @@ fn lower_simple_merge(
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedMutationQuery> {
     unsafe {
-        if sys::cypher_ast_merge_nactions(merge_clause) != 0 {
-            return unsupported(
-                "MERGE ON CREATE/ON MATCH actions are not executable in Query engine",
-            );
-        }
         let path = checked_node(sys::cypher_ast_merge_get_pattern_path(merge_clause))?;
         let edge = lower_create_edge_path(path, parameters, "MERGE")?;
         if edge.hop_range.is_some() {
@@ -2406,6 +2405,27 @@ fn lower_simple_merge(
             .id
             .ok_or_else(|| unsupported_value("MERGE requires destination id"))?;
         let edge_metadata = edge_metadata_from_edge_pattern(&edge);
+        let mut on_create = MergeBranchMetadata::default();
+        let mut on_match = MergeBranchMetadata::default();
+        for idx in 0..sys::cypher_ast_merge_nactions(merge_clause) {
+            let action = checked_node(sys::cypher_ast_merge_get_action(merge_clause, idx))?;
+            if is_instance(action, sys::CYPHER_AST_ON_CREATE) {
+                for item_idx in 0..sys::cypher_ast_on_create_nitems(action) {
+                    let item = checked_node(sys::cypher_ast_on_create_get_item(action, item_idx))?;
+                    apply_merge_branch_set(&mut on_create, &edge, item, parameters)?;
+                }
+            } else if is_instance(action, sys::CYPHER_AST_ON_MATCH) {
+                for item_idx in 0..sys::cypher_ast_on_match_nitems(action) {
+                    let item = checked_node(sys::cypher_ast_on_match_get_item(action, item_idx))?;
+                    apply_merge_branch_set(&mut on_match, &edge, item, parameters)?;
+                }
+            } else {
+                return unsupported(format!(
+                    "unsupported MERGE action {}",
+                    node_type_name(action)
+                ));
+            }
+        }
         Ok(ParsedMutationQuery {
             patterns: Vec::new(),
             predicate: None,
@@ -2416,9 +2436,73 @@ fn lower_simple_merge(
                 src_metadata: vertex_metadata_from_node_pattern(&edge.src),
                 dst_metadata: vertex_metadata_from_node_pattern(&edge.dst),
                 edge_metadata,
+                on_create: Box::new(on_create),
+                on_match: Box::new(on_match),
             }],
         })
     }
+}
+
+/// Folds one `ON CREATE SET` or `ON MATCH SET` item into the branch metadata.
+///
+/// A standalone `MERGE` has at most three bindings, the two endpoints and the
+/// relationship, and each resolves to a fixed id at parse time, so the item is
+/// lowered straight to a metadata patch rather than to a `SetProperty` action
+/// that would need a binding row to execute against. A self-loop written with
+/// one variable, `(a {id: 1})-[:R]->(a {id: 1})`, patches both endpoints, which
+/// coalesce into one vertex write.
+fn apply_merge_branch_set(
+    branch: &mut MergeBranchMetadata,
+    edge: &RowEdgePattern,
+    item: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<()> {
+    let action = lower_set_item(item, parameters)?;
+    let binding = match &action {
+        RowMutationAction::SetProperty { binding, .. }
+        | RowMutationAction::SetLabels { binding, .. } => binding,
+        _ => unreachable!("lower_set_item returns only SET actions"),
+    };
+    let on_src = edge.src.binding.as_ref() == Some(binding);
+    let on_dst = edge.dst.binding.as_ref() == Some(binding);
+    let on_edge = edge.binding.as_ref() == Some(binding);
+    if !on_src && !on_dst && !on_edge {
+        return unsupported(format!(
+            "MERGE ON CREATE/ON MATCH SET references {binding}, which the MERGE pattern does not bind"
+        ));
+    }
+    match action {
+        RowMutationAction::SetProperty {
+            property, value, ..
+        } => {
+            if on_edge {
+                branch.edge.properties.insert(property, value);
+                return Ok(());
+            }
+            if on_src {
+                branch
+                    .src
+                    .properties
+                    .insert(property.clone(), value.clone());
+            }
+            if on_dst {
+                branch.dst.properties.insert(property, value);
+            }
+        }
+        RowMutationAction::SetLabels { labels, .. } => {
+            if on_edge {
+                return unsupported("SET cannot add labels to a relationship");
+            }
+            if on_src {
+                branch.src.labels.extend(labels.iter().cloned());
+            }
+            if on_dst {
+                branch.dst.labels.extend(labels);
+            }
+        }
+        _ => unreachable!("lower_set_item returns only SET actions"),
+    }
+    Ok(())
 }
 
 fn lower_create_mutations(
@@ -2504,51 +2588,59 @@ fn lower_set_actions(
         let mut actions = Vec::with_capacity(item_count as usize);
         for idx in 0..item_count {
             let item = checked_node(sys::cypher_ast_set_get_item(set_clause, idx))?;
-            if is_instance(item, sys::CYPHER_AST_SET_PROPERTY) {
-                let property = checked_node(sys::cypher_ast_set_property_get_property(item))?;
-                let Some((binding, property)) = property_expression_binding(property)? else {
-                    return unsupported("SET property requires <node>.<property>");
-                };
-                if property.eq_ignore_ascii_case("id") {
-                    return unsupported("SET cannot update node id");
-                }
-                validate_component("property", &property)?;
-                let expression = checked_node(sys::cypher_ast_set_property_get_expression(item))?;
-                actions.push(RowMutationAction::SetProperty {
-                    binding,
-                    property,
-                    value: scalar_property_value(expression, parameters)?,
-                });
-                continue;
-            }
-            if is_instance(item, sys::CYPHER_AST_SET_LABELS) {
-                let binding = identifier_name(checked_node(
-                    sys::cypher_ast_set_labels_get_identifier(item),
-                )?)?;
-                let mut labels = BTreeSet::new();
-                for label_idx in 0..sys::cypher_ast_set_labels_nlabels(item) {
-                    let label = label_name(checked_node(sys::cypher_ast_set_labels_get_label(
-                        item, label_idx,
-                    ))?)?;
-                    validate_component("label", &label)?;
-                    labels.insert(label);
-                }
-                if labels.is_empty() {
-                    return unsupported("SET label item has no labels");
-                }
-                actions.push(RowMutationAction::SetLabels { binding, labels });
-                continue;
-            }
-            if is_instance(item, sys::CYPHER_AST_SET_ALL_PROPERTIES)
-                || is_instance(item, sys::CYPHER_AST_MERGE_PROPERTIES)
-            {
-                return unsupported(
-                    "SET property-map replacement is not executable in Query engine",
-                );
-            }
-            return unsupported(format!("unsupported SET item {}", node_type_name(item)));
+            actions.push(lower_set_item(item, parameters)?);
         }
         Ok(actions)
+    }
+}
+
+/// Lowers one item of a `SET` clause, or of a `MERGE` action's `ON CREATE SET`
+/// or `ON MATCH SET`, which carry the same item nodes. Returns only
+/// `SetProperty` or `SetLabels`.
+fn lower_set_item(
+    item: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowMutationAction> {
+    unsafe {
+        if is_instance(item, sys::CYPHER_AST_SET_PROPERTY) {
+            let property = checked_node(sys::cypher_ast_set_property_get_property(item))?;
+            let Some((binding, property)) = property_expression_binding(property)? else {
+                return unsupported("SET property requires <node>.<property>");
+            };
+            if property.eq_ignore_ascii_case("id") {
+                return unsupported("SET cannot update node id");
+            }
+            validate_component("property", &property)?;
+            let expression = checked_node(sys::cypher_ast_set_property_get_expression(item))?;
+            return Ok(RowMutationAction::SetProperty {
+                binding,
+                property,
+                value: scalar_property_value(expression, parameters)?,
+            });
+        }
+        if is_instance(item, sys::CYPHER_AST_SET_LABELS) {
+            let binding = identifier_name(checked_node(
+                sys::cypher_ast_set_labels_get_identifier(item),
+            )?)?;
+            let mut labels = BTreeSet::new();
+            for label_idx in 0..sys::cypher_ast_set_labels_nlabels(item) {
+                let label = label_name(checked_node(sys::cypher_ast_set_labels_get_label(
+                    item, label_idx,
+                ))?)?;
+                validate_component("label", &label)?;
+                labels.insert(label);
+            }
+            if labels.is_empty() {
+                return unsupported("SET label item has no labels");
+            }
+            return Ok(RowMutationAction::SetLabels { binding, labels });
+        }
+        if is_instance(item, sys::CYPHER_AST_SET_ALL_PROPERTIES)
+            || is_instance(item, sys::CYPHER_AST_MERGE_PROPERTIES)
+        {
+            return unsupported("SET property-map replacement is not executable in Query engine");
+        }
+        unsupported(format!("unsupported SET item {}", node_type_name(item)))
     }
 }
 
@@ -4081,6 +4173,86 @@ mod tests {
     }
 
     #[test]
+    fn lowers_merge_on_create_and_on_match_into_branch_metadata() {
+        let merge = parse_opencypher_mutation_query_with_parameters(
+            "MERGE (u:User {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
+             ON CREATE SET u.created_at = $now, r.since = $now, v:Fresh \
+             ON MATCH SET u.seen = true, v.visits = 2",
+            &BTreeMap::from([("now".to_string(), VertexPropertyValue::Integer(100))]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            merge.actions,
+            vec![RowMutationAction::MergeEdge {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                src_metadata: VertexMetadata::default().with_label("User"),
+                dst_metadata: VertexMetadata::default(),
+                edge_metadata: EdgeMetadata::default(),
+                on_create: Box::new(MergeBranchMetadata {
+                    src: VertexMetadata::default()
+                        .with_property("created_at", VertexPropertyValue::Integer(100)),
+                    dst: VertexMetadata::default().with_label("Fresh"),
+                    edge: EdgeMetadata::default()
+                        .with_property("since", VertexPropertyValue::Integer(100)),
+                }),
+                on_match: Box::new(MergeBranchMetadata {
+                    src: VertexMetadata::default()
+                        .with_property("seen", VertexPropertyValue::Bool(true)),
+                    dst: VertexMetadata::default()
+                        .with_property("visits", VertexPropertyValue::Integer(2)),
+                    edge: EdgeMetadata::default(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_self_loop_branch_patches_both_endpoints() {
+        let merge = parse_opencypher_mutation_query_with_parameters(
+            "MERGE (a {id: 7})-[:SELF]->(a {id: 7}) ON CREATE SET a.fresh = true",
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let RowMutationAction::MergeEdge { on_create, .. } = &merge.actions[0] else {
+            panic!("expected MERGE action");
+        };
+        let patch =
+            VertexMetadata::default().with_property("fresh", VertexPropertyValue::Bool(true));
+        assert_eq!(on_create.src, patch);
+        assert_eq!(on_create.dst, patch);
+    }
+
+    #[test]
+    fn rejects_merge_branch_sets_the_pattern_cannot_resolve() {
+        for (query, reason) in [
+            (
+                "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2}) ON CREATE SET w.x = 1",
+                "references w, which the MERGE pattern does not bind",
+            ),
+            (
+                "MERGE (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) ON MATCH SET r:Tagged",
+                "SET cannot add labels to a relationship",
+            ),
+            (
+                "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2}) ON CREATE SET u.id = 3",
+                "SET cannot update node id",
+            ),
+            (
+                "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2}) ON CREATE SET u += {x: 1}",
+                "SET property-map replacement is not executable",
+            ),
+        ] {
+            let err = parse_opencypher_mutation_query_with_parameters(query, &BTreeMap::new())
+                .unwrap_err();
+            assert!(err.to_string().contains(reason), "{query}: {err}");
+        }
+    }
+
+    #[test]
     fn lowers_distinct_row_query() {
         let parsed = parse_opencypher_row_query(
             "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id AS src",
@@ -4541,6 +4713,8 @@ mod tests {
                 src_metadata: VertexMetadata::default().with_label("User"),
                 dst_metadata: VertexMetadata::default(),
                 edge_metadata: EdgeMetadata::default(),
+                on_create: Box::default(),
+                on_match: Box::default(),
             }]
         );
     }
