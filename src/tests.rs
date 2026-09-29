@@ -15759,3 +15759,81 @@ async fn xlog_purge_forces_one_bootstrap_then_recovers() {
     let check = shard.build_graph_index(cell_id, edge_type).await.unwrap();
     assert_eq!(incremental.generation, check.generation);
 }
+
+/// Singleflight and double-check on matrix adjacency hydration: when two or more
+/// tasks concurrently request an uncached matrix generation, they must not
+/// perform redundant remote tile fetches or decode the same matrix tiles twice.
+/// The first task acquires the hydration permit and performs the load; subsequent
+/// tasks waiting on the in-flight generation must observe the completed result
+/// in `matrix_cache`, record a cache hit, and skip hydration entirely.
+#[tokio::test]
+async fn concurrent_matrix_adjacency_hydration_double_checks_cache() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/concurrent-matrix-adjacency-hydration";
+
+    let mut options = GraphOpenOptions::default();
+    options.cache_policy.max_concurrent_hydrations = 2;
+    options.cache_policy.max_matrix_adjacencies = 10;
+    let mut memory = GraphMemoryConfig::default();
+    memory.max_matrix_adjacency_bytes = 10 * 1024 * 1024;
+
+    let writer = GraphShard::open_standalone_writer_with_memory_options(
+        path,
+        Arc::clone(&object_store),
+        options.clone(),
+        memory.clone(),
+    )
+    .await
+    .unwrap();
+
+    writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "m1"))
+        .await
+        .unwrap();
+    let current_ep = writer.current_epoch("cell-a").await.unwrap();
+    let build_result = writer
+        .build_matrix_tiles("cell-a", "FOLLOWS", current_ep, 2)
+        .await
+        .unwrap();
+    let epoch = build_result.base_epoch;
+
+    writer
+        .matrix_cache
+        .lock()
+        .await
+        .remove(&MatrixCacheKey::new("cell-a", "FOLLOWS", epoch));
+
+    let reader = Arc::new(
+        GraphShard::open_with_memory_options(path, Arc::clone(&object_store), options, memory)
+            .await
+            .unwrap(),
+    );
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+
+    let r1 = Arc::clone(&reader);
+    let task1 =
+        tokio::spawn(async move { r1.cached_matrix_adjacency("cell-a", "FOLLOWS", epoch).await });
+
+    let r2 = Arc::clone(&reader);
+    let task2 =
+        tokio::spawn(async move { r2.cached_matrix_adjacency("cell-a", "FOLLOWS", epoch).await });
+
+    let (res1, res2) = tokio::join!(task1, task2);
+    let adj1 = res1.unwrap().unwrap();
+    let adj2 = res2.unwrap().unwrap();
+    assert_eq!(adj1, adj2);
+
+    let metrics = reader.graph_cache_metrics();
+    assert_eq!(
+        metrics.matrix_adjacency_hits, 1,
+        "task 2 must hit the double-checked cache post-permit"
+    );
+
+    assert_eq!(
+        metrics.hydration_completed, 3,
+        "only 1 hydration must occur during reader execution"
+    );
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
