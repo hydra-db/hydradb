@@ -14,11 +14,56 @@ impl GraphShard {
             return Ok(cached);
         }
 
+        let tx = loop {
+            let mut inflight = self.inflight_matrix_hydrations.lock().await;
+            if let Some(cached) = self.matrix_cache.lock().await.get(&cache_key) {
+                self.cache_metrics
+                    .record_hit(GraphCacheKind::MatrixAdjacency);
+                return Ok(cached);
+            }
+            if let Some(mut rx) = inflight.get(&cache_key).cloned() {
+                drop(inflight);
+                let _ = rx.changed().await;
+                if let Some(cached) = self.matrix_cache.lock().await.get(&cache_key) {
+                    self.cache_metrics
+                        .record_hit(GraphCacheKind::MatrixAdjacency);
+                    return Ok(cached);
+                }
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                inflight.insert(cache_key.clone(), rx);
+                break tx;
+            }
+        };
+
+        let res = self
+            .cached_matrix_adjacency_internal(cell_id, edge_type, base_epoch, cache_key.clone())
+            .await;
+
+        let mut inflight = self.inflight_matrix_hydrations.lock().await;
+        inflight.remove(&cache_key);
+        let _ = tx.send(true);
+        res
+    }
+
+    async fn cached_matrix_adjacency_internal(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: StorageSequence,
+        cache_key: MatrixCacheKey,
+    ) -> Result<Arc<MatrixAdjacency>> {
         self.cache_metrics
             .record_miss(GraphCacheKind::MatrixAdjacency);
         let _permit = self
             .acquire_hydration_permit("cached_matrix_adjacency")
             .await?;
+        if let Some(cached) = self.matrix_cache.lock().await.get(&cache_key) {
+            self.cache_metrics
+                .record_hit(GraphCacheKind::MatrixAdjacency);
+            return Ok(cached);
+        }
+
         let artifact = self
             .latest_matrix_artifact(cell_id, edge_type, base_epoch)
             .await?

@@ -207,6 +207,7 @@ impl GraphShard {
                 tenant_quota,
                 memory.max_matrix_adjacency_bytes,
             )),
+            inflight_matrix_hydrations: Mutex::new(BTreeMap::new()),
             graphblas_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_graphblas_matrices,
                 tenant_quota,
