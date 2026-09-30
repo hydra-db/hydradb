@@ -255,6 +255,15 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.ClientError.Cluster.NotALeader".to_string(),
             message: error.to_string(),
         },
+        GraphError::WriteRequiresWriter { .. } => BoltError::Query {
+            code: "Neo.ClientError.Cluster.NotALeader".to_string(),
+            message: error.to_string(),
+        },
+        GraphError::ReadOnlyShardStorage => BoltError::Forbidden(error.to_string()),
+        GraphError::CellDropped { .. } => BoltError::Query {
+            code: "Neo.ClientError.Database.DatabaseNotFound".to_string(),
+            message: error.to_string(),
+        },
         // A routing refusal is transient and belongs to *this node*, so the
         // driver must move to the next router rather than fail the query. A
         // `ClientError` here would be read as "your request is wrong" and end
