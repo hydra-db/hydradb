@@ -251,8 +251,14 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
         // until it gives up. The owner rides in the message, TiKV's
         // `NotLeader { leader_hint }` — and is absent, not guessed, when this
         // node has shed its view and has nothing truthful to point at.
-        GraphError::NotCellWriter { .. } => BoltError::Query {
+        GraphError::NotCellWriter { .. }
+        | GraphError::WriteRequiresWriter { .. } => BoltError::Query {
             code: "Neo.ClientError.Cluster.NotALeader".to_string(),
+            message: error.to_string(),
+        },
+        GraphError::ReadOnlyShardStorage => BoltError::Forbidden(error.to_string()),
+        GraphError::CellDropped { .. } => BoltError::Query {
+            code: "Neo.ClientError.Database.DatabaseNotFound".to_string(),
             message: error.to_string(),
         },
         // A routing refusal is transient and belongs to *this node*, so the

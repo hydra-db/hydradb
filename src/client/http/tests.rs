@@ -171,6 +171,27 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn writer_authority_and_dropped_cell_are_not_internal_errors() {
+    let write_requires_writer = HttpApiError::from_graph(GraphError::WriteRequiresWriter {
+        operation: "routed_write",
+        cell_id: "cell-0".to_string(),
+    });
+    assert_eq!(write_requires_writer.status, StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(write_requires_writer.code, "write_requires_writer");
+
+    let read_only = HttpApiError::from_graph(GraphError::ReadOnlyShardStorage);
+    assert_eq!(read_only.status, StatusCode::FORBIDDEN);
+    assert_eq!(read_only.code, "read_only_storage");
+
+    let cell_dropped = HttpApiError::from_graph(GraphError::CellDropped {
+        operation: "query",
+        cell_id: "cell-0".to_string(),
+    });
+    assert_eq!(cell_dropped.status, StatusCode::NOT_FOUND);
+    assert_eq!(cell_dropped.code, "cell_dropped");
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
