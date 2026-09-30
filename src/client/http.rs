@@ -415,6 +415,27 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            GraphError::RetryExhausted { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "retry_exhausted",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::UnknownShard { .. } => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "unknown_shard",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::SnapshotExpired { .. } => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "snapshot_expired",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }

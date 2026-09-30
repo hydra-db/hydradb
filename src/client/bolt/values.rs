@@ -229,6 +229,10 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.Transaction.BookmarkTimeout".to_string(),
             message: error.to_string(),
         },
+        GraphError::SnapshotExpired { .. } => BoltError::Query {
+            code: "Neo.ClientError.Transaction.InvalidBookmark".to_string(),
+            message: error.to_string(),
+        },
         GraphError::InvalidKeyComponent { .. }
         | GraphError::MissingQueryParameter { .. }
         | GraphError::QueryParse { .. }
@@ -243,6 +247,14 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
         },
         GraphError::IdempotencyConflict { .. } => BoltError::Query {
             code: "Neo.ClientError.Transaction.Invalid".to_string(),
+            message: error.to_string(),
+        },
+        GraphError::RetryExhausted { .. } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.DeadlockDetected".to_string(),
+            message: error.to_string(),
+        },
+        GraphError::UnknownShard { .. } => BoltError::Query {
+            code: "Neo.ClientError.Database.DatabaseNotFound".to_string(),
             message: error.to_string(),
         },
         // Touch point (c). Drivers already know this code: discard the routing
