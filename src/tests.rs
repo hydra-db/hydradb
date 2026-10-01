@@ -9785,6 +9785,7 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
     assert!(QueryTransportSecret::try_new("").is_err());
     assert!(QueryTransportSecret::try_new("   ").is_err());
 
+    // Server rejects all requests when configured with a blank bearer token.
     let server = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(StaticQueryClient),
@@ -9793,7 +9794,8 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
     .await
     .unwrap();
     let err = TcpQueryCellClient::new(server.local_addr())
-        .with_bearer_token("   ")
+        .with_bearer_token("valid-secret")
+        .insecure_allow_plaintext()
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "query-transport-blank-deny"),
             "MATCH (u {id: 1}) RETURN u.id",
@@ -9803,6 +9805,22 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
     assert!(err.to_string().contains("unauthorized"));
     assert!(server.metrics().auth_failures >= 1);
     server.stop().await.unwrap();
+
+    // Client rejects a blank bearer token instead of silently becoming anonymous.
+    let client = TcpQueryCellClient::new("127.0.0.1:0".parse().unwrap())
+        .with_bearer_token("   ")
+        .insecure_allow_plaintext();
+    let err = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-blank-deny"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("bearer token cannot be empty"),
+        "expected bearer token empty error, got {err}"
+    );
 }
 
 #[cfg(feature = "query-transport")]
