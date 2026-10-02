@@ -2024,6 +2024,32 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+#[test]
+fn write_conflicts_are_retryable_transient_errors_to_bolt_clients() {
+    let conflicts = [
+        GraphError::ConditionalWriteConflict {
+            operation: "relationship-import",
+            key: "edge/a/b".to_string(),
+        },
+        GraphError::ControlMetadataConflict {
+            key: "control/graph".to_string(),
+            expected_generation: Some(3),
+            actual_generation: None,
+        },
+    ];
+
+    for conflict in conflicts {
+        let expected_detail = conflict.to_string();
+        match graph_error_to_bolt(conflict) {
+            BoltError::Query { code, message } => {
+                assert_eq!(code, "Neo.TransientError.Transaction.DeadlockDetected");
+                assert_eq!(message, expected_detail);
+            }
+            other => panic!("expected a retryable Neo transient error, got {other:?}"),
+        }
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted

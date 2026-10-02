@@ -267,6 +267,16 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
             message: error.to_string(),
         },
+        // A lost write race is transient: re-running the query against the
+        // new state can succeed. `DeadlockDetected` is the Neo4j code drivers
+        // retry automatically; `LockClientStopped` and `Terminated` are
+        // excluded from driver retry, so they would turn a retryable conflict
+        // into a hard failure.
+        GraphError::ConditionalWriteConflict { .. }
+        | GraphError::ControlMetadataConflict { .. } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.DeadlockDetected".to_string(),
+            message: error.to_string(),
+        },
         _ => {
             tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
