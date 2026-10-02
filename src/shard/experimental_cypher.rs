@@ -27,6 +27,9 @@ mod statistics;
 
 #[cfg(test)]
 mod optional_match_predicate_tests;
+
+#[cfg(test)]
+mod union_distinct_tests;
 use observability::{PlanIdentity, RequestObservation};
 
 /// Upper bound on the estimated bytes the per-shard statistics memo retains.
