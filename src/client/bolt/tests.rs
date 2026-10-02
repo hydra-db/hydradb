@@ -2024,6 +2024,50 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+#[test]
+fn graph_scope_mismatch_reaches_bolt_clients_as_invalid_bookmark() {
+    let error = graph_error_to_bolt(GraphError::GraphScopeMismatch {
+        expected: "scope-a cell cell-0".to_string(),
+        actual: "scope-b cell cell-0".to_string(),
+    });
+    match error {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Transaction.InvalidBookmark");
+            assert_eq!(message, "bookmark belongs to another graph scope or cell");
+        }
+        other => panic!("expected InvalidBookmark, got {other:?}"),
+    }
+}
+
+#[test]
+fn configuration_errors_reach_bolt_clients_as_configuration_error() {
+    let unsafe_durability = graph_error_to_bolt(GraphError::UnsafeDurabilityConfig {
+        operation: "write",
+        reason: "node requires await_durable_writes".to_string(),
+    });
+    match unsafe_durability {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.General.ConfigurationError");
+            assert_eq!(message, "internal graph configuration error");
+        }
+        other => panic!("expected ConfigurationError, got {other:?}"),
+    }
+
+    let routed_mismatch = graph_error_to_bolt(GraphError::RoutedWriterConfigMismatch {
+        path: "store/cell-0".to_string(),
+        node_id: "node-1".to_string(),
+        existing: std::time::Duration::from_millis(500),
+        requested: std::time::Duration::from_millis(1000),
+    });
+    match routed_mismatch {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.General.ConfigurationError");
+            assert_eq!(message, "internal graph configuration error");
+        }
+        other => panic!("expected ConfigurationError, got {other:?}"),
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted
