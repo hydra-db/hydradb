@@ -4,7 +4,7 @@ objectStore:
 
 auth:
   token: ci-only-auth-token-with-more-than-32-characters
-
+##
 tls:
   public:
     enabled: false
