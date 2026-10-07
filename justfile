@@ -145,6 +145,10 @@ check-examples-chaos:
 test *args:
     cargo test --locked --lib {{args}}
 
+# Offline opt-in migration; all application writers must be stopped first.
+unstable-backfill-vertex-membership *args:
+    cargo run --locked --example unstable_backfill_vertex_membership -- {{args}}
+
 # Run library tests with OpenCypher enabled.
 test-opencypher:
     cargo test --locked --features opencypher --lib

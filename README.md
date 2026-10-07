@@ -33,6 +33,10 @@ can be replaced or scaled without moving the graph itself.
 
 ## Architecture
 
+Canonical vertex membership is available as an unstable opt-in. See the
+[migration and lifecycle guide](docs/unstable-vertex-membership.md) before
+enabling it for an existing graph store.
+
 ```mermaid
 flowchart LR
     C["Applications<br/>Neo4j drivers or HTTPS"]

@@ -369,6 +369,28 @@ impl GraphShard {
         vertex_id: VertexId,
         metadata: VertexMetadata,
     ) -> Result<()> {
+        self.set_vertex_metadata_inner(cell_id, vertex_id, metadata, false)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn set_matched_vertex_metadata(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+    ) -> Result<()> {
+        self.set_vertex_metadata_inner(cell_id, vertex_id, metadata, true)
+            .await
+    }
+
+    async fn set_vertex_metadata_inner(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+        require_presence: bool,
+    ) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         validate_vertex_metadata(&metadata)?;
         self.ensure_write_authority(cell_id, "set_vertex_metadata")?;
@@ -384,7 +406,7 @@ impl GraphShard {
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .set_vertex_metadata_txn(cell_id, vertex_id, metadata.clone())
+                .set_vertex_metadata_txn(cell_id, vertex_id, metadata.clone(), require_presence)
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
@@ -646,12 +668,13 @@ impl GraphShard {
         cell_id: &str,
         vertex_id: VertexId,
         metadata: VertexMetadata,
+        require_presence: bool,
     ) -> Result<()> {
         let lock = self
             .acquire_local_write_guard_no_fence(cell_id, "set_vertex_metadata")
             .await?;
         let result = self
-            .set_vertex_metadata_txn_locked(cell_id, vertex_id, metadata)
+            .set_vertex_metadata_txn_locked(cell_id, vertex_id, metadata, require_presence)
             .await;
         finish_local_write(lock, result).await
     }
@@ -661,6 +684,7 @@ impl GraphShard {
         cell_id: &str,
         vertex_id: VertexId,
         metadata: VertexMetadata,
+        require_presence: bool,
     ) -> Result<()> {
         let txn = self
             .db
@@ -671,17 +695,41 @@ impl GraphShard {
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
         let vertex_key = keys::vertex(cell_id, vertex_id);
-        let previous = match read_txn_remote(&txn, &vertex_key).await? {
+        let stored = read_txn_remote(&txn, &vertex_key).await?;
+        let existed = stored.is_some();
+        if require_presence && !existed {
+            let key = keys::vertex_membership(cell_id);
+            if let Some(value) = read_txn_remote(&txn, &key).await? {
+                if super::vertex_membership::validate_membership_writer(
+                    cell_id,
+                    &key,
+                    &value,
+                    self.unstable_canonical_vertex_membership,
+                )? {
+                    return Err(GraphError::ConditionalWriteConflict {
+                        operation: "set_matched_vertex_metadata",
+                        key: vertex_key,
+                    });
+                }
+            }
+        }
+        let previous = match stored {
             Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
             None => VertexMetadata::default(),
         };
-        if previous == metadata {
+        if previous == metadata && (existed || !self.unstable_canonical_vertex_membership) {
             self.db.refresh_writer_fence().await?;
             return Ok(());
         }
         self.validate_changing_write().await?;
-        let epoch = next_epoch_txn(&txn, cell_id).await?;
-        apply_vertex_metadata_update_txn(&txn, cell_id, vertex_id, &previous, &metadata, epoch)?;
+        apply_vertex_metadata_update_txn(
+            &txn,
+            cell_id,
+            vertex_id,
+            &previous,
+            &metadata,
+            self.unstable_canonical_vertex_membership,
+        )?;
         commit_txn_strict(txn, self.await_durable_writes).await
     }
 
@@ -725,6 +773,22 @@ impl GraphShard {
             }
         }
         self.ensure_write_authority(cell_id, "merge_vertex_metadata_batch")?;
+        let membership_key = keys::vertex_membership(cell_id);
+        if let Some(value) = snapshot
+            .get_with_options(membership_key.as_bytes(), &options)
+            .await?
+        {
+            if !super::vertex_membership::validate_membership_writer(
+                cell_id,
+                &membership_key,
+                &value,
+                self.unstable_canonical_vertex_membership,
+            )? {
+                return Err(super::vertex_membership::membership_maintenance_error(
+                    cell_id,
+                ));
+            }
+        }
         let keys = updates
             .iter()
             .map(|(vertex_id, _)| keys::vertex(cell_id, *vertex_id))
@@ -740,6 +804,11 @@ impl GraphShard {
         .await?;
         for (vertex_id, patch) in updates {
             let key = keys::vertex(cell_id, *vertex_id);
+            if self.unstable_canonical_vertex_membership
+                && existing.get(&key).and_then(Option::as_ref).is_none()
+            {
+                return Ok(false);
+            }
             let previous = match existing.get(&key).and_then(Option::as_ref) {
                 Some(value) => decode_vertex_metadata(&key, value)?,
                 None => VertexMetadata::default(),
@@ -803,7 +872,10 @@ impl GraphShard {
                     Some(value) => decode_vertex_metadata(&vertex_key, value)?,
                     None => VertexMetadata::default(),
                 };
-                if previous != *metadata {
+                if previous != *metadata
+                    || (self.unstable_canonical_vertex_membership
+                        && existing.get(&vertex_key).and_then(Option::as_ref).is_none())
+                {
                     changed.push((*vertex_id, previous, metadata.clone()));
                 }
             }
@@ -815,7 +887,14 @@ impl GraphShard {
         self.validate_changing_write().await?;
         let epoch = next_epoch_txn(&txn, cell_id).await?;
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(
+                &txn,
+                cell_id,
+                *vertex_id,
+                previous,
+                metadata,
+                self.unstable_canonical_vertex_membership,
+            )?;
         }
         let changed_count = changed.len();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
@@ -868,7 +947,7 @@ impl GraphShard {
             let mut merged = previous.clone();
             merged.labels.extend(patch.labels);
             merged.properties.extend(patch.properties);
-            if previous != merged {
+            if previous != merged || (self.unstable_canonical_vertex_membership && !existed) {
                 changed.push((vertex_id, previous, merged));
             }
         }
@@ -894,7 +973,14 @@ impl GraphShard {
         self.validate_changing_write().await?;
         let epoch = next_epoch_txn(&txn, cell_id).await?;
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(
+                &txn,
+                cell_id,
+                *vertex_id,
+                previous,
+                metadata,
+                self.unstable_canonical_vertex_membership,
+            )?;
         }
         let changed_count = changed.len();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
@@ -942,11 +1028,13 @@ impl GraphShard {
         let mut changed = Vec::new();
         for (vertex_id, metadata) in updates {
             let vertex_key = keys::vertex(cell_id, vertex_id);
-            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+            let stored = read_txn_remote(&txn, &vertex_key).await?;
+            let existed = stored.is_some();
+            let previous = match stored {
                 Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
                 None => VertexMetadata::default(),
             };
-            if previous == metadata {
+            if previous == metadata && (existed || !self.unstable_canonical_vertex_membership) {
                 continue;
             }
             if previous != VertexMetadata::default() {
@@ -962,9 +1050,15 @@ impl GraphShard {
         if changed.is_empty() {
             return Ok(0);
         }
-        let epoch = next_epoch_txn(&txn, cell_id).await?;
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(
+                &txn,
+                cell_id,
+                *vertex_id,
+                previous,
+                metadata,
+                self.unstable_canonical_vertex_membership,
+            )?;
         }
         let changed_count = changed.len();
         commit_txn_strict(txn, self.await_durable_writes).await?;
@@ -1500,6 +1594,15 @@ impl GraphShard {
             .map(|&index| keys::vertex(cell_id, deletions[index].0))
             .collect();
         let vertex_values = read_txn_remote_many(&txn, vertex_keys.iter().cloned()).await?;
+        let present_vertices = non_replay_indices
+            .iter()
+            .filter_map(|&index| {
+                vertex_values
+                    .get(&keys::vertex(cell_id, deletions[index].0))
+                    .and_then(Option::as_ref)
+                    .map(|_| deletions[index].0)
+            })
+            .collect::<BTreeSet<_>>();
         let mut pending = Vec::new();
         for (i, &index) in non_replay_indices.iter().enumerate() {
             let (vertex_id, idempotency_key, detach, constraints) = &deletions[index];
@@ -1840,17 +1943,14 @@ impl GraphShard {
                 ) && vertex_matches_path_node_constraints(vertex_id, &previous, &constraints);
             let connected =
                 !detach && requires_isolation && connected_vertices.contains(&vertex_id);
-            let vertex_deleted =
-                !connected && (!previous.labels.is_empty() || !previous.properties.is_empty());
+            let vertex_deleted = !connected
+                && if self.unstable_canonical_vertex_membership {
+                    present_vertices.contains(&vertex_id)
+                } else {
+                    !previous.labels.is_empty() || !previous.properties.is_empty()
+                };
             if vertex_deleted {
-                apply_vertex_metadata_update_txn(
-                    &txn,
-                    cell_id,
-                    vertex_id,
-                    &previous,
-                    &VertexMetadata::default(),
-                    commit_epoch,
-                )?;
+                delete_vertex_record_txn(&txn, cell_id, vertex_id, &previous)?;
             }
             let changed = vertex_deleted
                 || edge_counts[pending_index] > 0
@@ -3900,7 +4000,7 @@ impl GraphShard {
                 *vertex_id,
                 previous,
                 next,
-                epoch,
+                self.unstable_canonical_vertex_membership,
             )?;
         }
 
@@ -4998,7 +5098,7 @@ impl GraphShard {
                 *vertex_id,
                 previous,
                 next,
-                epoch,
+                self.unstable_canonical_vertex_membership,
             )?;
         }
         if edge_metadata_changed {
@@ -7295,12 +7395,12 @@ fn apply_vertex_metadata_update_txn(
     vertex_id: VertexId,
     previous: &VertexMetadata,
     next: &VertexMetadata,
-    _epoch: StorageSequence,
+    preserve_membership: bool,
 ) -> Result<()> {
     validate_vertex_metadata(next)?;
     let vertex_key = keys::vertex(cell_id, vertex_id);
     delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
-    if next.labels.is_empty() && next.properties.is_empty() {
+    if next.labels.is_empty() && next.properties.is_empty() && !preserve_membership {
         txn.delete(vertex_key.as_bytes())?;
     } else {
         txn.put(
@@ -7309,6 +7409,17 @@ fn apply_vertex_metadata_update_txn(
         )?;
         put_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, next)?;
     }
+    Ok(())
+}
+
+fn delete_vertex_record_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    vertex_id: VertexId,
+    previous: &VertexMetadata,
+) -> Result<()> {
+    delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
+    txn.delete(keys::vertex(cell_id, vertex_id).as_bytes())?;
     Ok(())
 }
 
@@ -7867,6 +7978,12 @@ impl GraphShard {
         epoch: StorageSequence,
         changes: &[(VertexId, VertexId, bool)],
     ) -> Result<()> {
+        for (src, dst, exists) in changes {
+            if *exists {
+                self.ensure_vertex_endpoints_txn(txn, cell_id, &[*src, *dst])
+                    .await?;
+            }
+        }
         let span = tracing::info_span!(
             "write.index_update",
             hydradb.cell_id = %cell_id,

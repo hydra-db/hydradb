@@ -3,6 +3,9 @@ use futures::StreamExt;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 
+#[path = "vertex_membership_tests.rs"]
+mod canonical_vertex_membership;
+
 async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> GraphShard {
     GraphShard::open_standalone_writer(path, object_store)
         .await

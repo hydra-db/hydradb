@@ -56,6 +56,7 @@ pub struct RuntimeConfig {
     pub bolt_node_addresses: BTreeMap<String, String>,
     pub read_routing: BoltReadRouting,
     pub cypher_engine: CypherEngineMode,
+    pub unstable_canonical_vertex_membership: bool,
     pub auth_token_file: PathBuf,
     pub tls_certificate: Option<PathBuf>,
     pub tls_private_key: Option<PathBuf>,
@@ -283,6 +284,11 @@ impl RuntimeConfig {
             bolt_node_addresses,
             read_routing: parse_read_routing(&values, "GRAPH_READ_ROUTING")?,
             cypher_engine: parse_cypher_engine(&values, "GRAPH_CYPHER_ENGINE")?,
+            unstable_canonical_vertex_membership: parse_bool(
+                &values,
+                "GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP",
+                false,
+            )?,
             auth_token_file: PathBuf::from(value(
                 &values,
                 "GRAPH_AUTH_TOKEN_FILE",
@@ -350,6 +356,7 @@ impl RuntimeConfig {
 
     pub fn graph_open_options(&self) -> GraphOpenOptions {
         let mut options = GraphOpenOptions::default();
+        options.unstable_canonical_vertex_membership = self.unstable_canonical_vertex_membership;
         options.limits = GraphLimits {
             max_query_scan_edges: self.max_query_scan_edges,
             max_query_runtime_ms: Some(self.max_query_runtime_ms),
@@ -630,6 +637,33 @@ mod tests {
         let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
         let error = RuntimeConfig::from_values(values).unwrap_err();
         assert!(error.to_string().contains("requires GRAPH_TLS_CERTIFICATE"));
+    }
+
+    #[test]
+    fn canonical_vertex_membership_requires_explicit_opt_in() {
+        let mut values =
+            BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
+        assert!(
+            !RuntimeConfig::from_values(values.clone())
+                .unwrap()
+                .graph_open_options()
+                .unstable_canonical_vertex_membership
+        );
+        values.insert(
+            "GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP".into(),
+            "true".into(),
+        );
+        assert!(
+            RuntimeConfig::from_values(values.clone())
+                .unwrap()
+                .graph_open_options()
+                .unstable_canonical_vertex_membership
+        );
+        values.insert(
+            "GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP".into(),
+            "invalid".into(),
+        );
+        assert!(RuntimeConfig::from_values(values).is_err());
     }
 
     #[test]
