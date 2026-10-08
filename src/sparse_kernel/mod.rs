@@ -754,6 +754,55 @@ mod tests {
         assert_eq!(compact.edge_visits, rust.edge_visits);
     }
 
+    #[test]
+    fn zero_hop_range_preserves_start_without_compiled_ordinal() {
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
+        let adjacency = BTreeMap::from([(1, BTreeSet::from([2]))]);
+        let starts = [1, 99, 99];
+        let rust = expand_range(&adjacency, &starts, 0, 1, SparseKernelBackend::Adjacency)
+            .expect("adjacency expansion should succeed");
+
+        let compact = expand_range(&adjacency, &starts, 0, 1, SparseKernelBackend::CompactCsc)
+            .expect("compact CSC expansion should succeed");
+        assert_eq!(compact.backend, SparseKernelBackend::CompactCsc);
+        assert_eq!(compact.vertices, rust.vertices);
+        assert_eq!(compact.edge_visits, rust.edge_visits);
+
+        let graphblas = expand_range(&adjacency, &starts, 0, 1, SparseKernelBackend::SuiteSparse)
+            .expect("GraphBLAS expansion should succeed");
+        assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparse);
+        assert_eq!(graphblas.vertices, rust.vertices);
+        assert_eq!(graphblas.edge_visits, rust.edge_visits);
+    }
+
+    #[cfg(feature = "opencypher")]
+    #[test]
+    fn zero_hop_counts_include_starts_without_compiled_ordinals() {
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
+        let adjacency = BTreeMap::from([(1, BTreeSet::from([2]))]);
+        let starts = [1, 99, 99];
+        let compact = compile_graphblas_matrix(&adjacency, SparseKernelBackend::CompactCsc)
+            .expect("compact CSC matrix should compile");
+        let graphblas = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+            .expect("GraphBLAS matrix should compile");
+
+        for compiled in [&compact, &graphblas] {
+            for (min_hops, max_hops) in [(0, 0), (0, 1)] {
+                let materialized = expand_range_compiled_graphblas(
+                    compiled, &adjacency, &starts, min_hops, max_hops,
+                )
+                .expect("range expansion should succeed");
+                let counted = expand_range_count_compiled_graphblas(
+                    compiled, &adjacency, &starts, min_hops, max_hops,
+                )
+                .expect("range count should succeed");
+
+                assert_eq!(counted.vertices, materialized.vertices.len() as u64);
+                assert_eq!(counted.edge_visits, materialized.edge_visits);
+            }
+        }
+    }
+
     // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
     // here: it is process-global and would race concurrent shard tests.
     #[test]
