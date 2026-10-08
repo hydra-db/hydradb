@@ -46,8 +46,13 @@ const MAX_DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const CHANGE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const INDEXER_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn indexer_open_options(max_wal_tail_files: u64, slatedb_cache_bytes: usize) -> GraphOpenOptions {
+fn indexer_open_options(
+    max_wal_tail_files: u64,
+    slatedb_cache_bytes: usize,
+    canonical_vertex_membership: bool,
+) -> GraphOpenOptions {
     let mut options = GraphOpenOptions::default();
+    options.unstable_canonical_vertex_membership = canonical_vertex_membership;
     options.limits = GraphLimits {
         max_wal_tail_files,
         ..GraphLimits::default()
@@ -61,6 +66,16 @@ fn indexer_open_options(max_wal_tail_files: u64, slatedb_cache_bytes: usize) -> 
     options.reader_manifest_poll_interval = INDEXER_READER_MANIFEST_POLL_INTERVAL;
     options.cache.slatedb_cache_bytes = slatedb_cache_bytes;
     options
+}
+
+fn parse_canonical_vertex_membership(value: &str) -> RuntimeResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(
+            format!("invalid boolean GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP={other}").into(),
+        ),
+    }
 }
 const DEFAULT_READINESS_FAILURE_THRESHOLD: u64 = 3;
 const MAX_READINESS_FAILURE_THRESHOLD: u64 = 100;
@@ -1224,7 +1239,15 @@ async fn main() -> RuntimeResult<()> {
         &(640usize * 1024 * 1024).to_string(),
     )
     .parse::<usize>()?;
-    let open_options = indexer_open_options(max_wal_tail_files, slatedb_cache_bytes);
+    let canonical_vertex_membership = parse_canonical_vertex_membership(&env_value(
+        "GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP",
+        "false",
+    ))?;
+    let open_options = indexer_open_options(
+        max_wal_tail_files,
+        slatedb_cache_bytes,
+        canonical_vertex_membership,
+    );
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
     let wake_token = read_indexer_wake_token()?;
 
@@ -3514,6 +3537,7 @@ mod tests {
             indexer_open_options(
                 GraphLimits::default().max_wal_tail_files,
                 GraphOpenOptions::default().cache.slatedb_cache_bytes,
+                false,
             ),
             max_open_scopes,
             DEFAULT_SCOPE_CONCURRENCY,
@@ -3523,15 +3547,107 @@ mod tests {
 
     #[test]
     fn indexer_readers_are_checkpoint_free_and_refresh_on_demand() {
-        let options = indexer_open_options(123, 456);
+        let options = indexer_open_options(123, 456, false);
 
         assert_eq!(options.limits.max_wal_tail_files, 123);
         assert_eq!(options.cache.slatedb_cache_bytes, 456);
+        assert!(!options.unstable_canonical_vertex_membership);
         assert_eq!(options.reader_mode, GraphReaderMode::FollowLatest);
         assert_eq!(
             options.reader_manifest_poll_interval,
             INDEXER_READER_MANIFEST_POLL_INTERVAL
         );
+    }
+
+    #[tokio::test]
+    async fn indexer_can_build_a_completed_membership_cell() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let scope = GraphScope::default();
+        let options = indexer_open_options(123, 456, true);
+        let writer = hydradb::GraphShard::open_standalone_writer_with_options(
+            format!("{}/cell-0", scope.scoped_store_path("graph/data")),
+            Arc::clone(&object_store),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            writer
+                .unstable_backfill_vertex_membership(
+                    "cell-0",
+                    hydradb::VertexMembershipBackfillOptions::default(),
+                )
+                .await
+                .unwrap()
+                .complete
+        );
+        writer
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".into(),
+                edge_type: "FOLLOWS".into(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "membership-indexer-edge".into(),
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = IndexerScopeCache::new(
+            "graph/data".into(),
+            vec!["cell-0".into()],
+            object_store,
+            options,
+            1,
+            1,
+            Arc::clone(&metrics),
+        );
+        let (cluster, _) = cache.cluster_for_scope(&scope).await.unwrap();
+        let outcome = run_index_cycle(
+            &cluster,
+            &scope.to_string(),
+            &["cell-0".into()],
+            1,
+            IndexBuildMode::Full,
+            250_000,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &metrics,
+            IndexWorkKind::Sweep,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.built);
+        let shard = cluster.shard("cell-0").unwrap();
+        assert!(shard
+            .current_graph_index("cell-0", "FOLLOWS")
+            .await
+            .unwrap()
+            .is_some());
+        for id in [1, 2] {
+            assert!(shard
+                .vertex_metadata_if_exists("cell-0", id)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        drop(cluster);
+        cache.close().await.unwrap();
+    }
+
+    #[test]
+    fn canonical_membership_setting_rejects_invalid_values() {
+        for value in ["true", "1", "on", "yes", " TRUE "] {
+            assert!(parse_canonical_vertex_membership(value).unwrap());
+        }
+        for value in ["false", "0", "off", "no"] {
+            assert!(!parse_canonical_vertex_membership(value).unwrap());
+        }
+        assert!(parse_canonical_vertex_membership("tru")
+            .unwrap_err()
+            .to_string()
+            .contains("GRAPH_UNSTABLE_CANONICAL_VERTEX_MEMBERSHIP"));
     }
 
     /// The kill switch defaults to the pre-existing behaviour, and refuses a

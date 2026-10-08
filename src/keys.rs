@@ -192,6 +192,10 @@ pub fn vertex(cell_id: &str, vertex_id: VertexId) -> String {
     format!("cell/{cell_id}/vertex/{vertex_id:020}")
 }
 
+pub fn vertex_membership(cell_id: &str) -> String {
+    format!("cell/{cell_id}/vertex_membership")
+}
+
 #[cfg(feature = "experimental-cypher-engine")]
 pub fn vertex_prefix(cell_id: &str) -> String {
     format!("cell/{cell_id}/vertex/")

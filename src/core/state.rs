@@ -234,6 +234,7 @@ pub struct GraphShard {
     pub(crate) artifact_build_gate: Arc<Semaphore>,
     pub(crate) gc_gate: Arc<Semaphore>,
     pub(crate) index_policy: GraphIndexPolicy,
+    pub(crate) unstable_canonical_vertex_membership: bool,
     pub(crate) await_durable_writes: bool,
     pub(crate) write_authority: GraphWriteAuthority,
     pub(crate) local_write_guard: Arc<Mutex<()>>,

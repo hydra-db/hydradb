@@ -32,6 +32,8 @@ impl GraphShard {
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "matrix_reachable")
+            .await?;
         ensure_limit(
             "matrix_reachable",
             u64::from(hops),

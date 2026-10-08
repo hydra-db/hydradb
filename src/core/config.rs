@@ -252,6 +252,10 @@ pub struct GraphOpenOptions {
     pub cache_policy: GraphCachePolicy,
     pub backpressure_policy: GraphBackpressurePolicy,
     pub index_policy: GraphIndexPolicy,
+    /// Enables canonical empty-vertex writes. Existing cells require
+    /// `unstable_backfill_vertex_membership` before query binding switches to
+    /// canonical membership. All writers/readers must opt in before activation.
+    pub unstable_canonical_vertex_membership: bool,
     /// Controls whether read-only SlateDB handles maintain GC-protecting
     /// checkpoints. Ordinary graph readers retain the managed default.
     pub reader_mode: GraphReaderMode,
@@ -280,6 +284,7 @@ impl Default for GraphOpenOptions {
             cache_policy: GraphCachePolicy::default(),
             backpressure_policy: GraphBackpressurePolicy::default(),
             index_policy: GraphIndexPolicy::default(),
+            unstable_canonical_vertex_membership: false,
             reader_mode: GraphReaderMode::default(),
             reader_manifest_poll_interval: GRAPH_READER_MANIFEST_POLL_INTERVAL,
             fence_backoff_interval: DEFAULT_FENCE_BACKOFF_INTERVAL,

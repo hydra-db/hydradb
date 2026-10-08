@@ -1471,13 +1471,18 @@ impl GraphShard {
                 let metadata = self
                     .vertex_metadata_batch_at(cell_id, &vertex_ids, read_epoch, budget)
                     .await?;
-                for ((encoded, vertex_id), (_, metadata)) in candidates.into_iter().zip(metadata) {
+                let metadata = metadata.into_iter().collect::<BTreeMap<_, _>>();
+                for (encoded, vertex_id) in candidates {
                     if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str())
                     {
                         exhausted = true;
                         break;
                     }
                     examined += 1;
+                    let Some(metadata) = metadata.get(&vertex_id).cloned() else {
+                        rejected += 1;
+                        continue;
+                    };
                     if metadata
                         .properties
                         .get(property)
@@ -1600,6 +1605,23 @@ impl GraphShard {
         let Some(request) = graph_kernel_row_query_request(query) else {
             return Ok(None);
         };
+        if budget
+            .read_only_io(
+                "cypher_membership_readiness",
+                self.unstable_vertex_membership_complete(cell_id),
+            )
+            .await?
+            && (request.hop_range.0 == 0
+                || budget
+                    .read_only_io(
+                        "cypher_vertex_presence",
+                        self.vertex_metadata_if_exists(cell_id, request.src),
+                    )
+                    .await?
+                    .is_none())
+        {
+            return Ok(None);
+        }
         if request.projection == GraphKernelProjection::CountAll && request.edge.dst.id.is_none() {
             let (count, edge_visits) = self
                 .reachable_count_in_hop_range_at(
@@ -2110,10 +2132,17 @@ impl GraphShard {
                 .await;
         }
 
-        let read_epoch = self.current_epoch(&context.cell_id).await?;
-        let mut bindings = self
-            .match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
+        let snapshot = budget
+            .read_only_io("cypher_mutation_snapshot", self.db.snapshot())
             .await?;
+        let read_epoch = snapshot.seq();
+        let mut bindings = GraphStore::scope_snapshot(snapshot, async {
+            self.ensure_cell_readable(&context.cell_id, "cypher_mutation_match")
+                .await?;
+            self.match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
+                .await
+        })
+        .await?;
         if let Some(predicate) = &query.predicate {
             let mut filtered = Vec::with_capacity(bindings.len());
             for row in bindings {
@@ -2278,7 +2307,7 @@ impl GraphShard {
                 result.noops = result.noops.saturating_add(1);
                 continue;
             }
-            self.set_vertex_metadata(&context.cell_id, vertex_id, metadata)
+            self.set_matched_vertex_metadata(&context.cell_id, vertex_id, metadata)
                 .await?;
             result.updated_vertices = result.updated_vertices.saturating_add(1);
         }
@@ -5775,7 +5804,24 @@ impl GraphShard {
                 feature: "variable-length MATCH requires a fixed source id".to_string(),
             });
         };
-        let (vertices, edge_visits) = self
+        let canonical = budget
+            .read_only_io(
+                "cypher_membership_readiness",
+                self.unstable_vertex_membership_complete(cell_id),
+            )
+            .await?;
+        if canonical
+            && budget
+                .read_only_io(
+                    "cypher_vertex_presence",
+                    self.vertex_metadata_if_exists(cell_id, src),
+                )
+                .await?
+                .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let (mut vertices, edge_visits) = self
             .reachable_vertices_in_hop_range_at(
                 cell_id,
                 &edge.edge_type,
@@ -5785,6 +5831,10 @@ impl GraphShard {
                 budget,
             )
             .await?;
+        if canonical && min_hops == 0 && !vertices.contains(&src) {
+            vertices.push(src);
+            vertices.sort_unstable();
+        }
         budget.check("cypher_reachable")?;
         self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
         self.ensure_query_intermediate_rows("cypher_reachable_rows", vertices.len())?;
@@ -5857,7 +5907,28 @@ impl GraphShard {
             )
             .await?;
         match access {
-            RowQueryAccess::VertexIdSeek => Ok(pattern.id.map(|id| vec![id])),
+            RowQueryAccess::VertexIdSeek => {
+                let Some(id) = pattern.id else {
+                    return Ok(None);
+                };
+                if budget
+                    .read_only_io(
+                        "cypher_membership_readiness",
+                        self.unstable_vertex_membership_complete(cell_id),
+                    )
+                    .await?
+                    && budget
+                        .read_only_io(
+                            "cypher_vertex_presence",
+                            self.vertex_metadata_if_exists(cell_id, id),
+                        )
+                        .await?
+                        .is_none()
+                {
+                    return Ok(Some(Vec::new()));
+                }
+                Ok(Some(vec![id]))
+            }
             RowQueryAccess::VertexPropertyIndex { property } => {
                 let Some(value) = pattern.properties.get(&property) else {
                     return Err(GraphError::CorruptValue {
@@ -5971,11 +6042,17 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<(VertexId, VertexMetadata)>> {
+        let canonical = budget
+            .read_only_io(
+                "cypher_membership_readiness",
+                self.unstable_vertex_membership_complete(cell_id),
+            )
+            .await?;
         stream::iter(vertex_ids.iter().copied().map(|vertex_id| async move {
             budget.check("cypher_metadata_hydration")?;
             let started = Instant::now();
             let metadata = self
-                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .vertex_metadata_if_exists_at(cell_id, vertex_id, read_epoch, budget)
                 .instrument(tracing::info_span!(
                     "query.property_fetch",
                     hydradb.cell_id = %cell_id,
@@ -5984,12 +6061,33 @@ impl GraphShard {
                 .await?;
             self.operation_metrics
                 .record_property_fetch(started.elapsed().as_micros() as u64);
-            Ok::<_, GraphError>((vertex_id, metadata))
+            Ok::<_, GraphError>(
+                metadata
+                    .map(|metadata| (vertex_id, metadata))
+                    .or_else(|| (!canonical).then(|| (vertex_id, VertexMetadata::default()))),
+            )
         }))
         .buffered(QUERY_METADATA_HYDRATION_CONCURRENCY)
         .boxed()
-        .try_collect()
+        .try_collect::<Vec<_>>()
         .await
+        .map(|records| records.into_iter().flatten().collect())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn vertex_metadata_if_exists_at(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        _read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Option<VertexMetadata>> {
+        budget
+            .read_only_io(
+                "cypher_vertex_metadata",
+                self.vertex_metadata_if_exists(cell_id, vertex_id),
+            )
+            .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -7211,6 +7309,23 @@ impl GraphShard {
             context.cancellation_token.clone(),
         );
         budget.check("cypher_graph_kernel_page")?;
+        if budget
+            .read_only_io(
+                "cypher_membership_readiness",
+                self.unstable_vertex_membership_complete(&context.cell_id),
+            )
+            .await?
+            && (request.hop_range.0 == 0
+                || budget
+                    .read_only_io(
+                        "cypher_vertex_presence",
+                        self.vertex_metadata_if_exists(&context.cell_id, request.src),
+                    )
+                    .await?
+                    .is_none())
+        {
+            return Ok(None);
+        }
         if request.edge.dst.id.is_none() {
             match request.projection {
                 GraphKernelProjection::NodeId => {
@@ -8655,6 +8770,7 @@ impl GraphShard {
         if GraphStore::snapshot_cell_is_readable(cell_id) {
             return Ok(());
         }
+        self.unstable_vertex_membership_complete(cell_id).await?;
         if self
             .read_remote(&keys::cell_drop_marker(cell_id))
             .await?
@@ -12722,7 +12838,8 @@ impl GraphShard {
             hydrate_us = hydrate_us.saturating_add(
                 u64::try_from(hydrate_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             );
-            for ((encoded, vertex_id), (_, metadata)) in candidates.into_iter().zip(metadata) {
+            let metadata = metadata.into_iter().collect::<BTreeMap<_, _>>();
+            for (encoded, vertex_id) in candidates {
                 if accepted.len() >= required
                     && (window.index_order || boundary.as_deref() != Some(encoded.as_str()))
                 {
@@ -12734,6 +12851,9 @@ impl GraphShard {
                 // the break above would step over candidates this loop dropped
                 // and `already_returned` would then skip them for good.
                 last_seen = Some((encoded.clone(), vertex_id));
+                let Some(metadata) = metadata.get(&vertex_id).cloned() else {
+                    continue;
+                };
                 // A stale index entry must not surface a value the vertex no
                 // longer holds.
                 let current = match metadata.properties.get(property) {

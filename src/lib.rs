@@ -84,7 +84,8 @@ pub use core::model::{
     EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeRecord, GraphCellDropResult,
     GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, NeighborBatchEntry, QueryFloat,
     RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
-    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
+    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult,
+    VertexMembershipBackfillOptions, VertexMembershipBackfillReport, VertexMetadata,
     VertexPropertyValue,
 };
 pub use core::namespace::{
