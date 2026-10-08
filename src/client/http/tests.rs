@@ -171,6 +171,107 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+fn namespace_headers(values: &[&[u8]]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for value in values {
+        headers.append(
+            GRAPH_NAMESPACE_HEADER,
+            HeaderValue::from_bytes(value).expect("valid header bytes"),
+        );
+    }
+    headers
+}
+
+/// An absent namespace header and an unreadable one are different requests: the
+/// first has opted into the server's default, the second is naming a namespace
+/// and failing. Collapsing the second into the first sends the query to
+/// `default` — a namespace the client never asked for — whenever
+/// `allow_default_namespace` is on, which is the one configuration where the
+/// mistake is silent rather than a 400. `0xff` is a legal header byte on the
+/// wire and an illegal one for `HeaderValue::to_str`.
+#[test]
+fn an_unreadable_namespace_header_is_rejected_rather_than_defaulted() {
+    let headers = namespace_headers(&[&[0xff]]);
+
+    let error = http_graph_scope(&headers, "g".to_string(), true)
+        .expect_err("a present but unreadable namespace header must not fall back to the default");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_namespace");
+    assert!(
+        error.message.contains(GRAPH_NAMESPACE_HEADER),
+        "the client must be told which header it got wrong: {}",
+        error.message
+    );
+}
+
+/// With the default `allow_default_namespace = false` an unreadable header was
+/// already refused, but as `missing_namespace` — the wrong diagnosis, because
+/// the client did send the header. The status was right by accident; this keeps
+/// the two answers distinguishable so a client can tell "you sent nothing" from
+/// "what you sent is unreadable".
+#[test]
+fn an_unreadable_namespace_header_is_not_reported_as_a_missing_one() {
+    let headers = namespace_headers(&[&[0xff]]);
+
+    let error = http_graph_scope(&headers, "g".to_string(), false)
+        .expect_err("an unreadable namespace header is refused however defaulting is configured");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_namespace");
+}
+
+/// `HeaderMap::get` returns the first value of a repeated header, so a request
+/// naming two namespaces would have silently been served from whichever the
+/// client happened to send first. Tenancy is not a field to guess at: refuse.
+#[test]
+fn a_repeated_namespace_header_is_rejected_rather_than_resolved_to_the_first() {
+    let headers = namespace_headers(&[b"tenant-a", b"tenant-b"]);
+
+    let error = http_graph_scope(&headers, "g".to_string(), true)
+        .expect_err("two conflicting namespace headers must not resolve to the first");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_namespace");
+}
+
+/// The paths that were already correct, pinned so that refusing the unreadable
+/// and the repeated header does not cost the readable, the absent, or the
+/// readable-but-invalid one their existing answers.
+#[test]
+fn readable_absent_and_invalid_namespace_headers_keep_their_answers() {
+    // `HttpApiError` is deliberately not `Debug` — it is a response, not a
+    // diagnostic — so the success arms unwrap by hand rather than with
+    // `expect`, and report the message the client would have seen.
+    let headers = namespace_headers(&[b"tenant-a/team-b"]);
+    let named = http_graph_scope(&headers, "g".to_string(), true)
+        .unwrap_or_else(|error| panic!("a readable namespace must resolve: {}", error.message));
+    assert_eq!(
+        named.namespace,
+        NamespacePath::new([
+            NamespaceId::new("tenant-a").unwrap(),
+            NamespaceId::new("team-b").unwrap(),
+        ])
+        .unwrap()
+    );
+    assert_eq!(named.graph_id, GraphId::new("g").unwrap());
+
+    let defaulted = http_graph_scope(&HeaderMap::new(), "g".to_string(), true)
+        .unwrap_or_else(|error| panic!("an absent header must still default: {}", error.message));
+    assert_eq!(defaulted.namespace, NamespacePath::default());
+
+    let missing = http_graph_scope(&HeaderMap::new(), "g".to_string(), false)
+        .expect_err("an absent header is still required when defaulting is off");
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.code, "missing_namespace");
+
+    // Readable but not a legal component: rejected by `NamespaceId::new`, which
+    // is a path the unreadable case never reached.
+    let invalid = http_graph_scope(&namespace_headers(&[b"tenant a"]), "g".to_string(), true)
+        .expect_err("a readable namespace is still validated");
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
