@@ -2,6 +2,10 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/YPtwenvxY8)
+
+Join the community on [Discord](https://discord.gg/YPtwenvxY8). Contributions
+follow a vouch-and-approve flow; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 HydraDB is an object-store-native distributed graph database written in Rust.
 It combines durable graph storage on SlateDB with snapshot-consistent

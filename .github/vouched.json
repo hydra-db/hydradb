@@ -1,0 +1,13 @@
+{
+  "_comment": "Contribution roster. 'maintainers' may run /vouch and /approved. 'vouched' maps each vouched login to the maintainer who vouched them. See CONTRIBUTING.md.",
+  "maintainers": [
+    "arrry-hydraDB",
+    "abhishekt-hydra",
+    "vixhal-baraiya",
+    "SohamRatnaparkhi",
+    "vyomgoyal",
+    "saivenu-hydradb",
+    "tushar-hydradb"
+  ],
+  "vouched": {}
+}

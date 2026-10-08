@@ -1,0 +1,83 @@
+name: PR limit
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'Comment "N of 3" on all existing open PRs'
+        type: boolean
+        default: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+env:
+  MAX_OPEN: 3
+
+jobs:
+  enforce:
+    if: ${{ github.event_name == 'pull_request_target' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MAX = parseInt(process.env.MAX_OPEN, 10);
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const number = pr.number;
+
+            const got = await github.rest.repos.getContent({
+              owner: context.repo.owner, repo: context.repo.repo, path: '.github/vouched.json', ref: context.payload.repository.default_branch });
+            const roster = JSON.parse(Buffer.from(got.data.content, 'base64').toString('utf8'));
+            if ((roster.maintainers || []).includes(author)) { core.info('Maintainer, exempt from cap.'); return; }
+            const found = await github.paginate(github.rest.search.issuesAndPullRequests, {
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:open author:${author} -is:draft`, per_page: 100 });
+            const open = found.map(p => p.number).sort((a, b) => a - b);
+            const rank = open.indexOf(number) + 1 || open.length;
+
+            if (open.length > MAX) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
+                body: `You have ${open.length} open PRs, over the limit of ${MAX}. Closing this one; please get an existing PR merged or closed first. The fastest way to get an open PR closed is to ask in the #pr-discussion channel on [Discord](https://discord.gg/YPtwenvxY8).` });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: number, state: 'closed' });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
+                body: `This is PR ${rank} of ${MAX} you may keep open at a time.` });
+            }
+
+  backfill:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MAX = parseInt(process.env.MAX_OPEN, 10);
+            const got = await github.rest.repos.getContent({
+              owner: context.repo.owner, repo: context.repo.repo, path: '.github/vouched.json', ref: context.payload.repository.default_branch });
+            const maintainers = (JSON.parse(Buffer.from(got.data.content, 'base64').toString('utf8')).maintainers) || [];
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 });
+            const byAuthor = {};
+            for (const p of prs) {
+              if (p.draft) continue;
+              const a = p.user.login;
+              if (maintainers.includes(a)) continue;
+              (byAuthor[a] ||= []).push(p.number);
+            }
+            for (const [a, nums] of Object.entries(byAuthor)) {
+              nums.sort((x, y) => x - y);
+              const total = nums.length;
+              const over = total - MAX;
+              for (let i = 0; i < total; i++) {
+                const rank = i + 1;
+                const body = over <= 0
+                  ? `This is PR ${rank} of ${MAX} you may keep open at a time, @${a}.`
+                  : `⚠️ @${a}, you have ${total} open PRs, over the limit of ${MAX}. This is PR ${rank}. **Please close at least ${over} of your open PRs** to get within the limit, or new PRs will be closed automatically. Fastest way to close one: ask in the #pr-discussion channel on [Discord](https://discord.gg/YPtwenvxY8).`;
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: nums[i], body });
+              }
+            }
