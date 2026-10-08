@@ -19844,6 +19844,48 @@ async fn cypher_row_engine_rejects_excess_intermediate_rows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_result_rows_use_intermediate_row_limit_not_vertex_limit() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let limits = GraphLimits {
+        max_query_result_vertices: 3,
+        max_query_intermediate_rows: 100,
+        ..GraphLimits::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/max-result-vertices-vs-rows",
+        object_store,
+        limits,
+    )
+    .await
+    .unwrap();
+
+    for q in [
+        "CREATE (a {id: 1})-[:E]->(b {id: 2})",
+        "CREATE (a {id: 1})-[:E]->(b {id: 3})",
+        "CREATE (a {id: 4})-[:E]->(b {id: 2})",
+        "CREATE (a {id: 4})-[:E]->(b {id: 3})",
+    ] {
+        shard
+            .execute_cypher(QueryContext::new("cell-a", "create"), q)
+            .await
+            .unwrap();
+    }
+    shard.build_graph_index("cell-a", "E").await.unwrap();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "probe"),
+            "MATCH (a)-[:E]->(t)<-[:E]-(b) RETURN t.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 8);
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_bound_one_hop_scan_limit_ignores_unrelated_edges() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(

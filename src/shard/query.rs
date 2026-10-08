@@ -7095,7 +7095,7 @@ impl GraphShard {
             actual: window.skip,
             limit: usize::MAX as u64,
         })?;
-        let max = self.limits.max_query_result_vertices;
+        let max = self.limits.max_query_intermediate_rows;
         let mut rows: Vec<_> = projected
             .into_iter()
             .skip(skip)
@@ -7174,7 +7174,7 @@ impl GraphShard {
             limit: usize::MAX as u64,
         })?;
         let mut rows: Vec<_> = rows.into_iter().skip(skip).collect();
-        let max = self.limits.max_query_result_vertices;
+        let max = self.limits.max_query_intermediate_rows;
         if let Some(limit) = window.limit {
             ensure_limit("query_result_limit", limit as u64, max as u64)?;
             rows.truncate(limit);
@@ -7425,7 +7425,7 @@ impl GraphShard {
         cursor_offset: u64,
         page_size: usize,
     ) -> Result<QueryContext> {
-        let max = self.limits.max_query_result_vertices;
+        let max = self.limits.max_query_intermediate_rows;
         if page_size == 0 {
             return Err(GraphError::AdmissionRejected {
                 operation: "query_page_size",
