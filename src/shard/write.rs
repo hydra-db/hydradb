@@ -7312,6 +7312,28 @@ fn apply_vertex_metadata_update_txn(
     Ok(())
 }
 
+// SlateDB's write batch asserts that keys stay at or under u16::MAX bytes and
+// panics past it, so an index key that embeds client-supplied metadata has to
+// be refused here, as a client error, before it reaches the storage layer.
+// The overflow is reachable from an ordinary write: string property values are
+// hex-encoded into the vertex, edge, and relationship property index keys, so
+// a value a little over 32 KiB already produces an oversized key. Only the put
+// paths need the check; the delete paths rebuild keys from metadata that this
+// check admitted when it was stored.
+fn validated_metadata_index_key(kind: &'static str, name: &str, key: String) -> Result<String> {
+    if key.len() > usize::from(u16::MAX) {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "GraphQuery",
+            feature: format!(
+                "{kind} {name} produces a {}-byte index key; the storage limit is {} bytes",
+                key.len(),
+                u16::MAX
+            ),
+        });
+    }
+    Ok(key)
+}
+
 fn put_vertex_metadata_indexes_txn(
     txn: &DbTransaction,
     cell_id: &str,
@@ -7320,18 +7342,27 @@ fn put_vertex_metadata_indexes_txn(
 ) -> Result<()> {
     for label in &metadata.labels {
         txn.put(
-            keys::vertex_label(cell_id, label, vertex_id).as_bytes(),
+            validated_metadata_index_key(
+                "label",
+                label,
+                keys::vertex_label(cell_id, label, vertex_id),
+            )?
+            .as_bytes(),
             encode_u64(vertex_id).as_slice(),
         )?;
     }
     for (property, value) in &metadata.properties {
         txn.put(
-            keys::vertex_property_index(
-                cell_id,
+            validated_metadata_index_key(
+                "property",
                 property,
-                &encode_vertex_property_value_key(value),
-                vertex_id,
-            )
+                keys::vertex_property_index(
+                    cell_id,
+                    property,
+                    &encode_vertex_property_value_key(value),
+                    vertex_id,
+                ),
+            )?
             .as_bytes(),
             encode_u64(vertex_id).as_slice(),
         )?;
@@ -7400,14 +7431,18 @@ fn put_edge_metadata_indexes_txn(
 ) -> Result<()> {
     for (property, value) in &metadata.properties {
         txn.put(
-            keys::edge_property_index(
-                target.cell_id,
-                target.edge_type,
+            validated_metadata_index_key(
+                "property",
                 property,
-                &encode_vertex_property_value_key(value),
-                target.src,
-                target.dst,
-            )
+                keys::edge_property_index(
+                    target.cell_id,
+                    target.edge_type,
+                    property,
+                    &encode_vertex_property_value_key(value),
+                    target.src,
+                    target.dst,
+                ),
+            )?
             .as_bytes(),
             encode_u64(target.dst).as_slice(),
         )?;
@@ -7429,15 +7464,19 @@ fn put_relationship_property_indexes_txn(
 ) -> Result<()> {
     for (property, value) in &record.metadata.properties {
         txn.put(
-            keys::relationship_property_index(
-                &record.cell_id,
-                &record.edge_type,
+            validated_metadata_index_key(
+                "property",
                 property,
-                &encode_vertex_property_value_key(value),
-                record.src,
-                record.dst,
-                record.relationship_id,
-            )
+                keys::relationship_property_index(
+                    &record.cell_id,
+                    &record.edge_type,
+                    property,
+                    &encode_vertex_property_value_key(value),
+                    record.src,
+                    record.dst,
+                    record.relationship_id,
+                ),
+            )?
             .as_bytes(),
             encode_u64(record.relationship_id).as_slice(),
         )?;
