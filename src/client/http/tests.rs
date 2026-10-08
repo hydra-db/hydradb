@@ -171,6 +171,27 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn configuration_errors_return_internal_server_error_with_details() {
+    let unsafe_durability = HttpApiError::from_graph(GraphError::UnsafeDurabilityConfig {
+        operation: "write",
+        reason: "node requires await_durable_writes".to_string(),
+    });
+    assert_eq!(unsafe_durability.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(unsafe_durability.code, "configuration_error");
+    assert_eq!(unsafe_durability.message, "internal graph configuration error");
+
+    let routed_mismatch = HttpApiError::from_graph(GraphError::RoutedWriterConfigMismatch {
+        path: "store/cell-0".to_string(),
+        node_id: "node-1".to_string(),
+        existing: std::time::Duration::from_millis(500),
+        requested: std::time::Duration::from_millis(1000),
+    });
+    assert_eq!(routed_mismatch.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(routed_mismatch.code, "configuration_error");
+    assert_eq!(routed_mismatch.message, "internal graph configuration error");
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
