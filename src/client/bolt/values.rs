@@ -225,7 +225,11 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
     match error {
         GraphError::GraphScopeAccessDenied { .. } => BoltError::Forbidden(error.to_string()),
         GraphError::AdmissionRejected { .. } => BoltError::ResourceExhausted(error.to_string()),
-        GraphError::SnapshotAhead { .. } => BoltError::Query {
+        GraphError::SnapshotAhead { .. }
+        | GraphError::SnapshotExpired { .. }
+        | GraphError::SnapshotChanged { .. }
+        | GraphError::QueryStatsSnapshotChanged { .. }
+        | GraphError::ControlWatermarkRegression { .. } => BoltError::Query {
             code: "Neo.TransientError.Transaction.BookmarkTimeout".to_string(),
             message: error.to_string(),
         },
