@@ -19690,6 +19690,66 @@ Feature: Supported row-query corpus
 }
 
 #[cfg(feature = "opencypher")]
+#[test]
+fn cypher_tck_corpus_skips_feature_level_background_scenarios() {
+    let corpus = parse_opencypher_tck_corpus(
+        r#"
+Feature: Background-dependent feature
+
+  Background:
+    Given an empty graph
+    And having executed:
+      """
+      CREATE (a:Person {name: 'Alice'})
+      """
+
+  Scenario: match-with-background
+    When executing query:
+      """
+      MATCH (p:Person) RETURN p.name AS name
+      """
+    Then the result should be, in order:
+      | name |
+      | 'Alice' |
+
+  Scenario: second-match-with-background
+    When executing query:
+      """
+      MATCH (p:Person) RETURN count(p) AS total
+      """
+    Then the result should be, in order:
+      | total |
+      | 1 |
+
+Feature: Standalone feature without background
+
+  Scenario: standalone-query
+    When executing query:
+      """
+      RETURN 1 AS id
+      """
+    Then the result should be, in order:
+      | id |
+      | 1 |
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(corpus.cases.len(), 1);
+    assert_eq!(corpus.skipped.len(), 2);
+    assert_eq!(corpus.cases[0].name, "standalone-query");
+
+    let report = corpus.compatibility_report();
+    assert_eq!(report.total_scenarios, 3);
+    assert_eq!(report.runnable_scenarios, 1);
+    assert_eq!(report.skipped_scenarios, 2);
+    assert!(report
+        .skipped
+        .iter()
+        .all(|reason| reason.contains("feature-level background")));
+}
+
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_row_engine_records_operational_metrics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

@@ -108,6 +108,7 @@ struct TckCorpusParser<'a> {
     cases: Vec<CypherTckCase>,
     skipped: Vec<String>,
     total_scenarios: usize,
+    has_background: bool,
 }
 
 impl<'a> TckCorpusParser<'a> {
@@ -118,13 +119,24 @@ impl<'a> TckCorpusParser<'a> {
             cases: Vec::new(),
             skipped: Vec::new(),
             total_scenarios: 0,
+            has_background: false,
         }
     }
 
     fn parse(&mut self) -> Result<CypherTckCorpus> {
         while self.idx < self.lines.len() {
             let line = self.trimmed();
-            if let Some(name) = scenario_name(line) {
+            if line.starts_with('#') {
+                self.idx += 1;
+                continue;
+            }
+            if line.starts_with("Feature:") {
+                self.has_background = false;
+                self.idx += 1;
+            } else if line == "Background:" || line.starts_with("Background:") {
+                self.has_background = true;
+                self.idx += 1;
+            } else if let Some(name) = scenario_name(line) {
                 self.total_scenarios += 1;
                 self.idx += 1;
                 self.parse_scenario(name)?;
@@ -142,11 +154,21 @@ impl<'a> TckCorpusParser<'a> {
     fn parse_scenario(&mut self, name: String) -> Result<()> {
         let mut query = None;
         let mut expected = None;
-        let mut unsupported = None;
+        let mut unsupported = if self.has_background {
+            Some(format!(
+                "{name}: feature-level background requires an external TCK fixture runner"
+            ))
+        } else {
+            None
+        };
 
         while self.idx < self.lines.len() {
             let line = self.trimmed();
-            if scenario_name(line).is_some() {
+            if scenario_name(line).is_some()
+                || line.starts_with("Feature:")
+                || line == "Background:"
+                || line.starts_with("Background:")
+            {
                 break;
             }
             if line.starts_with("Given ")
