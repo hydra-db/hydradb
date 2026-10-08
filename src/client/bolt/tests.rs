@@ -2024,6 +2024,47 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+#[test]
+fn retry_exhaustion_snapshot_expired_and_unknown_shard_reach_bolt_clients() {
+    let retry_exhausted = graph_error_to_bolt(GraphError::RetryExhausted {
+        operation: "vertex-insert",
+        attempts: 10,
+    });
+    match retry_exhausted {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.DeadlockDetected");
+            assert!(message.contains("vertex-insert"));
+            assert!(message.contains("10"));
+        }
+        other => panic!("expected a transient deadlock Bolt error, got {other:?}"),
+    }
+
+    let unknown_shard = graph_error_to_bolt(GraphError::UnknownShard {
+        cell_id: "cell-missing".to_string(),
+    });
+    match unknown_shard {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Database.DatabaseNotFound");
+            assert!(message.contains("cell-missing"));
+        }
+        other => panic!("expected a database not found Bolt error, got {other:?}"),
+    }
+
+    let snapshot_expired = graph_error_to_bolt(GraphError::SnapshotExpired {
+        cell_id: "cell-0".to_string(),
+        edge_type: "KNOWS".to_string(),
+        read_epoch: 5,
+        min_epoch: 10,
+    });
+    match snapshot_expired {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Transaction.InvalidBookmark");
+            assert!(message.contains("compacted watermark"));
+        }
+        other => panic!("expected an invalid bookmark Bolt error, got {other:?}"),
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted
