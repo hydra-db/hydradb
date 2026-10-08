@@ -171,6 +171,24 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn an_idempotency_conflict_is_a_409_and_visible_to_http_clients() {
+    let conflict = HttpApiError::from_graph(GraphError::IdempotencyConflict {
+        operation: "relationship-import",
+        idempotency_key: "caller-operation-42".to_string(),
+        reason: "this key already stored a result for a different payload",
+    });
+
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "idempotency_conflict");
+    assert_eq!(conflict.owner, None);
+    assert!(!conflict.authenticate);
+
+    assert!(conflict.message.contains("relationship-import"));
+    assert!(conflict.message.contains("caller-operation-42"));
+    assert!(conflict.message.contains("different payload"));
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
