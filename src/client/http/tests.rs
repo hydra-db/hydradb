@@ -399,3 +399,30 @@ async fn http_api_serves_authenticated_queries_over_https() {
     drop(client);
     server.stop().await.unwrap();
 }
+
+#[test]
+fn write_requires_writer_is_a_421() {
+    let err = HttpApiError::from_graph(GraphError::WriteRequiresWriter {
+        operation: "insert",
+        cell_id: "cell-1".to_string(),
+    });
+    assert_eq!(err.status, StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(err.code, "write_requires_writer");
+}
+
+#[test]
+fn read_only_shard_storage_is_a_403() {
+    let err = HttpApiError::from_graph(GraphError::ReadOnlyShardStorage);
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    assert_eq!(err.code, "read_only_storage");
+}
+
+#[test]
+fn cell_dropped_is_a_404() {
+    let err = HttpApiError::from_graph(GraphError::CellDropped {
+        operation: "lookup",
+        cell_id: "cell-1".to_string(),
+    });
+    assert_eq!(err.status, StatusCode::NOT_FOUND);
+    assert_eq!(err.code, "cell_dropped");
+}
