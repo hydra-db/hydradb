@@ -1090,6 +1090,92 @@ fn push_elided_literal(shape: &mut String) {
     shape.push('?');
 }
 
+const MAX_QUERY_NESTING_DEPTH: usize = 64;
+
+fn ensure_query_nesting_depth(query: &str) -> Result<()> {
+    let mut depth = 0_usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut chars = query.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_single_quote {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if in_double_quote {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '"' {
+                in_double_quote = false;
+            }
+            continue;
+        }
+        if in_backtick {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '`' {
+                if chars.peek() == Some(&'`') {
+                    chars.next();
+                } else {
+                    in_backtick = false;
+                }
+            }
+            continue;
+        }
+
+        if ch == '/' {
+            if chars.peek() == Some(&'/') {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            } else if chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+        }
+
+        if ch == '\'' {
+            in_single_quote = true;
+        } else if ch == '"' {
+            in_double_quote = true;
+        } else if ch == '`' {
+            in_backtick = true;
+        } else if matches!(ch, '(' | '[' | '{') {
+            depth = depth.saturating_add(1);
+            if depth > MAX_QUERY_NESTING_DEPTH {
+                return Err(parse_error(format!(
+                    "query exceeds maximum expression nesting depth limit of {MAX_QUERY_NESTING_DEPTH}"
+                )));
+            }
+        } else if matches!(ch, ')' | ']' | '}') {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    Ok(())
+}
+
 struct ParsedCypher {
     result: *mut sys::cypher_parse_result_t,
 }
@@ -1151,6 +1237,7 @@ impl ParsedCypher {
     // (200 terms is fine); without it a deep chain aborts the process rather
     // than returning an error.
     fn parse(query: &str) -> Result<Self> {
+        ensure_query_nesting_depth(query)?;
         let c_query =
             CString::new(query).map_err(|_| parse_error("query contains an embedded NUL byte"))?;
 
@@ -7349,5 +7436,21 @@ mod tests {
             opencypher_query_fingerprint("MATCH ((("),
             query_shape_fingerprint("MATCH ((("),
         );
+    }
+
+    #[test]
+    fn deeply_nested_query_expressions_are_rejected() {
+        // 70 levels of parentheses exceed MAX_QUERY_NESTING_DEPTH (64)
+        let open_parens = "(".repeat(70);
+        let close_parens = ")".repeat(70);
+        let pathological = format!("MATCH (n) WHERE {open_parens}n.id = 1{close_parens} RETURN n");
+        let error = parse_opencypher_row_query(&pathological).expect_err("should reject excessive nesting");
+        assert!(matches!(error, GraphError::QueryParse { .. }));
+        assert!(error.to_string().contains("nesting depth limit"));
+
+        // Parentheses, brackets, and braces inside string literals, comments, and backtick identifiers do not count towards nesting depth
+        let literal_parens = "(".repeat(100);
+        let safe_query = format!("MATCH (`n({literal_parens})`) WHERE `n({literal_parens})`.name = '{literal_parens}' /* {literal_parens} */ RETURN `n({literal_parens})`");
+        assert!(parse_opencypher_row_query(&safe_query).is_ok());
     }
 }
