@@ -245,6 +245,11 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.ClientError.Transaction.Invalid".to_string(),
             message: error.to_string(),
         },
+        GraphError::ConditionalWriteConflict { .. }
+        | GraphError::ControlMetadataConflict { .. } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.LockClientStopped".to_string(),
+            message: error.to_string(),
+        },
         // Touch point (c). Drivers already know this code: discard the routing
         // table, re-route, retry. Without it a refused write arrives as an
         // opaque backend error and the driver retries into the same wrong node

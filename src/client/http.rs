@@ -415,6 +415,27 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            GraphError::IdempotencyConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ConditionalWriteConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "write_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ControlMetadataConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "control_metadata_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }
