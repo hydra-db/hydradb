@@ -267,6 +267,20 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
             message: error.to_string(),
         },
+        GraphError::CorruptValue { .. } => {
+            tracing::error!(target: "slatedb_graph_kernel", error = %error, "data corruption detected");
+            BoltError::Query {
+                code: "Neo.DatabaseError.General.StorageEngineError".to_string(),
+                message: "internal data corruption detected".to_string(),
+            }
+        },
+        GraphError::SparseKernel { .. } => {
+            tracing::error!(target: "slatedb_graph_kernel", error = %error, "sparse traversal kernel error");
+            BoltError::Query {
+                code: "Neo.DatabaseError.Statement.ExecutionFailed".to_string(),
+                message: "sparse traversal kernel execution error".to_string(),
+            }
+        },
         _ => {
             tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())

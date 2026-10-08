@@ -2024,6 +2024,33 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+#[test]
+fn corruption_and_kernel_errors_reach_bolt_clients_as_database_errors() {
+    let corrupt = graph_error_to_bolt(GraphError::CorruptValue {
+        key: "cell-0/nodes/42".to_string(),
+        reason: "invalid postcard payload".to_string(),
+    });
+    match corrupt {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.General.StorageEngineError");
+            assert_eq!(message, "internal data corruption detected");
+        }
+        other => panic!("expected StorageEngineError, got {other:?}"),
+    }
+
+    let kernel = graph_error_to_bolt(GraphError::SparseKernel {
+        backend: "SuiteSparse",
+        reason: "dimension mismatch in semiring".to_string(),
+    });
+    match kernel {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.Statement.ExecutionFailed");
+            assert_eq!(message, "sparse traversal kernel execution error");
+        }
+        other => panic!("expected ExecutionFailed, got {other:?}"),
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted
