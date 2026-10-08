@@ -3064,6 +3064,9 @@ fn merge_distributed_inner_join(
                     reason: "right row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             right_by_key.entry(key).or_default().push(row);
         }
 
@@ -3074,6 +3077,9 @@ fn merge_distributed_inner_join(
                     reason: "left row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             if let Some(right_rows) = right_by_key.get(key) {
                 for right_row in right_rows {
                     let mut values = left_row.values.clone();
@@ -3091,6 +3097,9 @@ fn merge_distributed_inner_join(
                     reason: "left row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             left_by_key.entry(key).or_default().push(row);
         }
 
@@ -3101,6 +3110,9 @@ fn merge_distributed_inner_join(
                     reason: "right row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             if let Some(left_rows) = left_by_key.get(key) {
                 for left_row in left_rows {
                     let mut values = left_row.values.clone();
@@ -5384,5 +5396,70 @@ mod scope_grant_tests {
             &GraphScope::new(tenant, GraphId::new("other").unwrap()),
             QueryTransportAction::Read,
         ));
+    }
+
+    #[test]
+    fn merge_distributed_inner_join_drops_null_join_keys() {
+        // Case 1: right rows <= left rows (exercises right_by_key hash-table branch)
+        let left_result = QueryResultSet::new(
+            vec![QueryColumn::new("id"), QueryColumn::new("manager_id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::Null]),
+                QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        );
+        let right_result = QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::Null]),
+            ],
+        );
+        let leg_results = BTreeMap::from([
+            ("users".to_string(), left_result),
+            ("managers".to_string(), right_result),
+        ]);
+        let join = DistributedQueryJoin::inner("users", "manager_id", "managers", "id");
+
+        let merged = merge_distributed_inner_join(&leg_results, &join).unwrap();
+        assert_eq!(
+            merged.rows,
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(10),
+                QueryValue::VertexId(10),
+            ])]
+        );
+
+        // Case 2: left rows < right rows (exercises left_by_key hash-table branch)
+        let left_result_small = QueryResultSet::new(
+            vec![QueryColumn::new("id"), QueryColumn::new("manager_id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::Null]),
+            ],
+        );
+        let right_result_large = QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::Null]),
+                QueryRow::new(vec![QueryValue::Null]),
+            ],
+        );
+        let leg_results_rev = BTreeMap::from([
+            ("users".to_string(), left_result_small),
+            ("managers".to_string(), right_result_large),
+        ]);
+        let merged_rev = merge_distributed_inner_join(&leg_results_rev, &join).unwrap();
+        assert_eq!(
+            merged_rev.rows,
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(10),
+                QueryValue::VertexId(10),
+            ])]
+        );
     }
 }
