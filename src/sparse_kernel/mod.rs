@@ -24,15 +24,18 @@
 //! | `expand` (fixed hops) | yes | yes | yes |
 //! | `expand_range` (min..max hops) | yes | yes | yes |
 //! | `expand_range_count` (count pushdown) | no | yes | yes |
-//! | `expand_range_window` (skip/limit pushdown) | no | yes | yes |
 //! | `contains_edge` | no | yes | yes |
 //! | Precompiled, cached per epoch | no | yes | yes |
+//!
+//! Skip/limit is *not* pushed into any kernel. `shard::query` materialises the
+//! reachable set, sorts it ascending, caches it, and trims with
+//! `graph_kernel_window_sorted_vertices`, on every rung of the ladder.
 //!
 //! Kernel 1 is therefore a strict subset. When the compiled path is
 //! unavailable it returns `None` and callers fall through to kernel 1 (see
 //! `shard::query`, counted by `query_rust_sparse_fallbacks`) — which is a
-//! capability downgrade, not merely a slower path: counts and windows must be
-//! answered by materialising the full vertex set and trimming afterwards.
+//! capability downgrade, not merely a slower path: counts must be answered by
+//! materialising the full vertex set and trimming afterwards.
 //!
 //! # Cost model
 //!
