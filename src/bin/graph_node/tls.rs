@@ -20,35 +20,6 @@ pub struct FileTlsReloader {
     task: JoinHandle<()>,
 }
 
-fn load_certificate_material(
-    certificate_path: &Path,
-    private_key_path: &Path,
-) -> TlsResult<(
-    Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
-    tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
-    DefaultHasher,
-)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
-    let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
-    }
-    let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
-        )
-    })?;
-    let mut fingerprint = DefaultHasher::new();
-    certificate_bytes.hash(&mut fingerprint);
-    private_key_bytes.hash(&mut fingerprint);
-    Ok((certificates, private_key, fingerprint))
-}
-
 impl FileTlsReloader {
     pub fn start(
         certificate_path: &Path,
@@ -112,24 +83,69 @@ impl FileTlsReloader {
 }
 
 fn load_server_config(
-    certificate_path: &PathBuf,
-    private_key_path: &PathBuf,
+    certificate_path: &Path,
+    private_key_path: &Path,
 ) -> TlsResult<(ServerConfig, u64)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
-    let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
-    }
-    let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
+    let certificate_bytes = std::fs::read(certificate_path).map_err(|err| {
         Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
+            err.kind(),
+            format!(
+                "cannot read TLS certificate file at {}: {err}",
+                certificate_path.display()
+            ),
         )
     })?;
+    let private_key_bytes = std::fs::read(private_key_path).map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!(
+                "cannot read TLS private key file at {}: {err}",
+                private_key_path.display()
+            ),
+        )
+    })?;
+    let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "invalid PEM format in TLS certificate file at {}: {err}",
+                    certificate_path.display()
+                ),
+            )
+        })?;
+    if certificates.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "TLS certificate file at {} contains no certificates",
+                certificate_path.display()
+            ),
+        )
+        .into());
+    }
+    let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
+    let private_key = rustls_pemfile::private_key(&mut private_key_reader)
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "invalid PEM format in TLS private key file at {}: {err}",
+                    private_key_path.display()
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "TLS private key file at {} contains no key",
+                    private_key_path.display()
+                ),
+            )
+        })?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)?;
@@ -177,5 +193,107 @@ mod tests {
         .unwrap();
         provider.current_server_config().unwrap();
         reloader.stop().await;
+    }
+
+    #[test]
+    fn missing_certificate_file_names_path_and_preserves_error_kind() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("missing.crt");
+        let private_key_path = root.path().join("tls.key");
+        write_certificate_pair(&root.path().join("dummy.crt"), &private_key_path);
+
+        let err = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("cannot read TLS certificate file at"),
+            "{err_str}"
+        );
+        assert!(
+            err_str.contains(&certificate_path.display().to_string()),
+            "{err_str}"
+        );
+        let io_err = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn missing_private_key_file_names_path_and_preserves_error_kind() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("tls.crt");
+        let private_key_path = root.path().join("missing.key");
+        write_certificate_pair(&certificate_path, &root.path().join("dummy.key"));
+
+        let err = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("cannot read TLS private key file at"),
+            "{err_str}"
+        );
+        assert!(
+            err_str.contains(&private_key_path.display().to_string()),
+            "{err_str}"
+        );
+        let io_err = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn empty_certificate_file_names_path() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("empty.crt");
+        let private_key_path = root.path().join("tls.key");
+        std::fs::write(&certificate_path, b"").unwrap();
+        write_certificate_pair(&root.path().join("dummy.crt"), &private_key_path);
+
+        let err = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("contains no certificates"),
+            "{err_str}"
+        );
+        assert!(
+            err_str.contains(&certificate_path.display().to_string()),
+            "{err_str}"
+        );
+    }
+
+    #[test]
+    fn empty_private_key_file_names_path() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("tls.crt");
+        let private_key_path = root.path().join("empty.key");
+        write_certificate_pair(&certificate_path, &root.path().join("dummy.key"));
+        std::fs::write(&private_key_path, b"").unwrap();
+
+        let err = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("contains no key"),
+            "{err_str}"
+        );
+        assert!(
+            err_str.contains(&private_key_path.display().to_string()),
+            "{err_str}"
+        );
+    }
+
+    #[test]
+    fn certificate_directory_names_path() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_dir = root.path().join("cert_dir");
+        let private_key_path = root.path().join("tls.key");
+        std::fs::create_dir(&certificate_dir).unwrap();
+        write_certificate_pair(&root.path().join("dummy.crt"), &private_key_path);
+
+        let err = load_server_config(&certificate_dir, &private_key_path).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("cannot read TLS certificate file at"),
+            "{err_str}"
+        );
+        assert!(
+            err_str.contains(&certificate_dir.display().to_string()),
+            "{err_str}"
+        );
     }
 }
