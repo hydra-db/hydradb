@@ -38,10 +38,13 @@ jobs:
               ['admin', 'write'].includes(await github.rest.repos.getCollaboratorPermissionLevel({
                 owner: context.repo.owner, repo: context.repo.repo, username: login }).then(r => r.data.permission, () => 'none'));
 
-            if (pr.user.type === 'Bot') { core.info('Bot PR, exempt from cap.'); return; }
             // The cap went live when #230 merged; older PRs are exempt (they still count towards a new PR's total).
-            if (new Date(pr.created_at) < new Date('2026-10-08T11:57:53Z')) { core.info('Opened before the cap, exempt.'); return; }
-            if ((pr.labels || []).some(l => l.name === 'gate-override')) { core.info('Has gate-override, exempt from cap.'); return; }
+            const capStart = new Date('2026-10-08T11:57:53Z');
+            const overridden = (p) => (p.labels || []).some(l => l.name === 'gate-override');
+
+            if (pr.user.type === 'Bot') { core.info('Bot PR, exempt from cap.'); return; }
+            if (new Date(pr.created_at) < capStart) { core.info('Opened before the cap, exempt.'); return; }
+            if (overridden(pr)) { core.info('Has gate-override, exempt from cap.'); return; }
             if (context.payload.action === 'reopened' && await isTeam(context.payload.sender.login)) { core.info('Reopened by a maintainer, exempt from cap.'); return; }
             if (await isTeam(author)) { core.info('Maintainer, exempt from cap.'); return; }
             const found = await github.paginate(github.rest.search.issuesAndPullRequests, {
@@ -50,9 +53,17 @@ jobs:
             const rank = open.indexOf(number) + 1 || open.length;
 
             if (open.length > MAX) {
-              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
-                body: `You have ${open.length} open PRs, over the limit of ${MAX}. Closing this one; please get an existing PR merged or closed first. The fastest way to get an open PR closed is to ask in the #pr-discussion channel on [Discord](https://discord.gg/YPtwenvxY8).` });
-              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: number, state: 'closed' });
+              // Close the newest PRs over the cap (CONTRIBUTING.md), not the PR that triggered this run.
+              // Old and overridden PRs count towards the total but are never closed here.
+              const toClose = found
+                .filter(p => new Date(p.created_at) >= capStart && !overridden(p))
+                .map(p => p.number).sort((a, b) => b - a)
+                .slice(0, open.length - MAX);
+              for (const n of toClose) {
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+                  body: `You have ${open.length} open PRs, over the limit of ${MAX}. Closing this one, your newest; please get an existing PR merged or closed first. The fastest way to get an open PR closed is to ask in the #pr-discussion channel on [Discord](https://discord.gg/YPtwenvxY8).` });
+                await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: n, state: 'closed' });
+              }
             } else {
               await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
                 body: `This is PR ${rank} of ${MAX} you may keep open at a time.` });
