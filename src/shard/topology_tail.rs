@@ -529,6 +529,43 @@ mod tests {
         assert_eq!(incoming, BTreeSet::from([1, 2]));
     }
 
+    /// Issue #69: an edge whose endpoints are both in the current frontier
+    /// must still be followed. Graph: 0->2, 0->3, 3->2, 2->9. After hop 1 the
+    /// frontier is {2, 3}; 2 is reachable in exactly 2 hops only via 3->2.
+    #[test]
+    fn an_edge_between_two_frontier_members_is_not_lost() {
+        use crate::sparse_kernel::{
+            compile_graphblas_matrix, expand_range_compiled_graphblas, Adjacency,
+            SparseKernelBackend,
+        };
+        let adjacency: Adjacency = BTreeMap::from([
+            (0, BTreeSet::from([2, 3])),
+            (2, BTreeSet::from([9])),
+            (3, BTreeSet::from([2])),
+        ]);
+        // A non-empty overlay touching an unrelated edge: the normal state
+        // between indexer cycles, which routes queries to the overlay path.
+        let mut overlay = GraphTopologyOverlay::default();
+        overlay.set(100, 101, true);
+
+        for backend in [SparseKernelBackend::CompactCsc, SparseKernelBackend::SuiteSparse] {
+            let compiled = compile_graphblas_matrix(&adjacency, backend).expect("compile");
+            for (min, max) in [(2, 2), (3, 3), (1, 3)] {
+                let without = expand_range_compiled_graphblas(&compiled, &adjacency, &[0], min, max)
+                    .expect("compiled range")
+                    .vertices
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let with = expand_range_with_overlay(&compiled, &overlay, &[0], min, max)
+                    .expect("overlay range")
+                    .vertices
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(with, without, "backend {backend:?}, *{min}..{max}");
+            }
+        }
+    }
+
     #[test]
     fn malformed_wal_topology_isolated_to_its_cell_and_edge_type() {
         let mut parsed = Vec::new();
