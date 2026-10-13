@@ -17,16 +17,9 @@ impl GraphTopologyOverlay {
         self.states.entry(src).or_default().insert(dst, exists);
     }
 
-    fn state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
-        self.states
-            .get(&src)
-            .and_then(|destinations| destinations.get(&dst))
-            .copied()
-    }
-
     /// Flat iteration over every `(src, dst, exists)` delta in the overlay.
     ///
-    /// The read path consumes the overlay through point lookups
+    /// The read path consumes the overlay through per-source lookups
     /// (`expand_range_with_overlay` below); the incremental index builder in
     /// `src/engine/index_store.rs` instead needs to walk every delta once to
     /// patch a decoded CSC adjacency, which is what this exposes.
@@ -57,7 +50,6 @@ impl GraphTopologyOverlay {
         u64::try_from(self.states.len()).unwrap_or(u64::MAX)
     }
 
-    #[cfg(feature = "opencypher")]
     pub(crate) fn apply_out_neighbors(
         &self,
         src: VertexId,
@@ -81,7 +73,10 @@ impl GraphTopologyOverlay {
     /// SuiteSparse C kernel; these let a repro assert on the overlay directly.
     #[cfg(test)]
     pub(crate) fn test_state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
-        self.state(src, dst)
+        self.states
+            .get(&src)
+            .and_then(|destinations| destinations.get(&dst))
+            .copied()
     }
 
     #[cfg(test)]
@@ -457,40 +452,25 @@ pub(crate) fn expand_range_with_overlay(
     let mut frontier = starts.iter().copied().collect::<BTreeSet<_>>();
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
-    let empty = BTreeMap::new();
 
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
         }
-        let frontier_values = frontier.iter().copied().collect::<Vec<_>>();
-        let base =
-            crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
-        edge_visits = edge_visits.saturating_add(base.edge_visits);
-        let mut next = base.vertices.into_iter().collect::<BTreeSet<_>>();
-
+        // Expand each frontier vertex on its own and union the results, as
+        // `expand_range_compiled_graphblas` does. A single kernel call over the
+        // whole frontier treats the frontier as already seen, which drops any
+        // edge whose endpoints are both frontier members (#69).
+        let mut next = BTreeSet::new();
         for src in &frontier {
-            let Some(changes) = overlay.states.get(src) else {
-                continue;
-            };
-            edge_visits = edge_visits.saturating_add(changes.len() as u64);
-            for (dst, exists) in changes {
-                if *exists {
-                    next.insert(*dst);
-                    continue;
-                }
-                if next.contains(dst)
-                    && !frontier.iter().any(|candidate| {
-                        overlay.state(*candidate, *dst).unwrap_or_else(|| {
-                            crate::sparse_kernel::compiled_graphblas_contains_edge(
-                                compiled, *candidate, *dst,
-                            )
-                        })
-                    })
-                {
-                    next.remove(dst);
-                }
-            }
+            let mut neighbors =
+                crate::sparse_kernel::compiled_graphblas_out_neighbors(compiled, *src)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+            edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+            edge_visits =
+                edge_visits.saturating_add(overlay.apply_out_neighbors(*src, &mut neighbors));
+            next.extend(neighbors);
         }
 
         if hop >= min_hops {
@@ -548,20 +528,93 @@ mod tests {
         let mut overlay = GraphTopologyOverlay::default();
         overlay.set(100, 101, true);
 
-        for backend in [SparseKernelBackend::CompactCsc, SparseKernelBackend::SuiteSparse] {
+        for backend in [
+            SparseKernelBackend::CompactCsc,
+            SparseKernelBackend::SuiteSparse,
+        ] {
             let compiled = compile_graphblas_matrix(&adjacency, backend).expect("compile");
             for (min, max) in [(2, 2), (3, 3), (1, 3)] {
-                let without = expand_range_compiled_graphblas(&compiled, &adjacency, &[0], min, max)
-                    .expect("compiled range")
-                    .vertices
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
+                let without =
+                    expand_range_compiled_graphblas(&compiled, &adjacency, &[0], min, max)
+                        .expect("compiled range")
+                        .vertices
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
                 let with = expand_range_with_overlay(&compiled, &overlay, &[0], min, max)
                     .expect("overlay range")
                     .vertices
                     .into_iter()
                     .collect::<BTreeSet<_>>();
                 assert_eq!(with, without, "backend {backend:?}, *{min}..{max}");
+            }
+        }
+    }
+
+    /// Index + overlay must answer exactly like an index compiled from the
+    /// graph with the overlay already applied, for inserts and deletes alike.
+    #[test]
+    fn overlay_range_matches_compiled_range_on_random_graphs() {
+        use crate::sparse_kernel::{
+            compile_graphblas_matrix, expand_range_compiled_graphblas, Adjacency,
+            SparseKernelBackend,
+        };
+        // Small deterministic LCG so the corpus is reproducible without a dev-dependency.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) % bound
+        };
+
+        for case in 0..200 {
+            let vertices = 2 + next(10);
+            let mut base: Adjacency = BTreeMap::new();
+            for _ in 0..next(vertices * 3) {
+                base.entry(next(vertices))
+                    .or_default()
+                    .insert(next(vertices));
+            }
+            let mut overlay = GraphTopologyOverlay::default();
+            let mut merged = base.clone();
+            for _ in 0..next(6) {
+                let (src, dst, exists) = (next(vertices), next(vertices), next(2) == 0);
+                overlay.set(src, dst, exists);
+                if exists {
+                    merged.entry(src).or_default().insert(dst);
+                } else if let Some(out) = merged.get_mut(&src) {
+                    out.remove(&dst);
+                }
+            }
+            merged.retain(|_, out| !out.is_empty());
+
+            for backend in [
+                SparseKernelBackend::CompactCsc,
+                SparseKernelBackend::SuiteSparse,
+            ] {
+                let base_index = compile_graphblas_matrix(&base, backend).expect("compile base");
+                let merged_index =
+                    compile_graphblas_matrix(&merged, backend).expect("compile merged");
+                let start = next(vertices);
+                // min_hops >= 1: zero-hop ranges are out of scope for #69.
+                let min = 1 + u8::try_from(next(3)).expect("small");
+                let max = min + u8::try_from(next(3)).expect("small");
+                let expected =
+                    expand_range_compiled_graphblas(&merged_index, &merged, &[start], min, max)
+                        .expect("compiled range")
+                        .vertices
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                let actual = expand_range_with_overlay(&base_index, &overlay, &[start], min, max)
+                    .expect("overlay range")
+                    .vertices
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "case {case}, backend {backend:?}, start {start}, *{min}..{max}, base {base:?}, overlay {:?}",
+                    overlay.states
+                );
             }
         }
     }

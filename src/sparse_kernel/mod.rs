@@ -24,7 +24,6 @@
 //! | `expand` (fixed hops) | yes | yes | yes |
 //! | `expand_range` (min..max hops) | yes | yes | yes |
 //! | `expand_range_count` (count pushdown) | no | yes | yes |
-//! | `contains_edge` | no | yes | yes |
 //! | Precompiled, cached per epoch | no | yes | yes |
 //!
 //! Skip/limit is *not* pushed into any kernel. `shard::query` materialises the
@@ -326,14 +325,6 @@ pub(crate) fn compiled_graphblas_kernel(compiled: &CompiledGraphBlasMatrix) -> S
     compiled.kernel()
 }
 
-pub(crate) fn compiled_graphblas_contains_edge(
-    compiled: &CompiledGraphBlasMatrix,
-    src: VertexId,
-    dst: VertexId,
-) -> bool {
-    compiled.contains_edge(src, dst)
-}
-
 #[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_in_neighbors(
     compiled: &CompiledGraphBlasMatrix,
@@ -342,7 +333,6 @@ pub(crate) fn compiled_graphblas_in_neighbors(
     compiled.in_neighbors(vertex)
 }
 
-#[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_out_neighbors(
     compiled: &CompiledGraphBlasMatrix,
     vertex: VertexId,
