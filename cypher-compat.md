@@ -60,8 +60,13 @@ exactly three long.
 
 Variable-length `MATCH` requires the source node to have a fixed integer
 `id`. Source nodes matched only by labels or other properties are not
-supported for variable-length traversal. For inbound patterns, the source
-node is the right-hand node, so it must carry the fixed `id`.
+supported for variable-length traversal.
+
+For an inbound pattern, the source is the right-hand node. So
+`(x)<-[:DEPENDS_ON*1..2]-(c {id: 3})` returns the nodes that `c` reaches.
+These are the same rows as `(c {id: 3})-[:DEPENDS_ON*1..2]->(x)`. The pattern
+does not return the nodes that reach `c`. To find those nodes, store a reverse
+relationship type and traverse it forward.
 
 The maximum is required. `*1..` and `*` are rejected, because an unbounded
 traversal on a large graph has no predictable cost. The minimum defaults to 1
