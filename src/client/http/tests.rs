@@ -171,6 +171,45 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn an_idempotency_conflict_is_a_409_conflict_and_names_reason() {
+    let conflict = HttpApiError::from_graph(GraphError::IdempotencyConflict {
+        operation: "write_edge",
+        idempotency_key: "key-123".to_string(),
+        reason: "payload mismatch",
+    });
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "idempotency_conflict");
+    assert!(
+        conflict.message.contains("key-123"),
+        "idempotency key must survive: {}",
+        conflict.message
+    );
+    assert!(
+        conflict.message.contains("payload mismatch"),
+        "reason must survive: {}",
+        conflict.message
+    );
+}
+
+#[test]
+fn a_conditional_write_conflict_is_a_409_conflict() {
+    let conflict = HttpApiError::from_graph(GraphError::ConditionalWriteConflict {
+        operation: "update_manifest",
+        key: "manifest-1".to_string(),
+    });
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "write_conflict");
+    assert!(conflict.message.contains("manifest-1"));
+}
+
+#[test]
+fn a_configuration_error_is_a_400_bad_request() {
+    let config_err = HttpApiError::from_graph(GraphError::ReadOnlyShardStorage);
+    assert_eq!(config_err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(config_err.code, "invalid_configuration");
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
