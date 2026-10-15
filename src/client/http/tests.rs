@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 struct HttpTestClient {
     observed_epochs: Mutex<Vec<Option<u64>>>,
+    observed_idempotency_keys: Mutex<Vec<String>>,
     refreshes: AtomicU64,
 }
 
@@ -21,6 +22,10 @@ impl QueryCellClient for HttpTestClient {
         _query: &str,
     ) -> Result<QueryResultSet> {
         self.observed_epochs.lock().await.push(context.read_epoch);
+        self.observed_idempotency_keys
+            .lock()
+            .await
+            .push(context.idempotency_key.clone());
         Ok(QueryResultSet::new(
             vec![QueryColumn::new("n")],
             (1..=3)
@@ -39,6 +44,10 @@ impl QueryCellClient for HttpTestClient {
         page_size: usize,
     ) -> Result<QueryResultPage> {
         self.observed_epochs.lock().await.push(context.read_epoch);
+        self.observed_idempotency_keys
+            .lock()
+            .await
+            .push(context.idempotency_key.clone());
         let offset = cursor.map_or(0, |cursor| cursor.offset as usize);
         let all_rows: Vec<_> = (1..=3)
             .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
@@ -175,6 +184,7 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
+        observed_idempotency_keys: Mutex::new(Vec::new()),
         refreshes: AtomicU64::new(0),
     });
     let server = ClientHttpServer::bind(
@@ -271,6 +281,7 @@ async fn an_http_read_epoch_rejection_is_counted_as_a_prepare_failure() {
 async fn http_strong_consistency_refreshes_the_slatedb_reader() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
+        observed_idempotency_keys: Mutex::new(Vec::new()),
         refreshes: AtomicU64::new(0),
     });
     let server = ClientHttpServer::bind(
@@ -303,10 +314,74 @@ async fn http_strong_consistency_refreshes_the_slatedb_reader() {
     server.stop().await.unwrap();
 }
 
+/// The auto-assigned `http-query-N` counter restarts with the process and a
+/// caller-supplied `query_id` is only a request handle, so neither may become
+/// the durable mutation identity — that is how a post-restart write collides
+/// with a stale idempotency record and is silently absorbed.
+#[tokio::test]
+async fn http_query_ids_never_become_durable_mutation_identities() {
+    let backend = Arc::new(HttpTestClient {
+        observed_epochs: Mutex::new(Vec::new()),
+        observed_idempotency_keys: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
+    });
+    let server = ClientHttpServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        http_service(Arc::clone(&backend)),
+        HttpQueryServerConfig::default()
+            .with_default_page_size(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let url = format!("http://{}/v1/graphs/social/query", server.local_addr());
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!({
+            "cell_id": "cell-a",
+            "query": "MATCH (n {id: 1}) RETURN n.id"
+        }),
+        serde_json::json!({
+            "cell_id": "cell-a",
+            "query": "MATCH (n {id: 1}) RETURN n.id"
+        }),
+        serde_json::json!({
+            "cell_id": "cell-a",
+            "query_id": "caller-request-7",
+            "query": "MATCH (n {id: 1}) RETURN n.id"
+        }),
+    ] {
+        let response = client
+            .post(&url)
+            .bearer_auth("http-secret")
+            .header(GRAPH_NAMESPACE_HEADER, "acme")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    let keys = backend.observed_idempotency_keys.lock().await;
+    assert_eq!(keys.len(), 3);
+    assert_ne!(keys[0], keys[1]);
+    assert_ne!(keys[2], "caller-request-7");
+    for key in keys.iter() {
+        let encoded = key
+            .strip_prefix("http-mutation-v1-")
+            .expect("generated keys use the versioned namespace");
+        encoded
+            .parse::<Ulid>()
+            .expect("generated key contains a ULID");
+    }
+    server.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn ndjson_stream_uses_one_snapshot_backed_server_cursor() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
+        observed_idempotency_keys: Mutex::new(Vec::new()),
         refreshes: AtomicU64::new(0),
     });
     let server = ClientHttpServer::bind(
@@ -364,6 +439,7 @@ async fn http_api_serves_authenticated_queries_over_https() {
         "127.0.0.1:0".parse().unwrap(),
         http_service(Arc::new(HttpTestClient {
             observed_epochs: Mutex::new(Vec::new()),
+            observed_idempotency_keys: Mutex::new(Vec::new()),
             refreshes: AtomicU64::new(0),
         })),
         HttpQueryServerConfig::default()
