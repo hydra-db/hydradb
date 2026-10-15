@@ -171,6 +171,25 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn corruption_and_kernel_errors_return_internal_server_error_with_explicit_codes() {
+    let corrupt = HttpApiError::from_graph(GraphError::CorruptValue {
+        key: "cell-0/nodes/42".to_string(),
+        reason: "invalid postcard payload".to_string(),
+    });
+    assert_eq!(corrupt.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(corrupt.code, "data_corruption");
+    assert_eq!(corrupt.message, "internal data corruption detected");
+
+    let kernel = HttpApiError::from_graph(GraphError::SparseKernel {
+        backend: "SuiteSparse",
+        reason: "dimension mismatch in semiring".to_string(),
+    });
+    assert_eq!(kernel.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(kernel.code, "kernel_error");
+    assert_eq!(kernel.message, "sparse traversal kernel execution error");
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {

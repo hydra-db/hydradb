@@ -428,6 +428,26 @@ impl HttpApiError {
                 owner: None,
                 authenticate: false,
             },
+            GraphError::CorruptValue { .. } => {
+                tracing::error!(target: "slatedb_graph_kernel", error = %error, "data corruption detected");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "data_corruption",
+                    message: "internal data corruption detected".to_string(),
+                    owner: None,
+                    authenticate: false,
+                }
+            }
+            GraphError::SparseKernel { .. } => {
+                tracing::error!(target: "slatedb_graph_kernel", error = %error, "sparse traversal kernel error");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "kernel_error",
+                    message: "sparse traversal kernel execution error".to_string(),
+                    owner: None,
+                    authenticate: false,
+                }
+            }
             _ => {
                 tracing::warn!(target: "hydradb", error = %error, "HTTP suppressed internal graph error");
                 Self {
