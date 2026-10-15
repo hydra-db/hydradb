@@ -108,6 +108,7 @@ struct TckCorpusParser<'a> {
     cases: Vec<CypherTckCase>,
     skipped: Vec<String>,
     total_scenarios: usize,
+    feature_has_background: bool,
 }
 
 impl<'a> TckCorpusParser<'a> {
@@ -118,13 +119,20 @@ impl<'a> TckCorpusParser<'a> {
             cases: Vec::new(),
             skipped: Vec::new(),
             total_scenarios: 0,
+            feature_has_background: false,
         }
     }
 
     fn parse(&mut self) -> Result<CypherTckCorpus> {
         while self.idx < self.lines.len() {
             let line = self.trimmed();
-            if let Some(name) = scenario_name(line) {
+            if line.starts_with("Feature:") {
+                self.feature_has_background = false;
+                self.idx += 1;
+            } else if line.starts_with("Background:") {
+                self.feature_has_background = true;
+                self.idx += 1;
+            } else if let Some(name) = scenario_name(line) {
                 self.total_scenarios += 1;
                 self.idx += 1;
                 self.parse_scenario(name)?;
@@ -142,11 +150,16 @@ impl<'a> TckCorpusParser<'a> {
     fn parse_scenario(&mut self, name: String) -> Result<()> {
         let mut query = None;
         let mut expected = None;
-        let mut unsupported = None;
+        let mut unsupported = self.feature_has_background.then(|| {
+            format!("{name}: feature-level Background setup is not represented in corpus cases")
+        });
 
         while self.idx < self.lines.len() {
             let line = self.trimmed();
-            if scenario_name(line).is_some() {
+            if scenario_name(line).is_some()
+                || line.starts_with("Feature:")
+                || line.starts_with("Background:")
+            {
                 break;
             }
             if line.starts_with("Given ")
