@@ -171,6 +171,35 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn contention_and_conflict_errors_are_mapped_to_409_conflict() {
+    let idempotency = HttpApiError::from_graph(GraphError::IdempotencyConflict {
+        operation: "relationship-import",
+        idempotency_key: "key-1".to_string(),
+        reason: "payload mismatch",
+    });
+    assert_eq!(idempotency.status, StatusCode::CONFLICT);
+    assert_eq!(idempotency.code, "idempotency_conflict");
+    assert!(idempotency.message.contains("key-1"));
+
+    let write_conflict = HttpApiError::from_graph(GraphError::ConditionalWriteConflict {
+        operation: "vertex-cas",
+        key: "v:1".to_string(),
+    });
+    assert_eq!(write_conflict.status, StatusCode::CONFLICT);
+    assert_eq!(write_conflict.code, "write_conflict");
+    assert!(write_conflict.message.contains("vertex-cas"));
+
+    let control_conflict = HttpApiError::from_graph(GraphError::ControlMetadataConflict {
+        key: "ctl:meta".to_string(),
+        expected_generation: Some(1),
+        actual_generation: Some(2),
+    });
+    assert_eq!(control_conflict.status, StatusCode::CONFLICT);
+    assert_eq!(control_conflict.code, "control_metadata_conflict");
+    assert!(control_conflict.message.contains("ctl:meta"));
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
