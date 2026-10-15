@@ -4800,16 +4800,12 @@ where
         QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
         QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
     };
-    match &result {
-        Ok(_) => runtime
+    if result.is_ok() {
+        runtime
             .metrics
             .requests_completed
-            .fetch_add(1, Ordering::Relaxed),
-        Err(_) => runtime
-            .metrics
-            .requests_failed
-            .fetch_add(1, Ordering::Relaxed),
-    };
+            .fetch_add(1, Ordering::Relaxed);
+    }
     result
 }
 
@@ -5384,5 +5380,48 @@ mod scope_grant_tests {
             &GraphScope::new(tenant, GraphId::new("other").unwrap()),
             QueryTransportAction::Read,
         ));
+    }
+
+    #[tokio::test]
+    async fn metered_query_failure_reconciles_request_counters() {
+        let metrics = Arc::new(QueryTransportMetrics::default());
+        let runtime = Arc::new(QueryTransportServerRuntime {
+            config: QueryTransportServerConfig::default(),
+            metrics: metrics.clone(),
+            lifecycle: Arc::new(Mutex::new(QueryTransportLifecycle::default())),
+            request_gate: Arc::new(Semaphore::new(10)),
+            namespace_query_gates: BTreeMap::new(),
+            connection_gate: Arc::new(Semaphore::new(10)),
+            control_connection_gate: Arc::new(Semaphore::new(10)),
+        });
+
+        let scope = GraphScope::new(
+            NamespacePath::root(NamespaceId::new("test").unwrap()),
+            GraphId::new("default").unwrap(),
+        );
+        let lifecycle_key = QueryLifecycleKey::new(
+            QueryTransportPrincipal::Anonymous,
+            scope,
+            "q1",
+        );
+
+        let result = execute_metered_query(&runtime, &lifecycle_key, |_cancellation_token| async {
+            Err::<QueryResultSet, _>(GraphError::AdmissionRejected {
+                operation: "test",
+                actual: 10,
+                limit: 5,
+            })
+        })
+        .await;
+
+        let response = match result {
+            Ok(result) => QueryTransportResponse::Rows { result },
+            Err(err) => transport_error_response(&runtime, err),
+        };
+
+        assert!(matches!(response, QueryTransportResponse::Error { .. }));
+        assert_eq!(metrics.requests_started.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.requests_failed.load(Ordering::Relaxed), 1);
     }
 }
