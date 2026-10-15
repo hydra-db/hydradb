@@ -2024,6 +2024,33 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+#[test]
+fn writer_authority_and_dropped_cell_reach_bolt_clients() {
+    let write_requires_writer = graph_error_to_bolt(GraphError::WriteRequiresWriter {
+        operation: "routed_write",
+        cell_id: "cell-0".to_string(),
+    });
+    match write_requires_writer {
+        BoltError::Query { code, .. } => assert_eq!(code, "Neo.ClientError.Cluster.NotALeader"),
+        other => panic!("expected NotALeader, got {other:?}"),
+    }
+
+    let read_only = graph_error_to_bolt(GraphError::ReadOnlyShardStorage);
+    match read_only {
+        BoltError::Forbidden(_) => {}
+        other => panic!("expected Forbidden, got {other:?}"),
+    }
+
+    let cell_dropped = graph_error_to_bolt(GraphError::CellDropped {
+        operation: "query",
+        cell_id: "cell-0".to_string(),
+    });
+    match cell_dropped {
+        BoltError::Query { code, .. } => assert_eq!(code, "Neo.ClientError.Database.DatabaseNotFound"),
+        other => panic!("expected DatabaseNotFound, got {other:?}"),
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted

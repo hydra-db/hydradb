@@ -415,6 +415,27 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            GraphError::WriteRequiresWriter { .. } => Self {
+                status: StatusCode::MISDIRECTED_REQUEST,
+                code: "write_requires_writer",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ReadOnlyShardStorage => Self {
+                status: StatusCode::FORBIDDEN,
+                code: "read_only_storage",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::CellDropped { .. } => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "cell_dropped",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }
