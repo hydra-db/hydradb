@@ -428,6 +428,17 @@ impl HttpApiError {
                 owner: None,
                 authenticate: false,
             },
+            GraphError::UnsafeDurabilityConfig { .. }
+            | GraphError::RoutedWriterConfigMismatch { .. } => {
+                tracing::warn!(target: "slatedb_graph_kernel", error = %error, "HTTP configuration error");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "configuration_error",
+                    message: "internal graph configuration error".to_string(),
+                    owner: None,
+                    authenticate: false,
+                }
+            }
             _ => {
                 tracing::warn!(target: "hydradb", error = %error, "HTTP suppressed internal graph error");
                 Self {
