@@ -356,8 +356,12 @@ paths, cache outcomes, consistency mode, scope, cell, storage sequence, and
 planner decisions. Build with `--features server-runtime,otlp` or
 `--features indexer-runtime,otlp` to export OpenTelemetry data.
 
-Prometheus duration histograms have deliberately different units. Check each
-metric's unit before building latency dashboards or alerts.
+Prometheus duration histograms have deliberately different units, and the name
+suffix is the only place the unit is stated: `/metrics` emits no `# HELP` text.
+Client operation latencies such as `graph_client_operation_read_duration_seconds`
+are in seconds; the bookmark-wait, query, mutation-batch, and query-transport
+histograms end in `_microseconds`. Check the suffix before building latency
+dashboards or alerts, and never sum, divide, or compare series across the two.
 
 ## Development
 
@@ -466,6 +470,10 @@ documented above.
 |---|---|
 | [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
 | [Using HydraDB](USING-HYDRADB.md) | Getting started, querying, and operating HydraDB |
+| [OpenCypher subset](cypher-compat.md) | What the engine accepts today, and what it rejects at parse time |
+| [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
+| [Agent notes](AGENTS.md) | How to build, run, and not trip over `RUST_MIN_STACK` |
+| [Development](DEVELOPMENT.md) | Verification recipes and local harnesses |
 
 ## Contributing
 

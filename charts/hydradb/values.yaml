@@ -2,7 +2,10 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/hydradb
+  # Published by .github/workflows/container.yml on v* tags. An empty tag
+  # resolves to Chart.appVersion. Internal EKS staging still overrides this
+  # in examples/values-eks.yaml.
+  repository: ghcr.io/hydra-db/hydradb
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent
