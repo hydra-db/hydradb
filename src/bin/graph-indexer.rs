@@ -1057,6 +1057,7 @@ fn record_failed_cycle_readiness(
 }
 
 struct IndexerAdminServer {
+    local_addr: SocketAddr,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<std::io::Result<()>>,
 }
@@ -3034,8 +3035,10 @@ impl IndexerAdminServer {
         wake_min_interval: Duration,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
         let router = Router::new()
             .route("/livez", get(|| async { StatusCode::OK }))
+            .route("/healthz", get(|| async { StatusCode::OK }))
             .route("/readyz", get(indexer_readiness))
             .route("/metrics", get(indexer_metrics))
             .route("/v1/changes:process", post(process_index_changes))
@@ -3057,7 +3060,15 @@ impl IndexerAdminServer {
                 })
                 .await
         });
-        Ok(Self { stop_tx, task })
+        Ok(Self {
+            local_addr,
+            stop_tx,
+            task,
+        })
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     async fn stop(self) -> RuntimeResult<()> {
@@ -4680,5 +4691,39 @@ mod tests {
             Cow::Borrowed("cell-0")
         ));
         assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[tokio::test]
+    async fn indexer_admin_server_serves_livez_and_healthz_routes() {
+        let metrics = Arc::new(IndexerMetrics::default());
+        metrics.ready.store(true, Ordering::Release);
+
+        let server = IndexerAdminServer::bind("127.0.0.1:0".parse().unwrap(), metrics)
+            .await
+            .expect("indexer admin server binds");
+
+        let client = reqwest::Client::new();
+        let livez = client
+            .get(format!("http://{}/livez", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(livez.status(), reqwest::StatusCode::OK);
+
+        let healthz = client
+            .get(format!("http://{}/healthz", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(healthz.status(), reqwest::StatusCode::OK);
+
+        let readyz = client
+            .get(format!("http://{}/readyz", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+
+        server.stop().await.unwrap();
     }
 }

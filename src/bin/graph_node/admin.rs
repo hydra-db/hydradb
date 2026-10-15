@@ -1119,6 +1119,7 @@ impl AdminServer {
     fn serve(listener: TcpListener, local_addr: SocketAddr, state: AdminState) -> Result<Self> {
         let router = Router::new()
             .route("/livez", get(live))
+            .route("/healthz", get(live))
             .route("/readyz", get(readiness))
             .route("/metrics", get(metrics))
             .route(
@@ -3122,6 +3123,69 @@ mod tests {
                 "{name} is a new series carrying an unbounded scope label"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn admin_server_serves_livez_and_healthz_routes() {
+        let directory =
+            ObjectStoreNodeDirectory::new(["cell-a".to_string()], ["graph-node-0".to_string()])
+                .expect("a one-cell directory");
+        let placement = PlacementView::new(
+            "graph-node-0",
+            ["graph-node-0".to_string()],
+            PlacementConfig::default(),
+        )
+        .expect("a fleet of one");
+        let routed_node = Arc::new(
+            ScopedRoutedGraphCluster::new(
+                "graph/data",
+                NamespacePath::default(),
+                GraphId::default(),
+                "graph-node-0",
+                directory,
+                placement.clone(),
+                Arc::new(InMemory::new()),
+                GraphOpenOptions::default(),
+                GraphMemoryConfig::default(),
+                4,
+            )
+            .expect("a routed cluster"),
+        );
+        let ready = NodeReadiness::new(placement);
+        ready.mark_ready();
+
+        let server = AdminServer::bind_scoped(
+            "127.0.0.1:0".parse().unwrap(),
+            ready,
+            query_service(),
+            routed_node,
+        )
+        .await
+        .expect("admin server binds");
+
+        let client = reqwest::Client::new();
+        let livez = client
+            .get(format!("http://{}/livez", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(livez.status(), reqwest::StatusCode::OK);
+
+        let healthz = client
+            .get(format!("http://{}/healthz", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(healthz.status(), reqwest::StatusCode::OK);
+
+        let readyz = client
+            .get(format!("http://{}/readyz", server.local_addr()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+
+        server.stop().await.unwrap();
     }
 }
 // weave: run 'weave explain src/bin/graph_node/admin.rs' for per-hunk detail, 'weave check' to verify your resolution
