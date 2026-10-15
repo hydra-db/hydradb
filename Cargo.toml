@@ -87,6 +87,7 @@ edition = "2021"
 rust-version = "1.91"
 description = "Object-store-native distributed graph database"
 repository = "https://github.com/hydra-db/hydradb"
+license = "AGPL-3.0-only"
 readme = "README.md"
 publish = false
 

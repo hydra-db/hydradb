@@ -14,6 +14,12 @@ on:
     tags:
       - "v*"
 
+# Never cancels a tag push: that would leave a release tag with an incomplete
+# manifest list.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -183,6 +189,10 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
+          # Word splitting is the mechanism here, not an accident: both
+          # substitutions expand to several arguments — one `-t` pair per tag,
+          # one reference per digest file.
+          # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)

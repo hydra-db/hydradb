@@ -2,7 +2,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/hydradb
+  # Published by `container.yml` on every `v*` tag. Must stay public, or
+  # `helm install` fails for anyone without registry credentials.
+  # `tag` empty means the chart falls back to `.Chart.AppVersion`. Pin `digest`
+  # instead for a deployment that must not move when a tag is repointed.
+  repository: ghcr.io/hydra-db/hydradb
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent

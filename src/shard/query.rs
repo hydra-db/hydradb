@@ -10900,7 +10900,7 @@ fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<Opti
             let bound = !row.null_values.contains(binding)
                 && !row.null_relationships.contains(binding)
                 && (row.values.contains_key(binding) || row.relationships.contains_key(binding));
-            Some(!bound != *negated)
+            Some(bound == *negated)
         }
     })
 }
