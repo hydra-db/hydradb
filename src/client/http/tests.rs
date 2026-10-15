@@ -171,6 +171,35 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+#[test]
+fn retry_exhaustion_snapshot_expired_and_unknown_shard_are_not_internal_errors() {
+    let retry_exhausted = HttpApiError::from_graph(GraphError::RetryExhausted {
+        operation: "vertex-insert",
+        attempts: 10,
+    });
+    assert_eq!(retry_exhausted.status, StatusCode::CONFLICT);
+    assert_eq!(retry_exhausted.code, "retry_exhausted");
+    assert!(retry_exhausted.message.contains("vertex-insert"));
+    assert!(retry_exhausted.message.contains("10"));
+
+    let unknown_shard = HttpApiError::from_graph(GraphError::UnknownShard {
+        cell_id: "cell-missing".to_string(),
+    });
+    assert_eq!(unknown_shard.status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown_shard.code, "unknown_shard");
+    assert!(unknown_shard.message.contains("cell-missing"));
+
+    let snapshot_expired = HttpApiError::from_graph(GraphError::SnapshotExpired {
+        cell_id: "cell-0".to_string(),
+        edge_type: "KNOWS".to_string(),
+        read_epoch: 5,
+        min_epoch: 10,
+    });
+    assert_eq!(snapshot_expired.status, StatusCode::BAD_REQUEST);
+    assert_eq!(snapshot_expired.code, "snapshot_expired");
+    assert!(snapshot_expired.message.contains("compacted watermark"));
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
