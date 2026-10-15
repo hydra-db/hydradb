@@ -3,6 +3,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{StorageSequence, VertexId};
 
 pub type RelationshipId = u64;
+
+/// Bounded maintenance work for the unstable canonical membership migration.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct VertexMembershipBackfillOptions {
+    pub max_records_per_commit: usize,
+    /// Bound canonical bytes read and estimated endpoint transaction bytes.
+    /// A single larger record requires an explicitly larger budget.
+    pub max_bytes_per_commit: usize,
+    pub max_commits: usize,
+    /// Restart scanning after an unexpected storage-sequence change. Existing
+    /// records are preserved; this cannot deactivate a completed cell.
+    pub restart: bool,
+}
+
+impl Default for VertexMembershipBackfillOptions {
+    fn default() -> Self {
+        Self {
+            max_records_per_commit: 256,
+            max_bytes_per_commit: 8 * 1024 * 1024,
+            max_commits: 64,
+            restart: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexMembershipBackfillReport {
+    pub complete: bool,
+    pub records_examined: u64,
+    pub vertices_created: u64,
+    pub storage_sequence: StorageSequence,
+    /// Legacy isolated vertices without a surviving record or live edge cannot
+    /// be reconstructed. Applications must re-import them if required.
+    pub legacy_isolated_vertices_may_be_missing: bool,
+}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphRepairReport {
     pub cell_id: String,
