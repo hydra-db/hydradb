@@ -4917,10 +4917,11 @@ impl GraphShard {
                 tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id),
             )
             .await?;
+        let fingerprint = relationship_create_fingerprint(mutation, metadata_updates, edge_metadata);
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
 
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-            return decode_commit_idempotency(&idem_key, mutation, &value);
+            return decode_commit_idempotency(&idem_key, mutation, fingerprint, &value);
         }
 
         let current_epoch = txn.seqnum();
@@ -4967,7 +4968,7 @@ impl GraphShard {
                 };
                 txn.put(
                     idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
+                    encode_commit_idempotency(mutation, fingerprint, &result),
                 )?;
                 commit_txn_traced(
                     txn,
@@ -5018,7 +5019,7 @@ impl GraphShard {
         if existing_edge_epoch.is_some() {
             txn.put(
                 idem_key.as_bytes(),
-                encode_commit_idempotency(mutation, &result),
+                encode_commit_idempotency(mutation, fingerprint, &result),
             )?;
             commit_txn_traced(
                 txn,
@@ -5085,7 +5086,7 @@ impl GraphShard {
         }
         txn.put(
             idem_key.as_bytes(),
-            encode_commit_idempotency(mutation, &result),
+            encode_commit_idempotency(mutation, fingerprint, &result),
         )?;
 
         commit_txn_traced(
@@ -6274,9 +6275,10 @@ impl GraphShard {
         let mut already_existed = 0_u64;
 
         for mutation in mutations {
+            let fingerprint = relationship_create_fingerprint(mutation, &[], &EdgeMetadata::default());
             let idem_key = keys::idempotency(cell_id, "create", &mutation.idempotency_key);
             if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-                let result = decode_commit_idempotency(&idem_key, mutation, &value)?;
+                let result = decode_commit_idempotency(&idem_key, mutation, fingerprint, &value)?;
                 if result.already_existed {
                     already_existed = already_existed.saturating_add(1);
                 } else {
@@ -6325,7 +6327,7 @@ impl GraphShard {
                 };
                 txn.put(
                     idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
+                    encode_commit_idempotency(mutation, fingerprint, &result),
                 )?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
@@ -6342,7 +6344,7 @@ impl GraphShard {
                 known_edges.insert(identity, current_epoch);
                 txn.put(
                     idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
+                    encode_commit_idempotency(mutation, fingerprint, &result),
                 )?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
@@ -6374,7 +6376,7 @@ impl GraphShard {
                 known_edges.insert(identity, epoch);
                 txn.put(
                     idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
+                    encode_commit_idempotency(mutation, fingerprint, &result),
                 )?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
@@ -6414,7 +6416,7 @@ impl GraphShard {
             }
             txn.put(
                 idem_key.as_bytes(),
-                encode_commit_idempotency(mutation, &result),
+                encode_commit_idempotency(mutation, fingerprint, &result),
             )?;
             known_edges.insert(identity, next_epoch);
             *out_increments
