@@ -1702,6 +1702,8 @@ pub struct GraphCacheEntryCounts {
     pub relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_row_sets: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
 /// SlateDB storage-engine counters and gauges, snapshotted from the recorder
@@ -1801,6 +1803,8 @@ pub struct GraphCacheResidentBytes {
     pub source_relationship_rows: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_rows: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
 impl GraphCacheResidentBytes {
@@ -1813,6 +1817,7 @@ impl GraphCacheResidentBytes {
                     self.relationship_rows
                         .saturating_add(self.source_relationship_rows)
                         .saturating_add(self.relationship_property_rows)
+                        .saturating_add(self.native_path_results)
                 }
                 #[cfg(not(feature = "opencypher"))]
                 {
@@ -1867,4 +1872,43 @@ pub(crate) async fn finish_local_write<T>(guard: LocalWriteGuard, result: Result
 
 pub(crate) fn is_retryable_write_conflict(err: &GraphError) -> bool {
     matches!(err, GraphError::Slate(err) if matches!(err.kind(), ErrorKind::Transaction | ErrorKind::Invalid))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_cache_resident_bytes_total_includes_all_fields() {
+        let resident = GraphCacheResidentBytes {
+            matrix_adjacencies: 100,
+            graphblas_matrices: 200,
+            #[cfg(feature = "opencypher")]
+            relationship_rows: 300,
+            #[cfg(feature = "opencypher")]
+            source_relationship_rows: 400,
+            #[cfg(feature = "opencypher")]
+            relationship_property_rows: 500,
+            #[cfg(feature = "opencypher")]
+            native_path_results: 600,
+        };
+        #[cfg(feature = "opencypher")]
+        assert_eq!(resident.total(), 100 + 200 + 300 + 400 + 500 + 600);
+        #[cfg(not(feature = "opencypher"))]
+        assert_eq!(resident.total(), 100 + 200);
+    }
+
+    #[test]
+    fn graph_cache_entry_counts_default() {
+        let counts = GraphCacheEntryCounts::default();
+        assert_eq!(counts.matrix_artifacts, 0);
+        assert_eq!(counts.matrix_adjacencies, 0);
+        assert_eq!(counts.graphblas_matrices, 0);
+        #[cfg(feature = "opencypher")]
+        {
+            assert_eq!(counts.parsed_row_queries, 0);
+            assert_eq!(counts.relationship_row_sets, 0);
+            assert_eq!(counts.relationship_property_row_sets, 0);
+            assert_eq!(counts.native_path_results, 0);
+        }
+    }
 }
