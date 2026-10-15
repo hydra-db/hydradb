@@ -20062,6 +20062,187 @@ async fn cypher_row_planner_runs_selective_match_group_before_full_scan() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn reverse_expansion_returns_the_same_rows_as_forward_expansion() {
+    // The optimizer may walk an edge backwards when a reverse index exists and
+    // the destination is the cheaper endpoint. Both directions have to answer
+    // the same question. `explain` proves the plan differs, the rows prove the
+    // answer does not.
+    async fn seeded(path: &str, index_policy: GraphIndexPolicy) -> GraphShard {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            path,
+            object_store,
+            GraphOpenOptions {
+                index_policy,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Two followers, two authors, four posts, only some scoring 20.
+        for (idx, (src, dst)) in [(1_u64, 10_u64), (2, 10), (1, 11), (2, 11)]
+            .into_iter()
+            .enumerate()
+        {
+            shard
+                .write_edge(EdgeMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src,
+                    dst,
+                    idempotency_key: format!("rev-follows-{idx}"),
+                })
+                .await
+                .unwrap();
+        }
+        for (idx, (author, post, score)) in [
+            (10_u64, 100_u64, 20_u64),
+            (10, 101, 5),
+            (11, 102, 20),
+            (11, 103, 20),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            shard
+                .write_edge(EdgeMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "POSTED".to_string(),
+                    src: author,
+                    dst: post,
+                    idempotency_key: format!("rev-posted-{idx}"),
+                })
+                .await
+                .unwrap();
+            shard
+                .set_vertex_metadata(
+                    "reddit-home",
+                    post,
+                    VertexMetadata::default()
+                        .with_label("Post")
+                        .with_property("score", VertexPropertyValue::Integer(score)),
+                )
+                .await
+                .unwrap();
+        }
+        for author in [10_u64, 11] {
+            shard
+                .set_vertex_metadata(
+                    "reddit-home",
+                    author,
+                    VertexMetadata::default().with_label("Author"),
+                )
+                .await
+                .unwrap();
+        }
+        shard
+            .build_graph_index("reddit-home", "FOLLOWS")
+            .await
+            .unwrap();
+        shard
+            .build_graph_index("reddit-home", "POSTED")
+            .await
+            .unwrap();
+        shard
+    }
+
+    // Shapes that put the planner through different passes: a two hop join it
+    // reorders and reverses, a bound source it can only walk forwards, a label
+    // on the middle node, and a variable length expand.
+    const QUERIES: [&str; 4] = [
+        "MATCH (u)-[:FOLLOWS]->(v)-[:POSTED]->(p:Post {score: 20}) RETURN p.id AS id ORDER BY id",
+        "MATCH (u {id: 1})-[:FOLLOWS]->(v)-[:POSTED]->(p:Post) RETURN p.id AS id ORDER BY id",
+        "MATCH (u)-[:FOLLOWS]->(v:Author)-[:POSTED]->(p:Post {score: 20}) RETURN p.id AS id ORDER BY id",
+        "MATCH (u {id: 1})-[:FOLLOWS*1..2]->(v) RETURN v.id AS id ORDER BY id",
+    ];
+    const QUERY: &str = QUERIES[0];
+
+    let with_reverse = seeded("graph/reverse-expand-full", GraphIndexPolicy::Full).await;
+    let without_reverse = seeded(
+        "graph/reverse-expand-outbound",
+        GraphIndexPolicy::OutboundOnly,
+    )
+    .await;
+
+    // The plans must actually differ, or this compares one path with itself.
+    let reverse_plan = with_reverse
+        .explain_opencypher_rows(QueryContext::new("reddit-home", "reverse-plan"), QUERY)
+        .await
+        .unwrap();
+    let forward_plan = without_reverse
+        .explain_opencypher_rows(QueryContext::new("reddit-home", "forward-plan"), QUERY)
+        .await
+        .unwrap();
+    let reverse_used = reverse_plan.groups[0].patterns.iter().any(|pattern| {
+        pattern
+            .optimizer_passes
+            .contains(&RowQueryOptimizerPass::ReverseExpand)
+    });
+    let forward_used = forward_plan.groups[0].patterns.iter().any(|pattern| {
+        pattern
+            .optimizer_passes
+            .contains(&RowQueryOptimizerPass::ReverseExpand)
+    });
+    assert!(
+        reverse_used,
+        "the reverse index shard should have chosen a reverse expansion"
+    );
+    assert!(
+        !forward_used,
+        "the outbound-only shard cannot reverse expand without a reverse index"
+    );
+
+    let reverse_rows = with_reverse
+        .execute_cypher_rows(QueryContext::new("reddit-home", "reverse-rows"), QUERY)
+        .await
+        .unwrap();
+    let forward_rows = without_reverse
+        .execute_cypher_rows(QueryContext::new("reddit-home", "forward-rows"), QUERY)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reverse_rows.rows, forward_rows.rows,
+        "reverse expansion returned different rows from forward expansion"
+    );
+    // Two followers reach each author, so every post scoring 20 appears once
+    // per distinct `u` binding: three posts, six paths.
+    assert_eq!(
+        reverse_rows.rows.len(),
+        6,
+        "expected six paths onto the three posts scoring 20, got {:?}",
+        reverse_rows.rows
+    );
+
+    // Every shape must agree between the two plans, not only the first.
+    for (index, query) in QUERIES.iter().enumerate() {
+        let reverse = with_reverse
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", format!("shape-reverse-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+        let forward = without_reverse
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", format!("shape-forward-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reverse.rows, forward.rows,
+            "shape {index} disagreed between plans: {query}"
+        );
+    }
+
+    with_reverse.close().await.unwrap();
+    without_reverse.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_explain_shows_connectivity_aware_reverse_expansion() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-explain-optimizer", object_store).await;
