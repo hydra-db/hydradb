@@ -33,7 +33,10 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::rustls::{
-    pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    server::WebPkiClientVerifier,
+    ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
 };
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -4280,7 +4283,7 @@ async fn serve_query_transport_stream(
             runtime.config.tls_config.clone()
         };
         if let Some(tls_config) = tls_config {
-            let acceptor = TlsAcceptor::from(tls_config);
+            let acceptor = TlsAcceptor::from(Arc::clone(&tls_config));
             let handshake =
                 tokio::time::timeout(runtime.config.handshake_timeout, acceptor.accept(stream));
             let mut handshake_shutdown = shutdown.clone();
@@ -4311,7 +4314,7 @@ async fn serve_query_transport_stream(
                     ));
                 }
             };
-            let identity = query_transport_tls_identity(&stream);
+            let identity = query_transport_tls_identity(&stream, &tls_config);
             return serve_query_transport_io(
                 &mut stream,
                 client,
@@ -4339,20 +4342,70 @@ async fn serve_query_transport_stream(
 #[cfg(feature = "query-transport-tls")]
 fn query_transport_tls_identity<S>(
     stream: &tokio_rustls::server::TlsStream<S>,
+    tls_config: &RustlsServerConfig,
+) -> QueryTransportConnectionIdentity {
+    let (_, connection) = stream.get_ref();
+    tls_peer_identity(
+        connection.peer_certificates().unwrap_or_default(),
+        tls_config.crypto_provider(),
+    )
+}
+
+/// The identity of a client from the certificates it sent. The leaf is
+/// always the client. Any other certificate counts only if the leaf chains up
+/// to it. The client chooses which certificates to send, and the handshake
+/// skips the ones it does not need, so without this check a client could list
+/// a pinned certificate it has no key for.
+#[cfg(feature = "query-transport-tls")]
+pub(crate) fn tls_peer_identity(
+    certificates: &[CertificateDer<'static>],
+    provider: &Arc<CryptoProvider>,
 ) -> QueryTransportConnectionIdentity {
     let mut identity = QueryTransportConnectionIdentity::default();
-    let (_, connection) = stream.get_ref();
-    if let Some(certs) = connection.peer_certificates() {
-        for (index, cert) in certs.iter().enumerate() {
-            let digest = Sha256::digest(cert.as_ref());
-            let fingerprint = format!("sha256:{}", lowercase_hex(&digest));
-            if index == 0 {
-                identity.tls_peer_leaf_fingerprint = Some(fingerprint.clone());
-            }
-            identity.tls_peer_fingerprints.insert(fingerprint);
+    let Some((leaf, rest)) = certificates.split_first() else {
+        return identity;
+    };
+    let leaf_fingerprint = tls_certificate_fingerprint(leaf);
+    identity.tls_peer_leaf_fingerprint = Some(leaf_fingerprint.clone());
+    identity.tls_peer_fingerprints.insert(leaf_fingerprint);
+    let now = UnixTime::now();
+    for certificate in rest {
+        if tls_leaf_chains_to(leaf, certificate, rest, provider, now) {
+            identity
+                .tls_peer_fingerprints
+                .insert(tls_certificate_fingerprint(certificate));
         }
     }
     identity
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn tls_leaf_chains_to(
+    leaf: &CertificateDer<'static>,
+    issuer: &CertificateDer<'static>,
+    intermediates: &[CertificateDer<'static>],
+    provider: &Arc<CryptoProvider>,
+    now: UnixTime,
+) -> bool {
+    let mut roots = RootCertStore::empty();
+    if roots.add(issuer.clone()).is_err() {
+        return false;
+    }
+    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
+        .build()
+        .is_ok_and(|verifier| {
+            verifier
+                .verify_client_cert(leaf, intermediates, now)
+                .is_ok()
+        })
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn tls_certificate_fingerprint(certificate: &CertificateDer<'_>) -> String {
+    format!(
+        "sha256:{}",
+        lowercase_hex(&Sha256::digest(certificate.as_ref()))
+    )
 }
 
 #[cfg(feature = "query-transport")]

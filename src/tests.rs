@@ -9463,6 +9463,9 @@ struct TestMtlsBundle {
     server: Arc<tokio_rustls::rustls::ServerConfig>,
     clients: Vec<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
     anonymous_client: Arc<tokio_rustls::rustls::ClientConfig>,
+    /// `clients[1]`'s key and leaf, followed by the intermediate and then
+    /// `clients[0]`'s leaf, a certificate it does not hold the key for.
+    impersonating_client: Arc<tokio_rustls::rustls::ClientConfig>,
     intermediate_fingerprint: String,
 }
 
@@ -9539,6 +9542,9 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
     );
 
     let mut clients = Vec::new();
+    let mut client_certs: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
+        Vec::new();
+    let mut impersonating_client = None;
     let mut server_client_roots = RootCertStore::empty();
     server_client_roots.add(ca_cert.der().clone()).unwrap();
     for index in 0..2 {
@@ -9571,6 +9577,22 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
                 .collect::<String>()
         );
         clients.push((Arc::new(client_config), fingerprint));
+        if let Some(victim_cert) = client_certs.first() {
+            impersonating_client = Some(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(client_roots.clone())
+                    .with_client_auth_cert(
+                        vec![
+                            client_cert.der().clone(),
+                            intermediate_cert.der().clone(),
+                            victim_cert.clone(),
+                        ],
+                        private_key(&client_key),
+                    )
+                    .unwrap(),
+            ));
+        }
+        client_certs.push(client_cert.der().clone());
     }
 
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(server_client_roots))
@@ -9587,6 +9609,7 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
         server: Arc::new(server),
         clients,
         anonymous_client,
+        impersonating_client: impersonating_client.unwrap(),
         intermediate_fingerprint,
     }
 }
@@ -10222,6 +10245,19 @@ async fn tcp_query_transport_mtls_authenticates_certificates_and_rejects_invalid
         .await
         .unwrap_err();
     assert!(wrong_identity_err.to_string().contains("unauthorized"));
+
+    // The pinned leaf is public. Appending it after a different client's own
+    // leaf must not borrow its identity.
+    let impersonator = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.impersonating_client));
+    let impersonator_err = impersonator
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-appended-pinned-leaf"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(impersonator_err.to_string().contains("unauthorized"));
 
     let anonymous = TcpQueryCellClient::new(server.local_addr())
         .with_tls("localhost", Arc::clone(&bundle.anonymous_client));
