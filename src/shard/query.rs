@@ -7356,16 +7356,15 @@ impl GraphShard {
         let Some(src) = edge.src.id else {
             return Ok(None);
         };
-        let mut vertices = self
-            .out_neighbors_window_at(
-                &context.cell_id,
-                &edge.edge_type,
-                src,
-                read_epoch,
-                page_window,
-                Some(&budget),
-            )
-            .await?;
+        // One row per relationship, like the unpaged path; the adjacency list
+        // holds each neighbor only once.
+        let mut dsts = self
+            .source_relationship_dsts_at(&context.cell_id, edge, src, read_epoch, &budget)
+            .await?
+            .as_ref()
+            .clone();
+        dsts.sort_unstable();
+        let mut vertices = self.apply_query_window(dsts, page_window)?;
         let has_next = vertices.len() > page_size;
         vertices.truncate(page_size);
 
@@ -9183,6 +9182,7 @@ struct VertexMutationApplyState<'a> {
 #[cfg(feature = "opencypher")]
 fn streaming_neighbor_page_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
     if !query.union_arms.is_empty()
+        || query.distinct
         || query.predicate.is_some()
         || row_projections_have_aggregates(&query.projections)
         || query.pattern_groups.len() != 1
