@@ -85,7 +85,7 @@ property comparisons.
 Projections are `<binding>.<property>` or an aggregate. `RETURN *` is not
 executable, so name what you want.
 
-Aggregates: `count`, `sum`, `avg`, `collect`. `count(*)` is supported.
+Aggregates: `count`, `sum`, `avg`, `min`, `max`, `collect`. `count(*)` is supported.
 `DISTINCT` inside an aggregate argument is not, and neither is `count(DISTINCT *)`.
 
 `ORDER BY` accepts a projected alias, `<binding>.id`, or `count(*)`, ascending
@@ -262,7 +262,7 @@ Rejected at parse time, with the reason in the error:
 - Unbounded variable-length traversal, `*` or `*1..`
 - `WITH` that aliases, filters, orders, or drops a binding
 - Aggregate arguments marked `DISTINCT`, and `count(DISTINCT *)`
-- Aggregates beyond `count`, `sum`, `avg` and `collect`, so no `min` or `max`
+- Aggregates beyond `count`, `sum`, `avg`, `min`, `max`, and `collect`
 - `IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` in `WHERE`
 - `MATCH` hints
 - Nested unions, mixed `UNION` and `UNION ALL`, and unions containing writes
