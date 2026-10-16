@@ -2179,26 +2179,23 @@ impl GraphShard {
                     result.noops = result.noops.saturating_add(deleted.already_deleted);
                     result.topology_sequence =
                         result.topology_sequence.max(deleted.topology_sequence);
+                    let mut deletions = Vec::with_capacity(vertices.len());
                     for vertex_id in vertices {
                         budget.check("cypher_delete_vertex")?;
-                        let delete = if *detach {
-                            self.detach_delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!(
-                                    "{}.detach-delete-node.{vertex_id}",
-                                    context.idempotency_key
-                                ),
-                            )
-                            .await?
+                        let idempotency_key = if *detach {
+                            format!("{}.detach-delete-node.{vertex_id}", context.idempotency_key)
                         } else {
-                            self.delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!("{}.delete-node.{vertex_id}", context.idempotency_key),
-                            )
-                            .await?
+                            format!("{}.delete-node.{vertex_id}", context.idempotency_key)
                         };
+                        deletions.push((vertex_id, idempotency_key));
+                    }
+                    // Keep one Cypher DELETE binding in one graph transaction.
+                    // If any matched vertex cannot be deleted, the batch returns
+                    // an error before committing any of the matched vertices.
+                    for delete in self
+                        .delete_vertex_mutations_batch(&context.cell_id, deletions, *detach)
+                        .await?
+                    {
                         result.deleted_edges = result
                             .deleted_edges
                             .saturating_add(delete.incident_edges_deleted);
