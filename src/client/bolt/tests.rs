@@ -309,28 +309,45 @@ async fn routing_validates_bookmarks_without_waiting_for_graph_data() {
     )
     .await
     .is_err());
+    // Drivers send the bookmarks of every database they have used, so one for
+    // another cell is skipped rather than failing the request.
     let other = crate::ClientBookmark::new(
         ClientQueryTarget::new(GraphScope::default(), "cell-b").unwrap(),
-        10,
+        20,
     )
     .encode();
-    assert!(
-        prepare_bolt_route(&session, &context, vec![other], &BoltDict::new())
-            .await
-            .is_err()
-    );
+    prepare_bolt_route(&session, &context, vec![other.clone()], &BoltDict::new())
+        .await
+        .unwrap();
+
+    let run_with_bookmarks = |bookmarks: Vec<String>| {
+        BoltDict::from([(
+            "bookmarks".to_string(),
+            BoltValue::List(bookmarks.into_iter().map(BoltValue::String).collect()),
+        )])
+    };
+    let (_, _, request) = prepare_bolt_run(
+        &mut session,
+        &context,
+        "MATCH (n {id: 1}) RETURN n.id".to_string(),
+        BoltDict::new(),
+        run_with_bookmarks(vec![other.clone()]),
+    )
+    .unwrap();
+    assert_eq!(request.bookmark, None);
 
     let (authenticated, _, request) = prepare_bolt_run(
         &mut session,
         &context,
         "MATCH (n {id: 1}) RETURN n.id".to_string(),
         BoltDict::new(),
-        BoltDict::from([(
-            "bookmarks".to_string(),
-            BoltValue::List(vec![BoltValue::String(bookmark)]),
-        )]),
+        run_with_bookmarks(vec![other, bookmark]),
     )
     .unwrap();
+    assert_eq!(
+        request.bookmark,
+        Some(crate::ClientBookmark::new(target.clone(), 10))
+    );
     // RUN still carries the bookmark into execution, which must reject this stale reader.
     let error = service
         .execute_rows(&authenticated, request)

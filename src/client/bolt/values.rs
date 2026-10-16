@@ -15,11 +15,11 @@ pub(super) fn highest_matching_bookmark(
     let mut highest = None;
     for bookmark in bookmarks {
         let bookmark = ClientBookmark::parse(&bookmark).map_err(graph_error_to_bolt)?;
+        // Neo4j 5 bookmark managers are not per database, so a client sends the
+        // bookmarks of every database it has used. Another scope's or cell's
+        // bookmark says nothing about this target's store.
         if bookmark.target != *target {
-            return Err(BoltError::Query {
-                code: "Neo.ClientError.Transaction.InvalidBookmark".to_string(),
-                message: "bookmark belongs to another graph scope or cell".to_string(),
-            });
+            continue;
         }
         if highest
             .as_ref()

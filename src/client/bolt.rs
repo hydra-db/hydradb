@@ -1959,7 +1959,7 @@ async fn prepare_bolt_route(
         )
         .map_err(graph_error_to_bolt)?;
     // Routing depends on placement and writer leases, not the router's data
-    // snapshot. Validate scope/encoding here; RUN enforces the bookmark on the
+    // snapshot. Validate the encoding here; RUN enforces the bookmark on the
     // selected execution node before reading graph data.
     highest_matching_bookmark(&target, bookmarks)?;
     let table = match &context.routing_table_provider {
