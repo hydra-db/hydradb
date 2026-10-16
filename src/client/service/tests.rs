@@ -1452,6 +1452,384 @@ async fn experimental_mode_executes_specialized_batches_and_native_paths_on_thei
 }
 
 #[tokio::test]
+async fn server_cursor_continuation_does_not_estimate_rows() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 1 << 20, 60_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-cursor-no-rescan",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+    let first = service
+        .execute_page(&session, request.clone(), None, 1)
+        .await
+        .unwrap();
+    let mut token = first.page.next_cursor;
+    let before = CURSOR_ROW_ESTIMATES.with(|count| count.get());
+    while let Some(cursor) = token {
+        token = service
+            .execute_page(&session, request.clone(), Some(cursor), 1)
+            .await
+            .unwrap()
+            .page
+            .next_cursor;
+    }
+    let after = CURSOR_ROW_ESTIMATES.with(|count| count.get());
+    assert_eq!(
+        after - before,
+        0,
+        "pagination must use cached sizes, not walk row payloads"
+    );
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+fn cursor_payload_rows(count: usize) -> Vec<QueryRow> {
+    (0..count)
+        .map(|index| {
+            QueryRow::new(vec![
+                QueryValue::Count(index as u64),
+                QueryValue::Property(VertexPropertyValue::String("text".repeat(index % 23 + 1))),
+                QueryValue::List(vec![
+                    QueryValue::Null,
+                    QueryValue::List(vec![
+                        QueryValue::Bool(true),
+                        QueryValue::Property(VertexPropertyValue::String(
+                            "nested".repeat(index % 7 + 1),
+                        )),
+                    ]),
+                ]),
+                QueryValue::Path(Box::new(crate::QueryPath {
+                    nodes: vec![
+                        crate::QueryPathNode {
+                            id: index as u64,
+                            labels: vec!["Entity".into()],
+                            properties: BTreeMap::from([(
+                                "name".into(),
+                                VertexPropertyValue::String("node".repeat(index % 5 + 1)),
+                            )]),
+                        },
+                        crate::QueryPathNode {
+                            id: index as u64 + 1,
+                            labels: vec![],
+                            properties: BTreeMap::new(),
+                        },
+                    ],
+                    relationships: vec![crate::QueryPathRelationship {
+                        id: None,
+                        edge_type: "LINK".into(),
+                        src: index as u64,
+                        dst: index as u64 + 1,
+                        properties: BTreeMap::from([(
+                            "description".into(),
+                            VertexPropertyValue::String("relationship".into()),
+                        )]),
+                    }],
+                })),
+            ])
+        })
+        .collect()
+}
+
+fn expected_cursor_payload_bytes(rows: &[QueryRow]) -> u64 {
+    rows.iter().fold(0_u64, |total, row| {
+        total
+            .saturating_add(row.estimated_resident_bytes())
+            .saturating_add(std::mem::size_of::<u64>() as u64)
+    })
+}
+
+#[tokio::test]
+async fn server_cursor_sizes_payloads_before_locking_registry() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 1 << 20, 60_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(target(), "cursor-before-lock", "RETURN 1");
+    let rows = cursor_payload_rows(12);
+    let count = rows.len() as u64;
+    let registry = service.inner.cursors.lock().await;
+    let before = CURSOR_ROW_ESTIMATES.with(|count| count.get());
+    let mut start = std::pin::pin!(service.start_server_cursor(
+        &session,
+        &request,
+        QueryResultSet::new(vec![QueryColumn::new("value")], rows),
+        Some(7),
+        None,
+        1,
+    ));
+    assert!(futures::poll!(start.as_mut()).is_pending());
+    assert_eq!(
+        CURSOR_ROW_ESTIMATES.with(|count| count.get()) - before,
+        count,
+        "all payload sizing must finish before waiting for the registry lock"
+    );
+    drop(registry);
+    let page = start.await.unwrap();
+    assert!(page.page.next_cursor.is_some());
+}
+
+#[tokio::test]
+async fn server_cursor_cached_accounting_preserves_rows_and_metadata() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 8 << 20, 60_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(target(), "cursor-rich-rows", "RETURN 1");
+    let rows = cursor_payload_rows(257);
+    let columns = vec![
+        QueryColumn::new("count"),
+        QueryColumn::new("text"),
+        QueryColumn::new("list"),
+        QueryColumn::new("path"),
+    ];
+    let bookmark = Some(ClientBookmark::new(target(), 7));
+    let first = service
+        .start_server_cursor(
+            &session,
+            &request,
+            QueryResultSet::new(columns.clone(), rows.clone()),
+            Some(7),
+            bookmark.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+    let mut seen = first.page.rows;
+    let mut token = first.page.next_cursor;
+    let before = CURSOR_ROW_ESTIMATES.with(|count| count.get());
+    let mut page_index = 0;
+    while let Some(cursor) = token {
+        let expected = expected_cursor_payload_bytes(&rows[seen.len()..]);
+        assert_eq!(
+            service.inner.cursor_buffer_bytes.load(Ordering::Relaxed),
+            expected
+        );
+        assert_eq!(
+            service
+                .inner
+                .cursors
+                .lock()
+                .await
+                .get(&cursor.offset)
+                .unwrap()
+                .resident_bytes,
+            expected
+        );
+        let page = service
+            .continue_server_cursor(&session, &request, cursor, [1, 7, 32, 3][page_index % 4])
+            .await
+            .unwrap();
+        assert_eq!(page.page.columns, columns);
+        assert_eq!(page.read_epoch, Some(7));
+        assert_eq!(page.bookmark, bookmark);
+        seen.extend(page.page.rows);
+        token = page.page.next_cursor;
+        page_index += 1;
+    }
+    assert_eq!(seen, rows);
+    assert_eq!(CURSOR_ROW_ESTIMATES.with(|count| count.get()), before);
+    assert!(service.inner.cursors.lock().await.is_empty());
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn server_cursor_cached_accounting_isolated_across_concurrent_cursors() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 8 << 20, 60_000);
+    let session = authenticated_session(&service);
+    let first_request = ClientQueryRequest::new(target(), "cursor-first", "RETURN 1");
+    let second_request = ClientQueryRequest::new(target(), "cursor-second", "RETURN 1");
+    let first_rows = cursor_payload_rows(21);
+    let second_rows = cursor_payload_rows(13);
+    let first = service
+        .start_server_cursor(
+            &session,
+            &first_request,
+            QueryResultSet::new(vec![], first_rows.clone()),
+            Some(7),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    let second = service
+        .start_server_cursor(
+            &session,
+            &second_request,
+            QueryResultSet::new(vec![], second_rows.clone()),
+            Some(7),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    let first_token = first.page.next_cursor.unwrap();
+    let second_token = second.page.next_cursor.unwrap();
+    let (first_page, second_page) = tokio::join!(
+        service.continue_server_cursor(&session, &first_request, first_token, 3),
+        service.continue_server_cursor(&session, &second_request, second_token, 5),
+    );
+    assert_eq!(first_page.unwrap().page.rows, first_rows[1..4]);
+    assert_eq!(second_page.unwrap().page.rows, second_rows[1..6]);
+    assert_eq!(
+        service.inner.cursor_buffer_bytes.load(Ordering::Relaxed),
+        expected_cursor_payload_bytes(&first_rows[4..])
+            + expected_cursor_payload_bytes(&second_rows[6..])
+    );
+    let guard_is_live = service
+        .inner
+        .cursors
+        .lock()
+        .await
+        .get(&first_token.offset)
+        .unwrap()
+        .memory_diagnostic
+        .probe();
+    assert!(
+        service
+            .release_server_cursor(&session, &first_request, first_token)
+            .await
+    );
+    assert!(
+        !guard_is_live(),
+        "release must drop the diagnostic charge too"
+    );
+    assert!(
+        !service
+            .release_server_cursor(&session, &first_request, first_token)
+            .await
+    );
+    assert_eq!(
+        service.inner.cursor_buffer_bytes.load(Ordering::Relaxed),
+        expected_cursor_payload_bytes(&second_rows[6..])
+    );
+    service
+        .inner
+        .cursors
+        .lock()
+        .await
+        .get_mut(&second_token.offset)
+        .unwrap()
+        .expires_at = Instant::now() - Duration::from_secs(1);
+    let error = service
+        .continue_server_cursor(&session, &second_request, second_token, 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown or expired"));
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn server_cursor_rejected_continuation_keeps_cached_charge() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 1 << 20, 60_000);
+    let owner = authenticated_session(&service);
+    let request = ClientQueryRequest::new(target(), "cursor-owner", "RETURN 1");
+    let first = service
+        .start_server_cursor(
+            &owner,
+            &request,
+            QueryResultSet::new(vec![], cursor_payload_rows(9)),
+            Some(7),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    let token = first.page.next_cursor.unwrap();
+    let bytes = service.inner.cursor_buffer_bytes.load(Ordering::Relaxed);
+    let wrong_principal = session("another-principal");
+    assert!(service
+        .continue_server_cursor(&wrong_principal, &request, token, 2)
+        .await
+        .is_err());
+    assert!(
+        !service
+            .release_server_cursor(&wrong_principal, &request, token)
+            .await
+    );
+    for altered in [
+        ClientQueryRequest::new(target(), "another-query-id", "RETURN 1"),
+        ClientQueryRequest::new(target(), "cursor-owner", "RETURN 2"),
+        ClientQueryRequest::new(
+            ClientQueryTarget::new(GraphScope::default(), "another-cell").unwrap(),
+            "cursor-owner",
+            "RETURN 1",
+        ),
+        ClientQueryRequest::new(target(), "cursor-owner", "RETURN 1").with_parameters(
+            BTreeMap::from([("x".into(), VertexPropertyValue::Integer(1))]),
+        ),
+    ] {
+        assert!(service
+            .continue_server_cursor(&owner, &altered, token, 2)
+            .await
+            .is_err());
+        assert_eq!(
+            service.inner.cursor_buffer_bytes.load(Ordering::Relaxed),
+            bytes
+        );
+    }
+    assert!(service.release_server_cursor(&owner, &request, token).await);
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn server_cursor_admission_charges_cached_size_storage() {
+    let rows = cursor_payload_rows(4);
+    let payload_bytes = rows
+        .iter()
+        .map(QueryRow::estimated_resident_bytes)
+        .sum::<u64>();
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, payload_bytes, 60_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(target(), "cursor-cache-budget", "RETURN 1");
+    let error = service
+        .start_server_cursor(
+            &session,
+            &request,
+            QueryResultSet::new(vec![], rows),
+            Some(7),
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "client_cursor_buffer_bytes",
+            ..
+        }
+    ));
+    assert!(service.inner.cursors.lock().await.is_empty());
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn server_cursor_complete_first_page_does_not_charge_cached_sizes() {
+    for count in [0, 4] {
+        let rows = cursor_payload_rows(count);
+        let limit = rows
+            .iter()
+            .map(QueryRow::estimated_resident_bytes)
+            .sum::<u64>()
+            .max(1);
+        let service = cursor_service(Arc::new(AtomicU64::new(0)), 1, limit, 60_000);
+        let session = authenticated_session(&service);
+        let request = ClientQueryRequest::new(target(), "cursor-complete-page", "RETURN 1");
+        let page = service
+            .start_server_cursor(
+                &session,
+                &request,
+                QueryResultSet::new(vec![], rows.clone()),
+                Some(7),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.page.rows, rows);
+        assert!(page.page.next_cursor.is_none());
+        assert!(service.inner.cursors.lock().await.is_empty());
+        assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
 async fn server_cursor_executes_once_and_release_invalidates_it() {
     let executions = Arc::new(AtomicU64::new(0));
     let service = cursor_service(Arc::clone(&executions), 4, 1 << 20, 1_000);

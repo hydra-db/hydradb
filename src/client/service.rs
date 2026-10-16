@@ -1398,11 +1398,29 @@ struct ServerQueryCursor {
     query: String,
     parameters: BTreeMap<String, QueryParameterValue>,
     columns: Vec<QueryColumn>,
-    rows: VecDeque<QueryRow>,
+    rows: VecDeque<BufferedCursorRow>,
     read_epoch: Option<StorageSequence>,
     bookmark: Option<ClientBookmark>,
     expires_at: Instant,
     resident_bytes: u64,
+}
+
+// Immutable buffered rows carry the size charged at admission. Pagination must
+// not walk their values again while holding the shared cursor registry lock.
+struct BufferedCursorRow {
+    row: QueryRow,
+    resident_bytes: u64,
+}
+
+impl BufferedCursorRow {
+    fn new(row: QueryRow) -> Self {
+        let resident_bytes = estimate_cursor_row(&row)
+            .saturating_add((std::mem::size_of::<Self>() - std::mem::size_of::<QueryRow>()) as u64);
+        Self {
+            row,
+            resident_bytes,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2384,7 +2402,22 @@ impl ClientQueryService {
         bookmark: Option<ClientBookmark>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
-        let materialized_bytes = result.estimated_resident_bytes();
+        let QueryResultSet {
+            columns,
+            rows,
+            read_epoch: _,
+            storage_sequence: _,
+        } = result;
+        // Prepare and size the result before taking the registry lock. Rows
+        // returned immediately need no retained size-cache allocation.
+        let mut rows = rows.into_iter();
+        let page_rows: Vec<_> = rows.by_ref().take(page_size).collect();
+        let page_bytes = page_rows.iter().fold(0_u64, |total, row| {
+            total.saturating_add(estimate_cursor_row(row))
+        });
+        let remaining: VecDeque<_> = rows.map(BufferedCursorRow::new).collect();
+        let resident_bytes = query_rows_resident_bytes(&remaining);
+        let materialized_bytes = page_bytes.saturating_add(resident_bytes);
         let mut cursors = self.inner.cursors.lock().await;
         self.purge_expired_cursors(&mut cursors);
         let current_bytes = self.inner.cursor_buffer_bytes.load(Ordering::Relaxed);
@@ -2396,14 +2429,6 @@ impl ClientQueryService {
                 limit: self.inner.config.max_cursor_buffer_bytes,
             });
         }
-        let QueryResultSet {
-            columns,
-            rows,
-            read_epoch: _,
-            storage_sequence: _,
-        } = result;
-        let mut remaining = VecDeque::from(rows);
-        let page_rows = take_cursor_rows(&mut remaining, page_size);
         if remaining.is_empty() {
             return Ok(ClientQueryPage {
                 query_id: request.query_id.clone(),
@@ -2413,7 +2438,6 @@ impl ClientQueryService {
             });
         }
 
-        let resident_bytes = query_rows_resident_bytes(&remaining);
         if cursors.len() >= self.inner.config.max_server_cursors {
             return Err(GraphError::AdmissionRejected {
                 operation: "client_server_cursors",
@@ -2484,15 +2508,13 @@ impl ClientQueryService {
         let mut cursor = cursors
             .remove(&token.offset)
             .expect("cursor was checked while holding the cursor lock");
-        let previous_bytes = cursor.resident_bytes;
-        let page_rows = take_cursor_rows(&mut cursor.rows, page_size);
-        cursor.resident_bytes = query_rows_resident_bytes(&cursor.rows);
+        let (page_rows, released_bytes) = take_cursor_rows(&mut cursor.rows, page_size);
+        cursor.resident_bytes = cursor.resident_bytes.saturating_sub(released_bytes);
         cursor.memory_diagnostic.set_bytes(
             cursor
                 .resident_bytes
                 .saturating_add(cursor.diagnostic_request_bytes),
         );
-        let released_bytes = previous_bytes.saturating_sub(cursor.resident_bytes);
         self.inner
             .cursor_buffer_bytes
             .fetch_sub(released_bytes, Ordering::Relaxed);
@@ -3194,15 +3216,36 @@ fn next_cursor_id(next: &AtomicU64, cursors: &BTreeMap<u64, ServerQueryCursor>) 
     })
 }
 
-fn take_cursor_rows(rows: &mut VecDeque<QueryRow>, page_size: usize) -> Vec<QueryRow> {
+fn take_cursor_rows(
+    rows: &mut VecDeque<BufferedCursorRow>,
+    page_size: usize,
+) -> (Vec<QueryRow>, u64) {
     let count = page_size.min(rows.len());
-    rows.drain(..count).collect()
+    let mut released_bytes = 0_u64;
+    let page = rows
+        .drain(..count)
+        .map(|buffered| {
+            released_bytes = released_bytes.saturating_add(buffered.resident_bytes);
+            buffered.row
+        })
+        .collect();
+    (page, released_bytes)
 }
 
-fn query_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
-    rows.iter().fold(0_u64, |total, row| {
-        total.saturating_add(row.estimated_resident_bytes())
-    })
+fn query_rows_resident_bytes(rows: &VecDeque<BufferedCursorRow>) -> u64 {
+    rows.iter()
+        .fold(0_u64, |total, row| total.saturating_add(row.resident_bytes))
+}
+
+#[cfg(test)]
+thread_local! {
+    static CURSOR_ROW_ESTIMATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn estimate_cursor_row(row: &QueryRow) -> u64 {
+    #[cfg(test)]
+    CURSOR_ROW_ESTIMATES.with(|count| count.set(count.get() + 1));
+    row.estimated_resident_bytes()
 }
 
 fn result_read_epoch(
