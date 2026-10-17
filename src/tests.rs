@@ -22083,6 +22083,58 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
 }
 
 #[tokio::test]
+async fn matrix_reachable_does_not_depend_on_start_set_arity() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-reachable-start-arity", object_store).await;
+
+    // 1 -> 2 -> 1 is a cycle through the start vertex: 1 is reachable from
+    // itself in exactly 2 hops. 2 -> 3 gives a non-start answer too.
+    shard.write_edge(mutation(1, 2, "req-1")).await.unwrap();
+    shard.write_edge(mutation(2, 1, "req-2")).await.unwrap();
+    shard.write_edge(mutation(2, 3, "req-3")).await.unwrap();
+
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_matrix_tiles("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", base_epoch, 2)
+        .await
+        .unwrap();
+    // No `build_graph_index` call: `compiled_graphblas_query_snapshot` has no
+    // graph-index generation to compile from, so `matrix_reachable` falls
+    // back to the adjacency path while an artifact still exists -- the
+    // branch that used to special-case a single start vertex.
+    let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    let one_start = shard
+        .matrix_reachable(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1],
+            2,
+            read_epoch,
+        )
+        .await
+        .unwrap();
+    // 999 does not exist in the graph; adding it as a second start must not
+    // change what's reachable from 1.
+    let two_starts = shard
+        .matrix_reachable(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1, 999],
+            2,
+            read_epoch,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(one_start.vertices, two_starts.vertices);
+    // Starts are always excluded, even though 1 is reachable from itself
+    // through the 1 <-> 2 cycle.
+    assert!(!one_start.vertices.contains(&1));
+    assert_eq!(one_start.vertices, vec![2, 3]);
+}
+
+#[tokio::test]
 async fn compact_csc_policy_runs_and_reports_the_compact_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let options = GraphOpenOptions {

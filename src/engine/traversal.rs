@@ -76,22 +76,18 @@ impl GraphShard {
                 )
                 .await?
             else {
-                let traversal = if let [start] = starts {
-                    self.reachable_from_storage_frontier(
-                        cell_id,
-                        edge_type,
-                        *start,
-                        (1, hops),
-                        read_epoch,
-                        &QueryBudget::new(self.limits.max_query_runtime_ms, None),
-                    )
-                    .await?
-                } else {
-                    let adjacency = self
-                        .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-                        .await?;
-                    expand_sparse(&adjacency, starts, hops, sparse_kernel)?
-                };
+                // Every branch of this function must answer the same question:
+                // vertices reachable within `1..=hops` steps, starts excluded
+                // (what `expand_sparse`/`expand_compiled_graphblas` below
+                // compute). A single-start carve-out used to route here through
+                // `reachable_from_storage_frontier` instead, which keeps a
+                // start that's reachable via a cycle — a different answer that
+                // depended only on `starts.len()`. Always go through the
+                // adjacency path so the answer is invariant in start-set arity.
+                let adjacency = self
+                    .canonical_adjacency_at(cell_id, edge_type, read_epoch)
+                    .await?;
+                let traversal = expand_sparse(&adjacency, starts, hops, sparse_kernel)?;
                 return Ok(MatrixTraversalResult {
                     backend: TraversalBackend::DirectSnapshot,
                     vertices: traversal.vertices,
@@ -106,9 +102,20 @@ impl GraphShard {
             let started = Instant::now();
             let empty_adjacency = BTreeMap::new();
             let traversal = if let Some(overlay) = overlay {
-                crate::shard::topology_tail::expand_range_with_overlay(
+                // `expand_compiled_graphblas` below answers "reachable within
+                // `1..=hops` steps, starts excluded" — it seeds its `seen` set
+                // with `starts` and filters them back out at the end, even if
+                // a start is revisited through a cycle. `expand_range_with_overlay`
+                // has no such start filter, so a start reachable through a
+                // cycle would stay in its result. Keep the same `1..=hops`
+                // range (so every level still contributes) and filter starts
+                // out here, so the two branches agree regardless of whether a
+                // compiled matrix happens to have a WAL overlay.
+                let mut ranged = crate::shard::topology_tail::expand_range_with_overlay(
                     &compiled, &overlay, starts, 1, hops,
-                )?
+                )?;
+                ranged.vertices.retain(|vertex| !starts.contains(vertex));
+                ranged
             } else {
                 expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?
             };
