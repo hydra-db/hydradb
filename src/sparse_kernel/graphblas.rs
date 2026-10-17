@@ -295,7 +295,6 @@ impl CompiledCompactCscMatrix {
             .any(|index| self.neighbor(index) == dst_ordinal)
     }
 
-    #[cfg(feature = "opencypher")]
     fn neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         let Some(ordinal) = self.ordinal(vertex) else {
             return Vec::new();
@@ -726,7 +725,6 @@ impl CompiledGraphBlasMatrix {
             .neighbors(vertex)
     }
 
-    #[cfg(feature = "opencypher")]
     pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_out.neighbors(vertex)
     }

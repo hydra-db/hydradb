@@ -457,17 +457,22 @@ pub(crate) fn expand_range_with_overlay(
     let mut frontier = starts.iter().copied().collect::<BTreeSet<_>>();
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
-    let empty = BTreeMap::new();
 
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
         }
-        let frontier_values = frontier.iter().copied().collect::<Vec<_>>();
-        let base =
-            crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
-        edge_visits = edge_visits.saturating_add(base.edge_visits);
-        let mut next = base.vertices.into_iter().collect::<BTreeSet<_>>();
+        // `expand` is a reachability primitive: it seeds `seen` with `starts`
+        // and strips `starts` from its result. Passing the whole frontier as
+        // `starts` therefore hid every edge between two frontier members —
+        // the destination was already "seen". A per-vertex neighbourhood
+        // union has no such blind spot.
+        let mut next = BTreeSet::new();
+        for src in &frontier {
+            let neighbors = crate::sparse_kernel::compiled_graphblas_out_neighbors(compiled, *src);
+            edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+            next.extend(neighbors);
+        }
 
         for src in &frontier {
             let Some(changes) = overlay.states.get(src) else {
@@ -527,6 +532,34 @@ mod tests {
         let mut incoming = BTreeSet::new();
         assert_eq!(overlay.apply_in_neighbors(10, &mut incoming), 3);
         assert_eq!(incoming, BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn an_edge_between_two_frontier_members_is_not_lost() {
+        let adjacency = BTreeMap::from([
+            (0u64, BTreeSet::from([2u64, 3u64])),
+            (3u64, BTreeSet::from([2u64])),
+        ]);
+        let compiled = crate::sparse_kernel::compile_graphblas_matrix(
+            &adjacency,
+            crate::sparse_kernel::SparseKernelBackend::CompactCsc,
+        )
+        .expect("matrix compiles");
+        let overlay = GraphTopologyOverlay::default();
+
+        let with_overlay = expand_range_with_overlay(&compiled, &overlay, &[0], 2, 2)
+            .expect("overlay expansion succeeds");
+        let without_overlay = crate::sparse_kernel::expand_range_compiled_graphblas(
+            &compiled,
+            &BTreeMap::new(),
+            &[0],
+            2,
+            2,
+        )
+        .expect("range expansion succeeds");
+
+        assert_eq!(without_overlay.vertices, vec![2]);
+        assert_eq!(with_overlay.vertices, without_overlay.vertices);
     }
 
     #[test]

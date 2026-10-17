@@ -342,7 +342,6 @@ pub(crate) fn compiled_graphblas_in_neighbors(
     compiled.in_neighbors(vertex)
 }
 
-#[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_out_neighbors(
     compiled: &CompiledGraphBlasMatrix,
     vertex: VertexId,
