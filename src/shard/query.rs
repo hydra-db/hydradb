@@ -2154,17 +2154,33 @@ impl GraphShard {
         let mut pending_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
         let mut original_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
 
-        for action in &query.actions {
+        let mut actions = query.actions.iter().peekable();
+        while let Some(action) = actions.next() {
             budget.check("cypher_mutation_action")?;
             match action {
                 RowMutationAction::DeleteBinding { binding, detach } => {
+                    let mut delete_bindings = vec![binding];
+                    while let Some(RowMutationAction::DeleteBinding {
+                        binding: next_binding,
+                        detach: next_detach,
+                    }) = actions.peek()
+                    {
+                        if next_detach != detach {
+                            break;
+                        }
+                        delete_bindings.push(next_binding);
+                        actions.next();
+                    }
                     let mut relationships = BTreeSet::new();
                     let mut vertices = BTreeSet::new();
-                    for row in &bindings {
-                        if let Some(relationship) = row.relationships.get(binding) {
-                            relationships.insert(relationship.clone());
-                        } else {
-                            vertices.insert(row.get(binding)?);
+                    for binding in delete_bindings {
+                        for row in &bindings {
+                            budget.check("cypher_delete_collect")?;
+                            if let Some(relationship) = row.relationships.get(binding) {
+                                relationships.insert(relationship.clone());
+                            } else {
+                                vertices.insert(row.get(binding)?);
+                            }
                         }
                     }
                     let deleted = self
@@ -2189,7 +2205,7 @@ impl GraphShard {
                         };
                         deletions.push((vertex_id, idempotency_key));
                     }
-                    // Keep one Cypher DELETE binding in one graph transaction.
+                    // Keep all vertex targets of DELETE in one graph transaction.
                     // If any matched vertex cannot be deleted, the batch returns
                     // an error before committing any of the matched vertices.
                     for delete in self
