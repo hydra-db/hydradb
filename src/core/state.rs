@@ -1693,6 +1693,8 @@ pub struct GraphCacheEntryCounts {
     pub relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_row_sets: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
 /// SlateDB storage-engine counters and gauges, snapshotted from the recorder
@@ -1786,6 +1788,8 @@ pub struct GraphCacheResidentBytes {
     pub source_relationship_rows: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_rows: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
 impl GraphCacheResidentBytes {
@@ -1798,6 +1802,7 @@ impl GraphCacheResidentBytes {
                     self.relationship_rows
                         .saturating_add(self.source_relationship_rows)
                         .saturating_add(self.relationship_property_rows)
+                        .saturating_add(self.native_path_results)
                 }
                 #[cfg(not(feature = "opencypher"))]
                 {

@@ -2582,6 +2582,66 @@ async fn native_ms_paths_result_cache_is_invalidated_by_storage_epoch() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_path_result_cache_has_its_own_budget_and_is_reported() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    // `max_relationship_rows_bytes` is set to 1 byte so that if
+    // `native_path_result_cache` still shared that budget (the bug this test
+    // guards against), every native path result would be evicted as oversized.
+    let memory = GraphMemoryConfig {
+        max_relationship_rows_bytes: 1,
+        ..GraphMemoryConfig::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_memory_options(
+        "graph/native-path-result-cache-budget",
+        object_store,
+        GraphOpenOptions::default(),
+        memory,
+    )
+    .await
+    .unwrap();
+
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-path-budget-create"),
+            "CREATE (a:Entity {id: 1, name: 'alpha'})-[:RELATES]->(b:Entity {id: 2, name: 'beta'})",
+        )
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+    let query = "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                 sourceValues: ['alpha'], targetValues: ['beta'], \
+                 pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'outgoing', \
+                 pathCount: 1, resultLimit: 10}) YIELD path RETURN path";
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-path-budget-query"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+
+    let entry_counts = shard.graph_cache_entry_counts().await;
+    assert_eq!(entry_counts.native_path_results, 1);
+
+    let resident_bytes = shard.graph_cache_resident_bytes().await;
+    assert!(resident_bytes.native_path_results > 0);
+    assert_eq!(
+        resident_bytes.total(),
+        resident_bytes.matrix_adjacencies
+            + resident_bytes.graphblas_matrices
+            + resident_bytes.relationship_rows
+            + resident_bytes.source_relationship_rows
+            + resident_bytes.relationship_property_rows
+            + resident_bytes.native_path_results
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-parallel", object_store).await;

@@ -254,7 +254,7 @@ impl GraphShard {
             native_path_result_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
                 tenant_quota,
-                memory.max_relationship_rows_bytes,
+                memory.max_native_path_result_bytes,
             )),
             #[cfg(feature = "opencypher")]
             native_path_page_cursors: Mutex::new(Default::default()),
@@ -377,6 +377,8 @@ impl GraphShard {
         #[cfg(feature = "opencypher")]
         let relationship_property_row_sets =
             self.relationship_property_rows_cache.lock().await.len();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.len();
         GraphCacheEntryCounts {
             matrix_artifacts,
             matrix_adjacencies,
@@ -387,6 +389,8 @@ impl GraphShard {
             relationship_row_sets,
             #[cfg(feature = "opencypher")]
             relationship_property_row_sets,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 
@@ -409,6 +413,8 @@ impl GraphShard {
             .lock()
             .await
             .resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.resident_bytes();
         GraphCacheResidentBytes {
             matrix_adjacencies,
             graphblas_matrices,
@@ -418,6 +424,8 @@ impl GraphShard {
             source_relationship_rows,
             #[cfg(feature = "opencypher")]
             relationship_property_rows,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 

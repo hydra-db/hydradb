@@ -1643,6 +1643,10 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
                 "relationship_property_rows",
                 metrics.cache_entries.relationship_property_row_sets,
             ),
+            (
+                "native_path_results",
+                metrics.cache_entries.native_path_results,
+            ),
         ] {
             output.push_str(&format!(
                 "graph_cache_entries{{scope=\"{}\",cell_id=\"{}\",cache=\"{cache}\"}} {entries}\n",
@@ -1669,6 +1673,10 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
             (
                 "relationship_property_rows",
                 metrics.cache_resident_bytes.relationship_property_rows,
+            ),
+            (
+                "native_path_results",
+                metrics.cache_resident_bytes.native_path_results,
             ),
         ] {
             output.push_str(&format!(
