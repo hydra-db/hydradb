@@ -34,6 +34,7 @@ data:
   GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxRelationshipRowsBytes | quote }}
   GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxSourceRelationshipRowsBytes | quote }}
   GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxRelationshipPropertyRowsBytes | quote }}
+  GRAPH_MAX_NATIVE_PATH_RESULT_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxNativePathResultBytes | quote }}
   GRAPH_MAX_CONCURRENT_HYDRATIONS: {{ include "hydradb.decimalInteger" .Values.runtime.maxConcurrentHydrations | quote }}
   GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS: {{ include "hydradb.decimalInteger" .Values.runtime.maxConcurrentMatrixCompilations | quote }}
   GRAPH_INDEX_DISCOVERY_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.runtime.indexDiscoveryIntervalMs | quote }}
