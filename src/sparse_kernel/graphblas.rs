@@ -287,15 +287,6 @@ impl CompiledCompactCscMatrix {
         self.indices.get(index)
     }
 
-    fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
-        let (Some(src_ordinal), Some(dst_ordinal)) = (self.ordinal(src), self.ordinal(dst)) else {
-            return false;
-        };
-        self.neighbor_range(src_ordinal)
-            .any(|index| self.neighbor(index) == dst_ordinal)
-    }
-
-    #[cfg(feature = "opencypher")]
     fn neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         let Some(ordinal) = self.ordinal(vertex) else {
             return Vec::new();
@@ -715,10 +706,6 @@ impl CompiledGraphBlasMatrix {
         self.estimated_resident_bytes
     }
 
-    pub(crate) fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
-        self.canonical_out.contains_edge(src, dst)
-    }
-
     #[cfg(feature = "opencypher")]
     pub(crate) fn in_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_in
@@ -726,7 +713,6 @@ impl CompiledGraphBlasMatrix {
             .neighbors(vertex)
     }
 
-    #[cfg(feature = "opencypher")]
     pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_out.neighbors(vertex)
     }
