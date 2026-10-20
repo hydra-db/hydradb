@@ -18877,6 +18877,80 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
     );
 }
 
+/// Safety gate for how write conflicts reach clients. A statement's actions
+/// commit one at a time, so a conflict can escape after earlier actions are
+/// already durable. Here the relationship delete commits, the vertex delete
+/// spends its retry budget and fails, and a replay of the same statement
+/// (with the original idempotency key or a fresh one) re-runs the MATCH
+/// against the new state, finds nothing, and reports success with `a` still
+/// present. That is why Bolt and HTTP must not present these conflicts as safe
+/// to replay; see `write_conflicts_are_visible_and_not_driver_retryable_to_bolt_clients`.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn conflict_replay_after_relationship_delete_loses_original_match() {
+    async fn vertex_one_rows(shard: &GraphShard, cell: &str) -> usize {
+        shard
+            .execute_cypher_rows(
+                QueryContext::new(cell, "conflict-replay-read"),
+                "MATCH (a {id: 1}) RETURN a.id",
+            )
+            .await
+            .unwrap()
+            .rows
+            .len()
+    }
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-conflict-replay", object_store).await;
+    let cell = "conflict-replay";
+
+    shard
+        .execute_cypher(
+            QueryContext::new(cell, "conflict-replay-seed"),
+            "MERGE (a:User {id: 1})-[:LINK]->(b:User {id: 2})",
+        )
+        .await
+        .unwrap();
+
+    let statement = "MATCH (a {id: 1})-[r:LINK]->(b {id: 2}) DELETE r, a";
+    crate::shard::vertex_delete_fault::arm(cell);
+    let failed = shard
+        .execute_cypher(QueryContext::new(cell, "conflict-replay-delete"), statement)
+        .await;
+    crate::shard::vertex_delete_fault::disarm(cell);
+
+    assert!(
+        matches!(
+            failed,
+            Err(GraphError::ConditionalWriteConflict {
+                operation: "validate_vertex_delete_preparation",
+                ..
+            })
+        ),
+        "the vertex delete conflict must escape the statement: {failed:?}"
+    );
+    // The partial outcome: the first action is durable, the second is not.
+    assert!(!shard.edge_exists(cell, "LINK", 1, 2).await.unwrap());
+    assert_eq!(vertex_one_rows(&shard, cell).await, 1);
+
+    for idempotency_key in ["conflict-replay-delete", "conflict-replay-delete-retry"] {
+        let replay = shard
+            .execute_cypher(QueryContext::new(cell, idempotency_key), statement)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            QueryOutput::Mutation(QueryMutationResult::default()),
+            "a replay with key {idempotency_key} matches nothing and reports success"
+        );
+        assert_eq!(
+            vertex_one_rows(&shard, cell).await,
+            1,
+            "a replay with key {idempotency_key} leaves the vertex the statement asked to delete"
+        );
+    }
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_detach_delete_node_cascades_edges_and_metadata() {

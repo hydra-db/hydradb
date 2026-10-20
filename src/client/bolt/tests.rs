@@ -2024,6 +2024,44 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     }
 }
 
+/// A conflict can escape after earlier actions of the same statement have
+/// committed, so it must not use a code that drivers replay automatically.
+/// It must still reach the client as a coded error instead of the opaque
+/// backend error.
+#[test]
+fn write_conflicts_are_visible_and_not_driver_retryable_to_bolt_clients() {
+    let conflicts = [
+        GraphError::ConditionalWriteConflict {
+            operation: "relationship-import",
+            key: "edge/a/b".to_string(),
+        },
+        GraphError::ControlMetadataConflict {
+            key: "control/graph".to_string(),
+            expected_generation: Some(3),
+            actual_generation: None,
+        },
+    ];
+
+    for conflict in conflicts {
+        let expected_detail = conflict.to_string();
+        match graph_error_to_bolt(conflict) {
+            BoltError::Query { code, message } => {
+                assert_eq!(
+                    code,
+                    "Neo.DatabaseError.Transaction.TransactionCommitFailed"
+                );
+                assert!(
+                    !code.starts_with("Neo.TransientError."),
+                    "drivers retry transient errors, which is unsafe after a partial commit"
+                );
+                assert!(message.starts_with(&expected_detail), "{message}");
+                assert!(message.contains("may have committed"), "{message}");
+            }
+            other => panic!("expected a non-retryable Neo database error, got {other:?}"),
+        }
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
 /// that same single address, so a read lands on the node whose writer minted

@@ -32,6 +32,28 @@ async fn run_cancellable_delete_preparation<T>(
     }
 }
 
+/// Test-only switch that makes every vertex delete on an armed cell lose its
+/// conflict check. Keyed by cell so parallel tests on other cells never see it.
+#[cfg(test)]
+pub(crate) mod vertex_delete_fault {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    static ARMED_CELLS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    pub(crate) fn arm(cell_id: &str) {
+        ARMED_CELLS.lock().unwrap().insert(cell_id.to_string());
+    }
+
+    pub(crate) fn disarm(cell_id: &str) {
+        ARMED_CELLS.lock().unwrap().remove(cell_id);
+    }
+
+    pub(super) fn is_armed(cell_id: &str) -> bool {
+        ARMED_CELLS.lock().unwrap().contains(cell_id)
+    }
+}
+
 #[cfg(test)]
 mod cleanup_cancellation_tests {
     use super::*;
@@ -1452,6 +1474,17 @@ impl GraphShard {
         lock: &LocalWriteGuard,
         prepared: Option<PreparedVertexDelete>,
     ) -> Result<Vec<VertexDeleteResult>> {
+        // Fails before the transaction begins, so nothing commits, and with
+        // the operation the retry loop treats as retryable, so the conflict
+        // escapes only after the retry budget is spent: the same shape as a
+        // preparation that keeps losing its race in production.
+        #[cfg(test)]
+        if vertex_delete_fault::is_armed(cell_id) {
+            return Err(GraphError::ConditionalWriteConflict {
+                operation: "validate_vertex_delete_preparation",
+                key: cell_id.to_string(),
+            });
+        }
         let txn_started = std::time::Instant::now();
         let batch_items = deletions.len() as u64;
         let txn = self

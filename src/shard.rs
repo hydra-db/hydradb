@@ -17,3 +17,5 @@ pub(crate) mod write_pipeline;
 pub(crate) mod xlog;
 
 pub(crate) use query::QueryBudget;
+#[cfg(test)]
+pub(crate) use write::vertex_delete_fault;

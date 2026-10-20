@@ -171,6 +171,37 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+/// A lost write race is the caller's state having moved, not a server fault.
+/// 409 with a code per variant, so a client can tell a data conflict from a
+/// control-plane one and retry only the former's operation.
+#[test]
+fn write_conflicts_are_409s_and_not_internal_errors() {
+    let write = HttpApiError::from_graph(GraphError::ConditionalWriteConflict {
+        operation: "relationship-import",
+        key: "edge/a/b".to_string(),
+    });
+    assert_eq!(write.status, StatusCode::CONFLICT);
+    assert_eq!(write.code, "write_conflict");
+    assert!(
+        write.message.contains("relationship-import") && write.message.contains("edge/a/b"),
+        "the operation and key must survive to the client: {}",
+        write.message
+    );
+
+    let control = HttpApiError::from_graph(GraphError::ControlMetadataConflict {
+        key: "control/graph".to_string(),
+        expected_generation: Some(3),
+        actual_generation: Some(4),
+    });
+    assert_eq!(control.status, StatusCode::CONFLICT);
+    assert_eq!(control.code, "control_metadata_conflict");
+    assert!(
+        control.message.contains("control/graph"),
+        "the key must survive to the client: {}",
+        control.message
+    );
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {

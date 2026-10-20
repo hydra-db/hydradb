@@ -415,6 +415,27 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            // Two writers raced and this one lost. 409 is the honest status:
+            // the request was well formed and the state it assumed has moved.
+            // The catch-all's 500 would read as a server fault and hide that.
+            // 409 does not mean "replay as-is": statement actions commit one at
+            // a time, so earlier effects may already be durable, and a blind
+            // replay can re-match against them and silently skip the rest. The
+            // caller has to re-read before deciding to retry.
+            GraphError::ConditionalWriteConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "write_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ControlMetadataConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "control_metadata_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }

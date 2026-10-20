@@ -267,6 +267,23 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
             message: error.to_string(),
         },
+        // A conflict that escapes the executor is not an aborted statement.
+        // Mutation actions commit one storage transaction at a time, so for
+        // `MATCH (a)-[r]->(b) DELETE r, a` the relationship delete can be
+        // durable when the vertex delete loses its race. A replay re-runs the
+        // MATCH against that new state, finds nothing, and reports success
+        // with `a` still present. A `TransientError` code would mark the
+        // failure as safe to replay, so this uses a `DatabaseError`, which
+        // drivers do not retry. The message tells the caller to check the
+        // graph state before retrying.
+        GraphError::ConditionalWriteConflict { .. }
+        | GraphError::ControlMetadataConflict { .. } => BoltError::Query {
+            code: "Neo.DatabaseError.Transaction.TransactionCommitFailed".to_string(),
+            message: format!(
+                "{error}; earlier effects of this statement may have committed, \
+                 inspect the graph before retrying"
+            ),
+        },
         _ => {
             tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
