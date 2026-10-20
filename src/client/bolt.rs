@@ -11,7 +11,6 @@ use boltr::message::encode::encode_server_message;
 use boltr::message::{ClientMessage, ServerMessage};
 use boltr::types::{BoltDict, BoltValue};
 use bytes::BytesMut;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
@@ -27,6 +26,7 @@ use super::service::{
     ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
     ClientReadConsistency, PreparedClientQuery,
 };
+use crate::query::coordination::tls_peer_identity;
 use crate::query::opencypher::{opencypher_query_fingerprint, opencypher_query_shape_for_log};
 use crate::QueryFailureReason;
 use crate::{
@@ -451,12 +451,19 @@ async fn serve_bolt_connection_inner(
                         Instant::now() + config.handshake_timeout,
                         authentication_deadline,
                     ),
-                    TlsAcceptor::from(server_config).accept(stream),
+                    TlsAcceptor::from(Arc::clone(&server_config)).accept(stream),
                 )
                 .await
                 .map_err(|_| BoltError::Protocol("TLS handshake timed out".to_string()))?
                 .map_err(|err| BoltError::Io(std::io::Error::other(err)))?;
-                let identity = bolt_tls_identity(&tls_stream);
+                let identity = tls_peer_identity(
+                    tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .unwrap_or_default(),
+                    server_config.crypto_provider(),
+                );
                 (Box::new(tls_stream), identity)
             }
             None => (
@@ -491,36 +498,6 @@ async fn serve_bolt_connection_inner(
         authentication_deadline,
     )
     .await
-}
-
-fn bolt_tls_identity<S>(
-    stream: &tokio_rustls::server::TlsStream<S>,
-) -> QueryTransportConnectionIdentity {
-    let mut identity = QueryTransportConnectionIdentity::default();
-    let (_, connection) = stream.get_ref();
-    if let Some(certificates) = connection.peer_certificates() {
-        for (index, certificate) in certificates.iter().enumerate() {
-            let fingerprint = format!(
-                "sha256:{}",
-                lowercase_hex(&Sha256::digest(certificate.as_ref()))
-            );
-            if index == 0 {
-                identity.tls_peer_leaf_fingerprint = Some(fingerprint.clone());
-            }
-            identity.tls_peer_fingerprints.insert(fingerprint);
-        }
-    }
-    identity
-}
-
-fn lowercase_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 struct BoltConnectionContext {
