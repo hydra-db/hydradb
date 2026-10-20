@@ -301,6 +301,8 @@ pub struct GraphMemoryConfig {
     pub max_source_relationship_rows_bytes: usize,
     #[cfg(feature = "opencypher")]
     pub max_relationship_property_rows_bytes: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_native_path_result_bytes: usize,
     pub max_concurrent_matrix_compilations: usize,
 }
 
@@ -316,6 +318,8 @@ impl Default for GraphMemoryConfig {
             max_source_relationship_rows_bytes: 8 * 1024 * 1024,
             #[cfg(feature = "opencypher")]
             max_relationship_property_rows_bytes: 16 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_native_path_result_bytes: 8 * 1024 * 1024,
             max_concurrent_matrix_compilations: 1,
         }
     }
@@ -333,6 +337,8 @@ impl GraphMemoryConfig {
             max_source_relationship_rows_bytes: 2 * 1024 * 1024,
             #[cfg(feature = "opencypher")]
             max_relationship_property_rows_bytes: 4 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_native_path_result_bytes: 2 * 1024 * 1024,
             ..Self::default()
         }
     }
@@ -758,6 +764,7 @@ mod tests {
             assert_eq!(memory.max_relationship_rows_bytes, 2 * 1024 * 1024);
             assert_eq!(memory.max_source_relationship_rows_bytes, 2 * 1024 * 1024);
             assert_eq!(memory.max_relationship_property_rows_bytes, 4 * 1024 * 1024);
+            assert_eq!(memory.max_native_path_result_bytes, 2 * 1024 * 1024);
         }
     }
 

@@ -224,6 +224,7 @@ runtime:
   maxRelationshipRowsBytes: 8388608
   maxSourceRelationshipRowsBytes: 8388608
   maxRelationshipPropertyRowsBytes: 16777216
+  maxNativePathResultBytes: 8388608
   maxConcurrentHydrations: 2
   maxConcurrentMatrixCompilations: 1
   indexDiscoveryIntervalMs: 5000
