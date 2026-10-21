@@ -11773,7 +11773,7 @@ fn aggregate_projected_rows(
             }
         }
         let row = QueryRow::new(values);
-        let sort_keys = sort_keys_for_projected_only(&row, columns, order_by)?;
+        let sort_keys = sort_keys_for_projected_only(&row, projections, columns, order_by)?;
         push_projected_query_row(&mut projected, row, sort_keys);
     }
     Ok(projected)
@@ -11999,6 +11999,7 @@ fn sort_keys_for_row(
 #[cfg(feature = "opencypher")]
 fn sort_keys_for_projected_only(
     row: &QueryRow,
+    projections: &[RowProjection],
     columns: &[QueryColumn],
     order_by: &[RowSort],
 ) -> Result<Vec<QueryValue>> {
@@ -12007,15 +12008,17 @@ fn sort_keys_for_projected_only(
         keys.push(match &sort.expression {
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {
-                let Some(value) = row
-                    .values
+                // count(expr) finalizes to a Count value too, so find count(*)
+                // by its projection rather than by the first Count in the row.
+                let Some(value) = projections
                     .iter()
-                    .find(|value| matches!(value, QueryValue::Count(_)))
+                    .position(|projection| matches!(projection, RowProjection::CountAll))
+                    .and_then(|idx| row.values.get(idx))
                 else {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::OrderWindow,
                         dialect: "OpenCypher",
-                        feature: "count(*) ORDER BY requires an aggregate row".to_string(),
+                        feature: "count(*) ORDER BY requires count(*) in RETURN".to_string(),
                     });
                 };
                 value.clone()

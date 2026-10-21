@@ -18768,6 +18768,77 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_order_by_count_star_sorts_by_count_star_not_another_count() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-order-by-count-star", object_store).await;
+
+    for user in [1, 2, 3] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                user,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("team", VertexPropertyValue::String("a".to_string())),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            4,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("team", VertexPropertyValue::String("b".to_string()))
+                .with_property("score", VertexPropertyValue::Integer(5)),
+        )
+        .await
+        .unwrap();
+
+    // count(n.score) is projected before count(*) and orders the groups the
+    // other way round, so sorting by the wrong count column is visible.
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-order-by-count-star"),
+            "MATCH (n:User) RETURN n.team AS team, count(n.score) AS scored, \
+             count(*) AS total ORDER BY count(*) DESC",
+        )
+        .await
+        .unwrap();
+    let team = |name: &str| QueryValue::Property(VertexPropertyValue::String(name.to_string()));
+    assert_eq!(
+        rows.rows,
+        vec![
+            QueryRow::new(vec![team("a"), QueryValue::Count(0), QueryValue::Count(3)]),
+            QueryRow::new(vec![team("b"), QueryValue::Count(1), QueryValue::Count(1)]),
+        ]
+    );
+
+    // Without count(*) in RETURN there is nothing to sort by, so the query is
+    // rejected instead of being sorted by count(n.score).
+    let error = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-order-by-unprojected-count-star"),
+            "MATCH (n:User) RETURN n.team AS team, count(n.score) AS scored \
+             ORDER BY count(*) DESC",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::OrderWindow,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_executes_set_remove_delete_and_merge_mutations() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-mutations", object_store).await;
