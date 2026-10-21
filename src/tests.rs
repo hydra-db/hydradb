@@ -3709,6 +3709,78 @@ async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_set_before_delete_does_not_resurrect_vertex() {
+    let shard = open_test_shard("graph/cypher-set-before-delete", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("Person"),
+        )
+        .await
+        .unwrap();
+
+    // SET buffers the metadata change and is flushed after DELETE runs; the
+    // flush must not rewrite the vertex DELETE removed (#269).
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "set-before-delete"),
+            "MATCH (n:Person {id: 1}) SET n.name = 'Alice' DELETE n",
+        )
+        .await
+        .unwrap();
+
+    let after = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "set-before-delete-check"),
+            "MATCH (n:Person {id: 1}) RETURN n.id",
+        )
+        .await
+        .unwrap();
+    assert!(
+        after.rows.is_empty(),
+        "SET before DELETE left the node in the graph: {:?}",
+        after.rows
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_plain_delete_removes_vertex() {
+    let shard = open_test_shard("graph/cypher-plain-delete", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("Person"),
+        )
+        .await
+        .unwrap();
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "plain-delete"),
+            "MATCH (n:Person {id: 1}) DELETE n",
+        )
+        .await
+        .unwrap();
+
+    let after = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "plain-delete-check"),
+            "MATCH (n:Person {id: 1}) RETURN n.id",
+        )
+        .await
+        .unwrap();
+    assert!(
+        after.rows.is_empty(),
+        "plain DELETE left the node: {:?}",
+        after.rows
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rejects_metadata_multi_create_before_writing_any_edge() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-batch-metadata-reject", object_store).await;

@@ -2153,6 +2153,11 @@ impl GraphShard {
         let mut original_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
         let mut pending_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
         let mut original_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
+        // Vertices a DELETE in this mutation has removed. SET buffers metadata
+        // into `pending_metadata` and is flushed after the action loop; without
+        // this, `SET n.x = 1 DELETE n` would write the buffered metadata back
+        // and resurrect the deleted node (#269).
+        let mut deleted_vertices = BTreeSet::<VertexId>::new();
 
         for action in &query.actions {
             budget.check("cypher_mutation_action")?;
@@ -2181,6 +2186,7 @@ impl GraphShard {
                         result.topology_sequence.max(deleted.topology_sequence);
                     for vertex_id in vertices {
                         budget.check("cypher_delete_vertex")?;
+                        deleted_vertices.insert(vertex_id);
                         let delete = if *detach {
                             self.detach_delete_vertex(
                                 &context.cell_id,
@@ -2274,6 +2280,11 @@ impl GraphShard {
 
         for (vertex_id, metadata) in pending_metadata {
             budget.check("cypher_set_vertex_metadata")?;
+            // A vertex this mutation deleted must not be rewritten by a
+            // buffered SET, which would bring it back (#269).
+            if deleted_vertices.contains(&vertex_id) {
+                continue;
+            }
             if original_metadata.get(&vertex_id) == Some(&metadata) {
                 result.noops = result.noops.saturating_add(1);
                 continue;
