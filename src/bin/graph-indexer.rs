@@ -1124,12 +1124,8 @@ async fn main() -> RuntimeResult<()> {
 
     let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
     let root_scope = graph_scope()?;
-    let cells = env_value("GRAPH_CELLS", "cell-0")
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let cell_id = env_value("GRAPH_CELL_ID", "cell-0");
+    let cells = resolve_cells(std::env::var("GRAPH_CELLS").ok(), &cell_id);
     if cells.is_empty() {
         return Err("GRAPH_CELLS must contain at least one cell".into());
     }
@@ -3367,6 +3363,24 @@ fn env_value(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// The cell list the indexer scans.
+///
+/// When `GRAPH_CELLS` is unset it defaults to `GRAPH_CELL_ID` (passed in,
+/// itself defaulting to `cell-0`), matching `graph-node`. A fixed `cell-0`
+/// default meant that with `GRAPH_CELL_ID=cell-7` and no `GRAPH_CELLS`,
+/// graph-node wrote to `cell-7` while the indexer only scanned `cell-0`,
+/// silently indexing nothing (#271). Taking the raw value as an argument keeps
+/// this testable without touching the process env.
+fn resolve_cells(cells: Option<String>, cell_id: &str) -> Vec<String> {
+    cells
+        .unwrap_or_else(|| cell_id.to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn read_indexer_wake_token() -> RuntimeResult<String> {
     let path = env_value(
         "GRAPH_AUTH_TOKEN_FILE",
@@ -3450,6 +3464,17 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
 
     use super::*;
+
+    #[test]
+    fn resolve_cells_defaults_to_cell_id_when_unset() {
+        // Unset GRAPH_CELLS follows GRAPH_CELL_ID, as graph-node does.
+        assert_eq!(resolve_cells(None, "cell-7"), vec!["cell-7".to_string()]);
+        // An explicit list is honoured and trimmed.
+        assert_eq!(
+            resolve_cells(Some("cell-1, cell-2".to_string()), "cell-7"),
+            vec!["cell-1".to_string(), "cell-2".to_string()]
+        );
+    }
 
     #[tokio::test]
     async fn push_endpoint_authenticates_and_rate_limits_wakes() {
