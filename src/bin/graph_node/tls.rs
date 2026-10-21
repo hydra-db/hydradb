@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Error, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,35 +18,6 @@ pub struct FileTlsReloader {
     provider: Arc<ReloadableQueryTransportTlsServerConfigProvider>,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
-}
-
-fn load_certificate_material(
-    certificate_path: &Path,
-    private_key_path: &Path,
-) -> TlsResult<(
-    Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
-    tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
-    DefaultHasher,
-)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
-    let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
-    }
-    let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
-        )
-    })?;
-    let mut fingerprint = DefaultHasher::new();
-    certificate_bytes.hash(&mut fingerprint);
-    private_key_bytes.hash(&mut fingerprint);
-    Ok((certificates, private_key, fingerprint))
 }
 
 impl FileTlsReloader {
@@ -111,23 +82,51 @@ impl FileTlsReloader {
     }
 }
 
+/// Read a TLS secret, naming the attempted path on failure.
+///
+/// A bare `std::fs::read(path)?` surfaces as `Os { code: 2, kind: NotFound }`
+/// with no indication of which file — the certificate or the private key —
+/// failed or where it was looked for. On an unmounted secret volume that is
+/// the whole diagnosis an operator gets. Wrapping the error keeps `err.kind()`
+/// (so callers that branch on `NotFound` still can) while prefixing the label
+/// and path, matching how `GRAPH_AUTH_TOKEN_FILE` reads its secret.
+fn read_tls_secret(label: &str, path: &Path) -> TlsResult<Vec<u8>> {
+    std::fs::read(path).map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!("cannot read {label} at {}: {err}", path.display()),
+        )
+        .into()
+    })
+}
+
 fn load_server_config(
-    certificate_path: &PathBuf,
-    private_key_path: &PathBuf,
+    certificate_path: &Path,
+    private_key_path: &Path,
 ) -> TlsResult<(ServerConfig, u64)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
+    let certificate_bytes = read_tls_secret("TLS certificate", certificate_path)?;
+    let private_key_bytes = read_tls_secret("TLS private key", private_key_path)?;
     let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
     let certificates = rustls_pemfile::certs(&mut certificate_reader)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "TLS certificate file at {} is empty",
+                certificate_path.display()
+            ),
+        )
+        .into());
     }
     let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
     let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidData,
-            "TLS private key file contains no key",
+            format!(
+                "TLS private key file at {} contains no key",
+                private_key_path.display()
+            ),
         )
     })?;
     let config = ServerConfig::builder()
@@ -177,5 +176,44 @@ mod tests {
         .unwrap();
         provider.current_server_config().unwrap();
         reloader.stop().await;
+    }
+
+    #[test]
+    fn missing_certificate_names_the_path_and_keeps_kind() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("absent.crt");
+        let private_key_path = root.path().join("tls.key");
+        let error = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&certificate_path.display().to_string()),
+            "error should name the certificate path, got: {message}"
+        );
+        assert!(
+            message.contains("TLS certificate"),
+            "error should say which secret failed, got: {message}"
+        );
+        let io_error = error.downcast_ref::<Error>().expect("io::Error preserved");
+        assert_eq!(io_error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn empty_certificate_names_the_path() {
+        let root = tempfile::tempdir().unwrap();
+        let certificate_path = root.path().join("tls.crt");
+        let private_key_path = root.path().join("tls.key");
+        std::fs::write(&certificate_path, b"").unwrap();
+        let key = KeyPair::generate().unwrap();
+        std::fs::write(&private_key_path, key.serialize_pem()).unwrap();
+        let error = load_server_config(&certificate_path, &private_key_path).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&certificate_path.display().to_string()),
+            "error should name the certificate path, got: {message}"
+        );
+        assert!(
+            message.contains("is empty"),
+            "error should report the empty file, got: {message}"
+        );
     }
 }
