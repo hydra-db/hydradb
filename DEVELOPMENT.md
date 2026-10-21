@@ -38,14 +38,8 @@ silently drift into different test matrices.
 | `just smoke` | Isolated local object-store write, traversal, reopen, and verification | Temporary directory removed on exit |
 | `just smoke-graphblas` | The same smoke flow with SuiteSparse selected explicitly | Temporary directory removed on exit |
 | `just query-correctness` | Exact OpenCypher result checks | `bench-results/query_correctness.csv` and `.log` |
-| `just query-bench` | Configurable cold, hot, and concurrent query benchmark | `bench-results/query_bench_full.csv` and `.log` by default |
-| `just query-memory-profile` | Build/query memory matrix with runtime-selectable kernels | Results and logs under the configured benchmark directory |
 | `just stress` | Multiprocess writes, restart recovery, compaction, GC, and verification | Temporary local stores removed on exit |
 | `just fence` | Hard SlateDB writer-takeover proof | Temporary local stores removed on exit |
-
-The benchmark recipes intentionally use production-sized defaults and can run
-for a long time. Override their documented `GRAPH_QUERY_*` environment
-variables for a small development sample.
 
 ## Docker And MinIO Harnesses
 
@@ -53,7 +47,6 @@ variables for a small development sample.
 |---|---|
 | `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
 | `just minio-query-correctness` | Runs exact query checks against MinIO |
-| `just minio-query-bench` | Runs the query benchmark against MinIO |
 | `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
 | `just minio-fence` | Runs writer takeover against MinIO |
 | `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
@@ -72,15 +65,12 @@ external infrastructure or incur cloud cost.
 |---|---|
 | `scripts/runtime_smoke.sh` | Builds `graph-node`, checks readiness and metrics, then exercises Bolt, scoped databases, HTTP, and graceful shutdown; requires Python `neo4j` |
 | `scripts/bolt_neo4j_driver_smoke.sh` | Exercises direct and routing Bolt URIs through the official Python Neo4j driver |
-| `scripts/query_bench.sh`, `scripts/query_correctness.sh`, `scripts/query_memory_profile.sh` | Implement the corresponding local Just recipes |
+| `scripts/query_correctness.sh` | Implements the local `query-correctness` recipe |
 | `scripts/multiprocess_stress.sh`, `scripts/fence_takeover.sh` | Implement the local stress and fencing recipes |
-| `scripts/minio_*.sh` | MinIO smoke, correctness, benchmark, chaos, fencing, MBT, and write-profile harnesses; require Docker |
+| `scripts/minio_*.sh` | MinIO smoke, correctness, chaos, fencing, MBT, and write-profile harnesses; require Docker |
 | `scripts/multinode_k3s.sh` | Creates a disposable multi-node K3d cluster and performs disruptive failover tests; requires Docker, K3d, kubectl, and Helm |
 | `scripts/deploy_single_node_k3s.sh` | Builds and deploys to an existing K3s host using an S3 bucket; changes Kubernetes and AWS resources |
-| `scripts/ec2_graphblas_benchmark.sh` | Runs the containerized GraphBLAS benchmark against S3 on EC2; uses AWS credentials and can incur cost |
-| `scripts/run_s3_bolt_benchmark.sh` | Starts the S3-backed Bolt benchmark and optionally deletes its benchmark prefix afterward |
-| `scripts/neo4j_exact_hop_benchmark.sh` | Pulls and runs Neo4j in Docker for comparison measurements |
-| `scripts/bolt_graphblas_client.py`, `scripts/falkordb_bolt_benchmark.py`, `scripts/s3_bolt_driver_benchmark.py` | Python benchmark clients used by the shell harnesses; require the `neo4j` package |
+| `scripts/bolt_graphblas_client.py` | Python Bolt client for GraphBLAS query exercises; requires the `neo4j` package |
 | `scripts/multinode_k3s_client.py` | Runs inside the disposable K3d client Pod created by `multinode_k3s.sh` |
 
 `just update-slatedb` is a maintenance command, not a verification command. It

@@ -408,7 +408,6 @@ variables for a small development sample.
 |---|---|
 | `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
 | `just minio-query-correctness` | Runs exact query checks against MinIO |
-| `just minio-query-bench` | Runs the query benchmark against MinIO |
 | `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
 | `just minio-fence` | Runs writer takeover against MinIO |
 | `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
