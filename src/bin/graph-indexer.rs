@@ -3364,7 +3364,21 @@ fn graph_scope() -> RuntimeResult<GraphScope> {
 }
 
 fn env_value(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+    resolve_env_value(std::env::var(name).ok(), default)
+}
+
+/// Trim the value and treat an empty result as unset, so the indexer resolves
+/// the same base path, cell list and ids as `graph-node` from the same
+/// ConfigMap. `graph-node`'s `value()` already trims and empty-defaults; when
+/// the indexer did not, a space-padded or empty
+/// `GRAPH_DATA_PATH` left it watching a different prefix, building nothing, and
+/// still reporting healthy (#263).
+fn resolve_env_value(raw: Option<String>, default: &str) -> String {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_string()
 }
 
 fn read_indexer_wake_token() -> RuntimeResult<String> {
@@ -3450,6 +3464,21 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
 
     use super::*;
+
+    #[test]
+    fn resolve_env_value_trims_and_empty_defaults_like_graph_node() {
+        assert_eq!(
+            resolve_env_value(Some("graph/data ".to_string()), "graph/data"),
+            "graph/data"
+        );
+        assert_eq!(resolve_env_value(Some(String::new()), "graph/data"), "graph/data");
+        assert_eq!(resolve_env_value(Some("   ".to_string()), "graph/data"), "graph/data");
+        assert_eq!(resolve_env_value(None, "graph/data"), "graph/data");
+        assert_eq!(
+            resolve_env_value(Some("graph/other".to_string()), "graph/data"),
+            "graph/other"
+        );
+    }
 
     #[tokio::test]
     async fn push_endpoint_authenticates_and_rate_limits_wakes() {
