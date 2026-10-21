@@ -17012,6 +17012,102 @@ async fn cypher_rows_distinct_deduplicates_before_windowing() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_rows_page_distinct_deduplicates_without_order_by() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-page-distinct", object_store).await;
+
+    for (idx, dst) in [10, 11, 12].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-page-distinct-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-distinct-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id AS src",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("src")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            None,
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rows_page_without_order_by_keeps_parallel_relationships() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-page-parallel", object_store).await;
+
+    for (idx, dst) in [2, 4].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("row-page-parallel-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+    shard
+        .import_relationships_batch(
+            "cell-a",
+            "CHAIN",
+            [100, 101].map(|relationship_id| RelationshipMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: "CHAIN".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id,
+                metadata: EdgeMetadata::default(),
+            }),
+            "row-page-parallel-relationships",
+        )
+        .await
+        .unwrap();
+
+    let query = "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id";
+    let unpaged = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "row-page-parallel-all"), query)
+        .await
+        .unwrap();
+    let paged = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "row-page-parallel-page"),
+            query,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    let mut unpaged_rows = unpaged.rows;
+    let mut paged_rows = paged.rows;
+    unpaged_rows.sort_by_key(|row| format!("{:?}", row.values));
+    paged_rows.sort_by_key(|row| format!("{:?}", row.values));
+    assert_eq!(paged_rows, unpaged_rows);
+    assert_eq!(paged_rows.len(), 4);
+    assert!(paged.next_cursor.is_none());
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rows_page_returns_bounded_cursor_pages() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-pages", object_store).await;
