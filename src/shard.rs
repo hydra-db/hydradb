@@ -12,6 +12,7 @@ mod query;
 #[cfg(feature = "opencypher")]
 mod query_optimizer;
 pub(crate) mod topology_tail;
+mod vertex_membership;
 mod write;
 pub(crate) mod write_pipeline;
 pub(crate) mod xlog;

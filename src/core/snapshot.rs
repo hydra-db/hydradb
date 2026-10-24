@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     GraphShard, GraphStorageSnapshot, MatrixTraversalResult, Result, SparseKernelBackend,
-    StorageSequence, VertexId,
+    StorageSequence, VertexId, VertexMetadata,
 };
 pub struct GraphSnapshot<'a> {
     pub(crate) shard: &'a GraphShard,
@@ -23,6 +23,18 @@ impl<'a> GraphSnapshot<'a> {
     /// Returns the SlateDB sequence pinned by this snapshot.
     pub fn storage_sequence(&self) -> Option<StorageSequence> {
         Some(self.storage_snapshot.seq())
+    }
+
+    /// Canonical presence at this snapshot, including empty vertices.
+    pub async fn vertex_metadata_if_exists(
+        &self,
+        vertex: VertexId,
+    ) -> Result<Option<VertexMetadata>> {
+        crate::GraphStore::scope_snapshot(
+            Arc::clone(&self.storage_snapshot),
+            self.shard.vertex_metadata_if_exists(&self.cell_id, vertex),
+        )
+        .await
     }
 
     pub async fn edge_exists(&self, edge_type: &str, src: VertexId, dst: VertexId) -> Result<bool> {

@@ -198,6 +198,7 @@ impl GraphShard {
             gc_gate,
             index_policy: options.index_policy,
             await_durable_writes: options.durability.await_durable_writes,
+            unstable_canonical_vertex_membership: options.unstable_canonical_vertex_membership,
             write_authority,
             local_write_guard: Arc::new(Mutex::new(())),
             local_artifact_guard: Arc::new(Mutex::new(())),
@@ -623,6 +624,8 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
+        self.validate_vertex_membership_write_txn(txn, cell_id, operation)
+            .await?;
         if operation != "drop_cell" {
             let drop_marker = keys::cell_drop_marker(cell_id);
             let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
@@ -808,6 +811,11 @@ impl GraphShard {
             self.db.snapshot().await?
         };
         let read_epoch = storage_snapshot.seq();
+        GraphStore::scope_snapshot(
+            Arc::clone(&storage_snapshot),
+            self.unstable_vertex_membership_complete(cell_id),
+        )
+        .await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -921,6 +929,11 @@ impl GraphShard {
                 feature: "historical graph epochs are not SlateDB snapshots".to_string(),
             });
         }
+        GraphStore::scope_snapshot(
+            Arc::clone(&storage_snapshot),
+            self.unstable_vertex_membership_complete(cell_id),
+        )
+        .await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
