@@ -280,10 +280,14 @@ impl ObjectStoreWriterLeaseDirectory {
                 )
                 .await;
             let write_result = match write_result {
-                Err(ObjectStoreError::NotImplemented { .. }) if same_holder => {
-                    // LocalFileSystem lacks conditional update. Overwrite is safe
-                    // only for the still-valid incumbent; stale takeovers remain
-                    // fail-closed because they require real compare-and-swap.
+                Err(ObjectStoreError::NotImplemented { .. }) => {
+                    // LocalFileSystem lacks conditional update. The ownership guard
+                    // above already returned NotCellWriter for a lease still live
+                    // under another process, so everything reaching here is absent,
+                    // released, expired, or this process's own — none of which needs
+                    // compare-and-swap to overwrite safely. Matching on the holder
+                    // id instead strands a node whose lease file outlived an unclean
+                    // restart, because holder_id is a fresh ULID per process.
                     self.object_store
                         .put(&path, PutPayload::from(payload))
                         .await
@@ -860,6 +864,7 @@ fn parse_lease_u64(path: &Path, field: &str, value: Option<&str>) -> Result<u64>
 
 #[cfg(test)]
 mod tests {
+    use slatedb::object_store::local::LocalFileSystem;
     use slatedb::object_store::memory::InMemory;
 
     use super::*;
@@ -1032,6 +1037,43 @@ mod tests {
         assert_eq!(
             restarted
                 .acquire_or_renew(&scope, "cell-0", "node-1")
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    // `fresh_observer_does_not_restart_an_expired_lease_window` covers the same
+    // sequence on InMemory, which implements conditional update and so never
+    // reaches the fallback this exercises. LocalFileSystem is the store every
+    // `CLOUD_PROVIDER=local` deployment runs on.
+    #[tokio::test]
+    async fn expired_lease_is_recoverable_on_a_store_without_conditional_update() {
+        let root = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(root.path()).unwrap());
+        let scope = GraphScope::default();
+        directory(Arc::clone(&store), "old-process", Duration::from_secs(1))
+            .acquire_or_renew(&scope, "cell-0", "node-0")
+            .await
+            .unwrap();
+
+        // The lease file outlives an unclean restart and the replacement process
+        // draws a new holder id, so it must wait the incumbent out.
+        let restarted = directory(store, "new-process", Duration::from_secs(1));
+        assert!(matches!(
+            restarted
+                .acquire_or_renew(&scope, "cell-0", "node-0")
+                .await
+                .unwrap_err(),
+            GraphError::NotCellWriter { .. }
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+        assert_eq!(
+            restarted
+                .acquire_or_renew(&scope, "cell-0", "node-0")
                 .await
                 .unwrap(),
             2
