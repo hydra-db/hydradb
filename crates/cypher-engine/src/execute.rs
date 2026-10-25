@@ -152,13 +152,17 @@ fn dispatch_result_plan<'a>(
                         "all UNION arms must return the same column names",
                     ));
                 }
-                for row in result.rows {
-                    if *all || !combined.rows.contains(&row) {
-                        combined.rows.push(row);
-                    }
-                }
             } else {
-                combined = Some(result);
+                combined = Some(QueryResult {
+                    columns: result.columns.clone(),
+                    rows: Vec::new(),
+                });
+            }
+            let combined = combined.as_mut().expect("union result initialized");
+            for row in result.rows {
+                if *all || !combined.rows.contains(&row) {
+                    combined.rows.push(row);
+                }
             }
         }
         combined.ok_or_else(|| {
