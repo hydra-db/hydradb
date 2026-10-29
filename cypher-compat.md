@@ -252,6 +252,40 @@ MATCH (s:Score {score: $score}) RETURN s.id AS score_id ORDER BY score_id
 Scalar parameters work everywhere. A parameter holding a list of maps is only
 accepted as `UNWIND` input, and only through the client transport.
 
+## Data modeling constraints
+
+The OpenCypher subset implemented in HydraDB is shaped by object-store-native layout and index acceleration. Five constraints in particular shape schema and query design:
+
+### 1. Node-only `MATCH` requires an anchor predicate
+```cypher
+MATCH (n:User) RETURN count(*)
+MATCH (n {status: 'active'}) RETURN n.id
+```
+A bare `MATCH (n) RETURN count(*)` is rejected. HydraDB plans traversals through typed label and property index scans rather than full unindexed keyspace scans. Node-only queries must specify an `id`, `label`, or property predicate to anchor execution.
+
+### 2. Single relationship type per pattern (no alternation)
+```cypher
+MATCH (f:Fact)-[:RESTS_ON]->(s:Source) RETURN s.id
+```
+Relationship patterns take exactly one type. Alternation patterns such as `[:RESTS_ON|IN_SPACE]` are rejected. When modeling graphs that need multi-type traversals:
+- **Unified relationship type with a discriminator property**: Use a single edge type (e.g. `[:LINK {kind: 'rests_on'}]`) and filter with `WHERE`.
+- **Query union**: Combine separate paths using `UNION ALL`.
+
+### 3. Variable-length traversals require a fixed source id
+```cypher
+MATCH (u {id: 1})-[:MANAGES*1..4]->(v) RETURN v.id
+```
+Transitive closures and multi-hop paths (`*min..max`) must anchor on a fixed source `id` on the left-hand node. Global variable-length traversals across the entire graph are not planned in a single query and should be driven from bound start nodes.
+
+### 4. Node labels and non-id properties require a named node
+```cypher
+MATCH (p:Principal)-[:MEMBER_OF]->(s:Space) RETURN count(*)
+```
+Anonymous labeled nodes (such as `(:Principal)-[:MEMBER_OF]->(:Space)`) are rejected with `node labels and non-id properties require a named node`. Always assign a binding identifier (e.g. `(p:Principal)`) even if that binding is not projected in `RETURN`.
+
+### 5. Local storage vs. production object stores
+The development local filesystem provider (`CLOUD_PROVIDER=local`) does not implement conditional updates (`PutMode::Update`). Restarting a node over a pre-existing local data directory can cause subsequent write operations to fail. In development, start against clean local directories (`/tmp/sgk-*`), or use MinIO/S3 for persistent testing.
+
 ## Not supported
 
 Rejected at parse time, with the reason in the error:
