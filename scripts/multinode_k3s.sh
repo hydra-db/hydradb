@@ -280,7 +280,10 @@ wait_for_each_indexer_cycle() {
   local expected=${1:-2}
   for _ in $(seq 1 120); do
     local pods=()
-    mapfile -t pods < <(kubectl -n "$NAMESPACE" get pods \
+    local pod
+    while IFS= read -r pod; do
+      pods+=("$pod")
+    done < <(kubectl -n "$NAMESPACE" get pods \
       -l app.kubernetes.io/component=indexer \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
     local ready=0
@@ -363,7 +366,10 @@ client routing | tee "$STATE_DIR/routing.json"
 client concurrent | tee "$STATE_DIR/concurrent.json"
 
 log "removing one indexer host and proving the surviving indexer publishes"
-mapfile -t INDEXER_PODS < <(kubectl -n "$NAMESPACE" get pods \
+INDEXER_PODS=()
+while IFS= read -r pod; do
+  INDEXER_PODS+=("$pod")
+done < <(kubectl -n "$NAMESPACE" get pods \
   -l app.kubernetes.io/component=indexer \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
 [[ "${#INDEXER_PODS[@]}" -eq 2 ]] || die "expected two indexer pods"
@@ -382,7 +388,10 @@ kubectl -n "$NAMESPACE" rollout status deployment/hydradb-indexer --timeout=300s
 wait_for_each_indexer_cycle
 
 log "creating a graph-index baseline for the bounded WAL-tail outage test"
-mapfile -t INDEXER_PODS < <(kubectl -n "$NAMESPACE" get pods \
+INDEXER_PODS=()
+while IFS= read -r pod; do
+  INDEXER_PODS+=("$pod")
+done < <(kubectl -n "$NAMESPACE" get pods \
   -l app.kubernetes.io/component=indexer \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
 INDEXER_0_BEFORE="$(indexer_metric "${INDEXER_PODS[0]}" graph_indexer_successful_cycles)"
