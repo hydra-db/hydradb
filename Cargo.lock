@@ -1756,6 +1756,7 @@ name = "hydradb-cypher-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "hydradb-cypher-ast",
  "hydradb-cypher-parser-antlr",
  "indexmap",

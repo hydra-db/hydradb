@@ -48,6 +48,8 @@ struct BindingRow {
     /// instead, because flattening it to an id would lose the property map that
     /// `id.name` needs.
     values: BTreeMap<Symbol, QueryValue>,
+    /// Records referenced by node lists, including nested lists and aggregates.
+    vertex_lists: BTreeMap<Symbol, std::sync::Arc<Vec<VertexRecord>>>,
     /// Full records for a named relationship list, shared across aliases.
     relationship_lists: BTreeMap<Symbol, std::sync::Arc<Vec<RelationshipRecord>>>,
 }
@@ -401,12 +403,7 @@ fn project_binding_rows(
                     }
                     (expression, _) => {
                         let value = evaluate_group_expression(expression, &group)?;
-                        if let Some(records) =
-                            retain_relationship_records(group.iter().copied(), &value)
-                        {
-                            output.relationship_lists.insert(name.clone(), records);
-                        }
-                        output.values.insert(name, value);
+                        bind_computed_value(group.iter().copied(), name, value, &mut output);
                     }
                 }
             }
@@ -429,11 +426,7 @@ fn project_binding_rows(
                 }
                 expression => {
                     let value = to_query_value(evaluate_expression(expression, row)?);
-                    if let Some(records) = retain_relationship_records(std::iter::once(row), &value)
-                    {
-                        output.relationship_lists.insert(name.clone(), records);
-                    }
-                    output.values.insert(name, value);
+                    bind_computed_value(std::iter::once(row), name, value, &mut output);
                 }
             }
         }
@@ -499,21 +492,36 @@ fn carry_binding(row: &BindingRow, source: &Symbol, name: Symbol, output: &mut B
         // Person and answered a cross product where the row should have gone.
         output.nulls.insert(name);
     } else if let Some(value) = row.values.get(source) {
-        if let Some(records) = row
-            .relationship_lists
-            .get(source)
-            .cloned()
-            .or_else(|| retain_relationship_records(std::iter::once(row), value))
-        {
-            output.relationship_lists.insert(name.clone(), records);
-        }
-        output.values.insert(name, value.clone());
+        bind_computed_value(std::iter::once(row), name, value.clone(), output);
     } else {
         // Not in scope at all rather than null-bound. Lowering rejects that,
         // so this is a belt-and-braces null and is marked as one for the same
         // reason as above.
         output.nulls.insert(name);
     }
+}
+
+/// Bind computed nodes as entities so property and identity reads use the
+/// same record as a direct alias. Lists keep only the records they reference.
+fn bind_computed_value<'a>(
+    rows: impl Iterator<Item = &'a BindingRow> + Clone,
+    name: Symbol,
+    value: QueryValue,
+    output: &mut BindingRow,
+) {
+    if let Some(records) = retain_vertex_records(rows.clone(), &value) {
+        if let QueryValue::VertexId(id) = &value {
+            if let Some(record) = records.iter().find(|record| record.id == *id) {
+                output.vertices.insert(name, record.clone());
+                return;
+            }
+        }
+        output.vertex_lists.insert(name.clone(), records);
+    }
+    if let Some(records) = retain_relationship_records(rows, &value) {
+        output.relationship_lists.insert(name.clone(), records);
+    }
+    output.values.insert(name, value);
 }
 
 /// Carry only records referenced by a computed result, including nested lists
@@ -554,6 +562,50 @@ fn retain_relationship_records<'a>(
                 .values()
                 .flat_map(|records| records.iter()),
         ) {
+            if wanted.contains(&record.id) {
+                found.entry(record.id).or_insert_with(|| record.clone());
+            }
+        }
+    }
+    (!found.is_empty()).then(|| std::sync::Arc::new(found.into_values().collect()))
+}
+
+fn retain_vertex_records<'a>(
+    rows: impl IntoIterator<Item = &'a BindingRow>,
+    value: &QueryValue,
+) -> Option<std::sync::Arc<Vec<VertexRecord>>> {
+    fn identities(value: &QueryValue, into: &mut BTreeSet<VertexId>) {
+        match value {
+            QueryValue::VertexId(id) => {
+                into.insert(*id);
+            }
+            QueryValue::List(values) => {
+                for value in values {
+                    identities(value, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut wanted = BTreeSet::new();
+    identities(value, &mut wanted);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut found = BTreeMap::new();
+    for row in rows {
+        for records in row.vertex_lists.values() {
+            if records.len() == wanted.len()
+                && records.iter().all(|record| wanted.contains(&record.id))
+            {
+                return Some(records.clone());
+            }
+        }
+        for record in row
+            .vertices
+            .values()
+            .chain(row.vertex_lists.values().flat_map(|records| records.iter()))
+        {
             if wanted.contains(&record.id) {
                 found.entry(record.id).or_insert_with(|| record.clone());
             }
@@ -1297,13 +1349,18 @@ fn dispatch_binding_plan<'a>(
                                 let record = row
                                     .vertices
                                     .values()
+                                    .chain(
+                                        row.vertex_lists
+                                            .values()
+                                            .flat_map(|records| records.iter()),
+                                    )
                                     .find(|record| record.id == id)
                                     .ok_or_else(|| {
-                                    unsupported(
-                                        QueryFailureReason::Unwind,
-                                        "UNWIND vertex has no record in this row",
-                                    )
-                                })?;
+                                        unsupported(
+                                            QueryFailureReason::Unwind,
+                                            "UNWIND vertex has no record in this row",
+                                        )
+                                    })?;
                                 output.vertices.insert(binding.clone(), record.clone());
                             }
                             value => {
@@ -1565,6 +1622,7 @@ fn dispatch_binding_plan<'a>(
                             relationships: BTreeMap::new(),
                             nulls: BTreeSet::new(),
                             values: BTreeMap::new(),
+                            vertex_lists: BTreeMap::new(),
                             relationship_lists: BTreeMap::new(),
                         };
                         // Draining a run ranks within it, so only the best
@@ -2583,6 +2641,7 @@ async fn relationship_seek_rows(
             relationships: BTreeMap::from([(relationship_binding.clone(), relationship.clone())]),
             nulls: BTreeSet::new(),
             values: BTreeMap::new(),
+            vertex_lists: BTreeMap::new(),
             relationship_lists: BTreeMap::new(),
         };
         let Some(row) = seed.map_or(Some(row.clone()), |seed| merge_compatible_rows(seed, &row))
@@ -2825,6 +2884,7 @@ async fn ordered_relationship_window_rows(
                 // projected value; `values` only carries what a WITH boundary
                 // put there.
                 values: BTreeMap::new(),
+                vertex_lists: BTreeMap::new(),
                 relationship_lists: BTreeMap::new(),
                 // The walk only emits a hop it actually matched, so every name
                 // this row carries is bound; none of them is a null an
@@ -3287,6 +3347,7 @@ async fn range_seek_rows(
                 relationships: BTreeMap::new(),
                 nulls: BTreeSet::new(),
                 values: BTreeMap::new(),
+                vertex_lists: BTreeMap::new(),
                 relationship_lists: BTreeMap::new(),
             })
             .collect(),
@@ -3632,6 +3693,7 @@ fn residual_accepts(
         relationships: BTreeMap::new(),
         nulls: BTreeSet::new(),
         values: BTreeMap::new(),
+        vertex_lists: BTreeMap::new(),
         relationship_lists: BTreeMap::new(),
     };
     predicate_holds(
@@ -3731,6 +3793,7 @@ async fn hydrate_rows(
                 relationships: BTreeMap::new(),
                 nulls: BTreeSet::new(),
                 values: BTreeMap::new(),
+                vertex_lists: BTreeMap::new(),
                 relationship_lists: BTreeMap::new(),
             };
             // A residual is only present when the caller removed the Filter
@@ -4552,6 +4615,7 @@ fn merge_compatible_rows(left: &BindingRow, right: &BindingRow) -> Option<Bindin
     merged.relationships.extend(right.relationships.clone());
     merged.nulls.extend(right.nulls.iter().cloned());
     merged.values.extend(right.values.clone());
+    merged.vertex_lists.extend(right.vertex_lists.clone());
     merged
         .relationship_lists
         .extend(right.relationship_lists.clone());

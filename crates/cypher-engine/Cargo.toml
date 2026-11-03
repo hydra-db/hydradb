@@ -13,3 +13,5 @@ indexmap = { workspace = true }
 hydradb-cypher-parser-antlr = { path = "../cypher-parser-antlr" }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+futures = { workspace = true }
