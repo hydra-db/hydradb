@@ -259,7 +259,7 @@ impl GraphShard {
             native_path_result_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
                 tenant_quota,
-                memory.max_relationship_rows_bytes,
+                memory.max_native_path_result_bytes,
             )),
             #[cfg(feature = "opencypher")]
             native_path_page_cursors: Mutex::new(Default::default()),
@@ -382,6 +382,8 @@ impl GraphShard {
         #[cfg(feature = "opencypher")]
         let relationship_property_row_sets =
             self.relationship_property_rows_cache.lock().await.len();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.len();
         GraphCacheEntryCounts {
             matrix_artifacts,
             matrix_adjacencies,
@@ -392,6 +394,8 @@ impl GraphShard {
             relationship_row_sets,
             #[cfg(feature = "opencypher")]
             relationship_property_row_sets,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 
@@ -414,6 +418,8 @@ impl GraphShard {
             .lock()
             .await
             .resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.resident_bytes();
         GraphCacheResidentBytes {
             matrix_adjacencies,
             graphblas_matrices,
@@ -423,6 +429,8 @@ impl GraphShard {
             source_relationship_rows,
             #[cfg(feature = "opencypher")]
             relationship_property_rows,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 
@@ -940,5 +948,149 @@ impl GraphShard {
             read_epoch,
             storage_snapshot,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+
+    #[cfg(feature = "opencypher")]
+    #[tokio::test]
+    async fn independent_cache_byte_budgets_for_relationship_rows_and_native_path_results() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Case 1: Relationship rows budget is generous, native path result budget is 1 byte.
+        let memory1 = GraphMemoryConfig {
+            max_relationship_rows_bytes: 8 * 1024 * 1024,
+            max_native_path_result_bytes: 1,
+            ..GraphMemoryConfig::default()
+        };
+        let shard1 = GraphShard::open_standalone_writer_with_memory_options(
+            "graph/independent-budget-rel-generous",
+            object_store.clone(),
+            GraphOpenOptions::default(),
+            memory1,
+        )
+        .await
+        .unwrap();
+
+        shard1
+            .execute_cypher(
+                QueryContext::new("cell-a", "init-1"),
+                "CREATE (a:Entity {id: 1, name: 'alpha'})-[:RELATES]->(b:Entity {id: 2, name: 'beta'})",
+            )
+            .await
+            .unwrap();
+        shard1
+            .set_vertex_metadata(
+                "cell-a",
+                3,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String("gamma".to_string())),
+            )
+            .await
+            .unwrap();
+        shard1.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+        let rel_result = shard1
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", "rel-q1"),
+                "MATCH ({id: 1})-[r:RELATES]->({id: 2}) RETURN r._fid AS fid",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rel_result.rows.len(), 1);
+
+        let path_query = "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name',                           sourceValues: ['alpha', 'gamma'], targetValues: ['alpha', 'gamma'],                           pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'outgoing',                           pathCount: 1, resultLimit: 10}) YIELD path RETURN path";
+        let _ = shard1
+            .execute_cypher_rows(QueryContext::new("cell-a", "path-q1"), path_query)
+            .await
+            .unwrap();
+
+        let counts1 = shard1.graph_cache_entry_counts().await;
+        let resident1 = shard1.graph_cache_resident_bytes().await;
+        assert!(counts1.relationship_row_sets >= 1);
+        assert!(resident1.relationship_rows > 0);
+        assert_eq!(counts1.native_path_results, 0);
+        assert_eq!(resident1.native_path_results, 0);
+        assert_eq!(
+            resident1.total(),
+            resident1.matrix_adjacencies
+                + resident1.graphblas_matrices
+                + resident1.relationship_rows
+                + resident1.source_relationship_rows
+                + resident1.relationship_property_rows
+        );
+        shard1.close().await.unwrap();
+
+        // Case 2: Relationship rows budget is 1 byte, native path result budget is generous.
+        let memory2 = GraphMemoryConfig {
+            max_relationship_rows_bytes: 1,
+            max_source_relationship_rows_bytes: 1,
+            max_relationship_property_rows_bytes: 1,
+            max_native_path_result_bytes: 8 * 1024 * 1024,
+            ..GraphMemoryConfig::default()
+        };
+        let shard2 = GraphShard::open_standalone_writer_with_memory_options(
+            "graph/independent-budget-path-generous",
+            object_store,
+            GraphOpenOptions::default(),
+            memory2,
+        )
+        .await
+        .unwrap();
+
+        shard2
+            .execute_cypher(
+                QueryContext::new("cell-a", "init-2"),
+                "CREATE (a:Entity {id: 1, name: 'alpha'})-[:RELATES]->(b:Entity {id: 2, name: 'beta'})",
+            )
+            .await
+            .unwrap();
+        shard2
+            .set_vertex_metadata(
+                "cell-a",
+                3,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String("gamma".to_string())),
+            )
+            .await
+            .unwrap();
+        shard2.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+        let rel_result2 = shard2
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", "rel-q2"),
+                "MATCH ({id: 1})-[r:RELATES]->({id: 2}) RETURN r._fid AS fid",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rel_result2.rows.len(), 1);
+
+        let _ = shard2
+            .execute_cypher_rows(QueryContext::new("cell-a", "path-q2"), path_query)
+            .await
+            .unwrap();
+
+        let counts2 = shard2.graph_cache_entry_counts().await;
+        let resident2 = shard2.graph_cache_resident_bytes().await;
+        assert_eq!(counts2.relationship_row_sets, 0);
+        assert_eq!(resident2.relationship_rows, 0);
+        assert_eq!(counts2.native_path_results, 1);
+        assert!(resident2.native_path_results > 0);
+        assert_eq!(
+            resident2.total(),
+            resident2.matrix_adjacencies
+                + resident2.graphblas_matrices
+                + resident2.relationship_rows
+                + resident2.source_relationship_rows
+                + resident2.relationship_property_rows
+                + resident2.native_path_results
+        );
+        shard2.close().await.unwrap();
     }
 }

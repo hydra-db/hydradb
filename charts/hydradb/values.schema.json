@@ -237,6 +237,7 @@
         "maxRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxSourceRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxRelationshipPropertyRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxNativePathResultBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
         "indexDiscoveryIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
