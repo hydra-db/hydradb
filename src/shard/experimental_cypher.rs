@@ -1900,3 +1900,52 @@ fn may_satisfy_lower_bound(
         value > lower
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn vertex_identity_in_matches_equalities() {
+        let shard = GraphShard::open_standalone_writer(
+            "graph/experimental-vertex-identity-in",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .expect("open graph shard");
+        for id in [1, 2, 3] {
+            shard
+                .set_vertex_metadata("cell-a", id, VertexMetadata::default().with_label("Entity"))
+                .await
+                .expect("write vertex metadata");
+        }
+
+        let expected = vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ];
+        for (query, description) in [
+            (
+                "MATCH (n:Entity) WHERE n.id = 1 OR n.id = 3 RETURN n.id AS id ORDER BY id",
+                "equalities",
+            ),
+            (
+                "MATCH (n:Entity) WHERE n.id IN [1, 3] RETURN n.id AS id ORDER BY id",
+                "IN list",
+            ),
+        ] {
+            let result = shard
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "vertex-identity-in")
+                        .with_cypher_engine(CypherEngineMode::Experimental)
+                        .with_refreshed_reader(),
+                    query,
+                )
+                .await
+                .expect("execute identity query");
+            assert_eq!(result.rows, expected, "{description}");
+        }
+        shard.close().await.expect("close graph shard");
+    }
+}
