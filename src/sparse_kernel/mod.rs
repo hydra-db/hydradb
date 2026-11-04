@@ -304,14 +304,6 @@ pub(crate) fn compiled_graphblas_kernel(compiled: &CompiledGraphBlasMatrix) -> S
     compiled.kernel()
 }
 
-pub(crate) fn compiled_graphblas_contains_edge(
-    compiled: &CompiledGraphBlasMatrix,
-    src: VertexId,
-    dst: VertexId,
-) -> bool {
-    compiled.contains_edge(src, dst)
-}
-
 #[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_in_neighbors(
     compiled: &CompiledGraphBlasMatrix,
@@ -320,7 +312,6 @@ pub(crate) fn compiled_graphblas_in_neighbors(
     compiled.in_neighbors(vertex)
 }
 
-#[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_out_neighbors(
     compiled: &CompiledGraphBlasMatrix,
     vertex: VertexId,
