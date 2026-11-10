@@ -42,6 +42,7 @@ pub struct RuntimeConfig {
     pub max_relationship_rows_bytes: usize,
     pub max_source_relationship_rows_bytes: usize,
     pub max_relationship_property_rows_bytes: usize,
+    pub max_native_path_result_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
     pub max_open_scopes: usize,
@@ -262,6 +263,11 @@ impl RuntimeConfig {
                 "GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES",
                 16 * 1024 * 1024,
             )?,
+            max_native_path_result_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_NATIVE_PATH_RESULT_BYTES",
+                8 * 1024 * 1024,
+            )?,
             max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
             max_concurrent_matrix_compilations: parse_usize(
                 &values,
@@ -408,6 +414,7 @@ impl RuntimeConfig {
             max_relationship_rows_bytes: self.max_relationship_rows_bytes,
             max_source_relationship_rows_bytes: self.max_source_relationship_rows_bytes,
             max_relationship_property_rows_bytes: self.max_relationship_property_rows_bytes,
+            max_native_path_result_bytes: self.max_native_path_result_bytes,
             max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
         }
     }
@@ -681,4 +688,25 @@ fn parse_node_addresses(
 
 fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
     Err(Error::new(ErrorKind::InvalidInput, message.into()).into())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_native_path_result_bytes_is_parsed_and_passed_to_memory_config() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_MAX_NATIVE_PATH_RESULT_BYTES".to_string(),
+                "33554432".to_string(),
+            ),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.max_native_path_result_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            config.graph_memory_config().max_native_path_result_bytes,
+            32 * 1024 * 1024
+        );
+    }
 }
