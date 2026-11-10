@@ -255,6 +255,21 @@ where
         Self::new_with_byte_limit(max_entries, max_entries_per_tenant, usize::MAX)
     }
 
+    /// `max_resident_bytes == 0` means **no byte cap**, not "a zero-byte
+    /// budget".
+    ///
+    /// The entry count uses `0` to mean "this cache is disabled" and
+    /// short-circuits on it. A zero *byte* cap cannot mean the same thing:
+    /// the two knobs are independent, so an operator who sets
+    /// `GRAPH_MAX_MATRIX_ADJACENCIES=4` and leaves
+    /// `GRAPH_MAX_MATRIX_ADJACENCY_BYTES` at its default wants an entry-count
+    /// cap and no byte cap.
+    ///
+    /// Read as a literal budget it made every insert evict the whole cache,
+    /// pinned entries included, and then return `None`, so the cache stayed
+    /// empty and every load destroyed every other cell's cached matrix.
+    /// `usize::MAX` is how "no cap" is already spelled in this file:
+    /// [`Self::new`] passes it.
     pub(crate) fn new_with_byte_limit(
         max_entries: usize,
         max_entries_per_tenant: Option<usize>,
@@ -262,7 +277,11 @@ where
     ) -> Self {
         Self {
             max_entries,
-            max_resident_bytes,
+            max_resident_bytes: if max_resident_bytes == 0 {
+                usize::MAX
+            } else {
+                max_resident_bytes
+            },
             resident_bytes: 0,
             max_entries_per_tenant,
             clock: 0,
@@ -322,6 +341,15 @@ where
     ) -> Option<V> {
         if self.max_entries == 0 {
             metrics.record_quota_rejection();
+            return None;
+        }
+
+        // An entry larger than the whole budget can never be resident, so it
+        // is rejected here rather than inserted. Inserting it first would put
+        // the cache over budget, and the eviction loop would then throw away
+        // entries that had nothing to do with this one, including pinned
+        // ones, to make room for something that does not fit either.
+        if resident_bytes > self.max_resident_bytes {
             return None;
         }
 
@@ -422,5 +450,82 @@ where
                 self.tenant_entries.remove(tenant);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_limit_evicts_lru_entries() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
+        assert_eq!(
+            cache.insert_sized(1, "first", "cell", false, 60, &metrics),
+            Some("first")
+        );
+        assert_eq!(
+            cache.insert_sized(2, "second", "cell", false, 60, &metrics),
+            Some("second")
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.resident_bytes(), 60);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some("second"));
+    }
+
+    #[test]
+    fn oversized_entry_is_not_retained() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
+        assert_eq!(
+            cache.insert_sized(1, "oversized", "cell", true, 101, &metrics),
+            None
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
+    }
+
+    /// A zero byte cap means "no byte cap", the same way a zero entry-count
+    /// cap means "disabled", not "a zero-byte budget" that makes every insert
+    /// flush the cache.
+    #[test]
+    fn a_zero_byte_cap_means_no_byte_cap() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(4, None, 0);
+
+        assert_eq!(
+            cache.insert_sized(1, "first", "cell", true, 60, &metrics),
+            Some("first")
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&1), Some("first"));
+
+        assert_eq!(
+            cache.insert_sized(2, "second", "cell", false, 60, &metrics),
+            Some("second")
+        );
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&2), Some("second"));
+    }
+
+    /// An entry that cannot fit under the whole budget is rejected on its own.
+    /// It must not take the entries it could never have lived beside with it.
+    #[test]
+    fn an_oversized_entry_does_not_evict_the_entries_already_cached() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
+        assert_eq!(
+            cache.insert_sized(1, "first", "cell", false, 60, &metrics),
+            Some("first")
+        );
+        assert_eq!(
+            cache.insert_sized(2, "oversized", "cell", true, 101, &metrics),
+            None
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.resident_bytes(), 60);
+        assert_eq!(cache.get(&1), Some("first"));
     }
 }
