@@ -1,6 +1,6 @@
 # HydraDB
 
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![License: ELv2](https://img.shields.io/badge/license-ELv2-blue.svg)](LICENSE)
 [![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/HcBKJHXmnu)
 
@@ -478,4 +478,4 @@ should state the invariant they preserve and include a failure-oriented test.
 
 ## License
 
-HydraDB is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+HydraDB is licensed under the [Elastic License 2.0 (ELv2)](LICENSE).
