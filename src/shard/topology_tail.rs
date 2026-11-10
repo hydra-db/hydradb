@@ -17,6 +17,7 @@ impl GraphTopologyOverlay {
         self.states.entry(src).or_default().insert(dst, exists);
     }
 
+    #[cfg(feature = "opencypher")]
     pub(crate) fn state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
         self.states
             .get(&src)
@@ -26,7 +27,7 @@ impl GraphTopologyOverlay {
 
     /// Flat iteration over every `(src, dst, exists)` delta in the overlay.
     ///
-    /// The read path consumes the overlay through point lookups
+    /// The read path consumes the overlay through per-source lookups
     /// (`expand_range_with_overlay` below); the incremental index builder in
     /// `src/engine/index_store.rs` instead needs to walk every delta once to
     /// patch a decoded CSC adjacency, which is what this exposes.
@@ -43,7 +44,6 @@ impl GraphTopologyOverlay {
         u64::try_from(self.states.len()).unwrap_or(u64::MAX)
     }
 
-    #[cfg(feature = "opencypher")]
     pub(crate) fn out_neighbor_scan_work(&self, src: VertexId) -> u64 {
         self.states.get(&src).map_or(0, |destinations| {
             u64::try_from(destinations.len()).unwrap_or(u64::MAX)
@@ -69,7 +69,6 @@ impl GraphTopologyOverlay {
         self.in_neighbor_scan_work()
     }
 
-    #[cfg(feature = "opencypher")]
     pub(crate) fn apply_out_neighbors(
         &self,
         src: VertexId,
@@ -446,40 +445,25 @@ pub(crate) fn expand_range_with_overlay(
     let mut frontier = starts.iter().copied().collect::<BTreeSet<_>>();
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
-    let empty = BTreeMap::new();
 
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
         }
-        let frontier_values = frontier.iter().copied().collect::<Vec<_>>();
-        let base =
-            crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
-        edge_visits = edge_visits.saturating_add(base.edge_visits);
-        let mut next = base.vertices.into_iter().collect::<BTreeSet<_>>();
-
+        // Expand each frontier vertex on its own and union the results, as
+        // `expand_range_compiled_graphblas` does. A single kernel call over the
+        // whole frontier treats the frontier as already seen, which drops any
+        // edge whose endpoints are both frontier members (#69).
+        let mut next = BTreeSet::new();
         for src in &frontier {
-            let Some(changes) = overlay.states.get(src) else {
-                continue;
-            };
-            edge_visits = edge_visits.saturating_add(changes.len() as u64);
-            for (dst, exists) in changes {
-                if *exists {
-                    next.insert(*dst);
-                    continue;
-                }
-                if next.contains(dst)
-                    && !frontier.iter().any(|candidate| {
-                        overlay.state(*candidate, *dst).unwrap_or_else(|| {
-                            crate::sparse_kernel::compiled_graphblas_contains_edge(
-                                compiled, *candidate, *dst,
-                            )
-                        })
-                    })
-                {
-                    next.remove(dst);
-                }
-            }
+            let mut neighbors =
+                crate::sparse_kernel::compiled_graphblas_out_neighbors(compiled, *src)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+            edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+            edge_visits =
+                edge_visits.saturating_add(overlay.apply_out_neighbors(*src, &mut neighbors));
+            next.extend(neighbors);
         }
 
         if hop >= min_hops {
