@@ -2343,20 +2343,42 @@ impl GraphShard {
         let mut original_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
         let mut pending_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
         let mut original_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
+        // DELETE runs before buffered metadata is flushed. Remember its targets
+        // so SET/REMOVE cannot rewrite a deleted node or relationship afterward.
+        // Failed deletes return before either metadata buffer is flushed.
+        let mut deleted_vertices = BTreeSet::<VertexId>::new();
+        let mut deleted_relationships = BTreeSet::<BoundRelationship>::new();
 
-        for action in &query.actions {
+        let mut actions = query.actions.iter().peekable();
+        while let Some(action) = actions.next() {
             budget.check("cypher_mutation_action")?;
             match action {
                 RowMutationAction::DeleteBinding { binding, detach } => {
+                    let mut delete_bindings = vec![binding];
+                    while let Some(RowMutationAction::DeleteBinding {
+                        binding: next_binding,
+                        detach: next_detach,
+                    }) = actions.peek()
+                    {
+                        if next_detach != detach {
+                            break;
+                        }
+                        delete_bindings.push(next_binding);
+                        actions.next();
+                    }
                     let mut relationships = BTreeSet::new();
                     let mut vertices = BTreeSet::new();
-                    for row in &bindings {
-                        if let Some(relationship) = row.relationships.get(binding) {
-                            relationships.insert(relationship.clone());
-                        } else {
-                            vertices.insert(row.get(binding)?);
+                    for binding in delete_bindings {
+                        for row in &bindings {
+                            budget.check("cypher_delete_collect")?;
+                            if let Some(relationship) = row.relationships.get(binding) {
+                                relationships.insert(relationship.clone());
+                            } else {
+                                vertices.insert(row.get(binding)?);
+                            }
                         }
                     }
+                    deleted_relationships.extend(relationships.iter().cloned());
                     let deleted = self
                         .delete_bound_relationships_batch(
                             &context,
@@ -2369,26 +2391,24 @@ impl GraphShard {
                     result.noops = result.noops.saturating_add(deleted.already_deleted);
                     result.topology_sequence =
                         result.topology_sequence.max(deleted.topology_sequence);
+                    deleted_vertices.extend(vertices.iter().copied());
+                    let mut deletions = Vec::with_capacity(vertices.len());
                     for vertex_id in vertices {
                         budget.check("cypher_delete_vertex")?;
-                        let delete = if *detach {
-                            self.detach_delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!(
-                                    "{}.detach-delete-node.{vertex_id}",
-                                    context.idempotency_key
-                                ),
-                            )
-                            .await?
+                        let idempotency_key = if *detach {
+                            format!("{}.detach-delete-node.{vertex_id}", context.idempotency_key)
                         } else {
-                            self.delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!("{}.delete-node.{vertex_id}", context.idempotency_key),
-                            )
-                            .await?
+                            format!("{}.delete-node.{vertex_id}", context.idempotency_key)
                         };
+                        deletions.push((vertex_id, idempotency_key));
+                    }
+                    // Keep all vertex targets of DELETE in one graph transaction.
+                    // If any matched vertex cannot be deleted, the batch returns
+                    // an error before committing any of the matched vertices.
+                    for delete in self
+                        .delete_vertex_mutations_batch(&context.cell_id, deletions, *detach)
+                        .await?
+                    {
                         result.deleted_edges = result
                             .deleted_edges
                             .saturating_add(delete.incident_edges_deleted);
@@ -2420,6 +2440,7 @@ impl GraphShard {
                         };
                         relationships.insert(relationship.clone());
                     }
+                    deleted_relationships.extend(relationships.iter().cloned());
                     let deleted = self
                         .delete_bound_relationships_batch(
                             &context,
@@ -2464,6 +2485,9 @@ impl GraphShard {
 
         for (vertex_id, metadata) in pending_metadata {
             budget.check("cypher_set_vertex_metadata")?;
+            if deleted_vertices.contains(&vertex_id) {
+                continue;
+            }
             if original_metadata.get(&vertex_id) == Some(&metadata) {
                 result.noops = result.noops.saturating_add(1);
                 continue;
@@ -2474,6 +2498,12 @@ impl GraphShard {
         }
         for (relationship, metadata) in pending_edge_metadata {
             budget.check("cypher_set_relationship_metadata")?;
+            if deleted_relationships.contains(&relationship)
+                || deleted_vertices.contains(&relationship.src)
+                || deleted_vertices.contains(&relationship.dst)
+            {
+                continue;
+            }
             if original_edge_metadata.get(&relationship) == Some(&metadata) {
                 result.noops = result.noops.saturating_add(1);
                 continue;
