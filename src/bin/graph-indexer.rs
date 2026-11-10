@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env::VarError;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1259,9 +1260,9 @@ async fn main() -> RuntimeResult<()> {
         hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphIndexer))?;
     hydradb_telemetry::build_info::log();
 
-    let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
+    let data_path = env_value("GRAPH_DATA_PATH", "graph/data")?;
     let root_scope = graph_scope()?;
-    let cells = env_value("GRAPH_CELLS", "cell-0")
+    let cells = env_value("GRAPH_CELLS", "cell-0")?
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1271,7 +1272,7 @@ async fn main() -> RuntimeResult<()> {
         return Err("GRAPH_CELLS must contain at least one cell".into());
     }
     let interval =
-        Duration::from_millis(env_value("GRAPH_INDEXER_INTERVAL_MS", "5000").parse::<u64>()?);
+        Duration::from_millis(env_value("GRAPH_INDEXER_INTERVAL_MS", "5000")?.parse::<u64>()?);
     if interval.is_zero() {
         return Err("GRAPH_INDEXER_INTERVAL_MS must be greater than zero".into());
     }
@@ -1279,7 +1280,7 @@ async fn main() -> RuntimeResult<()> {
         env_value(
             "GRAPH_INDEXER_DIRTY_POLL_INTERVAL_MS",
             &DEFAULT_DIRTY_POLL_INTERVAL.as_millis().to_string(),
-        )
+        )?
         .parse::<u64>()?,
     );
     if !(MIN_DIRTY_POLL_INTERVAL..=MAX_DIRTY_POLL_INTERVAL).contains(&dirty_poll_interval) {
@@ -1290,7 +1291,7 @@ async fn main() -> RuntimeResult<()> {
         )
         .into());
     }
-    let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
+    let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1")?.parse::<usize>()?;
     let build_mode = IndexBuildMode::from_env()?;
     let planner_statistics = PlannerStatisticsPolicy::from_env()?;
     // Below this many edges the incremental path loses: the full scan rides
@@ -1300,11 +1301,11 @@ async fn main() -> RuntimeResult<()> {
     // MinIO: a 200k-edge graph rebuilt 2x faster full, a 1M-edge graph 3.8x
     // faster incrementally. Tune per deployment cache size.
     let incremental_min_edges =
-        env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
+        env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000")?.parse::<u64>()?;
     let scope_concurrency = env_value(
         "GRAPH_INDEXER_SCOPE_CONCURRENCY",
         &DEFAULT_SCOPE_CONCURRENCY.to_string(),
-    )
+    )?
     .parse::<usize>()?;
     if !(1..=MAX_SCOPE_CONCURRENCY).contains(&scope_concurrency) {
         return Err(format!(
@@ -1315,7 +1316,7 @@ async fn main() -> RuntimeResult<()> {
     let scopes_per_cycle = env_value(
         "GRAPH_INDEXER_SCOPES_PER_CYCLE",
         &DEFAULT_SCOPES_PER_CYCLE.to_string(),
-    )
+    )?
     .parse::<usize>()?;
     if !(scope_concurrency..=MAX_SCOPES_PER_CYCLE).contains(&scopes_per_cycle) {
         return Err(format!(
@@ -1326,7 +1327,7 @@ async fn main() -> RuntimeResult<()> {
     let readiness_failure_threshold = env_value(
         "GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD",
         &DEFAULT_READINESS_FAILURE_THRESHOLD.to_string(),
-    )
+    )?
     .parse::<u64>()?;
     if !(1..=MAX_READINESS_FAILURE_THRESHOLD).contains(&readiness_failure_threshold) {
         return Err(format!("GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD must be between 1 and {MAX_READINESS_FAILURE_THRESHOLD}").into());
@@ -1334,7 +1335,7 @@ async fn main() -> RuntimeResult<()> {
     let max_open_scopes = env_value(
         "GRAPH_INDEXER_MAX_OPEN_SCOPES",
         &DEFAULT_MAX_OPEN_SCOPES.to_string(),
-    )
+    )?
     .parse::<usize>()?;
     if !(scope_concurrency..=MAX_OPEN_SCOPES).contains(&max_open_scopes) {
         return Err(format!(
@@ -1352,15 +1353,16 @@ async fn main() -> RuntimeResult<()> {
     let max_wal_tail_files = env_value(
         "GRAPH_INDEXER_MAX_TAIL_FILES",
         &GraphLimits::default().max_wal_tail_files.to_string(),
-    )
+    )?
     .parse::<u64>()?;
     let slatedb_cache_bytes = env_value(
         "GRAPH_SLATE_DB_CACHE_BYTES",
         &(640usize * 1024 * 1024).to_string(),
-    )
+    )?
     .parse::<usize>()?;
     let open_options = indexer_open_options(max_wal_tail_files, slatedb_cache_bytes);
-    let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
+    let admin_addr =
+        env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091")?.parse::<SocketAddr>()?;
     let wake_token = read_indexer_wake_token()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
@@ -4419,26 +4421,48 @@ fn unix_time_ms() -> u64 {
 
 fn graph_scope() -> RuntimeResult<GraphScope> {
     let namespace = NamespacePath::new(
-        env_value("GRAPH_NAMESPACE", "default")
+        env_value("GRAPH_NAMESPACE", "default")?
             .split('/')
             .map(|segment| NamespaceId::new(segment.to_string()))
             .collect::<hydradb::Result<Vec<_>>>()?,
     )?;
     Ok(GraphScope::new(
         namespace,
-        GraphId::new(env_value("GRAPH_ID", "default"))?,
+        GraphId::new(env_value("GRAPH_ID", "default")?)?,
     ))
 }
 
-fn env_value(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+fn env_value(name: &str, default: &str) -> RuntimeResult<String> {
+    resolve_env_value(name, std::env::var(name), default)
+}
+
+/// Trims the value and treats empty as unset, as `graph-node` does. Split from
+/// [`env_value`] so the rule is testable without mutating process environment,
+/// which no parallel test may do.
+fn resolve_env_value(
+    name: &str,
+    raw: Result<String, VarError>,
+    default: &str,
+) -> RuntimeResult<String> {
+    match raw {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(default.to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        Err(VarError::NotPresent) => Ok(default.to_string()),
+        Err(VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8").into()),
+    }
 }
 
 fn read_indexer_wake_token() -> RuntimeResult<String> {
     let path = env_value(
         "GRAPH_AUTH_TOKEN_FILE",
         "/var/run/secrets/slatedb-graph/auth-token",
-    );
+    )?;
     let token = std::fs::read_to_string(&path)?.trim().to_string();
     if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
         return Err(format!(
@@ -4471,7 +4495,7 @@ impl IndexBuildMode {
     const VAR: &'static str = "GRAPH_INDEXER_BUILD_MODE";
 
     fn from_env() -> RuntimeResult<Self> {
-        Self::parse(&env_value(Self::VAR, "full"))
+        Self::parse(&env_value(Self::VAR, "full")?)
     }
 
     /// Split from [`Self::from_env`] so the accepted spellings are testable
@@ -4538,23 +4562,23 @@ impl PlannerStatisticsPolicy {
     fn from_env() -> RuntimeResult<Self> {
         let defaults = PlannerStatisticsBuildLimits::default();
         Self::parse(
-            &env_value(Self::VAR, "false"),
+            &env_value(Self::VAR, "false")?,
             &env_value(
                 Self::INTERVAL_VAR,
                 &Self::DEFAULT_INTERVAL.as_millis().to_string(),
-            ),
+            )?,
         )?
         .with_build_settings(
             &env_value(
                 Self::CONCURRENCY_VAR,
                 &Self::DEFAULT_CONCURRENCY.to_string(),
-            ),
+            )?,
             &env_value(
                 Self::TIMEOUT_VAR,
                 &Self::DEFAULT_BUILD_TIMEOUT.as_millis().to_string(),
-            ),
-            &env_value(Self::MAX_ENTRIES_VAR, &defaults.max_entries.to_string()),
-            &env_value(Self::EXACT_CAP_VAR, &defaults.exact_entries.to_string()),
+            )?,
+            &env_value(Self::MAX_ENTRIES_VAR, &defaults.max_entries.to_string())?,
+            &env_value(Self::EXACT_CAP_VAR, &defaults.exact_entries.to_string())?,
         )
     }
 
