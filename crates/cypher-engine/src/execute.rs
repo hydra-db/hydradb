@@ -4920,17 +4920,27 @@ fn evaluate_in_list(probe: EvaluatedValue, values: &[BoundValue]) -> EvaluatedVa
     if values.is_empty() {
         return EvaluatedValue::Truth(Some(false));
     }
-    let EvaluatedValue::Scalar(probe) = probe else {
+    if !matches!(
+        &probe,
+        EvaluatedValue::Scalar(_) | EvaluatedValue::Vertex(_)
+    ) {
         return EvaluatedValue::Truth(None);
-    };
+    }
     let mut saw_null = false;
     for candidate in values {
         match &candidate.value {
             ScalarValue::Null => saw_null = true,
-            value if scalar_values_equal(&probe, value) => {
-                return EvaluatedValue::Truth(Some(true))
+            value => {
+                let equal = match &probe {
+                    EvaluatedValue::Scalar(probe) => Some(scalar_values_equal(probe, value)),
+                    _ => evaluate_equal(probe.clone(), EvaluatedValue::Scalar(value.clone())),
+                };
+                match equal {
+                    Some(true) => return EvaluatedValue::Truth(Some(true)),
+                    None => saw_null = true,
+                    Some(false) => {}
+                }
             }
-            _ => {}
         }
     }
     EvaluatedValue::Truth(if saw_null { None } else { Some(false) })
