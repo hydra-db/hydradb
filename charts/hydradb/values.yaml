@@ -220,6 +220,10 @@ runtime:
   # accumulate. At the default replay concurrency, 128 is eight replay waves.
   maxWalFlushesBeforeL0Flush: 128
   l0FlushParallelism: 1
+  # A cap of 0 means "cache nothing", not "no limit": it disables that cache
+  # outright, so it stores nothing, evicts nothing, and every lookup falls
+  # through to the object store. The adjacency cache is off in the defaults
+  # below for that reason.
   maxMatrixAdjacencies: 0
   maxMatrixAdjacencyBytes: 0
   maxGraphblasMatrices: 16

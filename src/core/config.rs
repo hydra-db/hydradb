@@ -322,12 +322,23 @@ pub const DEFAULT_FENCE_BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphMemoryConfig {
     pub storage: GraphStorageMemoryConfig,
+    /// Resident-byte budget for the hydrated matrix adjacency cache. A budget
+    /// of zero disables that cache: nothing is stored, so lookups hydrate from
+    /// the object store, and no eviction work runs.
     pub max_matrix_adjacency_bytes: usize,
+    /// Resident-byte budget for the compiled GraphBLAS matrix cache. Zero
+    /// disables that cache, as above.
     pub max_graphblas_bytes: usize,
+    /// Resident-byte budget for the relationship rows cache. Zero disables
+    /// that cache, as above.
     #[cfg(feature = "opencypher")]
     pub max_relationship_rows_bytes: usize,
+    /// Resident-byte budget for the source relationship rows cache. Zero
+    /// disables that cache, as above.
     #[cfg(feature = "opencypher")]
     pub max_source_relationship_rows_bytes: usize,
+    /// Resident-byte budget for the relationship property rows cache. Zero
+    /// disables that cache, as above.
     #[cfg(feature = "opencypher")]
     pub max_relationship_property_rows_bytes: usize,
     pub max_concurrent_matrix_compilations: usize,
