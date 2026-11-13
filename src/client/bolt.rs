@@ -5,16 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use boltr::chunk::ChunkWriter;
 use boltr::error::BoltError;
-use boltr::message::encode::encode_server_message;
 use boltr::message::{ClientMessage, ServerMessage};
 use boltr::types::{BoltDict, BoltValue};
-use bytes::BytesMut;
+use hydradb_bolt_server::{
+    run_session, ConnectionGate, ConnectionPermit, Credentials, Interrupted, Outcome, SessionHandler, SessionIo, SessionLimits,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
@@ -23,48 +23,28 @@ use ulid::Ulid;
 use tracing::Instrument;
 
 use super::service::{
-    sanitize_caller_metadata, ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials,
-    ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
-    ClientReadConsistency, PreparedClientQuery,
+    sanitize_caller_metadata, ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest,
+    ClientQueryService, ClientQuerySession, ClientQueryTarget, ClientReadConsistency, PreparedClientQuery,
 };
 use crate::query::opencypher::{opencypher_query_fingerprint, opencypher_query_shape_for_log};
 use crate::QueryFailureReason;
 use crate::{
-    GraphError, GraphScope, QueryColumn, QueryCursorToken, QueryRow, QueryTransportAction,
+    GqlStatusReport, GraphError, GraphScope, QueryColumn, QueryCursorToken, QueryRow, QueryTransportAction,
     QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider, Result,
 };
 
 mod routing;
 mod values;
-mod wire;
 use routing::validate_bolt_routing_table;
-pub use routing::{
-    BoltReadRouting, BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
-    ObjectStoreBoltRoutingTableProvider,
-};
+pub use routing::{BoltReadRouting, BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, ObjectStoreBoltRoutingTableProvider};
 use values::{
-    bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt,
-    highest_matching_bookmark, query_value_to_bolt,
+    bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt, highest_matching_bookmark, query_value_to_bolt,
 };
-use wire::{bolt_server_handshake, read_bolt_messages};
 
-const BOLT_MAGIC: [u8; 4] = [0x60, 0x60, 0xb0, 0x17];
-const BOLT_MANIFEST_V1: [u8; 4] = [0x00, 0x00, 0x01, 0xff];
-const BOLT_NO_VERSION: [u8; 4] = [0, 0, 0, 0];
-const BOLT_SUPPORTED_VERSIONS: [(u8, u8); 4] = [(5, 4), (5, 3), (5, 2), (5, 1)];
-const DEFAULT_BOLT_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_BOLT_MAX_CONNECTIONS: usize = 1024;
-const DEFAULT_BOLT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_BOLT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOLT_GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(30);
-const DEFAULT_BOLT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const DEFAULT_BOLT_MAX_CONNECTION_AGE: Duration = Duration::from_secs(60 * 60);
-const DEFAULT_BOLT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOLT_ROUTING_TTL_SECS: i64 = 30;
 const DEFAULT_BOLT_PREFETCH_ROWS: usize = 256;
-const DEFAULT_BOLT_MAX_PIPELINED_MESSAGES: usize = 8;
-const MAX_BOLT_PIPELINE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-const BOLT_MAX_PACKSTREAM_DEPTH: usize = 32;
 const MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN: usize = 128;
 
 static NEXT_BOLT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -95,21 +75,22 @@ pub struct BoltServerConfig {
 
 impl BoltServerConfig {
     pub fn new(database_resolver: Arc<dyn ClientDatabaseResolver>) -> Self {
+        let limits = SessionLimits::default();
         Self {
             database_resolver,
             default_database: "default".to_string(),
             routing_ttl_secs: DEFAULT_BOLT_ROUTING_TTL_SECS,
             routing_servers: Vec::new(),
             routing_table_provider: None,
-            max_message_bytes: DEFAULT_BOLT_MAX_MESSAGE_BYTES,
+            max_message_bytes: limits.max_message_bytes,
             max_connections: DEFAULT_BOLT_MAX_CONNECTIONS,
             prefetch_rows: DEFAULT_BOLT_PREFETCH_ROWS,
-            max_pipelined_messages: DEFAULT_BOLT_MAX_PIPELINED_MESSAGES,
-            handshake_timeout: DEFAULT_BOLT_HANDSHAKE_TIMEOUT,
-            authentication_timeout: DEFAULT_BOLT_AUTHENTICATION_TIMEOUT,
-            idle_timeout: DEFAULT_BOLT_IDLE_TIMEOUT,
-            max_connection_age: DEFAULT_BOLT_MAX_CONNECTION_AGE,
-            write_timeout: DEFAULT_BOLT_WRITE_TIMEOUT,
+            max_pipelined_messages: limits.max_pipelined_messages,
+            handshake_timeout: limits.handshake_timeout,
+            authentication_timeout: limits.authentication_timeout,
+            idle_timeout: limits.idle_timeout,
+            max_connection_age: limits.max_connection_age,
+            write_timeout: limits.write_timeout,
             graceful_shutdown_timeout: DEFAULT_BOLT_GRACEFUL_SHUTDOWN,
             allow_plaintext: false,
             tls_config_provider: None,
@@ -131,10 +112,7 @@ impl BoltServerConfig {
         self
     }
 
-    pub fn with_routing_table_provider(
-        mut self,
-        provider: Arc<dyn BoltRoutingTableProvider>,
-    ) -> Self {
+    pub fn with_routing_table_provider(mut self, provider: Arc<dyn BoltRoutingTableProvider>) -> Self {
         self.routing_table_provider = Some(provider);
         self
     }
@@ -189,10 +167,7 @@ impl BoltServerConfig {
         self
     }
 
-    pub fn with_tls_provider(
-        mut self,
-        provider: Arc<dyn QueryTransportTlsServerConfigProvider>,
-    ) -> Self {
+    pub fn with_tls_provider(mut self, provider: Arc<dyn QueryTransportTlsServerConfigProvider>) -> Self {
         self.tls_config_provider = Some(provider);
         self
     }
@@ -212,46 +187,32 @@ impl BoltServerConfig {
         if !self.routing_servers.is_empty() {
             validate_bolt_routing_table(self.routing_ttl_secs, &self.routing_servers)?;
         }
-        if self.max_message_bytes == 0
-            || self.max_connections == 0
-            || self.prefetch_rows == 0
-            || self.max_pipelined_messages == 0
-        {
-            return bolt_config_error(
-                "message, connection, prefetch, and pipeline limits must be greater than zero",
-            );
+        if self.max_message_bytes == 0 || self.max_connections == 0 || self.prefetch_rows == 0 || self.max_pipelined_messages == 0 {
+            return bolt_config_error("message, connection, prefetch, and pipeline limits must be greater than zero");
         }
-        let buffered_bytes = self
-            .max_message_bytes
-            .checked_mul(self.max_pipelined_messages)
-            .and_then(|bytes| bytes.checked_mul(2))
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::InvalidRequest,
-                dialect: "Bolt",
-                feature: "Bolt pipeline byte budget overflows usize".to_string(),
-            })?;
-        if buffered_bytes > MAX_BOLT_PIPELINE_BUFFER_BYTES {
-            return bolt_config_error(
-                "message size and pipeline depth can buffer more than 64 MiB per connection",
-            );
+        if let Err(error) = self.session_limits().validate() {
+            return bolt_config_error(&error.to_string());
         }
-        if self.handshake_timeout.is_zero()
-            || self.authentication_timeout.is_zero()
-            || self.idle_timeout.is_zero()
-            || self.max_connection_age.is_zero()
-            || self.write_timeout.is_zero()
-            || self.graceful_shutdown_timeout.is_zero()
-        {
+        if self.graceful_shutdown_timeout.is_zero() {
             return bolt_config_error("Bolt connection timeouts must be greater than zero");
         }
         if self.tls_config_provider.is_none() && !self.allow_plaintext {
-            return bolt_config_error(
-                "Bolt requires TLS unless plaintext is explicitly enabled for development",
-            );
+            return bolt_config_error("Bolt requires TLS unless plaintext is explicitly enabled for development");
         }
-        self.database_resolver
-            .resolve_database(Some(&self.default_database))?;
+        self.database_resolver.resolve_database(Some(&self.default_database))?;
         Ok(())
+    }
+
+    fn session_limits(&self) -> SessionLimits {
+        SessionLimits {
+            max_message_bytes: self.max_message_bytes,
+            max_pipelined_messages: self.max_pipelined_messages,
+            handshake_timeout: self.handshake_timeout,
+            authentication_timeout: self.authentication_timeout,
+            idle_timeout: self.idle_timeout,
+            max_connection_age: self.max_connection_age,
+            write_timeout: self.write_timeout,
+        }
     }
 }
 
@@ -316,21 +277,13 @@ impl Drop for BoltServerHandle {
 pub struct ClientBoltServer;
 
 impl ClientBoltServer {
-    pub async fn bind(
-        addr: SocketAddr,
-        service: ClientQueryService,
-        config: BoltServerConfig,
-    ) -> Result<BoltServerHandle> {
+    pub async fn bind(addr: SocketAddr, service: ClientQueryService, config: BoltServerConfig) -> Result<BoltServerHandle> {
         config.validate()?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|err| bolt_io_error("bind", err))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|err| bolt_io_error("local_addr", err))?;
+        let listener = TcpListener::bind(addr).await.map_err(|err| bolt_io_error("bind", err))?;
+        let local_addr = listener.local_addr().map_err(|err| bolt_io_error("local_addr", err))?;
         let config = Arc::new(config);
         let metrics = Arc::new(BoltServerMetrics::default());
-        let connection_gate = Arc::new(Semaphore::new(config.max_connections));
+        let connection_gate = ConnectionGate::new(config.max_connections);
         let (stop_tx, stop_rx) = watch::channel(false);
         let task = tokio::spawn(run_bolt_server(
             listener,
@@ -354,7 +307,7 @@ async fn run_bolt_server(
     service: ClientQueryService,
     config: Arc<BoltServerConfig>,
     metrics: Arc<BoltServerMetrics>,
-    connection_gate: Arc<Semaphore>,
+    connection_gate: ConnectionGate,
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
@@ -374,9 +327,9 @@ async fn run_bolt_server(
                         continue;
                     }
                 };
-                let permit = match Arc::clone(&connection_gate).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
+                let permit = match connection_gate.try_acquire() {
+                    Some(permit) => permit,
+                    None => {
                         metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -400,10 +353,7 @@ async fn run_bolt_server(
         }
     }
     let graceful = async { while connections.join_next().await.is_some() {} };
-    if tokio::time::timeout(config.graceful_shutdown_timeout, graceful)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(config.graceful_shutdown_timeout, graceful).await.is_err() {
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
@@ -416,13 +366,11 @@ async fn serve_bolt_connection(
     service: ClientQueryService,
     config: Arc<BoltServerConfig>,
     metrics: Arc<BoltServerMetrics>,
-    _permit: OwnedSemaphorePermit,
+    _permit: ConnectionPermit,
     authentication_deadline: Instant,
 ) {
     metrics.active_connections.fetch_add(1, Ordering::Relaxed);
-    let result =
-        serve_bolt_connection_inner(stream, peer_addr, service, config, authentication_deadline)
-            .await;
+    let result = serve_bolt_connection_inner(stream, peer_addr, service, config, authentication_deadline).await;
     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
     if let Err(err) = result {
         if matches!(err, BoltError::Protocol(_)) {
@@ -440,39 +388,24 @@ async fn serve_bolt_connection_inner(
     authentication_deadline: Instant,
 ) -> std::result::Result<(), BoltError> {
     stream.set_nodelay(true)?;
-    let (mut io, identity): (Box<dyn BoltIo>, QueryTransportConnectionIdentity) =
-        match &config.tls_config_provider {
-            Some(provider) => {
-                let server_config = provider
-                    .current_server_config()
-                    .map_err(|err| BoltError::Backend(err.to_string()))?;
-                let tls_stream = tokio::time::timeout_at(
-                    std::cmp::min(
-                        Instant::now() + config.handshake_timeout,
-                        authentication_deadline,
-                    ),
-                    TlsAcceptor::from(server_config).accept(stream),
-                )
-                .await
-                .map_err(|_| BoltError::Protocol("TLS handshake timed out".to_string()))?
-                .map_err(|err| BoltError::Io(std::io::Error::other(err)))?;
-                let identity = bolt_tls_identity(&tls_stream);
-                (Box::new(tls_stream), identity)
-            }
-            None => (
-                Box::new(stream),
-                QueryTransportConnectionIdentity::default(),
-            ),
-        };
-    tokio::time::timeout_at(
-        std::cmp::min(
-            Instant::now() + config.handshake_timeout,
-            authentication_deadline,
-        ),
-        bolt_server_handshake(&mut *io),
-    )
-    .await
-    .map_err(|_| BoltError::Protocol("Bolt handshake timed out".to_string()))??;
+    let (mut io, identity): (Box<dyn BoltIo>, QueryTransportConnectionIdentity) = match &config.tls_config_provider {
+        Some(provider) => {
+            let server_config = provider
+                .current_server_config()
+                .map_err(|err| BoltError::Backend(err.to_string()))?;
+            let tls_stream = tokio::time::timeout_at(
+                std::cmp::min(Instant::now() + config.handshake_timeout, authentication_deadline),
+                TlsAcceptor::from(server_config).accept(stream),
+            )
+            .await
+            .map_err(|_| BoltError::Protocol("TLS handshake timed out".to_string()))?
+            .map_err(|err| BoltError::Io(std::io::Error::other(err)))?;
+            let identity = bolt_tls_identity(&tls_stream);
+            (Box::new(tls_stream), identity)
+        }
+        None => (Box::new(stream), QueryTransportConnectionIdentity::default()),
+    };
+    hydradb_bolt_server::handshake(&mut *io, config.handshake_timeout, authentication_deadline).await?;
 
     let context = Arc::new(BoltConnectionContext::new(
         service,
@@ -483,27 +416,20 @@ async fn serve_bolt_connection_inner(
         config.routing_table_provider.clone(),
         identity,
     ));
-    run_bolt_protocol(
-        io,
-        peer_addr,
+    let handler = BoltConnectionHandler {
         context,
-        config.as_ref(),
-        authentication_deadline,
-    )
-    .await
+        session: BoltProtocolSession::new(),
+        prefetch_rows: config.prefetch_rows,
+    };
+    run_session(io, peer_addr, handler, config.session_limits(), authentication_deadline).await
 }
 
-fn bolt_tls_identity<S>(
-    stream: &tokio_rustls::server::TlsStream<S>,
-) -> QueryTransportConnectionIdentity {
+fn bolt_tls_identity<S>(stream: &tokio_rustls::server::TlsStream<S>) -> QueryTransportConnectionIdentity {
     let mut identity = QueryTransportConnectionIdentity::default();
     let (_, connection) = stream.get_ref();
     if let Some(certificates) = connection.peer_certificates() {
         for (index, certificate) in certificates.iter().enumerate() {
-            let fingerprint = format!(
-                "sha256:{}",
-                lowercase_hex(&Sha256::digest(certificate.as_ref()))
-            );
+            let fingerprint = format!("sha256:{}", lowercase_hex(&Sha256::digest(certificate.as_ref())));
             if index == 0 {
                 identity.tls_peer_leaf_fingerprint = Some(fingerprint.clone());
             }
@@ -555,15 +481,6 @@ impl BoltConnectionContext {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum BoltState {
-    Negotiation,
-    Authentication,
-    Ready,
-    Streaming,
-    Failed,
-}
-
 struct BoltProtocolSession {
     id: String,
     authenticated: Option<ClientQuerySession>,
@@ -575,10 +492,7 @@ struct BoltProtocolSession {
 impl BoltProtocolSession {
     fn new() -> Self {
         Self {
-            id: format!(
-                "bolt-{}",
-                NEXT_BOLT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-            ),
+            id: format!("bolt-{}", NEXT_BOLT_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
             authenticated: None,
             database: None,
             next_query: 1,
@@ -623,13 +537,12 @@ struct PendingBoltResult {
     rows: VecDeque<QueryRow>,
     next_cursor: Option<QueryCursorToken>,
     bookmark: Option<ClientBookmark>,
+    /// The outcome's GQL-status objects, from the first page that carries
+    /// them; sent as `statuses` in the final SUCCESS.
+    statuses: Vec<GqlStatusReport>,
 }
 
-enum PageAwaitResult {
-    Complete(Result<ClientQueryPage>),
-    Reset,
-    Goodbye,
-}
+type PageAwaitResult = Interrupted<Result<Box<ClientQueryPage>>>;
 
 #[derive(Clone, Copy)]
 enum BoltRecordDisposition {
@@ -637,553 +550,284 @@ enum BoltRecordDisposition {
     Discard,
 }
 
-struct BoltReaderTask(JoinHandle<()>);
-
-impl BoltReaderTask {
-    fn new(task: JoinHandle<()>) -> Self {
-        Self(task)
-    }
-
-    async fn stop(mut self) {
-        self.0.abort();
-        let _ = (&mut self.0).await;
-    }
-}
-
-impl Drop for BoltReaderTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-struct BoltMessageWriter<W> {
-    writer: ChunkWriter<W>,
-    timeout: Duration,
-}
-
-impl<W> BoltMessageWriter<W>
-where
-    W: AsyncWrite + Unpin,
-{
-    fn new(writer: W, timeout: Duration) -> Self {
-        Self {
-            writer: ChunkWriter::new(writer),
-            timeout,
-        }
-    }
-
-    async fn send(&mut self, message: &ServerMessage) -> std::result::Result<(), BoltError> {
-        let mut bytes = BytesMut::new();
-        encode_server_message(&mut bytes, message);
-        tokio::time::timeout(self.timeout, async {
-            self.writer.write_message(&bytes).await?;
-            self.writer.flush().await
-        })
-        .await
-        .map_err(|_| {
-            BoltError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Bolt response write timed out",
-            ))
-        })?
-    }
-}
-
-struct BoltConnectionChannels<'a, W> {
-    message_rx: &'a mut mpsc::Receiver<std::result::Result<ClientMessage, BoltError>>,
-    queued: &'a mut VecDeque<ClientMessage>,
-    writer: &'a mut BoltMessageWriter<W>,
-    max_queued_messages: usize,
-}
-
-async fn run_bolt_protocol(
-    io: Box<dyn BoltIo>,
-    peer_addr: SocketAddr,
+/// graph-node's half of one Bolt connection: authentication against the
+/// query service, and RUN, PULL, DISCARD and ROUTE.
+struct BoltConnectionHandler {
     context: Arc<BoltConnectionContext>,
-    config: &BoltServerConfig,
-    mut authentication_deadline: Instant,
-) -> std::result::Result<(), BoltError> {
-    let (read_half, write_half) = tokio::io::split(io);
-    let (message_tx, mut message_rx) = mpsc::channel(config.max_pipelined_messages);
-    let reader_task = BoltReaderTask::new(tokio::spawn(read_bolt_messages(
-        read_half,
-        message_tx,
-        config.max_message_bytes,
-    )));
-    let mut writer = BoltMessageWriter::new(write_half, config.write_timeout);
-    let mut queued = VecDeque::new();
-    let mut state = BoltState::Negotiation;
-    let mut session = BoltProtocolSession::new();
-    let connection_deadline = Instant::now() + config.max_connection_age;
+    session: BoltProtocolSession,
+    prefetch_rows: usize,
+}
 
-    loop {
-        let now = Instant::now();
-        if now >= connection_deadline {
-            break;
-        }
-        if session.authenticated.is_none() && now >= authentication_deadline {
-            return Err(BoltError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Bolt authentication timeout elapsed",
-            )));
-        }
-        let incoming = match queued.pop_front() {
-            Some(message) => Some(Ok(message)),
-            None => {
-                tokio::select! {
-                    incoming = message_rx.recv() => incoming,
-                    _ = tokio::time::sleep(config.idle_timeout), if session.authenticated.is_some() => {
-                        return Err(BoltError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Bolt connection idle timeout elapsed",
-                        )));
-                    }
-                    _ = tokio::time::sleep_until(authentication_deadline), if session.authenticated.is_none() => {
-                        return Err(BoltError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Bolt authentication timeout elapsed",
-                        )));
-                    }
-                    _ = tokio::time::sleep_until(connection_deadline) => break,
-                }
-            }
-        };
-        let message = match incoming {
-            Some(Ok(message)) => message,
-            Some(Err(error)) => {
-                send_bolt_failure(&mut writer, &error).await?;
-                state = BoltState::Failed;
-                continue;
-            }
-            None => break,
-        };
+impl SessionHandler for BoltConnectionHandler {
+    fn server_agent(&self) -> String {
+        hydradb_protocol::bolt::server_agent(env!("CARGO_PKG_VERSION"))
+    }
 
-        if state == BoltState::Failed {
-            match message {
-                ClientMessage::Reset => {
-                    clear_pending_result(&context, &mut session).await;
-                    send_bolt_success(&mut writer, BoltDict::new()).await?;
-                    state = if session.authenticated.is_some() {
-                        BoltState::Ready
-                    } else {
-                        BoltState::Authentication
-                    };
-                }
-                ClientMessage::Goodbye => {
-                    clear_pending_result(&context, &mut session).await;
-                    break;
-                }
-                _ => send_bolt_message(&mut writer, &ServerMessage::Ignored).await?,
-            }
-            continue;
-        }
+    fn connection_id(&self) -> String {
+        self.session.id.clone()
+    }
 
-        match (state, message) {
-            (BoltState::Negotiation, ClientMessage::Hello { .. }) => {
-                send_bolt_success(
-                    &mut writer,
-                    BoltDict::from([
-                        (
-                            "server".to_string(),
-                            BoltValue::String(format!(
-                                "SlateDBGraph/{}",
-                                env!("CARGO_PKG_VERSION")
-                            )),
-                        ),
-                        (
-                            "connection_id".to_string(),
-                            BoltValue::String(session.id.clone()),
-                        ),
-                        ("hints".to_string(), BoltValue::Dict(BoltDict::new())),
-                    ]),
-                )
-                .await?;
-                state = BoltState::Authentication;
+    fn is_authenticated(&self) -> bool {
+        self.session.authenticated.is_some()
+    }
+
+    fn logon(&mut self, credentials: Credentials) -> bool {
+        match self
+            .context
+            .service
+            .authenticate(&bolt_client_credentials(credentials), &self.context.identity)
+        {
+            Ok(authenticated) => {
+                self.session.authenticated = Some(authenticated);
+                true
             }
-            (BoltState::Authentication, ClientMessage::Logon { auth }) => {
-                let credentials = match bolt_client_credentials(&auth) {
-                    Ok(credentials) => credentials,
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        break;
-                    }
-                };
-                match context
-                    .service
-                    .authenticate(&credentials, &context.identity)
-                {
-                    Ok(authenticated) => {
-                        session.authenticated = Some(authenticated);
-                        send_bolt_success(&mut writer, BoltDict::new()).await?;
-                        state = BoltState::Ready;
-                    }
-                    Err(_) => {
-                        send_bolt_failure(
-                            &mut writer,
-                            &BoltError::Authentication("invalid credentials".to_string()),
-                        )
-                        .await?;
-                        break;
-                    }
-                }
-            }
-            (_, ClientMessage::Goodbye) => {
-                clear_pending_result(&context, &mut session).await;
-                break;
-            }
-            (BoltState::Ready, ClientMessage::Reset)
-            | (BoltState::Streaming, ClientMessage::Reset) => {
-                clear_pending_result(&context, &mut session).await;
-                send_bolt_success(&mut writer, BoltDict::new()).await?;
-                state = BoltState::Ready;
-            }
-            (BoltState::Ready, ClientMessage::Logoff) => {
-                clear_pending_result(&context, &mut session).await;
-                session.authenticated = None;
-                session.database = None;
-                authentication_deadline = Instant::now() + config.authentication_timeout;
-                send_bolt_success(&mut writer, BoltDict::new()).await?;
-                state = BoltState::Authentication;
-            }
-            (
-                BoltState::Ready,
-                ClientMessage::Run {
-                    query,
-                    parameters,
-                    extra,
-                },
-            ) => {
-                // Read before `extra` is consumed below. A malformed
-                // `tx_metadata` is reported by `prepare_bolt_run` a line later
-                // with the right error; there is nothing useful to say about it
-                // twice.
-                let inbound_traceparent = bolt_traceparent(&extra).ok().flatten();
-                let query_fingerprint = opencypher_query_fingerprint(&query);
-                // Kept for the preparation-failure arm below, which names the
-                // statement it could not run; `query` itself moves into the
-                // request. Taken as the shape rather than as a copy of the
-                // text: this is held across preparation, and a RUN may carry a
-                // statement up to the 2 MiB message limit on each of the
-                // connections the listener allows, whereas the shape is capped
-                // at 4 KiB.
-                let query_shape = opencypher_query_shape_for_log(&query);
-                // Opened before anything can reject the request, and from the
-                // `db` name alone, so that a RUN which never becomes a
-                // statement is still attributed to the tenant that sent it.
-                let run_span = bolt_run_span(&session, &context, &extra);
-                run_span.record("hydradb.query.fingerprint", query_fingerprint.as_str());
-                crate::core::trace_context::adopt_remote_parent(
-                    &run_span,
-                    inbound_traceparent.as_deref(),
-                );
-                let (authenticated, database, request) = match run_span
-                    .in_scope(|| prepare_bolt_run(&mut session, &context, query, parameters, extra))
-                {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        run_span.in_scope(|| {
-                            tracing::warn!(target: "hydradb", error = %error, "Bolt RUN rejected");
-                        });
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let prepared = match context
-                    .service
-                    .prepare_page_request(&authenticated, request, config.prefetch_rows)
-                    .instrument(run_span.clone())
-                    .await
-                {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        run_span.record("error.class", error.class());
-                        run_span.in_scope(|| {
-                            // A query-class failure (unsupported, parse,
-                            // missing parameter) is about the statement, so the
-                            // line names it: the literal-free shape plus the
-                            // same closed reason the failure counter uses.
-                            // Everything else -- timeouts, freshness, storage
-                            // -- is not, and keeps the short line.
-                            match error.failure_reason() {
-                                Some(reason) => tracing::warn!(
-                                    target: "hydradb",
-                                    error = %error,
-                                    failure_reason = reason.as_str(),
-                                    cypher_engine = context.service.cypher_engine().as_str(),
-                                    query_shape = %query_shape,
-                                    "Bolt RUN preparation failed"
-                                ),
-                                None => tracing::warn!(
-                                    target: "hydradb",
-                                    error = %error,
-                                    "Bolt RUN preparation failed"
-                                ),
-                            }
-                        });
-                        send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let query_deadline = Instant::now()
-                    + Duration::from_millis(
-                        prepared
-                            .request
-                            .max_runtime_ms
-                            .expect("Bolt requests are normalized before execution"),
-                    );
-                let fields = prepared
-                    .columns
-                    .iter()
-                    .map(|column| BoltValue::String(column.name.clone()))
-                    .collect();
-                send_bolt_success(
-                    &mut writer,
-                    BoltDict::from([
-                        ("fields".to_string(), BoltValue::List(fields)),
-                        ("t_first".to_string(), BoltValue::Integer(0)),
-                        ("db".to_string(), BoltValue::String(database.clone())),
-                    ]),
-                )
-                .await?;
-                // Opened here, at RUN, and not at the execution boundary the
-                // PULLs land on: one statement is one trace, however many
-                // pages the client chooses to pull.
-                let statement_span = crate::client::service::client_root_span(
-                    &prepared.request,
-                    Some(prepared.action),
-                );
-                // Join the caller's trace if they sent one, before the span is
-                // ever entered. This is the ingestion-to-HydraDB edge; the
-                // node-to-node edge is the transport's own `traceparent` field.
-                crate::core::trace_context::adopt_remote_parent(
-                    &statement_span,
-                    inbound_traceparent.as_deref(),
-                );
-                session.pending = Some(PendingBoltResult {
-                    database,
-                    columns: prepared.columns.clone(),
-                    prepared,
-                    deadline: query_deadline,
-                    started: false,
-                    pages: 0,
-                    statement_span,
-                    rows: VecDeque::new(),
-                    next_cursor: None,
-                    bookmark: None,
-                });
-                state = BoltState::Streaming;
-            }
-            (BoltState::Streaming, ClientMessage::Pull { extra }) => {
-                let n = match bolt_stream_count(&extra, "PULL") {
-                    Ok(n) => n,
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let authenticated = match session.authenticated() {
-                    Ok(authenticated) => authenticated,
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let Some(pending) = session.pending.as_mut() else {
-                    let error = BoltError::Protocol("no pending result".to_string());
-                    send_bolt_failure(&mut writer, &error).await?;
-                    state = BoltState::Failed;
-                    continue;
-                };
-                let pull_result = {
-                    let mut channels = BoltConnectionChannels {
-                        message_rx: &mut message_rx,
-                        queued: &mut queued,
-                        writer: &mut writer,
-                        max_queued_messages: config.max_pipelined_messages,
-                    };
-                    consume_bolt_records(
-                        &context,
-                        &authenticated,
-                        pending,
-                        n,
-                        config.prefetch_rows,
-                        BoltRecordDisposition::Send,
-                        &mut channels,
-                    )
-                    .await
-                };
-                match pull_result {
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Complete(Ok(_))) => {
-                        let pending = session
-                            .pending
-                            .as_ref()
-                            .expect("PULL keeps pending state until summary");
-                        let has_more = !pending.rows.is_empty() || pending.next_cursor.is_some();
-                        let metadata = bolt_result_summary_metadata(pending, has_more);
-                        send_bolt_success(&mut writer, metadata).await?;
-                        if !has_more {
-                            clear_pending_result(&context, &mut session).await;
-                            state = BoltState::Ready;
-                        }
-                    }
-                    Ok(PageAwaitResult::Complete(Err(error))) => {
-                        send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Reset) => {
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Ready;
-                    }
-                    Ok(PageAwaitResult::Goodbye) => break,
-                }
-            }
-            (BoltState::Streaming, ClientMessage::Discard { extra }) => {
-                let count = match bolt_stream_count(&extra, "DISCARD") {
-                    Ok(count) => count,
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let authenticated = match session.authenticated() {
-                    Ok(authenticated) => authenticated,
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    }
-                };
-                let Some(pending) = session.pending.as_mut() else {
-                    let error = BoltError::Protocol("no pending result".to_string());
-                    send_bolt_failure(&mut writer, &error).await?;
-                    state = BoltState::Failed;
-                    continue;
-                };
-                let discard_result = {
-                    let mut channels = BoltConnectionChannels {
-                        message_rx: &mut message_rx,
-                        queued: &mut queued,
-                        writer: &mut writer,
-                        max_queued_messages: config.max_pipelined_messages,
-                    };
-                    consume_bolt_records(
-                        &context,
-                        &authenticated,
-                        pending,
-                        count,
-                        config.prefetch_rows,
-                        BoltRecordDisposition::Discard,
-                        &mut channels,
-                    )
-                    .await
-                };
-                match discard_result {
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Complete(Ok(_))) => {
-                        let pending = session
-                            .pending
-                            .as_ref()
-                            .expect("DISCARD keeps pending state until summary");
-                        let has_more = !pending.rows.is_empty() || pending.next_cursor.is_some();
-                        send_bolt_success(
-                            &mut writer,
-                            bolt_result_summary_metadata(pending, has_more),
-                        )
-                        .await?;
-                        if !has_more {
-                            clear_pending_result(&context, &mut session).await;
-                            state = BoltState::Ready;
-                        }
-                    }
-                    Ok(PageAwaitResult::Complete(Err(error))) => {
-                        send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Reset) => {
-                        clear_pending_result(&context, &mut session).await;
-                        state = BoltState::Ready;
-                    }
-                    Ok(PageAwaitResult::Goodbye) => break,
-                }
-            }
-            (
-                BoltState::Ready,
-                ClientMessage::Route {
-                    bookmarks, extra, ..
-                },
-            ) => {
-                let route_span = bolt_route_span(&session, &context, &extra);
-                match prepare_bolt_route(&session, &context, bookmarks, &extra)
-                    .instrument(route_span.clone())
-                    .await
-                {
-                    Ok(routing_table) => {
-                        send_bolt_success(
-                            &mut writer,
-                            BoltDict::from([("rt".to_string(), BoltValue::Dict(routing_table))]),
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        route_span.in_scope(|| {
-                            tracing::warn!(target: "hydradb", error = %error, "Bolt ROUTE rejected");
-                        });
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                    }
-                }
-            }
-            (BoltState::Ready, ClientMessage::Telemetry { .. }) => {
-                send_bolt_success(&mut writer, BoltDict::new()).await?;
-            }
-            (
-                BoltState::Ready,
-                ClientMessage::Begin { .. } | ClientMessage::Commit | ClientMessage::Rollback,
-            ) => {
-                send_bolt_failure(&mut writer, &explicit_transactions_unsupported()).await?;
-                state = BoltState::Failed;
-            }
-            _ => {
-                send_bolt_failure(
-                    &mut writer,
-                    &BoltError::Protocol(
-                        "message is invalid in the current Bolt state".to_string(),
-                    ),
-                )
-                .await?;
-                state = BoltState::Failed;
-            }
+            Err(_) => false,
         }
     }
 
-    clear_pending_result(&context, &mut session).await;
-    reader_task.stop().await;
-    tracing::debug!(target: "hydradb", %peer_addr, "Bolt session closed");
-    Ok(())
+    fn logoff(&mut self) {
+        self.session.authenticated = None;
+        self.session.database = None;
+    }
+
+    async fn clear_pending_result(&mut self) {
+        clear_pending_result(&self.context, &mut self.session).await;
+    }
+
+    async fn handle<W>(&mut self, message: ClientMessage, io: &mut SessionIo<W>) -> std::result::Result<Outcome, BoltError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        match message {
+            ClientMessage::Run { query, parameters, extra } => self.run(query, parameters, extra, io).await,
+            ClientMessage::Pull { extra } => self.consume(&extra, "PULL", BoltRecordDisposition::Send, io).await,
+            ClientMessage::Discard { extra } => self.consume(&extra, "DISCARD", BoltRecordDisposition::Discard, io).await,
+            ClientMessage::Route { bookmarks, extra, .. } => self.route(bookmarks, extra, io).await,
+            // BEGIN, COMMIT and ROLLBACK: the session hands over nothing else.
+            // Production clients reach graph-node through the turbolay proxy,
+            // which serves a single-statement transaction as an auto-commit
+            // RUN, so no transaction arrives here from it.
+            _ => {
+                io.failure(&explicit_transactions_unsupported()).await?;
+                Ok(Outcome::Failed)
+            }
+        }
+    }
+}
+
+impl BoltConnectionHandler {
+    async fn run<W>(
+        &mut self,
+        query: String,
+        parameters: BoltDict,
+        extra: BoltDict,
+        io: &mut SessionIo<W>,
+    ) -> std::result::Result<Outcome, BoltError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        let session = &mut self.session;
+        let context = &self.context;
+        // Read before `extra` is consumed below. A malformed
+        // `tx_metadata` is reported by `prepare_bolt_run` a line later
+        // with the right error; there is nothing useful to say about it
+        // twice.
+        let inbound_traceparent = bolt_traceparent(&extra).ok().flatten();
+        let query_fingerprint = opencypher_query_fingerprint(&query);
+        // Kept for the preparation-failure arm below, which names the
+        // statement it could not run; `query` itself moves into the
+        // request. Taken as the shape rather than as a copy of the
+        // text: this is held across preparation, and a RUN may carry a
+        // statement up to the 2 MiB message limit on each of the
+        // connections the listener allows, whereas the shape is capped
+        // at 4 KiB.
+        let query_shape = opencypher_query_shape_for_log(&query);
+        // Opened before anything can reject the request, and from the
+        // `db` name alone, so that a RUN which never becomes a
+        // statement is still attributed to the tenant that sent it.
+        let run_span = bolt_run_span(session, context, &extra);
+        run_span.record("hydradb.query.fingerprint", query_fingerprint.as_str());
+        crate::core::trace_context::adopt_remote_parent(&run_span, inbound_traceparent.as_deref());
+        let (authenticated, database, request) = match run_span.in_scope(|| prepare_bolt_run(session, context, query, parameters, extra)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                run_span.in_scope(|| {
+                    tracing::warn!(target: "hydradb", error = %error, "Bolt RUN rejected");
+                });
+                io.failure(&error).await?;
+                return Ok(Outcome::Failed);
+            }
+        };
+        let prepared = match context
+            .service
+            .prepare_page_request(&authenticated, request, self.prefetch_rows, false)
+            .instrument(run_span.clone())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                run_span.record("error.class", error.class());
+                run_span.in_scope(|| {
+                    // A query-class failure (unsupported, parse,
+                    // missing parameter) is about the statement, so the
+                    // line names it: the literal-free shape plus the
+                    // same closed reason the failure counter uses.
+                    // Everything else -- timeouts, freshness, storage
+                    // -- is not, and keeps the short line.
+                    match error.failure_reason() {
+                        Some(reason) => tracing::warn!(
+                            target: "hydradb",
+                            error = %error,
+                            failure_reason = reason.as_str(),
+                            cypher_engine = context.service.cypher_engine().as_str(),
+                            query_shape = %query_shape,
+                            "Bolt RUN preparation failed"
+                        ),
+                        None => tracing::warn!(
+                            target: "hydradb",
+                            error = %error,
+                            "Bolt RUN preparation failed"
+                        ),
+                    }
+                });
+                send_bolt_graph_failure(io, error).await?;
+                return Ok(Outcome::Failed);
+            }
+        };
+        let query_deadline = Instant::now()
+            + Duration::from_millis(
+                prepared
+                    .request
+                    .max_runtime_ms
+                    .expect("Bolt requests are normalized before execution"),
+            );
+        let fields = prepared
+            .columns
+            .iter()
+            .map(|column| BoltValue::String(column.name.clone()))
+            .collect();
+        io.success(BoltDict::from([
+            ("fields".to_string(), BoltValue::List(fields)),
+            ("t_first".to_string(), BoltValue::Integer(0)),
+            ("db".to_string(), BoltValue::String(database.clone())),
+        ]))
+        .await?;
+        // Opened here, at RUN, and not at the execution boundary the
+        // PULLs land on: one statement is one trace, however many
+        // pages the client chooses to pull.
+        let statement_span = crate::client::service::client_root_span(&prepared.request, Some(prepared.action));
+        // Join the caller's trace if they sent one, before the span is
+        // ever entered. This is the ingestion-to-HydraDB edge; the
+        // node-to-node edge is the transport's own `traceparent` field.
+        crate::core::trace_context::adopt_remote_parent(&statement_span, inbound_traceparent.as_deref());
+        session.pending = Some(PendingBoltResult {
+            database,
+            columns: prepared.columns.clone(),
+            prepared,
+            deadline: query_deadline,
+            started: false,
+            pages: 0,
+            statement_span,
+            rows: VecDeque::new(),
+            next_cursor: None,
+            bookmark: None,
+            statuses: Vec::new(),
+        });
+        Ok(Outcome::Streaming)
+    }
+
+    /// PULL or DISCARD, by `disposition`.
+    async fn consume<W>(
+        &mut self,
+        extra: &BoltDict,
+        operation: &'static str,
+        disposition: BoltRecordDisposition,
+        io: &mut SessionIo<W>,
+    ) -> std::result::Result<Outcome, BoltError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        let session = &mut self.session;
+        let context = &self.context;
+        let count = match bolt_stream_count(extra, operation) {
+            Ok(count) => count,
+            Err(error) => {
+                io.failure(&error).await?;
+                return Ok(Outcome::Failed);
+            }
+        };
+        let authenticated = match session.authenticated() {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                io.failure(&error).await?;
+                return Ok(Outcome::Failed);
+            }
+        };
+        let Some(pending) = session.pending.as_mut() else {
+            let error = BoltError::Protocol("no pending result".to_string());
+            io.failure(&error).await?;
+            return Ok(Outcome::Failed);
+        };
+        let result = consume_bolt_records(context, &authenticated, pending, count, self.prefetch_rows, disposition, io).await;
+        match result {
+            Err(error) => {
+                io.failure(&error).await?;
+                clear_pending_result(context, session).await;
+                Ok(Outcome::Failed)
+            }
+            Ok(PageAwaitResult::Complete(Ok(_))) => {
+                let pending = session.pending.as_ref().expect("PULL and DISCARD keep pending state until summary");
+                let has_more = !pending.rows.is_empty() || pending.next_cursor.is_some();
+                io.success(bolt_result_summary_metadata(pending, has_more)).await?;
+                if has_more {
+                    return Ok(Outcome::Streaming);
+                }
+                clear_pending_result(context, session).await;
+                Ok(Outcome::Ready)
+            }
+            Ok(PageAwaitResult::Complete(Err(error))) => {
+                send_bolt_graph_failure(io, error).await?;
+                clear_pending_result(context, session).await;
+                Ok(Outcome::Failed)
+            }
+            Ok(PageAwaitResult::Reset) => {
+                clear_pending_result(context, session).await;
+                Ok(Outcome::Ready)
+            }
+            Ok(PageAwaitResult::Goodbye) => Ok(Outcome::Close),
+        }
+    }
+
+    async fn route<W>(&mut self, bookmarks: Vec<String>, extra: BoltDict, io: &mut SessionIo<W>) -> std::result::Result<Outcome, BoltError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        let route_span = bolt_route_span(&self.session, &self.context, &extra);
+        match prepare_bolt_route(&self.session, &self.context, bookmarks, &extra)
+            .instrument(route_span.clone())
+            .await
+        {
+            Ok(routing_table) => {
+                io.success(BoltDict::from([("rt".to_string(), BoltValue::Dict(routing_table))]))
+                    .await?;
+                Ok(Outcome::Ready)
+            }
+            Err(error) => {
+                route_span.in_scope(|| {
+                    tracing::warn!(target: "hydradb", error = %error, "Bolt ROUTE rejected");
+                });
+                io.failure(&error).await?;
+                Ok(Outcome::Failed)
+            }
+        }
+    }
 }
 
 async fn clear_pending_result(context: &BoltConnectionContext, session: &mut BoltProtocolSession) {
     let Some(pending) = session.pending.take() else {
         return;
     };
-    let (Some(authenticated), Some(cursor)) = (session.authenticated.as_ref(), pending.next_cursor)
-    else {
+    let (Some(authenticated), Some(cursor)) = (session.authenticated.as_ref(), pending.next_cursor) else {
         return;
     };
     context
@@ -1192,36 +836,12 @@ async fn clear_pending_result(context: &BoltConnectionContext, session: &mut Bol
         .await;
 }
 
-fn bolt_client_credentials(
-    auth: &BoltDict,
-) -> std::result::Result<ClientQueryCredentials, BoltError> {
-    let scheme = auth
-        .get("scheme")
-        .and_then(BoltValue::as_str)
-        .unwrap_or("none");
-    match scheme {
-        "none" => Ok(ClientQueryCredentials::None),
-        "bearer" => Ok(ClientQueryCredentials::Bearer(
-            required_bolt_string(auth, "credentials")?.to_string(),
-        )),
-        "basic" => Ok(ClientQueryCredentials::Basic {
-            principal: required_bolt_string(auth, "principal")?.to_string(),
-            credentials: required_bolt_string(auth, "credentials")?.to_string(),
-        }),
-        _ => Err(BoltError::Authentication(format!(
-            "unsupported authentication scheme {scheme}"
-        ))),
+fn bolt_client_credentials(credentials: Credentials) -> ClientQueryCredentials {
+    match credentials {
+        Credentials::None => ClientQueryCredentials::None,
+        Credentials::Bearer(token) => ClientQueryCredentials::Bearer(token),
+        Credentials::Basic { principal, credentials } => ClientQueryCredentials::Basic { principal, credentials },
     }
-}
-
-fn required_bolt_string<'a>(
-    values: &'a BoltDict,
-    name: &str,
-) -> std::result::Result<&'a str, BoltError> {
-    values
-        .get(name)
-        .and_then(BoltValue::as_str)
-        .ok_or_else(|| BoltError::Authentication(format!("missing {name}")))
 }
 
 fn selected_bolt_database(
@@ -1231,13 +851,8 @@ fn selected_bolt_database(
 ) -> std::result::Result<String, BoltError> {
     match extra.get("db") {
         Some(BoltValue::String(database)) => Ok(database.clone()),
-        Some(_) => Err(BoltError::Protocol(
-            "db metadata must be a string".to_string(),
-        )),
-        None => Ok(session
-            .database
-            .clone()
-            .unwrap_or_else(|| context.default_database.clone())),
+        Some(_) => Err(BoltError::Protocol("db metadata must be a string".to_string())),
+        None => Ok(session.database.clone().unwrap_or_else(|| context.default_database.clone())),
     }
 }
 
@@ -1271,12 +886,7 @@ macro_rules! bolt_ingress_span {
 /// real error arrives a line later with its own message. A malformed `db`
 /// simply leaves the fields absent, which is the honest answer: there is no
 /// tenant to name.
-fn record_bolt_ingress_scope(
-    span: &tracing::Span,
-    session: &BoltProtocolSession,
-    context: &BoltConnectionContext,
-    extra: &BoltDict,
-) {
+fn record_bolt_ingress_scope(span: &tracing::Span, session: &BoltProtocolSession, context: &BoltConnectionContext, extra: &BoltDict) {
     let Ok(database) = selected_bolt_database(session, context, extra) else {
         return;
     };
@@ -1300,11 +910,7 @@ fn record_bolt_ingress_scope(
 ///
 /// It is deliberately short: it closes as soon as the statement is prepared,
 /// and `client.query` takes over as the root of the statement's own trace.
-fn bolt_run_span(
-    session: &BoltProtocolSession,
-    context: &BoltConnectionContext,
-    extra: &BoltDict,
-) -> tracing::Span {
+fn bolt_run_span(session: &BoltProtocolSession, context: &BoltConnectionContext, extra: &BoltDict) -> tracing::Span {
     let span = bolt_ingress_span!("bolt.run");
     record_bolt_ingress_scope(&span, session, context, extra);
     span
@@ -1316,11 +922,7 @@ fn bolt_run_span(
 /// have no tenancy anywhere. It is also the message a driver sends *first* and
 /// the one that fails when a tenant's grant is wrong, so a forbidden ROUTE with
 /// no tenant on it is a support ticket with nothing to grep for.
-fn bolt_route_span(
-    session: &BoltProtocolSession,
-    context: &BoltConnectionContext,
-    extra: &BoltDict,
-) -> tracing::Span {
+fn bolt_route_span(session: &BoltProtocolSession, context: &BoltConnectionContext, extra: &BoltDict) -> tracing::Span {
     let span = bolt_ingress_span!("bolt.route");
     record_bolt_ingress_scope(&span, session, context, extra);
     span
@@ -1341,15 +943,13 @@ fn prepare_bolt_run(
         .resolve_database(Some(&database))
         .map_err(graph_error_to_bolt)?;
     let query_id = session.next_query_id();
-    let mut request =
-        bolt_query_request(target.clone(), query_id.clone(), query, parameters, &extra)?;
+    let mut request = bolt_query_request(target.clone(), query_id.clone(), query, parameters, &extra)?;
     let runtime_limit_ms = context
         .service
         .effective_runtime_limit_ms(request.max_runtime_ms)
         .map_err(graph_error_to_bolt)?;
     request.max_runtime_ms = Some(runtime_limit_ms);
-    if let Some(bookmark) = highest_matching_bookmark(&target, bolt_bookmarks_from_extra(&extra)?)?
-    {
+    if let Some(bookmark) = highest_matching_bookmark(&target, bolt_bookmarks_from_extra(&extra)?)? {
         request = request.after_bookmark(bookmark);
     }
     Ok((authenticated, database, request))
@@ -1366,25 +966,23 @@ fn bolt_query_request(
         .iter()
         .map(|(name, value)| Ok((name.clone(), bolt_parameter_to_query_value(name, value)?)))
         .collect::<std::result::Result<BTreeMap<_, _>, BoltError>>()?;
-    let mut request =
-        ClientQueryRequest::new(target, query_id, query).with_query_parameters(parameters);
+    let mut request = ClientQueryRequest::new(target, query_id, query).with_query_parameters(parameters);
+    #[cfg(feature = "query-telemetry")]
+    {
+        request.protocol = "bolt";
+    }
     request = match bolt_mutation_idempotency_key(extra)? {
         Some(caller_key) => request.with_mutation_idempotency_key(caller_key),
-        None => request.with_server_generated_mutation_idempotency_key(format!(
-            "bolt-mutation-v1-{}",
-            Ulid::new()
-        )),
+        None => request.with_server_generated_mutation_idempotency_key(format!("bolt-mutation-v1-{}", Ulid::new())),
     };
     match extra.get("tx_timeout") {
         Some(BoltValue::Integer(timeout_ms)) => {
-            request = request.with_timeout_ms(u64::try_from(*timeout_ms).map_err(|_| {
-                BoltError::Protocol("tx_timeout must be a non-negative integer".to_string())
-            })?);
+            request = request.with_timeout_ms(
+                u64::try_from(*timeout_ms).map_err(|_| BoltError::Protocol("tx_timeout must be a non-negative integer".to_string()))?,
+            );
         }
         Some(_) => {
-            return Err(BoltError::Protocol(
-                "tx_timeout must be an integer".to_string(),
-            ));
+            return Err(BoltError::Protocol("tx_timeout must be an integer".to_string()));
         }
         None => {}
     }
@@ -1462,9 +1060,7 @@ fn bolt_tx_metadata(extra: &BoltDict) -> std::result::Result<Option<&BoltDict>, 
     match extra.get("tx_metadata") {
         None => Ok(None),
         Some(BoltValue::Dict(metadata)) => Ok(Some(metadata)),
-        Some(_) => Err(BoltError::Protocol(
-            "tx_metadata must be a dictionary".to_string(),
-        )),
+        Some(_) => Err(BoltError::Protocol("tx_metadata must be a dictionary".to_string())),
     }
 }
 
@@ -1483,10 +1079,7 @@ fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetad
     let Some(metadata) = bolt_tx_metadata(extra)? else {
         return Ok(BoltCallerMetadata::default());
     };
-    let dropped = metadata
-        .keys()
-        .filter(|key| !TX_METADATA_ALLOWLIST.contains(&key.as_str()))
-        .count();
+    let dropped = metadata.keys().filter(|key| !TX_METADATA_ALLOWLIST.contains(&key.as_str())).count();
     if dropped > 0 {
         // The count, never the keys: they are caller-controlled strings and
         // this line is here so "I set the key and nothing appeared" is
@@ -1505,18 +1098,11 @@ fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetad
     })
 }
 
-fn bolt_mutation_idempotency_key(
-    extra: &BoltDict,
-) -> std::result::Result<Option<String>, BoltError> {
+fn bolt_mutation_idempotency_key(extra: &BoltDict) -> std::result::Result<Option<String>, BoltError> {
     let Some(metadata) = bolt_tx_metadata(extra)? else {
         return Ok(None);
     };
-    let Some(value) = aliased_metadata_value(
-        metadata,
-        TX_METADATA_IDEMPOTENCY_KEY,
-        LEGACY_TX_METADATA_IDEMPOTENCY_KEY,
-    )?
-    else {
+    let Some(value) = aliased_metadata_value(metadata, TX_METADATA_IDEMPOTENCY_KEY, LEGACY_TX_METADATA_IDEMPOTENCY_KEY)? else {
         return Ok(None);
     };
     let BoltValue::String(value) = value else {
@@ -1525,9 +1111,7 @@ fn bolt_mutation_idempotency_key(
             message: format!("{TX_METADATA_IDEMPOTENCY_KEY} must be a string"),
         });
     };
-    if value.len() > MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN
-        || crate::validate_component("mutation_idempotency_key", value).is_err()
-    {
+    if value.len() > MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN || crate::validate_component("mutation_idempotency_key", value).is_err() {
         return Err(BoltError::Query {
             code: "Neo.ClientError.Statement.ArgumentError".to_string(),
             message: format!(
@@ -1568,67 +1152,45 @@ fn aliased_metadata_value<'a>(
     legacy_key: &str,
 ) -> std::result::Result<Option<&'a BoltValue>, BoltError> {
     match (metadata.get(canonical_key), metadata.get(legacy_key)) {
-        (Some(canonical), Some(legacy)) if canonical != legacy => Err(BoltError::Protocol(
-            format!("conflicting Bolt metadata values for {canonical_key} and {legacy_key}"),
-        )),
+        (Some(canonical), Some(legacy)) if canonical != legacy => Err(BoltError::Protocol(format!(
+            "conflicting Bolt metadata values for {canonical_key} and {legacy_key}"
+        ))),
         (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
     }
 }
 
-fn bolt_read_consistency(
-    extra: &BoltDict,
-) -> std::result::Result<Option<ClientReadConsistency>, BoltError> {
+fn bolt_read_consistency(extra: &BoltDict) -> std::result::Result<Option<ClientReadConsistency>, BoltError> {
     let direct = extra.get("consistency");
     let metadata = match bolt_tx_metadata(extra)? {
-        Some(metadata) => aliased_metadata_value(
-            metadata,
-            TX_METADATA_CONSISTENCY,
-            LEGACY_TX_METADATA_CONSISTENCY,
-        )?,
+        Some(metadata) => aliased_metadata_value(metadata, TX_METADATA_CONSISTENCY, LEGACY_TX_METADATA_CONSISTENCY)?,
         None => None,
     };
     let value = match (direct, metadata) {
         (Some(left), Some(right)) if left != right => {
-            return Err(BoltError::Protocol(
-                "conflicting Bolt consistency metadata".to_string(),
-            ));
+            return Err(BoltError::Protocol("conflicting Bolt consistency metadata".to_string()));
         }
         (Some(value), _) | (_, Some(value)) => Some(value),
         (None, None) => None,
     };
     match value {
         None => Ok(None),
-        Some(BoltValue::String(value)) if value == "causal" => {
-            Ok(Some(ClientReadConsistency::Causal))
-        }
-        Some(BoltValue::String(value)) if value == "strong" => {
-            Ok(Some(ClientReadConsistency::Strong))
-        }
-        Some(BoltValue::String(_)) => Err(BoltError::Protocol(
-            "consistency metadata must be causal or strong".to_string(),
-        )),
-        Some(_) => Err(BoltError::Protocol(
-            "consistency metadata must be a string".to_string(),
-        )),
+        Some(BoltValue::String(value)) if value == "causal" => Ok(Some(ClientReadConsistency::Causal)),
+        Some(BoltValue::String(value)) if value == "strong" => Ok(Some(ClientReadConsistency::Strong)),
+        Some(BoltValue::String(_)) => Err(BoltError::Protocol("consistency metadata must be causal or strong".to_string())),
+        Some(_) => Err(BoltError::Protocol("consistency metadata must be a string".to_string())),
     }
 }
 
 fn validate_bolt_run_extra(extra: &BoltDict) -> std::result::Result<(), BoltError> {
     if extra.contains_key("imp_user") {
-        return Err(BoltError::Forbidden(
-            "Bolt user impersonation is not supported".to_string(),
-        ));
+        return Err(BoltError::Forbidden("Bolt user impersonation is not supported".to_string()));
     }
     match extra.get("mode") {
         None => Ok(()),
         Some(BoltValue::String(mode)) if mode == "r" || mode == "w" => Ok(()),
-        Some(BoltValue::String(_)) => Err(BoltError::Protocol(
-            "mode metadata must be r or w".to_string(),
-        )),
-        Some(_) => Err(BoltError::Protocol(
-            "mode metadata must be a string".to_string(),
-        )),
+        Some(BoltValue::String(_)) => Err(BoltError::Protocol("mode metadata must be r or w".to_string())),
+        Some(_) => Err(BoltError::Protocol("mode metadata must be a string".to_string())),
     }
 }
 
@@ -1644,9 +1206,7 @@ fn bolt_bookmarks_from_extra(extra: &BoltDict) -> std::result::Result<Vec<String
                     .ok_or_else(|| BoltError::Protocol("bookmarks must be strings".to_string()))
             })
             .collect(),
-        Some(_) => Err(BoltError::Protocol(
-            "bookmarks must be a list of strings".to_string(),
-        )),
+        Some(_) => Err(BoltError::Protocol("bookmarks must be a list of strings".to_string())),
     }
 }
 
@@ -1656,50 +1216,16 @@ async fn await_bolt_page<W, F>(
     authenticated: &ClientQuerySession,
     scope: &GraphScope,
     query_id: &str,
-    channels: &mut BoltConnectionChannels<'_, W>,
+    io: &mut SessionIo<W>,
 ) -> std::result::Result<PageAwaitResult, BoltError>
 where
     W: AsyncWrite + Unpin,
     F: Future<Output = Result<ClientQueryPage>>,
 {
-    tokio::pin!(task);
-    loop {
-        tokio::select! {
-            result = &mut task => {
-                return Ok(PageAwaitResult::Complete(result));
-            }
-            incoming = channels.message_rx.recv() => {
-                match incoming {
-                    Some(Ok(ClientMessage::Reset)) => {
-                        let _ = service.cancel(authenticated, scope, query_id).await;
-                        let queued_before_reset = channels.queued.len();
-                        send_bolt_message(channels.writer, &ServerMessage::Ignored).await?;
-                        for _ in 0..queued_before_reset {
-                            channels.queued.pop_front();
-                            send_bolt_message(channels.writer, &ServerMessage::Ignored).await?;
-                        }
-                        send_bolt_success(channels.writer, BoltDict::new()).await?;
-                        return Ok(PageAwaitResult::Reset);
-                    }
-                    Some(Ok(ClientMessage::Goodbye)) | None => {
-                        let _ = service.cancel(authenticated, scope, query_id).await;
-                        return Ok(PageAwaitResult::Goodbye);
-                    }
-                    Some(Ok(message)) => {
-                        if channels.queued.len() >= channels.max_queued_messages {
-                            return Err(BoltError::ResourceExhausted(
-                                "Bolt pipelined message queue is full".to_string(),
-                            ));
-                        }
-                        channels.queued.push_back(message);
-                    }
-                    Some(Err(error)) => {
-                        return Err(error);
-                    }
-                }
-            }
-        }
-    }
+    let cancel = async {
+        let _ = service.cancel(authenticated, scope, query_id).await;
+    };
+    io.interruptible(async { task.await.map(Box::new) }, cancel).await
 }
 
 /// Record-encoding time accumulated across one PULL and reported to the
@@ -1748,7 +1274,7 @@ async fn consume_bolt_records<W>(
     count: Option<usize>,
     prefetch_rows: usize,
     disposition: BoltRecordDisposition,
-    channels: &mut BoltConnectionChannels<'_, W>,
+    io: &mut SessionIo<W>,
 ) -> std::result::Result<PageAwaitResult, BoltError>
 where
     W: AsyncWrite + Unpin,
@@ -1766,7 +1292,7 @@ where
                     .iter()
                     .map(query_value_to_bolt)
                     .collect::<std::result::Result<Vec<_>, BoltError>>()?;
-                send_bolt_message(channels.writer, &ServerMessage::Record { data: values }).await?;
+                io.send(&ServerMessage::Record { data: values }).await?;
                 serialize.add(started.elapsed());
             }
             remaining -= 1;
@@ -1829,22 +1355,12 @@ where
         };
         page_span.record("remaining_runtime_ms", remaining_runtime_ms);
         pending.prepared.request.max_runtime_ms = Some(remaining_runtime_ms);
-        let task = context.service.execute_prepared_page(
-            authenticated,
-            pending.prepared.clone(),
-            cursor,
-            fetch_size,
-        );
-        let awaited = await_bolt_page(
-            task,
-            &context.service,
-            authenticated,
-            &scope,
-            &query_id,
-            channels,
-        )
-        .instrument(page_span.clone())
-        .await?;
+        let task = context
+            .service
+            .execute_prepared_page(authenticated, pending.prepared.clone(), cursor, fetch_size);
+        let awaited = await_bolt_page(task, &context.service, authenticated, &scope, &query_id, io)
+            .instrument(page_span.clone())
+            .await?;
         match awaited {
             PageAwaitResult::Complete(Ok(page)) => {
                 if page.page.columns != pending.columns {
@@ -1862,6 +1378,9 @@ where
                 pending.prepared.request.read_epoch = page.read_epoch;
                 pending.rows.extend(page.page.rows);
                 pending.next_cursor = page.page.next_cursor;
+                if pending.statuses.is_empty() {
+                    pending.statuses = page.page.statuses;
+                }
                 pending.bookmark = page.bookmark;
             }
             PageAwaitResult::Complete(Err(error)) => {
@@ -1872,12 +1391,12 @@ where
         }
     }
     serialize.flush();
-    Ok(PageAwaitResult::Complete(Ok(ClientQueryPage {
+    Ok(PageAwaitResult::Complete(Ok(Box::new(ClientQueryPage {
         query_id: pending.prepared.request.query_id.clone(),
         page: crate::QueryResultPage::new(pending.columns.clone(), Vec::new(), pending.next_cursor),
         read_epoch: pending.prepared.request.read_epoch,
         bookmark: pending.bookmark.clone(),
-    })))
+    }))))
 }
 
 fn remaining_bolt_runtime_ms(deadline: Instant) -> std::result::Result<u64, BoltError> {
@@ -1897,25 +1416,56 @@ fn bolt_result_summary_metadata(pending: &PendingBoltResult, has_more: bool) -> 
         if let Some(bookmark) = &pending.bookmark {
             metadata.insert("bookmark".to_string(), BoltValue::String(bookmark.encode()));
         }
-        metadata.insert(
-            "db".to_string(),
-            BoltValue::String(pending.database.clone()),
-        );
+        metadata.insert("db".to_string(), BoltValue::String(pending.database.clone()));
         metadata.insert("t_last".to_string(), BoltValue::Integer(0));
-        metadata.insert("type".to_string(), BoltValue::String("r".to_string()));
+        // The statement's own access, classified from its text, not the
+        // client's declared mode: graph-node does not refuse a write sent in
+        // read mode. The turbolay proxy allows a ROLLBACK only after "r".
+        let query_type = match pending.prepared.action {
+            QueryTransportAction::Read => "r",
+            QueryTransportAction::Write | QueryTransportAction::Cancel | QueryTransportAction::Admin => "rw",
+        };
+        metadata.insert("type".to_string(), BoltValue::String(query_type.to_string()));
+        // GQL-status objects (ISO/IEC 39075 §4.9), in the shape Bolt 5.6
+        // gives `statuses`. A driver of an older protocol ignores the key.
+        if !pending.statuses.is_empty() {
+            metadata.insert("statuses".to_string(), bolt_statuses(&pending.statuses));
+        }
     }
     metadata
 }
 
-fn bolt_stream_count(
-    extra: &BoltDict,
-    operation: &'static str,
-) -> std::result::Result<Option<usize>, BoltError> {
+/// GQL-status objects as Bolt 5.6's `statuses` list.
+fn bolt_statuses(statuses: &[GqlStatusReport]) -> BoltValue {
+    BoltValue::List(
+        statuses
+            .iter()
+            .map(|status| {
+                BoltValue::Dict(BoltDict::from([
+                    ("gql_status".to_string(), BoltValue::String(status.gql_status.clone())),
+                    ("status_description".to_string(), BoltValue::String(status.description.clone())),
+                    ("diagnostic_record".to_string(), bolt_diagnostic_record(status)),
+                ]))
+            })
+            .collect(),
+    )
+}
+
+/// A GQL diagnostic record (§23.2) as a Bolt map of strings.
+fn bolt_diagnostic_record(status: &GqlStatusReport) -> BoltValue {
+    BoltValue::Dict(
+        status
+            .diagnostic
+            .iter()
+            .map(|(name, value)| (name.clone(), BoltValue::String(value.clone())))
+            .collect(),
+    )
+}
+
+fn bolt_stream_count(extra: &BoltDict, operation: &'static str) -> std::result::Result<Option<usize>, BoltError> {
     if let Some(query_id) = extra.get("qid") {
         if query_id.as_int() != Some(-1) {
-            return Err(BoltError::Protocol(format!(
-                "{operation} qid must be -1 for an auto-commit result"
-            )));
+            return Err(BoltError::Protocol(format!("{operation} qid must be -1 for an auto-commit result")));
         }
     }
     let n = extra.get("n").and_then(BoltValue::as_int).unwrap_or(-1);
@@ -1923,9 +1473,7 @@ fn bolt_stream_count(
         return Ok(None);
     }
     if n <= 0 {
-        return Err(BoltError::Protocol(format!(
-            "{operation} n must be -1 or a positive integer"
-        )));
+        return Err(BoltError::Protocol(format!("{operation} n must be -1 or a positive integer")));
     }
     usize::try_from(n)
         .map(Some)
@@ -1940,9 +1488,7 @@ async fn prepare_bolt_route(
 ) -> std::result::Result<BoltDict, BoltError> {
     let authenticated = session.authenticated()?;
     if extra.contains_key("imp_user") {
-        return Err(BoltError::Forbidden(
-            "Bolt user impersonation is not supported".to_string(),
-        ));
+        return Err(BoltError::Forbidden("Bolt user impersonation is not supported".to_string()));
     }
     let database = selected_bolt_database(session, context, extra)?;
     let target = context
@@ -1963,13 +1509,9 @@ async fn prepare_bolt_route(
     // selected execution node before reading graph data.
     highest_matching_bookmark(&target, bookmarks)?;
     let table = match &context.routing_table_provider {
-        Some(provider) => provider
-            .routing_table(&database, &target)
-            .await
-            .map_err(graph_error_to_bolt)?,
+        Some(provider) => provider.routing_table(&database, &target).await.map_err(graph_error_to_bolt)?,
         None if !context.routing_servers.is_empty() => {
-            BoltRoutingTable::new(context.routing_ttl_secs, context.routing_servers.clone())
-                .map_err(graph_error_to_bolt)?
+            BoltRoutingTable::new(context.routing_ttl_secs, context.routing_servers.clone()).map_err(graph_error_to_bolt)?
         }
         None => {
             return Err(BoltError::ResourceExhausted(
@@ -1988,14 +1530,7 @@ fn bolt_routing_table(table: &BoltRoutingTable, database: String) -> BoltDict {
             BoltValue::Dict(BoltDict::from([
                 (
                     "addresses".to_string(),
-                    BoltValue::List(
-                        server
-                            .addresses
-                            .iter()
-                            .cloned()
-                            .map(BoltValue::String)
-                            .collect(),
-                    ),
+                    BoltValue::List(server.addresses.iter().cloned().map(BoltValue::String).collect()),
                 ),
                 ("role".to_string(), BoltValue::String(server.role.clone())),
             ]))
@@ -2008,40 +1543,35 @@ fn bolt_routing_table(table: &BoltRoutingTable, database: String) -> BoltDict {
     ])
 }
 
-async fn send_bolt_success<W>(
-    writer: &mut BoltMessageWriter<W>,
-    metadata: BoltDict,
-) -> std::result::Result<(), BoltError>
+/// FAILURE for a failed query. Beside `code` and `message`, which every Bolt
+/// version reads, an engine error carries its GQL-status object (ISO/IEC
+/// 39075 §4.9) in the fields Bolt 5.7 gives FAILURE: `gql_status`,
+/// `description`, `neo4j_code` and `diagnostic_record`. A driver of an older
+/// protocol ignores them.
+async fn send_bolt_graph_failure<W>(io: &mut SessionIo<W>, error: GraphError) -> std::result::Result<(), BoltError>
 where
     W: AsyncWrite + Unpin,
 {
-    send_bolt_message(writer, &ServerMessage::Success { metadata }).await
+    let metadata = bolt_graph_failure_metadata(error);
+    io.send(&ServerMessage::Failure { metadata }).await
 }
 
-async fn send_bolt_failure<W>(
-    writer: &mut BoltMessageWriter<W>,
-    error: &BoltError,
-) -> std::result::Result<(), BoltError>
-where
-    W: AsyncWrite + Unpin,
-{
-    send_bolt_message(
-        writer,
-        &ServerMessage::Failure {
-            metadata: error.to_failure_metadata(),
-        },
-    )
-    .await
-}
-
-async fn send_bolt_message<W>(
-    writer: &mut BoltMessageWriter<W>,
-    message: &ServerMessage,
-) -> std::result::Result<(), BoltError>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.send(message).await
+/// The metadata of [`send_bolt_graph_failure`].
+fn bolt_graph_failure_metadata(error: GraphError) -> BoltDict {
+    let gql = match &error {
+        GraphError::GqlQuery { status, .. } => Some((**status).clone()),
+        _ => None,
+    };
+    let mut metadata = graph_error_to_bolt(error).to_failure_metadata();
+    if let Some(status) = gql {
+        if let Some(code) = metadata.get("code").cloned() {
+            metadata.insert("neo4j_code".to_string(), code);
+        }
+        metadata.insert("gql_status".to_string(), BoltValue::String(status.gql_status.clone()));
+        metadata.insert("description".to_string(), BoltValue::String(status.description.clone()));
+        metadata.insert("diagnostic_record".to_string(), bolt_diagnostic_record(&status));
+    }
+    metadata
 }
 
 fn bolt_io_error(operation: &'static str, error: std::io::Error) -> GraphError {

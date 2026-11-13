@@ -1,0 +1,39 @@
+[package]
+name = "turbolay-proxy-http"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The turbolay proxy's HTTP adapter, a pingora ProxyHttp over the shared core"
+publish = false
+
+# The only proxy crate that needs pingora's HTTP machinery, so editing the Bolt
+# adapter never rebuilds it, and its BoringSSL build (feature `boringssl`) stays
+# cached across edits elsewhere.
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+hydradb-protocol = { path = "../../protocol" }
+hydradb-scope = { path = "../../scope" }
+matchit = { workspace = true }
+moka = { workspace = true }
+percent-encoding = { workspace = true }
+pingora-core = { workspace = true }
+pingora-error = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tracing = { workspace = true }
+turbolay-proxy-core = { path = "../core" }
+turbolay-proxy-types = { path = "../types" }
+
+[dev-dependencies]
+# The null proxy example uses the same allocator as the real binary, so the
+# comparison is like for like.
+mimalloc = { workspace = true }
+
+[features]
+default = []
+# Downstream TLS through BoringSSL, not pingora's experimental rustls. The
+# binary turns it on for release images; local runs are plaintext.
+boringssl = ["pingora-core/boringssl", "pingora-proxy/boringssl"]

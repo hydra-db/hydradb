@@ -3,7 +3,7 @@ name: hydradb
 description: Stateless distributed graph database backed by SlateDB and object storage
 type: application
 version: 0.1.0
-appVersion: "0.3.0"
+appVersion: "0.4.0"
 kubeVersion: ">=1.27.0-0"
 home: https://github.com/hydra-db/hydradb
 sources:

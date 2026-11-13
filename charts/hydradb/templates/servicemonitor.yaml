@@ -15,7 +15,7 @@ spec:
   selector:
     matchLabels:
       {{- include "hydradb.selectorLabels" . | nindent 6 }}
-      graph.usecortex.io/metrics: "true"
+      graph.hydradb.io/metrics: "true"
   endpoints:
     - port: metrics
       path: /metrics

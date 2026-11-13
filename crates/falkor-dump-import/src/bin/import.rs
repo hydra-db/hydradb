@@ -1,19 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use falkor_dump_import::{
-    build_snapshot_spill_selected, load_spilled_scope, ExcludedGraph, ExternalKvSorter,
-    GraphSelection, OrphanEdge, RelationshipAnomaly, ResolvedScope, SnapshotGraph,
+    build_snapshot_spill_with_source_layout, finalize_image, load_spilled_scope, offline_import_limits, DedicatedLayout, ExcludedGraph,
+    ExternalKvSorter, GraphSelection, ImageFinalize, OrphanEdge, RelationshipAnomaly, ResolvedScope, SingleWriterLocalStore, SnapshotGraph,
+    SourceLayout, SpilledUnscoped, VerifiedEdgeType,
 };
-use falkordb_rdb::PropertyValue;
-use futures::future::try_join_all;
+use falkordb_rdb::{Properties, PropertyValue};
 use hydradb::{
-    encode_scope_namespace_id, object_store_from_env, EdgeMetadata, GraphId, GraphLimits,
-    GraphOpenOptions, GraphScope, GraphShard, NamespaceId, NamespacePath,
-    ObjectStoreGraphScopeDirectory, OfflineGraphImageEncoder, QueryFloat, QueryStatsDirection,
-    RelationshipMutation, SparseKernelBackend, VertexMetadata, VertexPropertyValue,
+    encode_scope_namespace_id, object_store_from_env, EdgeMetadata, GraphId, GraphScope, NamespacePath, ObjectStoreGraphScopeDirectory,
+    OfflineGraphImageEncoder, PlannerStatisticsBuildLimits, QueryFloat, RelationshipMutation, VertexMetadata, VertexPropertyValue,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -25,7 +23,11 @@ use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode};
 // v2 switched offline scopes to the canonical client namespace encoding. Keep
 // its receipts separate so --resume can never accept an image written at the
 // obsolete raw-identifier path.
-const COMPLETION_MAGIC: &str = "hydradb-falkor-direct-import-v2";
+// v3: identities follow Turbolay's writers and non-finite floats are refused, so
+// a v2 receipt, attempt marker or image is never resumed.
+// v4: every image is sealed past storage sequence 0 (GraphShard::seal_offline_image),
+// so a v3 image, which the first edge write would damage, is never resumed.
+const COMPLETION_MAGIC: &str = "hydradb-falkor-direct-import-v4";
 // Older binaries ignore unknown JSON fields. A distinct run marker prevents
 // them from treating an allowlisted image as a complete-snapshot import.
 const INCLUDED_RUN_MAGIC: &str = "hydradb-falkor-direct-import-included-v1";
@@ -46,6 +48,8 @@ struct Config {
     quarantine_dir: Option<PathBuf>,
     scratch_dir: Option<PathBuf>,
     selection: GraphSelection,
+    dedicated_layout: Option<DedicatedLayout>,
+    byog: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +62,11 @@ struct ScopeImportSummary {
     batches: usize,
     resumed: bool,
     deep_verified: bool,
+    /// Whether this run published the scope's planner statistics object. A
+    /// resumed scope publishes nothing, and neither does a store that cannot
+    /// do the conditional writes publication needs (a local directory can,
+    /// through `SingleWriterLocalStore`).
+    planner_statistics_published: bool,
     elapsed_milliseconds: u128,
 }
 
@@ -97,6 +106,10 @@ struct ImportRunMarker {
     excluded_graphs: Vec<ExcludedGraph>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     included_graphs: Vec<SnapshotGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dedicated_layout: Option<DedicatedLayout>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    byog: bool,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -115,6 +128,13 @@ struct QuarantineReport<'a> {
     relationship_anomalies: &'a [RelationshipAnomaly],
 }
 
+// The import allocates and frees a scope's records stage by stage. The system
+// allocator kept the freed memory too fragmented to reuse: on a production
+// graph of 8.5 million records a 20 GiB heap peak cost a 38 GiB RSS, which
+// mimalloc alone brought to 22 GiB.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -128,27 +148,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let planning = Instant::now();
     let scratch = if let Some(parent) = &config.scratch_dir {
         std::fs::create_dir_all(parent)?;
-        tempfile::Builder::new()
-            .prefix("falkor-direct-import-")
-            .tempdir_in(parent)?
+        tempfile::Builder::new().prefix("falkor-direct-import-").tempdir_in(parent)?
     } else {
-        tempfile::Builder::new()
-            .prefix("falkor-direct-import-")
-            .tempdir()?
+        tempfile::Builder::new().prefix("falkor-direct-import-").tempdir()?
     };
-    let plan = build_snapshot_spill_selected(
+    let plan = build_snapshot_spill_with_source_layout(
         &config.snapshot_root,
         config.workers,
         scratch.path(),
         &config.selection,
+        if config.byog {
+            SourceLayout::Byog
+        } else {
+            config
+                .dedicated_layout
+                .as_ref()
+                .map_or(SourceLayout::Shared, SourceLayout::Dedicated)
+        },
     )?;
-    if (plan.orphan_edges > 0 || plan.relationship_anomalies > 0) && config.quarantine_dir.is_none()
-    {
+    let unscoped_vertices = plan.unscoped_vertices.count;
+    if (plan.orphan_edges > 0 || plan.relationship_anomalies > 0 || unscoped_vertices > 0) && config.quarantine_dir.is_none() {
         return Err(format!(
-            "snapshot contains {} unreachable edge records and {} relationship anomalies; pass --quarantine-dir to preserve them before importing",
-            plan.orphan_edges, plan.relationship_anomalies
+            "snapshot contains {} unreachable edge records, {} relationship anomalies and {} vertices no scope can hold; pass --quarantine-dir to preserve them before importing",
+            plan.orphan_edges, plan.relationship_anomalies, unscoped_vertices
         )
         .into());
+    }
+    if let (Some(directory), false) = (&config.quarantine_dir, plan.unscoped_vertices.is_empty()) {
+        write_unscoped(directory, &plan.unscoped_vertices)?;
     }
     eprintln!(
         "direct_import_plan snapshot={} manifest_sha256={} objects={} selected_objects={} selected_dump_bytes={} included_graphs={} excluded_graphs={} scopes={} raw_scope_fragments={} raw_vertices={} raw_relationships={} orphan_edges={} relationship_anomalies={} dump_bytes={} elapsed_ms={}",
@@ -170,6 +197,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let object_store = object_store_from_env(config.env_file.clone())?;
+    // A local directory cannot do the conditional updates that publish each
+    // scope's planner statistics; this process is its only writer, so it does
+    // them itself. The statistics then travel with the image when the
+    // directory is copied to S3.
+    let object_store: Arc<dyn ObjectStore> = if std::env::var("CLOUD_PROVIDER").as_deref() == Ok("local") {
+        Arc::new(SingleWriterLocalStore::new(object_store))
+    } else {
+        object_store
+    };
     let directory = Arc::new(ObjectStoreGraphScopeDirectory::new(
         config.base_path.clone(),
         config.root_namespace.clone(),
@@ -183,14 +219,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_sha256 = plan.manifest_sha256.clone();
     for spilled in plan.scopes {
         if tasks.len() >= config.scope_concurrency {
-            let result = tasks
-                .join_next()
-                .await
-                .expect("a full scope worker set is not empty");
+            let result = tasks.join_next().await.expect("a full scope worker set is not empty");
             summaries.push(result.map_err(|error| format!("scope worker panicked: {error}"))??);
         }
         let scope = tokio::task::spawn_blocking(move || load_spilled_scope(&spilled)).await??;
-        if !scope.orphan_edges.is_empty() || !scope.relationship_anomalies.is_empty() {
+        if needs_quarantine(&scope) {
             let quarantine = config
                 .quarantine_dir
                 .as_ref()
@@ -203,16 +236,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot_id = snapshot_id.clone();
         let manifest_sha256 = manifest_sha256.clone();
         tasks.spawn(async move {
-            import_scope(
-                &config,
-                &snapshot_id,
-                &manifest_sha256,
-                scope,
-                object_store,
-                directory,
-            )
-            .await
-            .map_err(|error| error.to_string())
+            import_scope(&config, &snapshot_id, &manifest_sha256, scope, object_store, directory)
+                .await
+                .map_err(|error| error.to_string())
         });
     }
     while let Some(result) = tasks.join_next().await {
@@ -222,10 +248,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total_vertices: usize = summaries.iter().map(|summary| summary.vertices).sum();
     let total_relationships: usize = summaries.iter().map(|summary| summary.relationships).sum();
     let resumed = summaries.iter().filter(|summary| summary.resumed).count();
-    let deep_verified = summaries
-        .iter()
-        .filter(|summary| summary.deep_verified)
-        .count();
+    let deep_verified = summaries.iter().filter(|summary| summary.deep_verified).count();
     eprintln!(
         "direct_import_complete scopes={} resumed={} deep_verified={} verification_deferred={} vertices={} relationships={} elapsed_ms={}",
         summaries.len(),
@@ -254,9 +277,7 @@ async fn import_scope(
     let completion_path = completion_path(config, manifest_sha256, &scope_sha256);
     let mut promoting_deferred_completion = false;
     if config.resume {
-        if let Some(completion) =
-            read_json::<ScopeCompletion>(&object_store, &completion_path).await?
-        {
+        if let Some(completion) = read_json::<ScopeCompletion>(&object_store, &completion_path).await? {
             if completion.included_graphs != config.selection.included_names() {
                 return Err(format!("completion receipt graph selection does not match snapshot scope {scope_sha256}").into());
             }
@@ -279,6 +300,7 @@ async fn import_scope(
                     batches: completion.batches,
                     resumed: true,
                     deep_verified: completion.deep_verified,
+                    planner_statistics_published: false,
                     elapsed_milliseconds: started.elapsed().as_millis(),
                 });
             }
@@ -286,11 +308,7 @@ async fn import_scope(
         }
     }
     let graph_scope = storage_scope(config, &scope)?;
-    let shard_path = format!(
-        "{}/{}",
-        graph_scope.scoped_store_path(&config.base_path),
-        config.cell_id
-    );
+    let shard_path = format!("{}/{}", graph_scope.scoped_store_path(&config.base_path), config.cell_id);
     let destination_has_data = prefix_has_data(&object_store, &shard_path).await?;
     ensure_scope_attempt(
         &object_store,
@@ -306,11 +324,7 @@ async fn import_scope(
     let image_exists = prefix_has_data(&object_store, &manifest_path).await?;
     if image_exists {
         if !config.resume {
-            return Err(format!(
-                "destination scope already has a SlateDB manifest: {}",
-                scope.scope
-            )
-            .into());
+            return Err(format!("destination scope already has a SlateDB manifest: {}", scope.scope).into());
         }
         eprintln!(
             "direct_image_resume scope={} elapsed_ms={}",
@@ -318,8 +332,7 @@ async fn import_scope(
             started.elapsed().as_millis()
         );
     } else {
-        let image =
-            build_direct_image(config, &scope, &shard_path, Arc::clone(&object_store)).await?;
+        let image = build_direct_image(config, &scope, &shard_path, Arc::clone(&object_store)).await?;
         eprintln!(
             "direct_image_published scope={} entries={} ssts={} elapsed_ms={}",
             scope.scope,
@@ -328,25 +341,37 @@ async fn import_scope(
             started.elapsed().as_millis()
         );
     }
-    let mut options = GraphOpenOptions::default();
-    options.limits = offline_import_limits(config, &scope)?;
-    options.backpressure_policy.max_concurrent_artifact_builds = config.workers.clamp(1, 4);
-    // When deep verification is enabled it must be deterministic on offline
-    // builders even when SuiteSparse cannot start its optional JIT compiler.
-    // CompactCsc consumes the same published CSC generation without depending
-    // on host compiler discovery.
-    options.cache_policy.sparse_kernel = SparseKernelBackend::CompactCsc;
-    let shard = GraphShard::open_standalone_writer_with_options(
-        shard_path,
-        Arc::clone(&object_store),
-        options,
+    let mut by_type = BTreeMap::<String, Vec<(u64, u64)>>::new();
+    for relationship in scope.relationships.values() {
+        by_type
+            .entry(relationship.edge_type.clone())
+            .or_default()
+            .push((relationship.src, relationship.dst));
+    }
+    let mut batches = scope.vertices.len().div_ceil(config.batch_size);
+    for relationships in by_type.values() {
+        batches += relationships.len().div_ceil(config.batch_size);
+    }
+    let finalized = finalize_image(
+        ImageFinalize {
+            object_store: Arc::clone(&object_store),
+            shard_path,
+            cell_id: &config.cell_id,
+            scope: &graph_scope,
+            scope_label: scope.scope.to_string(),
+            directory: &directory,
+            edges: &by_type,
+            limits: offline_import_limits(scope.vertices.len(), scope.relationships.len(), config.batch_size)?,
+            max_concurrent_artifact_builds: config.workers.clamp(1, 4),
+            statistics_limits: import_statistics_limits(),
+            verify: !config.defer_deep_verification,
+            error_key: format!("direct-import/{scope_sha256}"),
+        },
+        |reports| check_merge_indexes(&scope, &scope_sha256, reports),
     )
     .await?;
-    let result = finalize_scope(config, &scope, &shard).await;
-    let close = shard.close().await;
-    let summary = result?;
-    close?;
-    directory.register(&graph_scope).await?;
+    let summary = (by_type.len(), batches, finalized.reports.is_some());
+    let planner_statistics_published = finalized.planner_statistics_published;
     let completion = ScopeCompletion {
         magic: COMPLETION_MAGIC.to_string(),
         snapshot_id: snapshot_id.to_string(),
@@ -376,34 +401,19 @@ async fn import_scope(
         batches: completion.batches,
         resumed: promoting_deferred_completion,
         deep_verified: completion.deep_verified,
+        planner_statistics_published,
         elapsed_milliseconds: started.elapsed().as_millis(),
     })
 }
 
-fn offline_import_limits(
-    config: &Config,
-    scope: &ResolvedScope,
-) -> Result<GraphLimits, Box<dyn std::error::Error + Send + Sync>> {
-    // The normal limits protect an online query from scanning an unexpectedly
-    // broad index.  This is an offline, manifest-bounded build: refreshing the
-    // indexes and statistics must be allowed to visit every record that the
-    // already validated scope contains.  Keeping the online defaults here
-    // makes a valid large scope fail halfway through publication (for example,
-    // a label with 250,001 vertices hits max_query_index_candidates).
-    let vertices = scope.vertices.len();
-    let relationships = scope.relationships.len();
-    let records = vertices.max(relationships).max(1);
-    let relationships_u64 = u64::try_from(relationships)?;
-    Ok(GraphLimits {
-        max_bulk_import_edges: config.batch_size.max(4_096),
-        max_artifact_build_edges: relationships_u64.max(1),
-        max_query_result_vertices: vertices.max(1),
-        max_query_intermediate_rows: records,
-        max_query_index_candidates: records,
-        max_query_scan_edges: relationships_u64.max(1),
-        max_query_runtime_ms: None,
-        ..GraphLimits::default()
-    })
+/// The import counts every index entry: the image is the scope's only data,
+/// and the online entry budget, which keeps an indexer from stalling on one
+/// scope, would only refuse a large import here.
+fn import_statistics_limits() -> PlannerStatisticsBuildLimits {
+    PlannerStatisticsBuildLimits {
+        max_entries: u64::MAX,
+        ..PlannerStatisticsBuildLimits::default()
+    }
 }
 
 async fn build_direct_image(
@@ -412,49 +422,81 @@ async fn build_direct_image(
     shard_path: &str,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<slatedb::OfflineImageResult, Box<dyn std::error::Error + Send + Sync>> {
-    const SORT_BUFFER_BYTES: usize = 256 * 1024 * 1024;
-    const TARGET_SST_BYTES: usize = 1024 * 1024 * 1024;
     let scratch = if let Some(parent) = &config.scratch_dir {
         std::fs::create_dir_all(parent)?;
-        tempfile::Builder::new()
-            .prefix("falkor-image-kv-")
-            .tempdir_in(parent)?
+        tempfile::Builder::new().prefix("falkor-image-kv-").tempdir_in(parent)?
     } else {
-        tempfile::Builder::new()
-            .prefix("falkor-image-kv-")
-            .tempdir()?
+        tempfile::Builder::new().prefix("falkor-image-kv-").tempdir()?
     };
-    let mut sorter = ExternalKvSorter::new(scratch.path(), SORT_BUFFER_BYTES)?;
+    // Each thread encodes and sorts the vertices and the relationships whose
+    // source vertex falls in its partition, so every structural edge's
+    // aggregates are counted by one encoder (absorb_disjoint_sources).
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let (partitions, sort_buffer_bytes) = image_build_shape(cores, config.scope_concurrency);
+    let parts = std::thread::scope(|threads| {
+        let workers = (0..partitions)
+            .map(|partition| {
+                let scratch = scratch.path().join(format!("partition-{partition:03}"));
+                threads.spawn(move || encode_partition(config, scope, partition, partitions, scratch, sort_buffer_bytes))
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "image encoder thread panicked")?)
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()
+    })?;
+    let mut parts = parts.into_iter();
+    let (mut sorter, mut encoder) = parts.next().expect("at least one partition");
+    for (rows, partition) in parts {
+        sorter.absorb(rows)?;
+        encoder.absorb_disjoint_sources(partition)?;
+    }
+    sorter.extend(encoder.finish_rows())?;
+    if scope.byog {
+        sorter.extend([OfflineGraphImageEncoder::byog_id_semantics_row()])?;
+    }
+    Ok(sorter
+        .publish(ObjectPath::from(shard_path), object_store, hydradb::GRAPH_SST_TARGET_BYTES)
+        .await?)
+}
+
+/// Sort-buffer memory for every image building at once: 256 MiB for each of
+/// the default eight concurrent scopes.
+const SORT_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// A scope's image-build partitions and each one's sort buffer. The scopes
+/// building at once share the cores and the sort budget, so a host with more
+/// cores gets more, smaller sort runs rather than more memory.
+fn image_build_shape(cores: usize, scope_concurrency: usize) -> (u64, usize) {
+    let partitions = (cores / scope_concurrency).max(1);
+    let sort_buffer_bytes = (SORT_BUDGET_BYTES / scope_concurrency / partitions).max(1);
+    (partitions as u64, sort_buffer_bytes)
+}
+
+/// The sorted rows and the encoder of one partition of a scope: the vertices
+/// with `id % partitions == partition`, and the relationships whose source does.
+fn encode_partition(
+    config: &Config,
+    scope: &ResolvedScope,
+    partition: u64,
+    partitions: u64,
+    scratch: PathBuf,
+    sort_buffer_bytes: usize,
+) -> Result<(ExternalKvSorter, OfflineGraphImageEncoder), Box<dyn std::error::Error + Send + Sync>> {
+    let mut sorter = ExternalKvSorter::new(scratch, sort_buffer_bytes)?;
     let mut encoder = OfflineGraphImageEncoder::new(&config.cell_id, true)?;
-    let mut label_counts = BTreeMap::<String, u64>::new();
-    let mut label_set_counts = BTreeMap::<Vec<String>, u64>::new();
-    let mut vertex_property_counts = BTreeMap::<String, BTreeMap<VertexPropertyValue, u64>>::new();
-    for vertex in scope.vertices.values() {
+    for vertex in scope.vertices.values().filter(|vertex| vertex.id % partitions == partition) {
         let metadata = VertexMetadata {
             labels: vertex.labels.clone(),
             properties: property_map(&vertex.properties)?,
         };
-        for label in &metadata.labels {
-            *label_counts.entry(label.clone()).or_default() += 1;
-        }
-        *label_set_counts
-            .entry(metadata.labels.iter().cloned().collect())
-            .or_default() += 1;
-        for (property, value) in &metadata.properties {
-            *vertex_property_counts
-                .entry(property.clone())
-                .or_default()
-                .entry(value.clone())
-                .or_default() += 1;
-        }
         sorter.extend(encoder.vertex_rows(vertex.id, &metadata)?)?;
     }
-    let mut edge_type_counts = BTreeMap::<String, u64>::new();
-    let mut expansion_counts =
-        BTreeMap::<String, (BTreeMap<Vec<String>, u64>, BTreeMap<Vec<String>, u64>)>::new();
-    let mut edge_property_counts =
-        BTreeMap::<String, BTreeMap<String, BTreeMap<VertexPropertyValue, u64>>>::new();
-    for relationship in scope.relationships.values() {
+    for relationship in scope
+        .relationships
+        .values()
+        .filter(|relationship| relationship.src % partitions == partition)
+    {
         let mutation = RelationshipMutation {
             cell_id: config.cell_id.clone(),
             edge_type: relationship.edge_type.clone(),
@@ -465,289 +507,115 @@ async fn build_direct_image(
                 properties: property_map(&relationship.properties)?,
             },
         };
-        *edge_type_counts
-            .entry(relationship.edge_type.clone())
-            .or_default() += 1;
-        let source_labels = scope
-            .vertices
-            .get(&relationship.src)
-            .expect("resolved relationship source exists")
-            .labels
-            .iter()
-            .cloned()
-            .collect();
-        let destination_labels = scope
-            .vertices
-            .get(&relationship.dst)
-            .expect("resolved relationship destination exists")
-            .labels
-            .iter()
-            .cloned()
-            .collect();
-        let expansion = expansion_counts
-            .entry(relationship.edge_type.clone())
-            .or_default();
-        *expansion.0.entry(source_labels).or_default() += 1;
-        *expansion.1.entry(destination_labels).or_default() += 1;
-        for (property, value) in &mutation.metadata.properties {
-            *edge_property_counts
-                .entry(relationship.edge_type.clone())
-                .or_default()
-                .entry(property.clone())
-                .or_default()
-                .entry(value.clone())
-                .or_default() += 1;
-        }
-        sorter.extend(encoder.relationship_rows(&mutation)?)?;
+        sorter.extend(if scope.byog {
+            encoder.relationship_rows_preserving_properties(&mutation)?
+        } else {
+            encoder.relationship_rows(&mutation)?
+        })?;
     }
-
-    let refreshed_at_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let scope_hash = scope_hash(scope);
-    for (edge_type, count) in &edge_type_counts {
-        sorter.extend(encoder.edge_type_query_stats_rows(edge_type, *count, refreshed_at_ms)?)?;
-    }
-    for (label, count) in &label_counts {
-        sorter.extend(encoder.vertex_label_query_stats_rows(label, *count, refreshed_at_ms)?)?;
-    }
-    for labels in label_set_counts.keys().filter(|labels| labels.len() > 1) {
-        sorter.extend(encoder.vertex_label_intersection_query_stats_rows(
-            labels,
-            superset_count(&label_set_counts, labels, &scope_hash)?,
-            refreshed_at_ms,
-        )?)?;
-    }
-    for (edge_type, (outbound, inbound)) in &expansion_counts {
-        let label_sets = outbound
-            .keys()
-            .chain(inbound.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for labels in label_sets {
-            let outgoing = superset_count(outbound, &labels, &scope_hash)?;
-            let incoming = superset_count(inbound, &labels, &scope_hash)?;
-            sorter.extend(encoder.edge_expansion_query_stats_rows(
-                edge_type,
-                QueryStatsDirection::Outgoing,
-                &labels,
-                outgoing,
-                refreshed_at_ms,
-            )?)?;
-            sorter.extend(encoder.edge_expansion_query_stats_rows(
-                edge_type,
-                QueryStatsDirection::Incoming,
-                &labels,
-                incoming,
-                refreshed_at_ms,
-            )?)?;
-            sorter.extend(encoder.edge_expansion_query_stats_rows(
-                edge_type,
-                QueryStatsDirection::Undirected,
-                &labels,
-                outgoing.checked_add(incoming).ok_or_else(|| {
-                    hydradb::GraphError::CorruptValue {
-                        key: format!("direct-import/{scope_hash}/{edge_type}/expansion"),
-                        reason: "undirected expansion count overflow".to_string(),
-                    }
-                })?,
-                refreshed_at_ms,
-            )?)?;
-        }
-    }
-    for (property, counts) in &vertex_property_counts {
-        sorter.extend(encoder.vertex_property_histogram_query_stats_rows(
-            property,
-            counts,
-            refreshed_at_ms,
-        )?)?;
-    }
-    for (edge_type, properties) in &edge_property_counts {
-        for (property, counts) in properties {
-            sorter.extend(encoder.edge_property_histogram_query_stats_rows(
-                edge_type,
-                property,
-                counts,
-                refreshed_at_ms,
-            )?)?;
-        }
-    }
-    sorter.extend(encoder.finish_rows())?;
-    Ok(sorter
-        .publish(ObjectPath::from(shard_path), object_store, TARGET_SST_BYTES)
-        .await?)
+    Ok((sorter, encoder))
 }
 
-async fn finalize_scope(
-    config: &Config,
-    scope: &ResolvedScope,
-    shard: &GraphShard,
-) -> hydradb::Result<(usize, usize, bool)> {
-    let mut batches = scope.vertices.len().div_ceil(config.batch_size);
-    let mut by_type = BTreeMap::<String, Vec<(u64, u64)>>::new();
-    for relationship in scope.relationships.values() {
-        by_type
-            .entry(relationship.edge_type.clone())
-            .or_default()
-            .push((relationship.src, relationship.dst));
-    }
-    let scope_hash = scope_hash(scope);
-    for relationships in by_type.values() {
-        batches += relationships.len().div_ceil(config.batch_size);
-    }
-
-    try_join_all(by_type.iter().map(|(edge_type, relationships)| {
-        shard.build_graph_index_from_edges(
-            &config.cell_id,
-            edge_type,
-            relationships.iter().copied(),
-        )
-    }))
-    .await?;
-    if config.defer_deep_verification {
-        return Ok((by_type.len(), batches, false));
-    }
-    let reports = try_join_all(by_type.iter().map(|(edge_type, relationships)| async move {
-        let report = shard
-            .verify_current_graph(&config.cell_id, edge_type, 3, 32)
-            .await?;
-        Ok::<_, hydradb::GraphError>((edge_type, relationships.len(), report))
-    }))
-    .await?;
+/// Every FalkorDB relationship carries its stable `id`, so a verified scope
+/// holds one identity index per relationship. A BYOG scope indexes only the
+/// user ids that are unique per endpoint pair.
+fn check_merge_indexes(scope: &ResolvedScope, scope_hash: &str, reports: &[VerifiedEdgeType]) -> hydradb::Result<()> {
     for (edge_type, relationship_count, report) in reports {
-        if !report.is_clean() {
-            return Err(hydradb::GraphError::CorruptValue {
-                key: format!("direct-import/{scope_hash}/{edge_type}"),
-                reason: format!(
-                    "post-import verification found {} mismatches: {:?}",
-                    report.mismatch_count, report.mismatch_samples
-                ),
-            });
-        }
-        let expected_relationships =
-            u64::try_from(relationship_count).map_err(|_| hydradb::GraphError::CorruptValue {
-                key: format!("direct-import/{scope_hash}/{edge_type}"),
-                reason: "relationship count does not fit u64".to_string(),
-            })?;
-        if report.relationship_merge_indexes != expected_relationships {
+        let expected_relationships = u64::try_from(*relationship_count).map_err(|_| hydradb::GraphError::CorruptValue {
+            key: format!("direct-import/{scope_hash}/{edge_type}"),
+            reason: "relationship count does not fit u64".to_string(),
+        })?;
+        let expected_merge_indexes = if scope.byog {
+            byog_merge_index_count(scope, edge_type)?
+        } else {
+            expected_relationships
+        };
+        if report.relationship_records != expected_relationships || report.relationship_merge_indexes != expected_merge_indexes {
             return Err(hydradb::GraphError::CorruptValue {
                 key: format!("direct-import/{scope_hash}/{edge_type}/merge-index"),
                 reason: format!(
-                    "verified {} relationship identity indexes for {expected_relationships} relationships",
-                    report.relationship_merge_indexes
+                    "verified {} relationship records / {} identity indexes; expected {expected_relationships} records / {expected_merge_indexes} indexes",
+                    report.relationship_records, report.relationship_merge_indexes
                 ),
             });
         }
     }
-    Ok((by_type.len(), batches, true))
+    Ok(())
 }
 
-fn superset_count(
-    exact_counts: &BTreeMap<Vec<String>, u64>,
-    required: &[String],
-    scope_hash: &str,
-) -> hydradb::Result<u64> {
-    exact_counts
-        .iter()
-        .filter(|(labels, _)| {
-            required
-                .iter()
-                .all(|required| labels.binary_search(required).is_ok())
-        })
-        .try_fold(0_u64, |total, (_, count)| {
-            total
-                .checked_add(*count)
-                .ok_or_else(|| hydradb::GraphError::CorruptValue {
-                    key: format!("direct-import/{scope_hash}/query-stats"),
-                    reason: "query statistics count overflow".to_string(),
-                })
-        })
+fn byog_merge_index_count(scope: &ResolvedScope, edge_type: &str) -> hydradb::Result<u64> {
+    let mut counts = BTreeMap::new();
+    for edge in scope.relationships.values().filter(|edge| edge.edge_type == edge_type) {
+        if let Some(value) = property_map(&edge.properties)?
+            .get("id")
+            .filter(|value| value.is_scalar_indexable())
+        {
+            *counts.entry((edge.src, edge.dst, value.clone())).or_insert(0usize) += 1;
+        }
+    }
+    Ok(counts.values().filter(|&&count| count == 1).count() as u64)
 }
 
-fn property_map(
-    properties: &BTreeMap<String, PropertyValue>,
-) -> hydradb::Result<BTreeMap<String, VertexPropertyValue>> {
+fn property_map(properties: &Properties) -> hydradb::Result<BTreeMap<String, VertexPropertyValue>> {
     properties
         .iter()
-        .filter_map(|(name, value)| {
-            property_value(name, value).map(|result| result.map(|value| (name.clone(), value)))
-        })
+        .filter_map(|(name, value)| property_value(name, value).map(|result| result.map(|value| (name.to_string(), value))))
         .collect()
 }
 
-fn property_value(
-    name: &str,
-    value: &PropertyValue,
-) -> Option<hydradb::Result<VertexPropertyValue>> {
+fn property_value(name: &str, value: &PropertyValue) -> Option<hydradb::Result<VertexPropertyValue>> {
     Some(Ok(match value {
         // A Cypher null is an absent property. Never manufacture a visible
         // string value for it.
         PropertyValue::Null => return None,
         PropertyValue::Bool(value) => VertexPropertyValue::Bool(*value),
         PropertyValue::Integer(value) => VertexPropertyValue::from_i64(*value),
-        PropertyValue::Float(value) => VertexPropertyValue::Float(QueryFloat(*value)),
-        PropertyValue::String(value) => VertexPropertyValue::String(value.clone()),
-        PropertyValue::Array(_)
-        | PropertyValue::Point { .. }
-        | PropertyValue::VectorF32(_)
-        | PropertyValue::Map(_) => {
+        // Turbolay stores a NaN or an infinity, but its query engine refuses every
+        // row that returns one, so the property would be unreadable after cutover.
+        PropertyValue::Float(value) if !value.is_finite() => {
             return Some(Err(hydradb::GraphError::CorruptValue {
                 key: format!("property/{name}"),
-                reason: "FalkorDB composite value has no lossless HydraDB property representation"
-                    .into(),
+                reason: format!("non-finite FalkorDB float {value} cannot be returned by Turbolay queries"),
             }))
         }
-        PropertyValue::DateTime(_)
-        | PropertyValue::Date(_)
-        | PropertyValue::Time(_)
-        | PropertyValue::Duration(_) => {
+        PropertyValue::Float(value) => VertexPropertyValue::Float(QueryFloat(*value)),
+        PropertyValue::String(value) => VertexPropertyValue::String(value.clone()),
+        PropertyValue::Array(_) | PropertyValue::Point { .. } | PropertyValue::VectorF32(_) | PropertyValue::Map(_) => {
             return Some(Err(hydradb::GraphError::CorruptValue {
                 key: format!("property/{name}"),
-                reason: "temporal FalkorDB values have no lossless HydraDB property representation"
-                    .into(),
+                reason: "FalkorDB composite value has no lossless Turbolay property representation".into(),
+            }))
+        }
+        PropertyValue::DateTime(_) | PropertyValue::Date(_) | PropertyValue::Time(_) | PropertyValue::Duration(_) => {
+            return Some(Err(hydradb::GraphError::CorruptValue {
+                key: format!("property/{name}"),
+                reason: "temporal FalkorDB values have no lossless Turbolay property representation".into(),
             }))
         }
     }))
 }
 
 fn storage_scope(config: &Config, scope: &ResolvedScope) -> hydradb::Result<GraphScope> {
-    let mut namespace = config.root_namespace.child(encode_scope_namespace_id(
-        "tenant_id",
-        &scope.scope.tenant_id,
-    )?)?;
+    let mut namespace = config
+        .root_namespace
+        .child(encode_scope_namespace_id("tenant_id", &scope.scope.tenant_id)?)?;
     if !scope.scope.sub_tenant_id.is_empty() {
-        namespace = namespace.child(encode_scope_namespace_id(
-            "sub_tenant_id",
-            &scope.scope.sub_tenant_id,
-        )?)?;
+        namespace = namespace.child(encode_scope_namespace_id("sub_tenant_id", &scope.scope.sub_tenant_id)?)?;
     }
     Ok(GraphScope::new(namespace, config.graph_id.clone()))
 }
 
-async fn prefix_has_data(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &str,
-) -> Result<bool, slatedb::object_store::Error> {
+async fn prefix_has_data(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<bool, slatedb::object_store::Error> {
     use futures::StreamExt as _;
-    Ok(store
-        .list(Some(&ObjectPath::from(prefix)))
-        .next()
-        .await
-        .transpose()?
-        .is_some())
+    Ok(store.list(Some(&ObjectPath::from(prefix))).next().await.transpose()?.is_some())
 }
 
 fn import_run_prefix(config: &Config, manifest_sha256: &str) -> String {
-    format!(
-        "{}/_offline_imports/v2/{manifest_sha256}",
-        config.base_path.trim_end_matches('/'),
-    )
+    format!("{}/_offline_imports/v2/{manifest_sha256}", config.base_path.trim_end_matches('/'),)
 }
 
 fn completion_path(config: &Config, manifest_sha256: &str, scope_sha256: &str) -> ObjectPath {
-    format!(
-        "{}/complete/{scope_sha256}.json",
-        import_run_prefix(config, manifest_sha256)
-    )
-    .into()
+    format!("{}/complete/{scope_sha256}.json", import_run_prefix(config, manifest_sha256)).into()
 }
 
 async fn read_json<T: DeserializeOwned>(
@@ -760,9 +628,9 @@ async fn read_json<T: DeserializeOwned>(
         Err(error) => return Err(error.into()),
     };
     let payload = result.bytes().await?;
-    Ok(Some(serde_json::from_slice(&payload).map_err(|error| {
-        format!("invalid JSON object at {path}: {error}")
-    })?))
+    Ok(Some(
+        serde_json::from_slice(&payload).map_err(|error| format!("invalid JSON object at {path}: {error}"))?,
+    ))
 }
 
 async fn put_json_create_exact<T>(
@@ -774,10 +642,7 @@ where
     T: DeserializeOwned + PartialEq + Serialize,
 {
     let payload = Bytes::from(serde_json::to_vec(value)?);
-    match store
-        .put_opts(path, payload.into(), PutMode::Create.into())
-        .await
-    {
+    match store.put_opts(path, payload.into(), PutMode::Create.into()).await {
         Ok(_) => Ok(()),
         Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
             let existing: T = read_json(store, path)
@@ -799,10 +664,7 @@ async fn put_completion(
     value: &ScopeCompletion,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let payload = Bytes::from(serde_json::to_vec(value)?);
-    match store
-        .put_opts(path, payload.clone().into(), PutMode::Create.into())
-        .await
-    {
+    match store.put_opts(path, payload.clone().into(), PutMode::Create.into()).await {
         Ok(_) => Ok(()),
         Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
             let existing: ScopeCompletion = read_json(store, path)
@@ -815,9 +677,7 @@ async fn put_completion(
             let mut unverified_value = value.clone();
             unverified_value.deep_verified = false;
             if !existing.deep_verified && value.deep_verified && existing == unverified_value {
-                store
-                    .put_opts(path, payload.into(), PutMode::Overwrite.into())
-                    .await?;
+                store.put_opts(path, payload.into(), PutMode::Overwrite.into()).await?;
                 return Ok(());
             }
             Err(format!("conflicting object at {path}").into())
@@ -851,9 +711,7 @@ fn validate_completion(
         || completion.edge_types != edge_types
         || (require_deep_verification && !completion.deep_verified)
     {
-        return Err(
-            format!("completion receipt does not match snapshot scope {scope_sha256}").into(),
-        );
+        return Err(format!("completion receipt does not match snapshot scope {scope_sha256}").into());
     }
     Ok(())
 }
@@ -863,13 +721,13 @@ async fn ensure_run_marker(
     config: &Config,
     plan: &falkor_dump_import::SnapshotSpill,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path: ObjectPath = format!(
-        "{}/run.json",
-        import_run_prefix(config, &plan.manifest_sha256)
-    )
-    .into();
+    let path: ObjectPath = format!("{}/run.json", import_run_prefix(config, &plan.manifest_sha256)).into();
     let expected = ImportRunMarker {
-        magic: if matches!(config.selection, GraphSelection::Include(_)) {
+        magic: if config.byog {
+            "hydradb-falkor-direct-import-byog-v2"
+        } else if config.dedicated_layout.is_some() {
+            "hydradb-falkor-direct-import-dedicated-v1"
+        } else if matches!(config.selection, GraphSelection::Include(_)) {
             INCLUDED_RUN_MAGIC
         } else {
             COMPLETION_MAGIC
@@ -885,21 +743,14 @@ async fn ensure_run_marker(
         cell_id: config.cell_id.clone(),
         excluded_graphs: plan.excluded_graphs.clone(),
         included_graphs: plan.included_graphs.clone(),
+        dedicated_layout: config.dedicated_layout.clone(),
+        byog: config.byog,
     };
-    let existing: Option<ImportRunMarker> = read_json(store, &path)
-        .await
-        .map_err(|error| error.to_string())?;
+    let existing: Option<ImportRunMarker> = read_json(store, &path).await.map_err(|error| error.to_string())?;
     match (config.resume, existing) {
-        (false, Some(_)) => Err(format!(
-            "import run already exists at {path}; use --resume for this exact snapshot"
-        )
-        .into()),
-        (true, None) => {
-            Err(format!("cannot resume without the import run marker at {path}").into())
-        }
-        (_, Some(existing)) if existing != expected => {
-            Err(format!("import run marker does not match at {path}").into())
-        }
+        (false, Some(_)) => Err(format!("import run already exists at {path}; use --resume for this exact snapshot").into()),
+        (true, None) => Err(format!("cannot resume without the import run marker at {path}").into()),
+        (_, Some(existing)) if existing != expected => Err(format!("import run marker does not match at {path}").into()),
         (true, Some(_)) => Ok(()),
         (false, None) => put_json_create_exact(store, &path, &expected)
             .await
@@ -917,11 +768,7 @@ async fn ensure_scope_attempt(
     scope: &ResolvedScope,
     destination_has_data: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path: ObjectPath = format!(
-        "{}/attempt/{scope_sha256}.json",
-        import_run_prefix(config, manifest_sha256)
-    )
-    .into();
+    let path: ObjectPath = format!("{}/attempt/{scope_sha256}.json", import_run_prefix(config, manifest_sha256)).into();
     let expected = ScopeAttempt {
         magic: COMPLETION_MAGIC.to_string(),
         manifest_sha256: manifest_sha256.to_string(),
@@ -941,36 +788,55 @@ async fn ensure_scope_attempt(
         return Ok(());
     }
     if destination_has_data {
-        return Err(format!(
-            "destination scope has data without a matching import marker: {}",
-            scope.scope
-        )
-        .into());
+        return Err(format!("destination scope has data without a matching import marker: {}", scope.scope).into());
     }
     put_json_create_exact(store, &path, &expected).await
 }
 
-fn scope_content_hash(
-    scope: &ResolvedScope,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(rmp_serde::to_vec_named(scope)?)
-    ))
+/// The SHA-256 of the scope's named MessagePack encoding, hashed as it is
+/// encoded: a large scope encodes to gigabytes, which a buffer would hold on
+/// top of the scope itself.
+fn scope_content_hash(scope: &ResolvedScope) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut hasher = Sha256::new();
+    rmp_serde::encode::write_named(&mut hasher, scope)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn scope_hash(scope: &ResolvedScope) -> String {
-    scope.scope.sha256_hex()
+    format!("{:x}", Sha256::digest(scope.scope.to_string().as_bytes()))
 }
-fn write_quarantine(
-    directory: &Path,
-    scopes: &[ResolvedScope],
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Write the snapshot's vertices no scope can hold, which belong to no
+/// scope's report, as `{"unscoped_vertices": [...]}`. Streamed one graph's
+/// spill file at a time, so the report never holds every vertex at once.
+fn write_unscoped(directory: &Path, unscoped: &SpilledUnscoped) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
     std::fs::create_dir_all(directory)?;
-    for scope in scopes
-        .iter()
-        .filter(|scope| !scope.orphan_edges.is_empty() || !scope.relationship_anomalies.is_empty())
-    {
+    let path = directory.join("unscoped-vertices.json");
+    let temporary = path.with_extension("json.tmp");
+    let mut report = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
+    report.write_all(b"{\"unscoped_vertices\":[")?;
+    let mut first = true;
+    for fragment in &unscoped.fragments {
+        for vertex in SpilledUnscoped::load(fragment)? {
+            if !first {
+                report.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut report, &vertex)?;
+        }
+    }
+    report.write_all(b"]}")?;
+    report.into_inner().map_err(|error| error.into_error())?.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+fn needs_quarantine(scope: &ResolvedScope) -> bool {
+    !scope.orphan_edges.is_empty() || !scope.relationship_anomalies.is_empty()
+}
+fn write_quarantine(directory: &Path, scopes: &[ResolvedScope]) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(directory)?;
+    for scope in scopes.iter().filter(|scope| needs_quarantine(scope)) {
         let path = directory.join(format!("{}.json", scope_hash(scope)));
         let temporary = path.with_extension("json.tmp");
         let report = QuarantineReport {
@@ -988,70 +854,53 @@ impl Config {
         Self::parse_args(std::env::args().skip(1))
     }
 
-    fn parse_args(
-        arguments: impl IntoIterator<Item = String>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut args = arguments.into_iter();
         let mut values = BTreeMap::new();
         let mut flags = BTreeSet::new();
         let mut selection = GraphSelection::All;
         while let Some(argument) = args.next() {
-            if argument == "--resume" || argument == "--defer-deep-verification" {
+            if argument == "--resume" || argument == "--defer-deep-verification" || argument == "--byog" {
                 flags.insert(argument);
                 continue;
             }
             if argument == "--exclude-graph" || argument == "--include-graph" {
-                let graph = args
-                    .next()
-                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                let graph = args.next().ok_or_else(|| format!("{argument} requires a value"))?;
                 selection.add_graph(&argument, graph)?;
                 continue;
             }
             if !argument.starts_with("--") {
                 return Err(format!("unexpected argument {argument}").into());
             }
-            let value = args
-                .next()
-                .ok_or_else(|| format!("{argument} requires a value"))?;
+            let value = args.next().ok_or_else(|| format!("{argument} requires a value"))?;
             values.insert(argument, value);
         }
         let snapshot_root = PathBuf::from(required(&mut values, "--snapshot-root")?);
-        let base_path = values
-            .remove("--base-path")
-            .unwrap_or_else(|| "graph/data".into());
-        let root = values
-            .remove("--root-namespace")
-            .unwrap_or_else(|| "default".into());
-        let root_namespace = NamespacePath::new(
-            root.split('/')
-                .map(|part| NamespaceId::new(part.to_string()))
-                .collect::<hydradb::Result<Vec<_>>>()?,
-        )?;
-        let graph_id = GraphId::new(
-            values
-                .remove("--graph-id")
-                .unwrap_or_else(|| "default".into()),
-        )?;
-        let cell_id = values
-            .remove("--cell-id")
-            .unwrap_or_else(|| "cell-0".into());
+        let base_path = values.remove("--base-path").unwrap_or_else(|| "graph/data".into());
+        let root = values.remove("--root-namespace").unwrap_or_else(|| "default".into());
+        let root_namespace = NamespacePath::parse(&root)?;
+        let graph_id = GraphId::new(values.remove("--graph-id").unwrap_or_else(|| "default".into()))?;
+        let cell_id = values.remove("--cell-id").unwrap_or_else(|| "cell-0".into());
         let workers = parse_number(
             values.remove("--workers"),
             std::thread::available_parallelism().map_or(1, usize::from),
             "workers",
         )?;
-        let scope_concurrency =
-            parse_number(values.remove("--scope-concurrency"), 8, "scope concurrency")?;
+        let scope_concurrency = parse_number(values.remove("--scope-concurrency"), 8, "scope concurrency")?;
         let batch_size = parse_number(values.remove("--batch-size"), 8_192, "batch size")?;
         let env_file = values.remove("--env-file");
         let quarantine_dir = values.remove("--quarantine-dir").map(PathBuf::from);
         let scratch_dir = values.remove("--scratch-dir").map(PathBuf::from);
+        let dedicated_layout = values
+            .remove("--dedicated-layout")
+            .map(|path| DedicatedLayout::read(Path::new(&path)))
+            .transpose()?;
+        let byog = flags.contains("--byog");
+        if byog && dedicated_layout.is_some() {
+            return Err("--byog and --dedicated-layout are mutually exclusive".into());
+        }
         if !values.is_empty() {
-            return Err(format!(
-                "unknown options: {}",
-                values.keys().cloned().collect::<Vec<_>>().join(", ")
-            )
-            .into());
+            return Err(format!("unknown options: {}", values.keys().cloned().collect::<Vec<_>>().join(", ")).into());
         }
         if workers == 0 || scope_concurrency == 0 || batch_size == 0 {
             return Err("workers, scope concurrency, and batch size must be positive".into());
@@ -1071,22 +920,15 @@ impl Config {
             quarantine_dir,
             scratch_dir,
             selection,
+            dedicated_layout,
+            byog,
         })
     }
 }
-fn required(
-    values: &mut BTreeMap<String, String>,
-    key: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    values
-        .remove(key)
-        .ok_or_else(|| format!("missing required {key}").into())
+fn required(values: &mut BTreeMap<String, String>, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    values.remove(key).ok_or_else(|| format!("missing required {key}").into())
 }
-fn parse_number(
-    value: Option<String>,
-    default: usize,
-    name: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
+fn parse_number(value: Option<String>, default: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(value
         .map(|value| value.parse())
         .transpose()

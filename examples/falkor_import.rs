@@ -4,9 +4,8 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use hydradb::{
-    object_store_from_env, EdgeMetadata, GraphCacheConfig, GraphError, GraphLimits,
-    GraphOpenOptions, GraphShard, RelationshipMutation, Result, VertexId, VertexMetadata,
-    VertexPropertyValue,
+    object_store_from_env, EdgeMetadata, GraphCacheConfig, GraphError, GraphLimits, GraphOpenOptions, GraphShard, RelationshipMutation,
+    Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt};
 
@@ -34,42 +33,28 @@ async fn main() -> Result<()> {
         .map(|cache_dir| GraphCacheConfig::disk_cache(cache_dir, config.cache_bytes))
         .unwrap_or_default();
     let options = {
-        let mut options = GraphOpenOptions::default();
-        options.limits = GraphLimits {
-            max_bulk_import_edges: config
-                .edge_batch_size
-                .max(config.metadata_batch_size)
-                .max(1),
-            max_artifact_build_edges: source.edge_count.max(1),
-            max_query_scan_edges: source.edge_count.max(1),
-            max_query_index_candidates: manifest_node_count.max(manifest_edge_count).max(1),
-            ..GraphLimits::default()
-        };
-        options.cache = cache;
-        options
+        let options = GraphOpenOptions::default();
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_bulk_import_edges: config.edge_batch_size.max(config.metadata_batch_size).max(1),
+                max_artifact_build_edges: source.edge_count.max(1),
+                max_query_scan_edges: source.edge_count.max(1),
+                max_query_index_candidates: manifest_node_count.max(manifest_edge_count).max(1),
+                ..GraphLimits::default()
+            },
+            cache,
+            ..options
+        }
     };
 
-    let shard = GraphShard::open_standalone_writer_with_options(
-        config.db_path.clone(),
-        Arc::clone(&object_store),
-        options,
-    )
-    .await?;
+    let shard = GraphShard::open_standalone_writer_with_options(config.db_path.clone(), Arc::clone(&object_store), options).await?;
 
-    let imported_vertices =
-        import_nodes_object(Arc::clone(&object_store), &nodes_key, &shard, &config).await?;
+    let imported_vertices = import_nodes_object(Arc::clone(&object_store), &nodes_key, &shard, &config).await?;
 
     let mut imported_edges = 0_u64;
     let mut imported_relationships = 0_u64;
     let mut imported_relationship_metadata = 0_usize;
-    let edge_import = import_edges_object(
-        Arc::clone(&object_store),
-        &edges_key,
-        &shard,
-        &config,
-        &source.graph,
-    )
-    .await?;
+    let edge_import = import_edges_object(Arc::clone(&object_store), &edges_key, &shard, &config, &source.graph).await?;
     imported_edges += edge_import.imported_edges;
     imported_relationships += edge_import.imported_relationships;
     imported_relationship_metadata += edge_import.imported_relationship_metadata;
@@ -78,12 +63,7 @@ async fn main() -> Result<()> {
         let epoch = shard.current_epoch(&config.cell_id).await?;
         for edge_type in edge_import.type_counts.keys() {
             shard
-                .build_adjacency_image(
-                    &config.cell_id,
-                    edge_type,
-                    epoch,
-                    config.artifact_chunk_size as u64,
-                )
+                .build_adjacency_image(&config.cell_id, edge_type, epoch, config.artifact_chunk_size as u64)
                 .await?;
         }
     }
@@ -129,6 +109,7 @@ struct ImportConfig {
     artifact_chunk_size: usize,
     cache_dir: Option<String>,
     cache_bytes: usize,
+    typed_properties: bool,
 }
 
 impl ImportConfig {
@@ -148,29 +129,16 @@ impl ImportConfig {
                 .unwrap_or("falkor")
                 .to_string()
         });
-        let db_path = parser
-            .optional("--db-path")?
-            .unwrap_or_else(|| format!("imports/falkor/{cell_id}"));
-        let edge_batch_size = parser
-            .optional_usize("--edge-batch-size")?
-            .unwrap_or(16_384)
-            .max(1);
-        let metadata_batch_size = parser
-            .optional_usize("--metadata-batch-size")?
-            .unwrap_or(4_096)
-            .max(1);
+        let db_path = parser.optional("--db-path")?.unwrap_or_else(|| format!("imports/falkor/{cell_id}"));
+        let edge_batch_size = parser.optional_usize("--edge-batch-size")?.unwrap_or(16_384).max(1);
+        let metadata_batch_size = parser.optional_usize("--metadata-batch-size")?.unwrap_or(4_096).max(1);
         let duplicate_policy = parser
             .optional("--duplicate-policy")?
             .map(|value| DuplicatePolicy::parse(&value))
             .transpose()?
             .unwrap_or(DuplicatePolicy::Preserve);
-        let artifact_chunk_size = parser
-            .optional_usize("--artifact-chunk-size")?
-            .unwrap_or(32_768)
-            .max(1);
-        let cache_bytes = parser
-            .optional_usize("--cache-bytes")?
-            .unwrap_or_else(default_cache_bytes);
+        let artifact_chunk_size = parser.optional_usize("--artifact-chunk-size")?.unwrap_or(32_768).max(1);
+        let cache_bytes = parser.optional_usize("--cache-bytes")?.unwrap_or_else(default_cache_bytes);
         let config = Self {
             source_prefix,
             env_file: parser.optional("--env-file")?,
@@ -183,6 +151,7 @@ impl ImportConfig {
             artifact_chunk_size,
             cache_dir: parser.optional("--cache-dir")?,
             cache_bytes,
+            typed_properties: parser.flag("--typed-properties"),
         };
         parser.finish()?;
         Ok(config)
@@ -203,12 +172,11 @@ impl ArgParser {
     }
 
     fn required(&mut self, name: &str) -> Result<String> {
-        self.optional(name)?
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                reason: hydradb::QueryFailureReason::InvalidRequest,
-                dialect: "FalkorImport",
-                feature: format!("missing required argument {name}"),
-            })
+        self.optional(name)?.ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: hydradb::QueryFailureReason::InvalidRequest,
+            dialect: "FalkorImport",
+            feature: format!("missing required argument {name}"),
+        })
     }
 
     fn optional(&mut self, name: &str) -> Result<Option<String>> {
@@ -237,13 +205,11 @@ impl ArgParser {
     fn optional_usize(&mut self, name: &str) -> Result<Option<usize>> {
         self.optional(name)?
             .map(|value| {
-                value
-                    .parse::<usize>()
-                    .map_err(|err| GraphError::UnsupportedQuery {
-                        reason: hydradb::QueryFailureReason::InvalidRequest,
-                        dialect: "FalkorImport",
-                        feature: format!("{name} must be a positive integer: {err}"),
-                    })
+                value.parse::<usize>().map_err(|err| GraphError::UnsupportedQuery {
+                    reason: hydradb::QueryFailureReason::InvalidRequest,
+                    dialect: "FalkorImport",
+                    feature: format!("{name} must be a positive integer: {err}"),
+                })
             })
             .transpose()
     }
@@ -346,11 +312,10 @@ struct EdgeTypeWriteState {
 }
 
 fn parse_manifest(text: &str, key: &str) -> Result<Manifest> {
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|err| GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("invalid manifest JSON: {err}"),
-        })?;
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("invalid manifest JSON: {err}"),
+    })?;
     let graph = manifest_graph_name(&value, key)?;
     Ok(Manifest {
         graph,
@@ -368,9 +333,7 @@ fn manifest_graph_name(value: &serde_json::Value, key: &str) -> Result<String> {
     let org_id = value.get("org_id").and_then(serde_json::Value::as_str);
     let tenant_id = value.get("tenant_id").and_then(serde_json::Value::as_str);
     match (org_id, tenant_id) {
-        (Some(org_id), Some(tenant_id)) if !org_id.is_empty() && !tenant_id.is_empty() => {
-            Ok(format!("{org_id}/{tenant_id}"))
-        }
+        (Some(org_id), Some(tenant_id)) if !org_id.is_empty() && !tenant_id.is_empty() => Ok(format!("{org_id}/{tenant_id}")),
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "manifest must include graph or org_id plus tenant_id".to_string(),
@@ -378,12 +341,7 @@ fn manifest_graph_name(value: &serde_json::Value, key: &str) -> Result<String> {
     }
 }
 
-async fn import_nodes_object(
-    object_store: Arc<dyn ObjectStore>,
-    key: &str,
-    shard: &GraphShard,
-    config: &ImportConfig,
-) -> Result<usize> {
+async fn import_nodes_object(object_store: Arc<dyn ObjectStore>, key: &str, shard: &GraphShard, config: &ImportConfig) -> Result<usize> {
     let path = Path::from(key.to_string());
     let raw = object_store.get(&path).await?;
     let mut stream = raw.into_stream();
@@ -425,7 +383,7 @@ async fn import_node_line(
     let Some(line) = decode_jsonl_line(key, line_no, line)? else {
         return Ok(());
     };
-    let (id, metadata) = parse_node_line(key, line_no, line)?;
+    let (id, metadata) = parse_node_line(key, line_no, line, config.typed_properties)?;
     state.batch.push((id, metadata));
     if state.batch.len() >= config.metadata_batch_size {
         state.imported += flush_node_batch(shard, config, &mut state.batch).await?;
@@ -433,27 +391,20 @@ async fn import_node_line(
     Ok(())
 }
 
-async fn flush_node_batch(
-    shard: &GraphShard,
-    config: &ImportConfig,
-    batch: &mut Vec<(VertexId, VertexMetadata)>,
-) -> Result<usize> {
+async fn flush_node_batch(shard: &GraphShard, config: &ImportConfig, batch: &mut Vec<(VertexId, VertexMetadata)>) -> Result<usize> {
     if batch.is_empty() {
         return Ok(0);
     }
     let updates = std::mem::take(batch);
-    shard
-        .import_vertex_metadata_batch(&config.cell_id, updates)
-        .await
+    shard.import_vertex_metadata_batch(&config.cell_id, updates).await
 }
 
-fn parse_node_line(key: &str, line_no: usize, line: &str) -> Result<(VertexId, VertexMetadata)> {
+fn parse_node_line(key: &str, line_no: usize, line: &str, typed_properties: bool) -> Result<(VertexId, VertexMetadata)> {
     let line_key = format!("{key}:{line_no}");
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
-            key: line_key.clone(),
-            reason: format!("invalid node JSON: {err}"),
-        })?;
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
+        key: line_key.clone(),
+        reason: format!("invalid node JSON: {err}"),
+    })?;
     let id = json_u64(&value, "id", &line_key)?;
     let mut metadata = VertexMetadata::default();
     let labels = value
@@ -474,7 +425,7 @@ fn parse_node_line(key: &str, line_no: usize, line: &str) -> Result<(VertexId, V
                 .to_string(),
         );
     }
-    metadata.properties = parse_properties(value.get("properties"), &line_key)?;
+    metadata.properties = parse_properties(value.get("properties"), &line_key, typed_properties)?;
     metadata
         .properties
         .entry("_fid".to_string())
@@ -513,28 +464,11 @@ async fn import_edges_object(
     }
     if !buffer.is_empty() {
         line_no += 1;
-        import_edge_line(
-            key,
-            line_no,
-            &buffer,
-            shard,
-            config,
-            source_graph,
-            &mut state,
-        )
-        .await?;
+        import_edge_line(key, line_no, &buffer, shard, config, source_graph, &mut state).await?;
     }
 
     for (edge_type, mut write_state) in std::mem::take(&mut state.states) {
-        flush_edge_type_state(
-            shard,
-            config,
-            source_graph,
-            &edge_type,
-            &mut write_state,
-            &mut state.totals,
-        )
-        .await?;
+        flush_edge_type_state(shard, config, source_graph, &edge_type, &mut write_state, &mut state.totals).await?;
     }
     Ok(state.totals)
 }
@@ -551,21 +485,9 @@ async fn import_edge_line(
     let Some(line) = decode_jsonl_line(key, line_no, line)? else {
         return Ok(());
     };
-    let parsed = parse_edge_line(key, line_no, line)?;
-    *state
-        .totals
-        .type_counts
-        .entry(parsed.edge_type.clone())
-        .or_default() += 1;
-    push_edge_for_import(
-        shard,
-        config,
-        source_graph,
-        state,
-        parsed.edge_type,
-        parsed.edge,
-    )
-    .await
+    let parsed = parse_edge_line(key, line_no, line, config.typed_properties)?;
+    *state.totals.type_counts.entry(parsed.edge_type.clone()).or_default() += 1;
+    push_edge_for_import(shard, config, source_graph, state, parsed.edge_type, parsed.edge).await
 }
 
 async fn push_edge_for_import(
@@ -582,23 +504,11 @@ async fn push_edge_for_import(
         write_state.records.len() >= config.edge_batch_size
     };
     if should_flush {
-        let mut write_state =
-            state
-                .states
-                .remove(&edge_type)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: format!("falkor_import/{edge_type}"),
-                    reason: "missing edge import state after flush trigger".to_string(),
-                })?;
-        flush_edge_type_state(
-            shard,
-            config,
-            source_graph,
-            &edge_type,
-            &mut write_state,
-            &mut state.totals,
-        )
-        .await?;
+        let mut write_state = state.states.remove(&edge_type).ok_or_else(|| GraphError::CorruptValue {
+            key: format!("falkor_import/{edge_type}"),
+            reason: "missing edge import state after flush trigger".to_string(),
+        })?;
+        flush_edge_type_state(shard, config, source_graph, &edge_type, &mut write_state, &mut state.totals).await?;
         state.states.insert(edge_type, write_state);
     }
     Ok(())
@@ -645,19 +555,18 @@ async fn flush_edge_type_state(
     Ok(())
 }
 
-fn parse_edge_line(key: &str, line_no: usize, line: &str) -> Result<ParsedEdgeLine> {
+fn parse_edge_line(key: &str, line_no: usize, line: &str, typed_properties: bool) -> Result<ParsedEdgeLine> {
     let line_key = format!("{key}:{line_no}");
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
-            key: line_key.clone(),
-            reason: format!("invalid edge JSON: {err}"),
-        })?;
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
+        key: line_key.clone(),
+        reason: format!("invalid edge JSON: {err}"),
+    })?;
     let edge_id = json_u64(&value, "id", &line_key)?;
     let edge_type = json_string(&value, "type", &line_key)?.to_string();
     let src = json_u64(&value, "source_id", &line_key)?;
     let dst = json_u64(&value, "target_id", &line_key)?;
     let mut metadata = EdgeMetadata {
-        properties: parse_properties(value.get("properties"), &line_key)?,
+        properties: parse_properties(value.get("properties"), &line_key, typed_properties)?,
     };
     metadata
         .properties
@@ -674,10 +583,7 @@ fn parse_edge_line(key: &str, line_no: usize, line: &str) -> Result<ParsedEdgeLi
     })
 }
 
-fn parse_properties(
-    value: Option<&serde_json::Value>,
-    key: &str,
-) -> Result<BTreeMap<String, VertexPropertyValue>> {
+fn parse_properties(value: Option<&serde_json::Value>, key: &str, typed_properties: bool) -> Result<BTreeMap<String, VertexPropertyValue>> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -685,15 +591,20 @@ fn parse_properties(
         key: key.to_string(),
         reason: "properties must be a JSON object".to_string(),
     })?;
-    Ok(object
+    object
         .iter()
         .map(|(property, value)| {
-            (
-                property.clone(),
-                VertexPropertyValue::from_json_value(value),
-            )
+            let property_value = if typed_properties {
+                VertexPropertyValue::from_typed_json_value(value).map_err(|reason| GraphError::CorruptValue {
+                    key: format!("{key}.properties.{property}"),
+                    reason,
+                })?
+            } else {
+                VertexPropertyValue::from_json_value(value)
+            };
+            Ok((property.clone(), property_value))
         })
-        .collect())
+        .collect()
 }
 
 async fn read_object_text(object_store: Arc<dyn ObjectStore>, key: &str) -> Result<String> {
@@ -796,6 +707,6 @@ fn print_usage() {
         "usage: cargo run --features json-properties --example falkor_import -- \\
          --source-prefix orgs/<org>/<graph> [--env-file .env] [--db-path imports/falkor/<graph>] \\
          [--cell-id <graph>] [--duplicate-policy preserve] \\
-         [--edge-batch-size 16384] [--metadata-batch-size 4096] [--build-artifacts]"
+         [--edge-batch-size 16384] [--metadata-batch-size 4096] [--typed-properties] [--build-artifacts]"
     );
 }

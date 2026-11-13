@@ -76,10 +76,11 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
+{{- /* minAvailable is rendered only when maxUnavailable is unset (poddisruptionbudgets.yaml). */ -}}
+{{- if and .Values.podDisruptionBudget.enabled (eq .Values.podDisruptionBudget.node.maxUnavailable nil) (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
 {{- fail "podDisruptionBudget.node.minAvailable cannot exceed node.replicaCount" -}}
 {{- end -}}
-{{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled (gt (int .Values.podDisruptionBudget.indexer.minAvailable) (int .Values.indexer.replicaCount)) -}}
+{{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled (eq .Values.podDisruptionBudget.indexer.maxUnavailable nil) (gt (int .Values.podDisruptionBudget.indexer.minAvailable) (int .Values.indexer.replicaCount)) -}}
 {{- fail "podDisruptionBudget.indexer.minAvailable cannot exceed indexer.replicaCount" -}}
 {{- end -}}
 {{- if and (eq .Values.node.updateStrategy "RollingUpdate") (gt (int .Values.node.rollingUpdatePartition) (int .Values.node.replicaCount)) -}}
@@ -90,10 +91,6 @@
 {{- end -}}
 {{- if lt (int .Values.indexer.scopesPerCycle) (int .Values.indexer.scopeConcurrency) -}}
 {{- fail "indexer.scopesPerCycle must be greater than or equal to indexer.scopeConcurrency" -}}
-{{- end -}}
-{{- $minimumCacheOpenFiles := mul (int .Values.runtime.maxOpenScopes) (mul (len .Values.graph.cells) 2) -}}
-{{- if lt (int .Values.runtime.dataCacheMaxOpenFiles) (int $minimumCacheOpenFiles) -}}
-{{- fail (printf "runtime.dataCacheMaxOpenFiles must be at least runtime.maxOpenScopes × graph.cells count × 2 (%d)" (int $minimumCacheOpenFiles)) -}}
 {{- end -}}
 {{- if lt (int .Values.runtime.writerLeaseMs) 3000 -}}
 {{- fail "runtime.writerLeaseMs must be at least 3000" -}}

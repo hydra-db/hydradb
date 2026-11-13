@@ -1,0 +1,32 @@
+name: LAGraph
+description: Restore or build the static LAGraph archive for the runner's GraphBLAS, and export LAGRAPH_LIB_DIR
+
+# Run after libgraphblas-dev is installed: the archive is compiled against that
+# exact package, so its version is part of the cache key, with the runner and
+# the build script that pins the LAGraph tag.
+runs:
+  using: composite
+  steps:
+    - name: Key the LAGraph build
+      id: key
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "graphblas=$(dpkg-query -W -f='${Version}' libgraphblas-dev)" >> "$GITHUB_OUTPUT"
+        echo "prefix=${RUNNER_TEMP}/lagraph" >> "$GITHUB_OUTPUT"
+    - name: Restore LAGraph
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ steps.key.outputs.prefix }}
+        key: lagraph-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install_lagraph.sh') }}-graphblas-${{ steps.key.outputs.graphblas }}
+    - name: Build LAGraph
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: bash scripts/install_lagraph.sh "${{ steps.key.outputs.prefix }}"
+    - name: Export LAGRAPH_LIB_DIR
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -f "${{ steps.key.outputs.prefix }}/lib/liblagraph.a"
+        echo "LAGRAPH_LIB_DIR=${{ steps.key.outputs.prefix }}/lib" >> "$GITHUB_ENV"

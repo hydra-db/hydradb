@@ -24,6 +24,7 @@ mkdir -p "$ROOT/store" "$ROOT/node-data-cache"
 TOKEN="runtime-smoke-auth-token-32-characters-long"
 printf '%s\n' "$TOKEN" >"$ROOT/auth-token"
 
+export GRAPH_USAGE_REPORT_ENABLED=false
 export CLOUD_PROVIDER=local
 export LOCAL_PATH="$ROOT/store"
 export GRAPH_NAMESPACE=smoke

@@ -22,9 +22,7 @@ use hydradb_cypher_ast::QueryFailureReason;
 use std::collections::BTreeSet;
 
 use crate::prepare::column_names;
-use crate::{
-    EngineError, EngineResult, GraphLogicalPlan, GraphPhysicalPlan, PhysicalExpression, Symbol,
-};
+use crate::{EngineError, EngineResult, GraphLogicalPlan, GraphPhysicalPlan, PhysicalExpression, PhysicalProjection, Symbol};
 
 /// A plan's root is not a result-producing shape.
 pub const RESULT_PLAN_ROOT: &str = "result_plan_root";
@@ -100,13 +98,9 @@ impl UnsupportedShape {
     /// share a class on purpose.
     pub(crate) fn reason(&self) -> QueryFailureReason {
         match self.kind {
-            UNION_EMPTY | UNION_COLUMN_MISMATCH | UNION_BINDING_MISMATCH => {
-                QueryFailureReason::Union
-            }
+            UNION_EMPTY | UNION_COLUMN_MISMATCH | UNION_BINDING_MISMATCH => QueryFailureReason::Union,
             UNDIRECTED_VARIABLE_LENGTH => QueryFailureReason::Pattern,
-            RESULT_PLAN_ROOT | NESTED_PROJECT_UNNAMED | NESTED_PROJECT_AGGREGATE => {
-                QueryFailureReason::Return
-            }
+            RESULT_PLAN_ROOT | NESTED_PROJECT_UNNAMED | NESTED_PROJECT_AGGREGATE => QueryFailureReason::Return,
             _ => QueryFailureReason::Other,
         }
     }
@@ -168,11 +162,26 @@ fn logical_result_plan(plan: &GraphLogicalPlan) -> ShapeResult {
             }
             arms.iter().try_for_each(logical_result_plan)
         }
-        GraphLogicalPlan::Project { input, .. } => logical_binding_plan(input),
-        _ => unsupported(
-            RESULT_PLAN_ROOT,
-            "a result-producing plan must have Project or Union at its root",
-        ),
+        GraphLogicalPlan::Project { input, .. } | GraphLogicalPlan::Finish { input } => logical_binding_plan(input),
+        GraphLogicalPlan::Next { input, next } => {
+            logical_result_plan(input)?;
+            logical_result_plan(next)
+        }
+        _ => unsupported(RESULT_PLAN_ROOT, "a result-producing plan must have Project or Union at its root"),
+    }
+}
+
+/// The name an item of a projection below a result plan binds: its alias, a
+/// bare variable's own name, or for `r.id` its result column's name, `r.id`
+/// (not `r`, whose record or element it reads). Any other computed item has
+/// none, and the shape is refused rather than run with a value under no
+/// name. Execution names items with this same function.
+pub(crate) fn nested_projection_name(item: &PhysicalProjection) -> Option<Symbol> {
+    match (&item.alias, &item.expression) {
+        (Some(alias), _) => Some(alias.clone()),
+        (None, PhysicalExpression::Binding(binding)) => Some(binding.clone()),
+        (None, PhysicalExpression::Identity(_)) => Some(Symbol::from(item.column_name().as_str())),
+        (None, _) => None,
     }
 }
 
@@ -184,8 +193,7 @@ fn logical_binding_plan(plan: &GraphLogicalPlan) -> ShapeResult {
                 if item.alias.is_none()
                     && !matches!(
                         item.expression,
-                        crate::LogicalExpression::Binding(_)
-                            | crate::LogicalExpression::Identity(_)
+                        crate::LogicalExpression::Binding(_) | crate::LogicalExpression::Identity(_)
                     )
                 {
                     return unsupported(
@@ -196,7 +204,10 @@ fn logical_binding_plan(plan: &GraphLogicalPlan) -> ShapeResult {
             }
             logical_binding_plan(input)
         }
-        GraphLogicalPlan::VariableExpand { input, .. } => logical_binding_plan(input),
+        GraphLogicalPlan::VariableExpand { input, iteration, .. } => {
+            logical_binding_plan(input)?;
+            iteration.as_ref().map_or(Ok(()), |iteration| logical_binding_plan(&iteration.plan))
+        }
         GraphLogicalPlan::SingleRow | GraphLogicalPlan::NodeScan { .. } => Ok(()),
         GraphLogicalPlan::Unwind { input, .. } => logical_binding_plan(input),
         GraphLogicalPlan::Expand { input, .. }
@@ -208,6 +219,23 @@ fn logical_binding_plan(plan: &GraphLogicalPlan) -> ShapeResult {
             logical_binding_plan(left)?;
             logical_binding_plan(right)
         }
+        // A subquery that ends in RETURN is a result plan of its own.
+        GraphLogicalPlan::Exists { input, subquery, .. } => {
+            logical_binding_plan(input)?;
+            match subquery.as_ref() {
+                GraphLogicalPlan::Project { .. } | GraphLogicalPlan::Union { .. } => logical_result_plan(subquery),
+                _ => logical_binding_plan(subquery),
+            }
+        }
+        GraphLogicalPlan::ScalarSubquery { input, subquery, .. } | GraphLogicalPlan::CallProcedure { input, subquery, .. } => {
+            logical_binding_plan(input)?;
+            logical_result_plan(subquery)
+        }
+        GraphLogicalPlan::Finish { .. } | GraphLogicalPlan::Next { .. } => {
+            unsupported(RESULT_PLAN_ROOT, "statement results occur only at the query root")
+        }
+        GraphLogicalPlan::SelectPaths { input, .. } | GraphLogicalPlan::BindPath { input, .. } => logical_binding_plan(input),
+        GraphLogicalPlan::PathUnion { inputs, .. } => inputs.iter().try_for_each(logical_binding_plan),
     }
 }
 
@@ -223,26 +251,21 @@ fn physical_result_plan(plan: &GraphPhysicalPlan) -> ShapeResult {
             // names are in the plan, so nothing has to execute to find a
             // mismatch, and `execute_result_plan` used to discover it only
             // after running an arm and collecting its rows.
-            let expected = column_names(first)
-                .map_err(|error| UnsupportedShape::new(UNION_COLUMN_MISMATCH, error.to_string()))?;
+            let expected = column_names(first).map_err(|error| UnsupportedShape::new(UNION_COLUMN_MISMATCH, error.to_string()))?;
             for arm in arms.iter().skip(1) {
-                let names = column_names(arm).map_err(|error| {
-                    UnsupportedShape::new(UNION_COLUMN_MISMATCH, error.to_string())
-                })?;
+                let names = column_names(arm).map_err(|error| UnsupportedShape::new(UNION_COLUMN_MISMATCH, error.to_string()))?;
                 if names != expected {
-                    return unsupported(
-                        UNION_COLUMN_MISMATCH,
-                        "all UNION arms must return the same column names",
-                    );
+                    return unsupported(UNION_COLUMN_MISMATCH, "all UNION arms must return the same column names");
                 }
             }
             Ok(())
         }
-        GraphPhysicalPlan::Project { input, .. } => physical_binding_plan(input),
-        _ => unsupported(
-            RESULT_PLAN_ROOT,
-            "a result-producing plan must have Project or Union at its root",
-        ),
+        GraphPhysicalPlan::Project { input, .. } | GraphPhysicalPlan::Finish { input } => physical_binding_plan(input),
+        GraphPhysicalPlan::Next { input, next } => {
+            physical_result_plan(input)?;
+            physical_result_plan(next)
+        }
+        _ => unsupported(RESULT_PLAN_ROOT, "a result-producing plan must have Project or Union at its root"),
     }
 }
 
@@ -268,12 +291,7 @@ fn physical_binding_plan(plan: &GraphPhysicalPlan) -> ShapeResult {
         }
         GraphPhysicalPlan::Project { input, items, .. } => {
             for item in items {
-                if item.alias.is_none()
-                    && !matches!(
-                        item.expression,
-                        PhysicalExpression::Binding(_) | PhysicalExpression::Identity(_)
-                    )
-                {
+                if nested_projection_name(item).is_none() {
                     return unsupported(
                         NESTED_PROJECT_UNNAMED,
                         "a projection below a result plan must alias every computed item",
@@ -282,31 +300,28 @@ fn physical_binding_plan(plan: &GraphPhysicalPlan) -> ShapeResult {
             }
             physical_binding_plan(input)
         }
-        GraphPhysicalPlan::VariableExpand { input, from, .. } => {
+        GraphPhysicalPlan::VariableExpand {
+            input, from, iteration, ..
+        } => {
             expand_source_is_bindable(input, from)?;
-            physical_binding_plan(input)
+            physical_binding_plan(input)?;
+            iteration
+                .as_ref()
+                .map_or(Ok(()), |iteration| physical_binding_plan(&iteration.plan))
         }
         GraphPhysicalPlan::Expand { input, from, .. } => {
             expand_source_is_bindable(input, from)?;
             physical_binding_plan(input)
         }
         GraphPhysicalPlan::SingleRow
-        | GraphPhysicalPlan::VertexIdSeek { .. }
-        | GraphPhysicalPlan::VertexPropertySeek { .. }
-        | GraphPhysicalPlan::VertexPropertyMultiSeek { .. }
-        | GraphPhysicalPlan::VertexPropertyScan { .. }
-        | GraphPhysicalPlan::OrderedVertexPropertyScan { .. }
-        | GraphPhysicalPlan::VertexLabelScan { .. }
-        | GraphPhysicalPlan::AllVertexScan { .. }
+        | GraphPhysicalPlan::VertexScan { .. }
         | GraphPhysicalPlan::RelationshipPropertySeek { .. }
         | GraphPhysicalPlan::RelationshipPropertyMultiSeek { .. }
         | GraphPhysicalPlan::OrderedRelationshipPropertyScan { .. } => Ok(()),
         // Same reasoning as the range probe below: the probe answers from the
         // edge index or declines to its fallback at run time, so the plan is
         // runnable only if the fallback is.
-        GraphPhysicalPlan::RelationshipTypeProbe { fallback, .. } => {
-            physical_binding_plan(fallback)
-        }
+        GraphPhysicalPlan::RelationshipTypeProbe { fallback, .. } => physical_binding_plan(fallback),
         GraphPhysicalPlan::Unwind { input, .. }
         | GraphPhysicalPlan::Filter { input, .. }
         | GraphPhysicalPlan::Sort { input, .. }
@@ -315,19 +330,27 @@ fn physical_binding_plan(plan: &GraphPhysicalPlan) -> ShapeResult {
         // The probe answers from the edge index or declines to its fallback at
         // run time, so the plan is runnable only if the fallback is: a shape
         // the probe cannot express is not made supported by the probe winning.
-        GraphPhysicalPlan::RelationshipPropertyRangeProbe { fallback, .. } => {
-            physical_binding_plan(fallback)
-        }
-        // Declines to its fallback at run time, like the probes above, so it
-        // is runnable exactly when the fallback is.
-        GraphPhysicalPlan::VertexPropertyRangeSeek { fallback, .. }
-        | GraphPhysicalPlan::VertexGuardedAccess { fallback, .. } => {
-            physical_binding_plan(fallback)
-        }
+        GraphPhysicalPlan::RelationshipPropertyRangeProbe { fallback, .. } => physical_binding_plan(fallback),
         GraphPhysicalPlan::NaturalJoin { left, right, .. } => {
             physical_binding_plan(left)?;
             physical_binding_plan(right)
         }
+        GraphPhysicalPlan::Exists { input, subquery, .. } => {
+            physical_binding_plan(input)?;
+            match subquery.as_ref() {
+                GraphPhysicalPlan::Project { .. } | GraphPhysicalPlan::Union { .. } => physical_result_plan(subquery),
+                _ => physical_binding_plan(subquery),
+            }
+        }
+        GraphPhysicalPlan::ScalarSubquery { input, subquery, .. } | GraphPhysicalPlan::CallProcedure { input, subquery, .. } => {
+            physical_binding_plan(input)?;
+            physical_result_plan(subquery)
+        }
+        GraphPhysicalPlan::Finish { .. } | GraphPhysicalPlan::Next { .. } => {
+            unsupported(RESULT_PLAN_ROOT, "statement results occur only at the query root")
+        }
+        GraphPhysicalPlan::SelectPaths { input, .. } | GraphPhysicalPlan::BindPath { input, .. } => physical_binding_plan(input),
+        GraphPhysicalPlan::PathUnion { inputs, .. } => inputs.iter().try_for_each(physical_binding_plan),
     }
 }
 
@@ -359,9 +382,14 @@ pub(crate) fn produced_symbols(plan: &GraphPhysicalPlan) -> BTreeSet<Symbol> {
 fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Symbol>) {
     match plan {
         GraphPhysicalPlan::SingleRow => {}
-        GraphPhysicalPlan::Unwind { input, binding, .. } => {
+        GraphPhysicalPlan::Unwind {
+            input, binding, position, ..
+        } => {
             collect_produced_symbols(input, symbols);
             symbols.insert(binding.clone());
+            if let Some((position, _)) = position {
+                symbols.insert(position.clone());
+            }
         }
         GraphPhysicalPlan::Union { arms, .. } => {
             // Mismatched arms are refused elsewhere; describing the union by
@@ -376,39 +404,22 @@ fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Sym
             for item in items {
                 if let Some(alias) = &item.alias {
                     symbols.insert(alias.clone());
-                } else if let PhysicalExpression::Binding(binding)
-                | PhysicalExpression::Identity(binding) = &item.expression
-                {
+                } else if let PhysicalExpression::Binding(binding) | PhysicalExpression::Identity(binding) = &item.expression {
                     symbols.insert(binding.clone());
                 }
             }
         }
-        GraphPhysicalPlan::VertexIdSeek { binding, .. }
-        | GraphPhysicalPlan::VertexPropertySeek { binding, .. }
-        | GraphPhysicalPlan::VertexPropertyMultiSeek { binding, .. }
-        | GraphPhysicalPlan::VertexPropertyScan { binding, .. }
-        | GraphPhysicalPlan::OrderedVertexPropertyScan { binding, .. }
-        | GraphPhysicalPlan::VertexLabelScan { binding, .. }
-        | GraphPhysicalPlan::AllVertexScan { binding } => {
-            symbols.insert(binding.clone());
+        GraphPhysicalPlan::VertexScan { scan } => {
+            symbols.insert(scan.binding().clone());
         }
         GraphPhysicalPlan::RelationshipPropertySeek {
-            from,
-            relationship,
-            to,
-            ..
+            from, relationship, to, ..
         }
         | GraphPhysicalPlan::RelationshipPropertyMultiSeek {
-            from,
-            relationship,
-            to,
-            ..
+            from, relationship, to, ..
         }
         | GraphPhysicalPlan::OrderedRelationshipPropertyScan {
-            from,
-            relationship,
-            to,
-            ..
+            from, relationship, to, ..
         } => {
             symbols.insert(from.clone());
             symbols.insert(relationship.clone());
@@ -429,10 +440,7 @@ fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Sym
             symbols.insert(to.clone());
         }
         GraphPhysicalPlan::Expand {
-            input,
-            relationship,
-            to,
-            ..
+            input, relationship, to, ..
         } => {
             collect_produced_symbols(input, symbols);
             if let Some(relationship) = relationship {
@@ -440,8 +448,12 @@ fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Sym
             }
             symbols.insert(to.clone());
         }
-        GraphPhysicalPlan::VariableExpand { input, to, .. } => {
+        GraphPhysicalPlan::VariableExpand {
+            input, relationship, to, ..
+        } => {
             collect_produced_symbols(input, symbols);
+            // `[rs:R*1..3]` binds its relationship list as well.
+            symbols.extend(relationship.iter().cloned());
             symbols.insert(to.clone());
         }
         // Either branch binds the same names, and the fallback is the plan the
@@ -458,21 +470,34 @@ fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Sym
             symbols.insert(relationship.clone());
             symbols.insert(to.clone());
         }
-        // Described through its fallback, as the probes are: either branch
-        // binds the same vertex.
-        GraphPhysicalPlan::VertexPropertyRangeSeek {
-            binding, fallback, ..
-        }
-        | GraphPhysicalPlan::VertexGuardedAccess {
-            binding, fallback, ..
-        } => {
-            collect_produced_symbols(fallback, symbols);
-            symbols.insert(binding.clone());
-        }
         GraphPhysicalPlan::NaturalJoin { left, right, .. } => {
             collect_produced_symbols(left, symbols);
             collect_produced_symbols(right, symbols);
         }
+        // The subquery's own names stay inside it; only its mark escapes.
+        GraphPhysicalPlan::Exists { input, binding, .. } | GraphPhysicalPlan::ScalarSubquery { input, binding, .. } => {
+            collect_produced_symbols(input, symbols);
+            symbols.insert(binding.clone());
+        }
+        GraphPhysicalPlan::CallProcedure { input, columns, .. } => {
+            collect_produced_symbols(input, symbols);
+            symbols.extend(columns.iter().cloned());
+        }
+        GraphPhysicalPlan::Finish { input } | GraphPhysicalPlan::SelectPaths { input, .. } => collect_produced_symbols(input, symbols),
+        // Every operand's names: those of the others are null on its rows.
+        GraphPhysicalPlan::PathUnion { inputs, .. } => {
+            for input in inputs {
+                collect_produced_symbols(input, symbols);
+            }
+        }
+        GraphPhysicalPlan::BindPath {
+            input, names, node_groups, ..
+        } => {
+            collect_produced_symbols(input, symbols);
+            symbols.extend(names.iter().cloned());
+            symbols.extend(node_groups.iter().map(|(name, _)| name.clone()));
+        }
+        GraphPhysicalPlan::Next { next, .. } => collect_produced_symbols(next, symbols),
         GraphPhysicalPlan::Filter { input, .. }
         | GraphPhysicalPlan::Sort { input, .. }
         | GraphPhysicalPlan::Skip { input, .. }

@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    BoundValue, GraphLogicalPlan, GraphPhysicalPlan, GraphPlanError, GraphPlanResult,
-    LogicalBinaryOperator, LogicalExpression, LogicalProjection, PhysicalBinaryOperator,
-    PhysicalExpression, PhysicalProjection, ScalarValue, Symbol, ValueOrigin,
+    BoundValue, GraphLogicalPlan, GraphPhysicalPlan, GraphPlanError, GraphPlanResult, LogicalBinaryOperator, LogicalExpression,
+    LogicalProjection, PhysicalBinaryOperator, PhysicalExpression, PhysicalProjection, ScalarValue, Symbol, ValueOrigin,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -18,10 +17,7 @@ impl PhysicalPlanningContext {
     }
 }
 
-pub fn plan_physical(
-    logical: &GraphLogicalPlan,
-    context: &PhysicalPlanningContext,
-) -> GraphPlanResult<GraphPhysicalPlan> {
+pub fn plan_physical(logical: &GraphLogicalPlan, context: &PhysicalPlanningContext) -> GraphPlanResult<GraphPhysicalPlan> {
     match logical {
         GraphLogicalPlan::NodeScan { binding, labels } => Ok(fallback_scan(binding, labels)),
         GraphLogicalPlan::Filter { input, predicate } => plan_filter(input, predicate, context),
@@ -42,28 +38,26 @@ fn plan_filter(
 ) -> GraphPlanResult<GraphPhysicalPlan> {
     let bound_predicate = bind_expression(predicate, context)?;
     let access = match input {
-        GraphLogicalPlan::NodeScan { binding, labels } => {
-            match equality_constraint(&bound_predicate) {
-                Some((constraint_binding, property, values)) if constraint_binding == *binding => {
-                    if values.len() == 1 {
-                        GraphPhysicalPlan::VertexPropertySeek {
-                            binding: binding.clone(),
-                            labels: labels.clone(),
-                            property,
-                            value: values.into_iter().next().expect("one value"),
-                        }
-                    } else {
-                        GraphPhysicalPlan::VertexPropertyMultiSeek {
-                            binding: binding.clone(),
-                            labels: labels.clone(),
-                            property,
-                            values,
-                        }
+        GraphLogicalPlan::NodeScan { binding, labels } => match equality_constraint(&bound_predicate) {
+            Some((constraint_binding, property, values)) if constraint_binding == *binding => {
+                if values.len() == 1 {
+                    GraphPhysicalPlan::VertexPropertySeek {
+                        binding: binding.clone(),
+                        labels: labels.clone(),
+                        property,
+                        value: values.into_iter().next().expect("one value"),
+                    }
+                } else {
+                    GraphPhysicalPlan::VertexPropertyMultiSeek {
+                        binding: binding.clone(),
+                        labels: labels.clone(),
+                        property,
+                        values,
                     }
                 }
-                _ => fallback_scan(binding, labels),
             }
-        }
+            _ => fallback_scan(binding, labels),
+        },
         _ => plan_physical(input, context)?,
     };
     Ok(GraphPhysicalPlan::Filter {
@@ -78,26 +72,18 @@ fn fallback_scan(binding: &Symbol, labels: &[Symbol]) -> GraphPhysicalPlan {
             binding: binding.clone(),
             label: label.clone(),
         },
-        [] => GraphPhysicalPlan::AllVertexScan {
-            binding: binding.clone(),
-        },
+        [] => GraphPhysicalPlan::AllVertexScan { binding: binding.clone() },
     }
 }
 
-fn bind_projection(
-    projection: &LogicalProjection,
-    context: &PhysicalPlanningContext,
-) -> GraphPlanResult<PhysicalProjection> {
+fn bind_projection(projection: &LogicalProjection, context: &PhysicalPlanningContext) -> GraphPlanResult<PhysicalProjection> {
     Ok(PhysicalProjection {
         expression: bind_expression(&projection.expression, context)?,
         alias: projection.alias.clone(),
     })
 }
 
-fn bind_expression(
-    expression: &LogicalExpression,
-    context: &PhysicalPlanningContext,
-) -> GraphPlanResult<PhysicalExpression> {
+fn bind_expression(expression: &LogicalExpression, context: &PhysicalPlanningContext) -> GraphPlanResult<PhysicalExpression> {
     Ok(match expression {
         LogicalExpression::Binding(binding) => PhysicalExpression::Binding(binding.clone()),
         LogicalExpression::Property { binding, property } => PhysicalExpression::Property {
@@ -105,10 +91,11 @@ fn bind_expression(
             property: property.clone(),
         },
         LogicalExpression::Parameter(parameter) => {
-            let value =
-                context.parameters.get(parameter).cloned().ok_or_else(|| {
-                    GraphPlanError::MissingParameter(parameter.as_str().to_string())
-                })?;
+            let value = context
+                .parameters
+                .get(parameter)
+                .cloned()
+                .ok_or_else(|| GraphPlanError::MissingParameter(parameter.as_str().to_string()))?;
             PhysicalExpression::Value(BoundValue {
                 value,
                 origin: ValueOrigin::Parameter(parameter.clone()),
@@ -118,11 +105,7 @@ fn bind_expression(
             value: value.clone(),
             origin: ValueOrigin::Literal,
         }),
-        LogicalExpression::Binary {
-            left,
-            operator,
-            right,
-        } => PhysicalExpression::Binary {
+        LogicalExpression::Binary { left, operator, right } => PhysicalExpression::Binary {
             left: Box::new(bind_expression(left, context)?),
             operator: match operator {
                 LogicalBinaryOperator::Equal => PhysicalBinaryOperator::Equal,
@@ -133,9 +116,7 @@ fn bind_expression(
     })
 }
 
-fn equality_constraint(
-    predicate: &PhysicalExpression,
-) -> Option<(Symbol, Symbol, Vec<BoundValue>)> {
+fn equality_constraint(predicate: &PhysicalExpression) -> Option<(Symbol, Symbol, Vec<BoundValue>)> {
     match predicate {
         PhysicalExpression::Binary {
             left,
@@ -161,16 +142,12 @@ fn equality_constraint(
     }
 }
 
-fn property_value(
-    property: &PhysicalExpression,
-    value: &PhysicalExpression,
-) -> Option<(Symbol, Symbol, Vec<BoundValue>)> {
+fn property_value(property: &PhysicalExpression, value: &PhysicalExpression) -> Option<(Symbol, Symbol, Vec<BoundValue>)> {
     let PhysicalExpression::Property { binding, property } = property else {
         return None;
     };
     let PhysicalExpression::Value(value) = value else {
         return None;
     };
-    (!matches!(value.value, ScalarValue::Null))
-        .then(|| (binding.clone(), property.clone(), vec![value.clone()]))
+    (!matches!(value.value, ScalarValue::Null)).then(|| (binding.clone(), property.clone(), vec![value.clone()]))
 }

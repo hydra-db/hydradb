@@ -47,12 +47,7 @@ pub struct ObjectStoreGraphScopeDirectory {
 }
 
 impl ObjectStoreGraphScopeDirectory {
-    pub fn new(
-        base_path: impl Into<String>,
-        root_namespace: NamespacePath,
-        graph_id: GraphId,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> Self {
+    pub fn new(base_path: impl Into<String>, root_namespace: NamespacePath, graph_id: GraphId, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             base_path: base_path.into().trim_matches('/').to_string(),
             root_namespace,
@@ -69,11 +64,7 @@ impl ObjectStoreGraphScopeDirectory {
         self.validate_scope(scope)?;
         let location = self.marker_path(scope);
         let payload = Bytes::from_static(SCOPE_MARKER_VERSION.as_bytes());
-        match self
-            .object_store
-            .put_opts(&location, payload.into(), PutMode::Create.into())
-            .await
-        {
+        match self.object_store.put_opts(&location, payload.into(), PutMode::Create.into()).await {
             Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -99,12 +90,7 @@ impl ObjectStoreGraphScopeDirectory {
     /// acknowledge all hints covered by one refreshed storage snapshot without
     /// deleting a later mutation. The ordinary scope directory remains the
     /// recovery path if a process exits before this asynchronous hint lands.
-    pub async fn notify_changed(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        sequence: u64,
-    ) -> Result<()> {
+    pub async fn notify_changed(&self, scope: &GraphScope, cell_id: &str, sequence: u64) -> Result<()> {
         self.validate_scope(scope)?;
         crate::validate_component("cell_id", cell_id)?;
         let location = self.sequenced_change_path(scope, cell_id, sequence, Ulid::new());
@@ -130,11 +116,7 @@ impl ObjectStoreGraphScopeDirectory {
                 sequence,
             });
         }
-        changes.sort_by(|left, right| {
-            left.scope
-                .cmp(&right.scope)
-                .then_with(|| left.location.cmp(&right.location))
-        });
+        changes.sort_by(|left, right| left.scope.cmp(&right.scope).then_with(|| left.location.cmp(&right.location)));
         Ok(changes)
     }
 
@@ -142,10 +124,7 @@ impl ObjectStoreGraphScopeDirectory {
         for change in changes {
             self.validate_scope(&change.scope)?;
         }
-        let locations = changes
-            .iter()
-            .map(|change| change.location.clone())
-            .collect::<Vec<_>>();
+        let locations = changes.iter().map(|change| change.location.clone()).collect::<Vec<_>>();
         let deletes = futures::stream::iter(locations)
             .map(|location| {
                 let object_store = Arc::clone(&self.object_store);
@@ -166,11 +145,7 @@ impl ObjectStoreGraphScopeDirectory {
     /// (scope, cell), overwritten rather than accumulated, so a hot scope that
     /// keeps asking costs one object. Best effort, like a change hint: a lost
     /// marker only delays the build until the node asks again.
-    pub async fn request_planner_statistics(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-    ) -> Result<()> {
+    pub async fn request_planner_statistics(&self, scope: &GraphScope, cell_id: &str) -> Result<()> {
         self.validate_scope(scope)?;
         crate::validate_component("cell_id", cell_id)?;
         let location = self.planner_statistics_request_path(scope, cell_id);
@@ -185,8 +160,7 @@ impl ObjectStoreGraphScopeDirectory {
         let mut objects = self.object_store.list(Some(&prefix));
         let mut requests = Vec::new();
         while let Some(metadata) = objects.next().await.transpose()? {
-            let (scope, cell_id) =
-                self.planner_statistics_request_from_path(metadata.location.as_ref())?;
+            let (scope, cell_id) = self.planner_statistics_request_from_path(metadata.location.as_ref())?;
             self.validate_scope(&scope)?;
             requests.push(PlannerStatisticsRequest {
                 scope,
@@ -195,27 +169,17 @@ impl ObjectStoreGraphScopeDirectory {
                 created_at: metadata.last_modified,
             });
         }
-        requests.sort_by(|left, right| {
-            left.scope
-                .cmp(&right.scope)
-                .then_with(|| left.cell_id.cmp(&right.cell_id))
-        });
+        requests.sort_by(|left, right| left.scope.cmp(&right.scope).then_with(|| left.cell_id.cmp(&right.cell_id)));
         Ok(requests)
     }
 
     /// Remove served (or given-up) requests. A request re-made after the
     /// listing is removed too; the node asks again if it still needs one.
-    pub async fn clear_planner_statistics_requests(
-        &self,
-        requests: &[PlannerStatisticsRequest],
-    ) -> Result<()> {
+    pub async fn clear_planner_statistics_requests(&self, requests: &[PlannerStatisticsRequest]) -> Result<()> {
         for request in requests {
             self.validate_scope(&request.scope)?;
         }
-        let locations = requests
-            .iter()
-            .map(|request| request.location.clone())
-            .collect::<Vec<_>>();
+        let locations = requests.iter().map(|request| request.location.clone()).collect::<Vec<_>>();
         let deletes = futures::stream::iter(locations)
             .map(|location| {
                 let object_store = Arc::clone(&self.object_store);
@@ -250,12 +214,7 @@ impl ObjectStoreGraphScopeDirectory {
 
     /// Advance the durable per-cell watermark without allowing a concurrent,
     /// older indexer pass to move it backwards.
-    pub async fn acknowledge_sequence(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        sequence: u64,
-    ) -> Result<()> {
+    pub async fn acknowledge_sequence(&self, scope: &GraphScope, cell_id: &str, sequence: u64) -> Result<()> {
         self.validate_scope(scope)?;
         crate::validate_component("cell_id", cell_id)?;
         let location = self.change_ack_path(scope, cell_id);
@@ -278,11 +237,7 @@ impl ObjectStoreGraphScopeDirectory {
                 Err(error) => return Err(error.into()),
             };
             let mode = current.map_or(PutMode::Create, PutMode::Update);
-            match self
-                .object_store
-                .put_opts(&location, payload.clone().into(), mode.into())
-                .await
-            {
+            match self.object_store.put_opts(&location, payload.clone().into(), mode.into()).await {
                 Ok(_) => return Ok(()),
                 Err(slatedb::object_store::Error::AlreadyExists { .. })
                 | Err(slatedb::object_store::Error::Precondition { .. })
@@ -297,15 +252,11 @@ impl ObjectStoreGraphScopeDirectory {
     }
 
     fn validate_scope(&self, scope: &GraphScope) -> Result<()> {
-        if scope.graph_id == self.graph_id && scope.namespace.is_descendant_of(&self.root_namespace)
-        {
+        if scope.graph_id == self.graph_id && scope.namespace.is_descendant_of(&self.root_namespace) {
             return Ok(());
         }
         Err(GraphError::GraphScopeMismatch {
-            expected: format!(
-                "{}/graphs/{} and descendants",
-                self.root_namespace, self.graph_id
-            ),
+            expected: format!("{}/graphs/{} and descendants", self.root_namespace, self.graph_id),
             actual: scope.to_string(),
         })
     }
@@ -313,22 +264,14 @@ impl ObjectStoreGraphScopeDirectory {
     fn registry_prefix(&self) -> Path {
         path_from_base(
             &self.base_path,
-            &format!(
-                "_graph_scopes/v1/{}/{}",
-                self.graph_id,
-                namespace_key(&self.root_namespace)
-            ),
+            &format!("_graph_scopes/v1/{}/{}", self.graph_id, namespace_key(&self.root_namespace)),
         )
     }
 
     fn change_prefix(&self) -> Path {
         path_from_base(
             &self.base_path,
-            &format!(
-                "_graph_scope_changes/v1/{}/{}",
-                self.graph_id,
-                namespace_key(&self.root_namespace)
-            ),
+            &format!("_graph_scope_changes/v1/{}/{}", self.graph_id, namespace_key(&self.root_namespace)),
         )
     }
 
@@ -356,19 +299,12 @@ impl ObjectStoreGraphScopeDirectory {
 
     fn planner_statistics_request_path(&self, scope: &GraphScope, cell_id: &str) -> Path {
         let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
-        let mut suffix = relative_namespace
-            .iter()
-            .map(NamespaceId::as_str)
-            .collect::<Vec<_>>()
-            .join("/");
+        let mut suffix = relative_namespace.iter().map(NamespaceId::as_str).collect::<Vec<_>>().join("/");
         if !suffix.is_empty() {
             suffix.push('/');
         }
         suffix.push_str(&hex_encode(cell_id.as_bytes()));
-        Path::from(format!(
-            "{}/{suffix}",
-            self.planner_statistics_request_prefix()
-        ))
+        Path::from(format!("{}/{suffix}", self.planner_statistics_request_prefix()))
     }
 
     fn planner_statistics_request_from_path(&self, location: &str) -> Result<(GraphScope, String)> {
@@ -387,11 +323,9 @@ impl ObjectStoreGraphScopeDirectory {
                 reason: "planner statistics request is missing its cell".to_string(),
             });
         };
-        let cell_id = String::from_utf8(hex_decode(encoded_cell, location)?).map_err(|error| {
-            GraphError::CorruptValue {
-                key: location.to_string(),
-                reason: format!("planner statistics request cell id is not UTF-8: {error}"),
-            }
+        let cell_id = String::from_utf8(hex_decode(encoded_cell, location)?).map_err(|error| GraphError::CorruptValue {
+            key: location.to_string(),
+            reason: format!("planner statistics request cell id is not UTF-8: {error}"),
         })?;
         crate::validate_component("cell_id", &cell_id)?;
         let mut namespace = self.root_namespace.clone();
@@ -403,11 +337,7 @@ impl ObjectStoreGraphScopeDirectory {
 
     fn marker_path(&self, scope: &GraphScope) -> Path {
         let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
-        let mut suffix = relative_namespace
-            .iter()
-            .map(NamespaceId::as_str)
-            .collect::<Vec<_>>()
-            .join("/");
+        let mut suffix = relative_namespace.iter().map(NamespaceId::as_str).collect::<Vec<_>>().join("/");
         if !suffix.is_empty() {
             suffix.push('/');
         }
@@ -415,19 +345,9 @@ impl ObjectStoreGraphScopeDirectory {
         Path::from(format!("{}/{suffix}", self.registry_prefix()))
     }
 
-    fn sequenced_change_path(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        sequence: u64,
-        id: Ulid,
-    ) -> Path {
+    fn sequenced_change_path(&self, scope: &GraphScope, cell_id: &str, sequence: u64, id: Ulid) -> Path {
         let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
-        let mut suffix = relative_namespace
-            .iter()
-            .map(NamespaceId::as_str)
-            .collect::<Vec<_>>()
-            .join("/");
+        let mut suffix = relative_namespace.iter().map(NamespaceId::as_str).collect::<Vec<_>>().join("/");
         if !suffix.is_empty() {
             suffix.push('/');
         }
@@ -440,11 +360,7 @@ impl ObjectStoreGraphScopeDirectory {
 
     fn change_ack_path(&self, scope: &GraphScope, cell_id: &str) -> Path {
         let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
-        let mut suffix = relative_namespace
-            .iter()
-            .map(NamespaceId::as_str)
-            .collect::<Vec<_>>()
-            .join("/");
+        let mut suffix = relative_namespace.iter().map(NamespaceId::as_str).collect::<Vec<_>>().join("/");
         if !suffix.is_empty() {
             suffix.push('/');
         }
@@ -475,10 +391,7 @@ impl ObjectStoreGraphScopeDirectory {
         Ok(GraphScope::new(namespace, self.graph_id.clone()))
     }
 
-    fn change_from_path(
-        &self,
-        location: &str,
-    ) -> Result<(GraphScope, Option<String>, Option<u64>)> {
+    fn change_from_path(&self, location: &str) -> Result<(GraphScope, Option<String>, Option<u64>)> {
         let prefix = self.change_prefix().to_string();
         let relative = location
             .strip_prefix(&prefix)
@@ -494,9 +407,7 @@ impl ObjectStoreGraphScopeDirectory {
                 reason: "scope change is missing its identifier".to_string(),
             });
         };
-        let (cell_id, sequence) = if let Some(encoded) =
-            change_id.strip_prefix(&format!("{SCOPE_CHANGE_SEQUENCE_PREFIX}."))
-        {
+        let (cell_id, sequence) = if let Some(encoded) = change_id.strip_prefix(&format!("{SCOPE_CHANGE_SEQUENCE_PREFIX}.")) {
             let parts = encoded.split('.').collect::<Vec<_>>();
             if parts.len() != 3 {
                 return Err(GraphError::CorruptValue {
@@ -504,44 +415,32 @@ impl ObjectStoreGraphScopeDirectory {
                     reason: "sequenced scope change has an invalid identifier".to_string(),
                 });
             }
-            let cell_id = String::from_utf8(hex_decode(parts[0], location)?).map_err(|error| {
-                GraphError::CorruptValue {
-                    key: location.to_string(),
-                    reason: format!("scope change cell id is not UTF-8: {error}"),
-                }
+            let cell_id = String::from_utf8(hex_decode(parts[0], location)?).map_err(|error| GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: format!("scope change cell id is not UTF-8: {error}"),
             })?;
             crate::validate_component("cell_id", &cell_id)?;
-            let sequence = parts[1]
-                .parse::<u64>()
-                .map_err(|error| GraphError::CorruptValue {
-                    key: location.to_string(),
-                    reason: format!("scope change has an invalid sequence: {error}"),
-                })?;
-            parts[2]
-                .parse::<Ulid>()
-                .map_err(|error| GraphError::CorruptValue {
-                    key: location.to_string(),
-                    reason: format!("scope change has an invalid identifier: {error}"),
-                })?;
+            let sequence = parts[1].parse::<u64>().map_err(|error| GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: format!("scope change has an invalid sequence: {error}"),
+            })?;
+            parts[2].parse::<Ulid>().map_err(|error| GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: format!("scope change has an invalid identifier: {error}"),
+            })?;
             (Some(cell_id), Some(sequence))
         } else {
-            change_id
-                .parse::<Ulid>()
-                .map_err(|error| GraphError::CorruptValue {
-                    key: location.to_string(),
-                    reason: format!("scope change has an invalid identifier: {error}"),
-                })?;
+            change_id.parse::<Ulid>().map_err(|error| GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: format!("scope change has an invalid identifier: {error}"),
+            })?;
             (None, None)
         };
         let mut namespace = self.root_namespace.clone();
         for segment in &segments[..segments.len() - 1] {
             namespace = namespace.child(NamespaceId::new((*segment).to_string())?)?;
         }
-        Ok((
-            GraphScope::new(namespace, self.graph_id.clone()),
-            cell_id,
-            sequence,
-        ))
+        Ok((GraphScope::new(namespace, self.graph_id.clone()), cell_id, sequence))
     }
 }
 
@@ -559,12 +458,10 @@ fn decode_covered_sequence(location: &str, value: &[u8]) -> Result<u64> {
         key: location.to_string(),
         reason: format!("scope change acknowledgement is not UTF-8: {error}"),
     })?;
-    value
-        .parse::<u64>()
-        .map_err(|error| GraphError::CorruptValue {
-            key: location.to_string(),
-            reason: format!("scope change acknowledgement is not a storage sequence: {error}"),
-        })
+    value.parse::<u64>().map_err(|error| GraphError::CorruptValue {
+        key: location.to_string(),
+        reason: format!("scope change acknowledgement is not a storage sequence: {error}"),
+    })
 }
 
 fn hex_encode(value: &[u8]) -> String {
@@ -612,12 +509,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
 }
 
 fn namespace_key(namespace: &NamespacePath) -> String {
-    namespace
-        .segments()
-        .iter()
-        .map(NamespaceId::as_str)
-        .collect::<Vec<_>>()
-        .join("/")
+    namespace.segments().iter().map(NamespaceId::as_str).collect::<Vec<_>>().join("/")
 }
 
 fn path_from_base(base_path: &str, suffix: &str) -> Path {

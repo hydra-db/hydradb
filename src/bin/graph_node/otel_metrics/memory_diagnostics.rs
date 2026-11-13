@@ -14,12 +14,9 @@ pub(super) struct Instruments {
 }
 #[cfg(feature = "otlp")]
 impl Instruments {
-    pub(super) fn register(
-        providers: &hydradb_telemetry::otlp::Providers,
-    ) -> Result<Self, hydradb_telemetry::meter::HistogramError> {
+    pub(super) fn register(providers: &hydradb_telemetry::otlp::Providers) -> Result<Self, hydradb_telemetry::meter::HistogramError> {
         use hydradb_telemetry::meter::{
-            CounterSpec, CounterUnit, HistogramSpec, HistogramUnit, ObservableCounter,
-            ObservableGauge, ObservableHistogram,
+            CounterSpec, CounterUnit, HistogramSpec, HistogramUnit, ObservableCounter, ObservableGauge, ObservableHistogram,
         };
         let meter = providers.meter(super::METER_NAME);
         Ok(Self {
@@ -43,12 +40,9 @@ impl Instruments {
                 self.items.record(&labels, snapshot.items as f64),
                 self.bytes.record(&labels, snapshot.estimated_bytes as f64),
                 self.oldest.record(&labels, snapshot.oldest_seconds),
-                self.oldest_tracked
-                    .record(&labels, snapshot.oldest_tracked_seconds),
-                self.overflow_items
-                    .record(&labels, snapshot.tracking_overflow_items as f64),
-                self.overflow_cohort
-                    .record(&labels, snapshot.overflow_cohort_seconds),
+                self.oldest_tracked.record(&labels, snapshot.oldest_tracked_seconds),
+                self.overflow_items.record(&labels, snapshot.tracking_overflow_items as f64),
+                self.overflow_cohort.record(&labels, snapshot.overflow_cohort_seconds),
                 self.entered.record(&labels, snapshot.entered),
                 self.exited.record(&labels, snapshot.exited),
             ];
@@ -57,11 +51,10 @@ impl Instruments {
                     tracing::warn!(%error, "memory diagnostic metric was not published");
                 }
             }
-            if let Err(error) = self.duration.record_snapshot(
-                &labels,
-                &snapshot.duration.bucket_counts,
-                snapshot.duration.sum_us,
-            ) {
+            if let Err(error) = self
+                .duration
+                .record_snapshot(&labels, &snapshot.duration.bucket_counts, snapshot.duration.sum_us)
+            {
                 tracing::warn!(%error, "memory diagnostic duration was not published");
             }
         }
@@ -86,12 +79,7 @@ pub(crate) fn append(output: &mut String) {
     }
     for sample in hydradb::memory_diagnostic_snapshot() {
         let stage = sample.stage;
-        writeln!(
-            output,
-            "graph_memory_diagnostic_items{{stage=\"{stage}\"}} {}",
-            sample.items
-        )
-        .unwrap();
+        writeln!(output, "graph_memory_diagnostic_items{{stage=\"{stage}\"}} {}", sample.items).unwrap();
         writeln!(
             output,
             "graph_memory_diagnostic_estimated_bytes{{stage=\"{stage}\"}} {}",
@@ -135,10 +123,7 @@ pub(crate) fn append(output: &mut String) {
         )
         .unwrap();
         for (bound, count) in sample.duration.cumulative() {
-            let le = bound.map_or_else(
-                || "+Inf".to_string(),
-                |b| (b as f64 / 1_000_000.0).to_string(),
-            );
+            let le = bound.map_or_else(|| "+Inf".to_string(), |b| (b as f64 / 1_000_000.0).to_string());
             writeln!(
                 output,
                 "graph_memory_diagnostic_duration_seconds_bucket{{stage=\"{stage}\",le=\"{le}\"}} {count}"

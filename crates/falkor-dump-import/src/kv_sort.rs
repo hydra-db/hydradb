@@ -62,37 +62,49 @@ impl ExternalKvSorter {
         Ok(())
     }
 
-    pub fn extend(
-        &mut self,
-        rows: impl IntoIterator<Item = OfflineImageRow>,
-    ) -> Result<(), KvSortError> {
+    pub fn extend(&mut self, rows: impl IntoIterator<Item = OfflineImageRow>) -> Result<(), KvSortError> {
         for row in rows {
             self.push(row)?;
         }
         Ok(())
     }
 
+    /// Take over another sorter's rows as sorted runs, so rows several threads
+    /// sorted apart publish as one image.
+    pub fn absorb(&mut self, mut other: ExternalKvSorter) -> Result<(), KvSortError> {
+        other.flush_run()?;
+        self.runs.append(&mut other.runs);
+        Ok(())
+    }
+
     pub async fn publish(
-        mut self,
+        self,
         path: ObjectPath,
         object_store: Arc<dyn ObjectStore>,
         target_sst_size_bytes: usize,
     ) -> Result<OfflineImageResult, KvSortError> {
-        self.flush_run()?;
-        self.collapse_runs()?;
-        let mut builder = OfflineImageBuilder::create(
-            path,
-            object_store,
-            OfflineImageOptions {
-                target_sst_size_bytes,
-            },
-        )
-        .await?;
-        let mut merger = RunMerger::open(&self.runs)?;
-        while let Some((key, value)) = merger.next_unique()? {
+        let options = OfflineImageOptions {
+            target_sst_size_bytes,
+            compression_codec: hydradb::GRAPH_SST_COMPRESSION_CODEC,
+            filter_policies: hydradb::graph_filter_policies(),
+        };
+        let mut builder = OfflineImageBuilder::create(path, object_store, options).await?;
+        for row in self.into_sorted_iter()? {
+            let (key, value) = row?;
             builder.add(key, value).await?;
         }
         Ok(builder.finish().await?)
+    }
+
+    /// Every row pushed, in key order, each key once: the rows `publish`
+    /// writes, for a caller that merges them with rows of its own. Two values
+    /// for one key are refused as the iterator reaches them.
+    pub fn into_sorted_iter(mut self) -> Result<SortedRows, KvSortError> {
+        self.flush_run()?;
+        self.collapse_runs()?;
+        Ok(SortedRows {
+            merger: RunMerger::open(&self.runs)?,
+        })
     }
 
     fn collapse_runs(&mut self) -> Result<(), KvSortError> {
@@ -104,9 +116,7 @@ impl ExternalKvSorter {
                     next.push(group[0].clone());
                     continue;
                 }
-                let output = self
-                    .scratch
-                    .join(format!("kv-merge-{pass:04}-{group_index:06}.bin"));
+                let output = self.scratch.join(format!("kv-merge-{pass:04}-{group_index:06}.bin"));
                 let mut writer = BufWriter::new(File::create(&output)?);
                 let mut merger = RunMerger::open(group)?;
                 while let Some((key, value)) = merger.next_unique()? {
@@ -130,11 +140,8 @@ impl ExternalKvSorter {
         if self.rows.is_empty() {
             return Ok(());
         }
-        self.rows
-            .sort_unstable_by(|left, right| left.key.cmp(&right.key));
-        let path = self
-            .scratch
-            .join(format!("kv-run-{:06}.bin", self.runs.len()));
+        self.rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        let path = self.scratch.join(format!("kv-run-{:06}.bin", self.runs.len()));
         let mut writer = BufWriter::new(File::create(&path)?);
         let mut previous: Option<&OfflineImageRow> = None;
         for row in &self.rows {
@@ -155,6 +162,21 @@ impl ExternalKvSorter {
         self.rows.clear();
         self.buffered_bytes = 0;
         Ok(())
+    }
+}
+
+/// The merged rows of an [`ExternalKvSorter`], from
+/// [`ExternalKvSorter::into_sorted_iter`], read from its run files in the
+/// caller's scratch directory.
+pub struct SortedRows {
+    merger: RunMerger,
+}
+
+impl Iterator for SortedRows {
+    type Item = Result<(Bytes, Bytes), KvSortError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.merger.next_unique().transpose()
     }
 }
 
@@ -180,10 +202,7 @@ impl RunMerger {
         if paths.len() > MAX_MERGE_FAN_IN {
             return Err(KvSortError::InvalidLength);
         }
-        let mut readers = paths
-            .iter()
-            .map(RunReader::open)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut readers = paths.iter().map(RunReader::open).collect::<Result<Vec<_>, _>>()?;
         let mut heap = BinaryHeap::new();
         for (run, reader) in readers.iter_mut().enumerate() {
             if let Some((key, value)) = reader.next()? {
@@ -203,11 +222,7 @@ impl RunMerger {
                 return Ok(self.pending.take());
             };
             if let Some((key, value)) = self.readers[row.run].next()? {
-                self.heap.push(HeapRow {
-                    run: row.run,
-                    key,
-                    value,
-                });
+                self.heap.push(HeapRow { run: row.run, key, value });
             }
             let Some((pending_key, pending_value)) = self.pending.take() else {
                 self.pending = Some((row.key, row.value));
@@ -265,10 +280,7 @@ struct HeapRow {
 
 impl Ord for HeapRow {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .key
-            .cmp(&self.key)
-            .then_with(|| other.run.cmp(&self.run))
+        other.key.cmp(&self.key).then_with(|| other.run.cmp(&self.run))
     }
 }
 

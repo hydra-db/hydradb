@@ -9,8 +9,7 @@ impl GraphShard {
         base_epoch: StorageSequence,
         chunk_size: u64,
     ) -> Result<MatrixArtifact> {
-        self.build_matrix_tiles(cell_id, edge_type, base_epoch, chunk_size)
-            .await
+        self.build_matrix_tiles(cell_id, edge_type, base_epoch, chunk_size).await
     }
 
     /// Compatibility name retained for callers that predate canonical adjacency images.
@@ -23,29 +22,20 @@ impl GraphShard {
     ) -> Result<MatrixArtifact> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.validate_write_fence(cell_id, "build_matrix_tiles")
-            .await?;
+        self.validate_write_fence(cell_id, "build_matrix_tiles").await?;
         if tile_size == 0 {
             return Err(GraphError::CorruptValue {
                 key: "matrix_tile_size".to_string(),
                 reason: "tile size must be greater than zero".to_string(),
             });
         }
-        ensure_limit(
-            "build_matrix_tiles",
-            base_epoch,
-            self.limits.max_artifact_source_epochs,
-        )?;
+        ensure_limit("build_matrix_tiles", base_epoch, self.limits.max_artifact_source_epochs)?;
 
-        let _permit = self
-            .acquire_artifact_build_permit("build_matrix_tiles")
-            .await?;
+        let _permit = self.acquire_artifact_build_permit("build_matrix_tiles").await?;
         let started = Instant::now();
         if base_epoch == self.current_epoch(cell_id).await? {
             return self
-                .build_current_matrix_tiles_streaming(
-                    cell_id, edge_type, base_epoch, tile_size, started,
-                )
+                .build_current_matrix_tiles_streaming(cell_id, edge_type, base_epoch, tile_size, started)
                 .await;
         }
         let snapshot = self.snapshot(cell_id).await?;
@@ -57,11 +47,8 @@ impl GraphShard {
             });
         }
         let generation_key = keys::adjacency_generation(cell_id, edge_type);
-        let adjacency_generation = GraphStore::scope_snapshot(
-            Arc::clone(&snapshot.storage_snapshot),
-            self.read_counter(&generation_key),
-        )
-        .await?;
+        let adjacency_generation =
+            SlateGraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), self.read_counter(&generation_key)).await?;
         if adjacency_generation > base_epoch {
             return Err(GraphError::SnapshotChanged {
                 operation: "build_matrix_tiles",
@@ -71,14 +58,8 @@ impl GraphShard {
                 current_epoch: adjacency_generation,
             });
         }
-        let edges = self
-            .edges_in_current_snapshot_at_topology(&snapshot, edge_type, base_epoch)
-            .await?;
-        ensure_limit(
-            "build_matrix_tiles_edges",
-            edges.len() as u64,
-            self.limits.max_artifact_build_edges,
-        )?;
+        let edges = self.edges_in_current_snapshot_at_topology(&snapshot, edge_type, base_epoch).await?;
+        ensure_limit("build_matrix_tiles_edges", edges.len() as u64, self.limits.max_artifact_build_edges)?;
         let (out_tiles, transpose_tiles) = (Vec::new(), Vec::new());
         let adjacency = Arc::new(adjacency_from_edges(&edges));
         let graphblas_csc = graphblas_csc_from_adjacency(adjacency.as_ref())?;
@@ -146,15 +127,8 @@ impl GraphShard {
                     graphblas_csc_key(cell_id, edge_type, base_epoch),
                     encode_graphblas_csc_manifest(&graphblas_manifest),
                 );
-                publish_matrix_artifact_manifests_with_cell_lock(
-                    self,
-                    cell_id,
-                    "build_matrix_tiles",
-                    edge_type,
-                    base_epoch,
-                    manifest_batch,
-                )
-                .await
+                publish_matrix_artifact_manifests_with_cell_lock(self, cell_id, "build_matrix_tiles", edge_type, base_epoch, manifest_batch)
+                    .await
             }
             .await;
             crate::finish_local_write(artifact_lock, result).await
@@ -163,25 +137,19 @@ impl GraphShard {
         {
             Ok(()) => {}
             Err(err) => {
-                self.cleanup_unpublished_matrix_artifacts_after_abort(
-                    cell_id, edge_type, base_epoch, &err,
-                )
-                .await;
+                self.cleanup_unpublished_matrix_artifacts_after_abort(cell_id, edge_type, base_epoch, &err)
+                    .await;
                 return Err(err);
             }
         }
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
-        let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
+        let pinned = artifact.edge_count >= self.cache_policy.pin_matrix_min_edges;
         let tenant = cell_id.to_string();
-        self.matrix_artifact_cache.lock().await.insert(
-            cache_key.clone(),
-            artifact.clone(),
-            tenant.clone(),
-            pinned,
-            &self.cache_metrics,
-        );
-        let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0
-            && self.cache_policy.max_graphblas_matrices == 0;
+        self.matrix_artifact_cache
+            .lock()
+            .await
+            .insert(cache_key.clone(), artifact.clone(), tenant.clone(), pinned, &self.cache_metrics);
+        let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0 && self.cache_policy.max_graphblas_matrices == 0;
         if retain_separate_adjacency {
             self.matrix_cache.lock().await.insert_sized(
                 cache_key.clone(),
@@ -195,8 +163,7 @@ impl GraphShard {
 
         // Kernel 1 has no compiled form, so it skips compilation entirely.
         let kernel = default_matrix_kernel(&self.cache_policy);
-        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0
-            && kernel != SparseKernelBackend::Adjacency;
+        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0 && kernel != SparseKernelBackend::Adjacency;
         if compile_matrix {
             let started = Instant::now();
             let compiled = Arc::new(compile_graphblas_csc(&graphblas_csc, kernel)?);
@@ -213,8 +180,7 @@ impl GraphShard {
                 .map(|(src, _)| *src)
             {
                 let started = Instant::now();
-                let prewarm =
-                    expand_compiled_graphblas(&compiled, adjacency.as_ref(), &[prewarm_start], 1)?;
+                let prewarm = expand_compiled_graphblas(&compiled, adjacency.as_ref(), &[prewarm_start], 1)?;
                 record_matrix_profile(
                     matrix_profile_enabled(),
                     "build_matrix_tiles_prewarm_graphblas",
@@ -223,14 +189,10 @@ impl GraphShard {
                 );
             }
             let resident_bytes = compiled.estimated_resident_bytes();
-            self.graphblas_cache.lock().await.insert_sized(
-                cache_key,
-                compiled,
-                tenant,
-                pinned,
-                resident_bytes,
-                &self.cache_metrics,
-            );
+            self.graphblas_cache
+                .lock()
+                .await
+                .insert_sized(cache_key, compiled, tenant, pinned, resident_bytes, &self.cache_metrics);
         }
         self.record_artifact_build_completed(started.elapsed());
         Ok(artifact)
@@ -244,15 +206,9 @@ impl GraphShard {
         tile_size: u64,
         started: Instant,
     ) -> Result<MatrixArtifact> {
-        let mut rows = self
-            .current_matrix_rows(cell_id, edge_type, base_epoch)
-            .await?;
+        let mut rows = self.current_matrix_rows(cell_id, edge_type, base_epoch).await?;
         rows.normalize();
-        ensure_limit(
-            "build_matrix_tiles_edges",
-            rows.live_edges,
-            self.limits.max_artifact_build_edges,
-        )?;
+        ensure_limit("build_matrix_tiles_edges", rows.live_edges, self.limits.max_artifact_build_edges)?;
 
         let artifact = match async {
             let artifact_lock = self
@@ -298,13 +254,9 @@ impl GraphShard {
                     edge_count: rows.live_edges,
                 };
 
-                let lock = self
-                    .acquire_local_write_guard(cell_id, "build_matrix_tiles")
-                    .await?;
+                let lock = self.acquire_local_write_guard(cell_id, "build_matrix_tiles").await?;
                 let publish_result = async {
-                    let ending_epoch = self
-                        .read_counter(&keys::adjacency_generation(cell_id, edge_type))
-                        .await?;
+                    let ending_epoch = self.read_counter(&keys::adjacency_generation(cell_id, edge_type)).await?;
                     if ending_epoch > base_epoch {
                         return Err(GraphError::SnapshotChanged {
                             operation: "build_matrix_tiles",
@@ -324,15 +276,7 @@ impl GraphShard {
                         graphblas_csc_key(cell_id, edge_type, base_epoch),
                         encode_graphblas_csc_manifest(&graphblas_manifest),
                     );
-                    publish_matrix_artifact_manifests(
-                        self,
-                        cell_id,
-                        "build_matrix_tiles",
-                        edge_type,
-                        base_epoch,
-                        manifest_batch,
-                    )
-                    .await
+                    publish_matrix_artifact_manifests(self, cell_id, "build_matrix_tiles", edge_type, base_epoch, manifest_batch).await
                 }
                 .await;
                 crate::finish_local_write(lock, publish_result).await?;
@@ -346,27 +290,21 @@ impl GraphShard {
         {
             Ok(artifact) => artifact,
             Err(err) => {
-                self.cleanup_unpublished_matrix_artifacts_after_abort(
-                    cell_id, edge_type, base_epoch, &err,
-                )
-                .await;
+                self.cleanup_unpublished_matrix_artifacts_after_abort(cell_id, edge_type, base_epoch, &err)
+                    .await;
                 return Err(err);
             }
         };
 
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
-        let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
+        let pinned = artifact.edge_count >= self.cache_policy.pin_matrix_min_edges;
         let tenant = cell_id.to_string();
-        self.matrix_artifact_cache.lock().await.insert(
-            cache_key.clone(),
-            artifact.clone(),
-            tenant.clone(),
-            pinned,
-            &self.cache_metrics,
-        );
+        self.matrix_artifact_cache
+            .lock()
+            .await
+            .insert(cache_key.clone(), artifact.clone(), tenant.clone(), pinned, &self.cache_metrics);
 
-        let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0
-            && self.cache_policy.max_graphblas_matrices == 0;
+        let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0 && self.cache_policy.max_graphblas_matrices == 0;
         let adjacency = if retain_separate_adjacency {
             Some(Arc::new(rows.to_adjacency()))
         } else {
@@ -385,8 +323,7 @@ impl GraphShard {
 
         // Kernel 1 has no compiled form, so it skips compilation entirely.
         let kernel = default_matrix_kernel(&self.cache_policy);
-        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0
-            && kernel != SparseKernelBackend::Adjacency;
+        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0 && kernel != SparseKernelBackend::Adjacency;
         if compile_matrix {
             let started = Instant::now();
             let graphblas_csc = matrix_rows_to_graphblas_csc(&rows)?;
@@ -407,8 +344,7 @@ impl GraphShard {
                 let empty_adjacency = MatrixAdjacency::new();
                 let adjacency_ref = adjacency.as_deref().unwrap_or(&empty_adjacency);
                 let started = Instant::now();
-                let prewarm =
-                    expand_compiled_graphblas(&compiled, adjacency_ref, &[prewarm_start], 1)?;
+                let prewarm = expand_compiled_graphblas(&compiled, adjacency_ref, &[prewarm_start], 1)?;
                 record_matrix_profile(
                     matrix_profile_enabled(),
                     "build_matrix_tiles_prewarm_graphblas",
@@ -417,14 +353,10 @@ impl GraphShard {
                 );
             }
             let resident_bytes = compiled.estimated_resident_bytes();
-            self.graphblas_cache.lock().await.insert_sized(
-                cache_key,
-                compiled,
-                tenant,
-                pinned,
-                resident_bytes,
-                &self.cache_metrics,
-            );
+            self.graphblas_cache
+                .lock()
+                .await
+                .insert_sized(cache_key, compiled, tenant, pinned, resident_bytes, &self.cache_metrics);
         }
 
         drop(rows);
@@ -441,14 +373,7 @@ impl GraphShard {
         base_epoch: StorageSequence,
         build_error: &GraphError,
     ) {
-        let cleanup = cleanup_unpublished_matrix_artifact_epoch(
-            self,
-            cell_id,
-            edge_type,
-            base_epoch,
-            "build_matrix_tiles_abort",
-        )
-        .await;
+        let cleanup = cleanup_unpublished_matrix_artifact_epoch(self, cell_id, edge_type, base_epoch, "build_matrix_tiles_abort").await;
         if cleanup.cleanup_errors > 0 {
             tracing::warn!(
                 target: "hydradb",
@@ -463,12 +388,7 @@ impl GraphShard {
         }
     }
 
-    async fn current_matrix_rows(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: StorageSequence,
-    ) -> Result<MatrixRows> {
+    async fn current_matrix_rows(&self, cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> Result<MatrixRows> {
         let mut rows = MatrixRows::default();
         let prefix = keys::out_edge_type_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
@@ -476,16 +396,10 @@ impl GraphShard {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let record = decode_edge_record(&key, &kv.value)?;
             rows.push(record.src, record.dst);
-            ensure_limit(
-                "build_matrix_tiles_edges",
-                rows.raw_edges,
-                self.limits.max_artifact_build_edges,
-            )?;
+            ensure_limit("build_matrix_tiles_edges", rows.raw_edges, self.limits.max_artifact_build_edges)?;
         }
 
-        let tombstones = self
-            .current_out_segment_tombstones(cell_id, edge_type, base_epoch)
-            .await?;
+        let tombstones = self.current_out_segment_tombstones(cell_id, edge_type, base_epoch).await?;
         let prefix = keys::out_segment_edge_type_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         while let Some(kv) = iter.next().await? {
@@ -498,11 +412,7 @@ impl GraphShard {
                 let tombstone_epoch = tombstones.get(&(segment.src, dst)).copied();
                 if segment_edge_visible(segment.storage_sequence, tombstone_epoch) {
                     rows.push(segment.src, dst);
-                    ensure_limit(
-                        "build_matrix_tiles_edges",
-                        rows.raw_edges,
-                        self.limits.max_artifact_build_edges,
-                    )?;
+                    ensure_limit("build_matrix_tiles_edges", rows.raw_edges, self.limits.max_artifact_build_edges)?;
                 }
             }
         }
@@ -515,9 +425,7 @@ impl GraphShard {
         edge_type: &str,
         read_epoch: StorageSequence,
     ) -> Result<MatrixAdjacency> {
-        let mut rows = self
-            .current_matrix_rows(cell_id, edge_type, read_epoch)
-            .await?;
+        let mut rows = self.current_matrix_rows(cell_id, edge_type, read_epoch).await?;
         rows.normalize();
         Ok(rows
             .rows
@@ -537,8 +445,7 @@ impl GraphShard {
         let mut tombstones = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
+            let (key_cell_id, key_edge_type, src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
             if key_cell_id != cell_id || key_edge_type != edge_type {
                 return Err(GraphError::CorruptValue {
                     key,
@@ -562,18 +469,14 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         if let Some(cached) = self.matrix_artifact_cache.lock().await.get_latest_by(
-            |key, _| {
-                key.cell_id == cell_id && key.edge_type == edge_type && key.base_epoch <= read_epoch
-            },
+            |key, _| key.cell_id == cell_id && key.edge_type == edge_type && key.base_epoch <= read_epoch,
             |key, _| key.base_epoch,
         ) {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::MatrixArtifact);
+            self.cache_metrics.record_hit(GraphCacheKind::MatrixArtifact);
             return Ok(Some(cached));
         }
 
-        self.cache_metrics
-            .record_miss(GraphCacheKind::MatrixArtifact);
+        self.cache_metrics.record_miss(GraphCacheKind::MatrixArtifact);
         if let Some(generation) = self.discover_graph_index(cell_id, edge_type).await? {
             if generation.base_sequence <= read_epoch {
                 let artifact = MatrixArtifact {
@@ -589,15 +492,13 @@ impl GraphShard {
                     MatrixCacheKey::new(cell_id, edge_type, artifact.base_epoch),
                     artifact.clone(),
                     cell_id.to_string(),
-                    self.cache_policy.pin_matrix_artifact(&artifact),
+                    artifact.edge_count >= self.cache_policy.pin_matrix_min_edges,
                     &self.cache_metrics,
                 );
                 return Ok(Some(artifact));
             }
         }
-        let _permit = self
-            .acquire_hydration_permit("latest_matrix_artifact")
-            .await?;
+        let _permit = self.acquire_hydration_permit("latest_matrix_artifact").await?;
         let prefix = matrix_manifest_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut latest: Option<MatrixArtifact> = None;
@@ -619,13 +520,9 @@ impl GraphShard {
         if !decoded.is_empty() {
             let mut cache = self.matrix_artifact_cache.lock().await;
             for artifact in decoded {
-                let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
+                let pinned = artifact.edge_count >= self.cache_policy.pin_matrix_min_edges;
                 cache.insert(
-                    MatrixCacheKey::new(
-                        &artifact.cell_id,
-                        &artifact.edge_type,
-                        artifact.base_epoch,
-                    ),
+                    MatrixCacheKey::new(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
                     artifact,
                     cell_id.to_string(),
                     pinned,
@@ -637,12 +534,7 @@ impl GraphShard {
     }
 }
 
-async fn prepare_matrix_artifact_build(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: StorageSequence,
-) -> Result<()> {
+async fn prepare_matrix_artifact_build(shard: &GraphShard, cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> Result<()> {
     prepare_artifact_build(
         shard,
         cell_id,

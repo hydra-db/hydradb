@@ -1,6 +1,5 @@
 use hydradb::{
-    local_object_store, object_store_from_env, EdgeMutation, GraphError, GraphIndexPolicy,
-    GraphOpenOptions, GraphShard, Result,
+    local_object_store, object_store_from_env, EdgeMutation, GraphError, GraphIndexPolicy, GraphOpenOptions, GraphShard, Result,
 };
 use slatedb::object_store::ObjectStore;
 use slatedb::{CloseReason, ErrorKind};
@@ -37,25 +36,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn incumbent(
-    object_store: Arc<dyn ObjectStore>,
-    data_path: &str,
-    signals: &Path,
-) -> Result<()> {
-    let shard = GraphShard::open_standalone_writer_with_options(
-        data_path.to_string(),
-        object_store,
-        graph_options(),
-    )
-    .await?;
+async fn incumbent(object_store: Arc<dyn ObjectStore>, data_path: &str, signals: &Path) -> Result<()> {
+    let shard = GraphShard::open_standalone_writer_with_options(data_path.to_string(), object_store, graph_options()).await?;
     shard.write_edge(mutation(100, 10, "incumbent-10")).await?;
     signal(signals, "incumbent-ready")?;
     wait_for_signal(signals, "takeover-committed").await?;
 
     match shard.write_edge(mutation(100, 777, "stale-777")).await {
-        Err(GraphError::Slate(error))
-            if matches!(error.kind(), ErrorKind::Closed(CloseReason::Fenced)) =>
-        {
+        Err(GraphError::Slate(error)) if matches!(error.kind(), ErrorKind::Closed(CloseReason::Fenced)) => {
             signal(signals, "stale-rejected")?;
             println!("SlateDB rejected the incumbent writer after takeover");
             Ok(())
@@ -71,18 +59,9 @@ async fn incumbent(
     }
 }
 
-async fn takeover(
-    object_store: Arc<dyn ObjectStore>,
-    data_path: &str,
-    signals: &Path,
-) -> Result<()> {
+async fn takeover(object_store: Arc<dyn ObjectStore>, data_path: &str, signals: &Path) -> Result<()> {
     wait_for_signal(signals, "incumbent-ready").await?;
-    let shard = GraphShard::open_standalone_writer_with_options(
-        data_path.to_string(),
-        object_store,
-        graph_options(),
-    )
-    .await?;
+    let shard = GraphShard::open_standalone_writer_with_options(data_path.to_string(), object_store, graph_options()).await?;
     shard.write_edge(mutation(100, 99, "takeover-99")).await?;
     signal(signals, "takeover-committed")?;
     wait_for_signal(signals, "stale-rejected").await?;
@@ -148,16 +127,15 @@ fn load_object_store(value: &str) -> Result<Arc<dyn ObjectStore>> {
 }
 
 fn graph_options() -> GraphOpenOptions {
-    let mut options = GraphOpenOptions::default();
-    options.index_policy = GraphIndexPolicy::OutboundOnly;
-    options
+    let options = GraphOpenOptions::default();
+    GraphOpenOptions {
+        index_policy: GraphIndexPolicy::OutboundOnly,
+        ..options
+    }
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 fn io_error(error: std::io::Error) -> GraphError {

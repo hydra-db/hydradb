@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/crates/pg-hydradb/target/
 /_apalache-out/
 __pycache__/
 *.py[cod]

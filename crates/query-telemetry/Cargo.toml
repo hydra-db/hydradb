@@ -1,0 +1,25 @@
+[package]
+name = "hydradb-query-telemetry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+
+[features]
+receiver = ["dep:axum", "dep:hydradb-usage-report", "dep:hydradb-pg-usage-report", "dep:subtle", "tokio/net"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+hydradb-usage-report = { path = "../usage-report", optional = true }
+hydradb-pg-usage-report = { path = "../pg-usage-report", optional = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true, optional = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "query-telemetry-receiver"
+path = "src/receiver.rs"
+required-features = ["receiver"]

@@ -16,3 +16,7 @@ hydradb-cypher-ast = { path = "../cypher-ast" }
 
 [build-dependencies]
 antlr-rust-codegen = { workspace = true }
+
+[[test]]
+name = "cypher25"
+path = "../../query-language/shared/tests/parser/cypher25.rs"

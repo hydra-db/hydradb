@@ -1,0 +1,36 @@
+[package]
+name = "hydradb-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "HydraDB wire protocol pieces shared by graph-node and the turbolay proxy: Bolt framing and handshakes, error codes, owner hints, HTTP header names"
+publish = false
+
+# No dependency on `hydradb`. The kernel's Bolt server and the turbolay proxy
+# both speak through this crate, so the bytes a node writes and the bytes the
+# proxy parses come from one place. `boltr` is the PackStream codec, the chunk
+# reader and writer and the handshake; this crate adds whole-message framing
+# over them, the version check on the client handshake and the strict message
+# validation graph-node applies.
+#
+# `owner`, `codes` and `http` are always built and need nothing, since the
+# kernel's error type formats owner hints in every build. The Bolt code sits
+# behind `bolt`, which the kernel turns on with `bolt-server`.
+[dependencies]
+boltr = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+bytesize = { workspace = true, optional = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["io-util"], optional = true }
+
+[features]
+default = ["bolt"]
+bolt = ["dep:boltr", "dep:bytes", "dep:bytesize", "dep:tokio"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+
+[[example]]
+name = "framing_bench"
+required-features = ["bolt"]

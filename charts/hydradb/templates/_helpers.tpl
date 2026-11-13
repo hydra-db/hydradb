@@ -60,14 +60,41 @@ app.kubernetes.io/component: {{ .component }}
 {{- default (printf "%s-server-tls" (include "hydradb.fullname" .)) .Values.tls.public.secretName -}}
 {{- end -}}
 
+{{- /* The Secret whose ca.crt buddy WAL followers trust, when one is mounted
+for them (runtime.buddyWal, TLS on, tls.public.peerCaSecretName set); empty
+otherwise, including when the CA comes from the public TLS secret. */ -}}
+{{- define "hydradb.peerCaSecretName" -}}
+{{- if and .Values.runtime.buddyWal .Values.tls.public.enabled .Values.tls.public.peerCaSecretName -}}
+{{- .Values.tls.public.peerCaSecretName -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "hydradb.nodeAddresses" -}}
+{{- include "hydradb.nodeAddressesOn" (dict "root" . "port" 7687) -}}
+{{- end -}}
+
+{{- /* Every node as id=host:port on `port`, the ids hydradb.nodeAddresses uses. */ -}}
+{{- define "hydradb.nodeAddressesOn" -}}
 {{- $addresses := list -}}
-{{- $fullname := include "hydradb.fullname" . -}}
-{{- $namespace := .Release.Namespace -}}
-{{- range $index := until (int .Values.node.replicaCount) -}}
-{{- $addresses = append $addresses (printf "%s-node-%d=%s-node-%d.%s-node-headless.%s.svc.cluster.local:7687" $fullname $index $fullname $index $fullname $namespace) -}}
+{{- $fullname := include "hydradb.fullname" .root -}}
+{{- $namespace := .root.Release.Namespace -}}
+{{- $port := .port -}}
+{{- range $index := until (int .root.Values.node.replicaCount) -}}
+{{- $addresses = append $addresses (printf "%s-node-%d=%s-node-%d.%s-node-headless.%s.svc.cluster.local:%v" $fullname $index $fullname $index $fullname $namespace $port) -}}
 {{- end -}}
 {{- join "," $addresses -}}
+{{- end -}}
+
+{{- define "hydradb.proxyServiceName" -}}
+{{- default (printf "%s-proxy" (include "hydradb.fullname" .)) .Values.proxy.service.name -}}
+{{- end -}}
+
+{{- define "hydradb.proxyImage" -}}
+{{- if .Values.proxy.image.digest -}}
+{{- printf "%s@%s" .Values.proxy.image.repository .Values.proxy.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.proxy.image.repository (default .Chart.AppVersion .Values.proxy.image.tag) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "hydradb.advertisedBoltAddress" -}}

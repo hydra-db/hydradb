@@ -20,7 +20,10 @@
 //! liveness rules testable by hand-building entries instead of sleeping.
 //! Decision 10 of the rendezvous placement design.
 //!
-//! # The four modules
+//! # The modules
+//!
+//! [`addresses`] is the configured membership, `node-id=host:port,...`, parsed
+//! the same way by graph-node and the turbolay proxy.
 //!
 //! [`hash`] is the frozen rendezvous score — pure functions over `&str`, and a
 //! wire format: changing the key encoding, the finalizer or the tie-break
@@ -48,12 +51,28 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+//!
+//! # Features
+//!
+//! `store` (default) builds [`heartbeat`], [`cell_writer`] and [`liveness`],
+//! which need the object store. Without it only [`hash`] and [`addresses`] are
+//! built, which is what the turbolay proxy links: the same frozen score and
+//! the same node list, no slatedb.
+
+pub mod addresses;
+#[cfg(feature = "store")]
 pub mod cell_writer;
 pub mod hash;
+#[cfg(feature = "store")]
 pub mod heartbeat;
+#[cfg(feature = "store")]
 pub mod liveness;
 
+pub use addresses::{NodeAddresses, NodeAddressesError};
+#[cfg(feature = "store")]
 pub use cell_writer::{put_cell_writer, read_cell_writer, CellWriterRecord};
 pub use hash::{owner, rank, score};
+#[cfg(feature = "store")]
 pub use heartbeat::{HeartbeatEntry, PlacementError};
+#[cfg(feature = "store")]
 pub use liveness::{live_nodes, LiveNodeSet, NodeView};

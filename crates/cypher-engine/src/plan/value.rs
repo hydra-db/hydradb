@@ -8,6 +8,12 @@ pub enum ScalarValue {
     Integer(i128),
     Float(Box<str>),
     String(Box<str>),
+    /// An exact decimal number (GQL §4.16.5, GV17).
+    Decimal(crate::Decimal),
+    /// A byte string (GQL §4.16.4, GV35).
+    Bytes(Box<[u8]>),
+    Date(i32),
+    List(Vec<ScalarValue>),
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

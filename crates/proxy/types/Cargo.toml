@@ -1,0 +1,13 @@
+[package]
+name = "turbolay-proxy-types"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Plain data shared by every turbolay proxy crate, and the pure retry policy"
+publish = false
+
+# Every other proxy crate depends on this one and rebuilds when it changes, so
+# it holds only data and pure functions.
+[dependencies]
+compact_str = { workspace = true }
+hydradb-scope = { path = "../../scope" }

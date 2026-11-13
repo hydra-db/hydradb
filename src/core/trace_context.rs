@@ -59,12 +59,8 @@ static BRIDGE: OnceLock<&'static dyn TraceContextBridge> = OnceLock::new();
 ///
 /// Returns `Err` if one is already installed. Nothing in the kernel calls this;
 /// it exists for the binaries.
-pub fn install_trace_context_bridge(
-    bridge: &'static dyn TraceContextBridge,
-) -> std::result::Result<(), &'static str> {
-    BRIDGE
-        .set(bridge)
-        .map_err(|_| "a trace context bridge is already installed")
+pub fn install_trace_context_bridge(bridge: &'static dyn TraceContextBridge) -> std::result::Result<(), &'static str> {
+    BRIDGE.set(bridge).map_err(|_| "a trace context bridge is already installed")
 }
 
 /// The `traceparent` for the currently active span, or `None`.

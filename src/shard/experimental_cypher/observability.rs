@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hydradb_cypher_engine::{
-    plan_shape_hash, ExecutionProfile, GraphPhysicalPlan, LowerTimings, OperatorProfile,
-    OperatorProfiler, PreparedQuery, StatisticsAccessReport, StatisticsProvider,
+    plan_shape_hash, ExecutionProfile, GraphPhysicalPlan, LowerTimings, OperatorProfile, OperatorProfiler, PreparedQuery,
+    StatisticsAccessReport, StatisticsProvider,
 };
 
 use super::super::query_optimizer::{slow_query_threshold_ms, wide_plan_threshold_rows};
@@ -125,11 +125,7 @@ impl AccessObservation {
         if report.declined {
             self.guard_stops += 1;
         }
-        if self
-            .widest
-            .as_ref()
-            .is_none_or(|widest| report.entries_read > widest.entries_read)
-        {
+        if self.widest.as_ref().is_none_or(|widest| report.entries_read > widest.entries_read) {
             self.widest = Some(report.clone());
         }
     }
@@ -138,9 +134,7 @@ impl AccessObservation {
 impl RequestWork {
     /// Run `future` with this request's counters installed for the adapter.
     pub(super) async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
-        REQUEST_WORK
-            .scope(Arc::clone(self), self.reads.scope(future))
-            .await
+        REQUEST_WORK.scope(Arc::clone(self), self.reads.scope(future)).await
     }
 
     /// Start attributing work to the operators of `plan`, which must be the
@@ -150,9 +144,7 @@ impl RequestWork {
     }
 
     fn lock_profiler(&self) -> std::sync::MutexGuard<'_, Option<OperatorProfiler>> {
-        self.profiler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.profiler.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn take_profile(&self) -> Option<ExecutionProfile> {
@@ -160,9 +152,7 @@ impl RequestWork {
     }
 
     fn lock_access(&self) -> std::sync::MutexGuard<'_, AccessObservation> {
-        self.access
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.access.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn access(&self) -> AccessObservation {
@@ -193,35 +183,17 @@ fn with_profiler(charge: impl FnOnce(&mut OperatorProfiler)) {
     });
 }
 
-/// SlateDB requests and point-read bytes issued so far by this request, to
-/// take a delta around one adapter call.
-pub(super) fn storage_totals() -> (u64, u64) {
-    REQUEST_WORK
-        .try_with(|work| work.reads.totals())
-        .unwrap_or_default()
-}
-
 /// Count one storage-adapter call and charge it to the running operator.
-/// `before` is [`storage_totals`] taken as the call started. A no-op outside a
-/// scoped request, such as adapter unit tests that call it directly.
-pub(super) fn record_storage_call(
-    call: &'static str,
-    elapsed_us: u64,
-    rows_out: usize,
-    before: (u64, u64),
-) {
+/// `call_reads` is the `(requests, bytes)` the call itself issued, measured in
+/// its own accounting scope. A no-op outside a scoped request, such as adapter
+/// unit tests that call it directly.
+pub(super) fn record_storage_call(call: &'static str, elapsed_us: u64, rows_out: usize, call_reads: (u64, u64)) {
     let _ = REQUEST_WORK.try_with(|work| {
         work.storage_us.fetch_add(elapsed_us, Ordering::Relaxed);
         work.storage_calls.fetch_add(1, Ordering::Relaxed);
-        work.widest_rows
-            .fetch_max(rows_out as u64, Ordering::Relaxed);
-        let (requests, bytes) = work.reads.totals();
+        work.widest_rows.fetch_max(rows_out as u64, Ordering::Relaxed);
         if let Some(profiler) = work.lock_profiler().as_mut() {
-            profiler.record_storage_call(
-                Duration::from_micros(elapsed_us),
-                requests.saturating_sub(before.0),
-                bytes.saturating_sub(before.1),
-            );
+            profiler.record_storage_call(Duration::from_micros(elapsed_us), call_reads.0, call_reads.1);
             // Classified by adapter call rather than reported from each body,
             // so the operator bodies stay free of accounting.
             match call {
@@ -308,6 +280,11 @@ pub(super) fn request_span() -> tracing::Span {
         hydradb.query.rows_widest = tracing::field::Empty,
         hydradb.query.rows_materialized = tracing::field::Empty,
         hydradb.query.rows_returned = tracing::field::Empty,
+        hydradb.storage.remote_gets = tracing::field::Empty,
+        hydradb.storage.remote_get_bytes = tracing::field::Empty,
+        hydradb.storage.ranged_gets = tracing::field::Empty,
+        hydradb.storage.puts = tracing::field::Empty,
+        hydradb.storage.put_bytes = tracing::field::Empty,
         hydradb.sampling.tail_keep = tracing::field::Empty,
         error.class = tracing::field::Empty,
     )
@@ -339,7 +316,7 @@ pub(super) struct RequestObservation {
 
 pub(super) struct PlanIdentity {
     hash: u64,
-    full_scan: bool,
+    may_scan_inventory: bool,
     /// Rendered once, because the hash needs it; attached to the span only
     /// when the request is sampled.
     shape: String,
@@ -350,7 +327,7 @@ impl PlanIdentity {
         let shape = prepared.plan_shape();
         Self {
             hash: plan_shape_hash(&shape),
-            full_scan: prepared.physical.contains_full_scan(),
+            may_scan_inventory: prepared.physical.may_scan_inventory(),
             shape,
         }
     }
@@ -359,12 +336,7 @@ impl PlanIdentity {
 /// Why a request's trace is worth keeping. The plan verdicts outrank the
 /// clock, as on the legacy route: a slow *and* wide plan is reported as wide,
 /// because that is the half an operator can act on.
-fn sampling_reason(
-    full_scan: bool,
-    widest_rows: u64,
-    estimate_missed: bool,
-    elapsed: Duration,
-) -> Option<&'static str> {
+fn sampling_reason(full_scan: bool, widest_rows: u64, estimate_missed: bool, elapsed: Duration) -> Option<&'static str> {
     if full_scan {
         Some(reason::FULL_SCAN)
     } else if widest_rows >= wide_plan_threshold_rows() {
@@ -404,11 +376,7 @@ impl RequestObservation {
 
     /// Collect the operator profile after execution, successful or not, and
     /// attach the estimates `statistics` gives for `plan`.
-    pub(super) fn collect_profile(
-        &mut self,
-        plan: &GraphPhysicalPlan,
-        statistics: &dyn StatisticsProvider,
-    ) {
+    pub(super) fn collect_profile(&mut self, plan: &GraphPhysicalPlan, statistics: &dyn StatisticsProvider) {
         self.profile = self.work.take_profile().map(|mut profile| {
             profile.attach_estimates(plan, statistics);
             profile
@@ -418,13 +386,7 @@ impl RequestObservation {
     /// Record the finished request on `span`, into `shard`'s counters, and,
     /// when a trigger fires, as a sampled plan. `elapsed` is the whole
     /// request as the shard saw it.
-    pub(super) fn finish<T>(
-        &self,
-        span: &tracing::Span,
-        shard: &GraphShard,
-        elapsed: Duration,
-        result: &Result<T, GraphError>,
-    ) {
+    pub(super) fn finish<T>(&self, span: &tracing::Span, shard: &GraphShard, elapsed: Duration, result: &Result<T, GraphError>) {
         let (parse, lower, bind) = self.preparation_split();
         let storage = Duration::from_micros(self.work.storage_us.load(Ordering::Relaxed));
         let operator_cpu = self.execute.saturating_sub(storage);
@@ -432,11 +394,7 @@ impl RequestObservation {
         // The storage calls and intermediate checks see each input, but an
         // operator that only combines its inputs, such as UNION, reports to
         // neither; the materialized result bounds what it produced.
-        let widest_rows = self
-            .work
-            .widest_rows
-            .load(Ordering::Relaxed)
-            .max(self.rows_materialized as u64);
+        let widest_rows = self.work.widest_rows.load(Ordering::Relaxed).max(self.rows_materialized as u64);
 
         span.record("hydradb.query.stage.parse_us", micros(parse));
         span.record("hydradb.query.stage.lower_us", micros(lower));
@@ -452,27 +410,17 @@ impl RequestObservation {
         span.record("hydradb.query.storage.calls", storage_calls);
         if let Some((sequence, built_at_ms)) = self.planner_statistics {
             span.record("hydradb.query.stats.sequence", sequence);
-            span.record(
-                "hydradb.query.stats.age_ms",
-                graph_now_millis().saturating_sub(built_at_ms),
-            );
+            span.record("hydradb.query.stats.age_ms", graph_now_millis().saturating_sub(built_at_ms));
         }
         let access = self.work.access();
         let source = access.source();
         record_access_path(span, &access, source);
         span.record("hydradb.query.rows_widest", widest_rows);
-        span.record(
-            "hydradb.query.rows_materialized",
-            self.rows_materialized as u64,
-        );
+        span.record("hydradb.query.rows_materialized", self.rows_materialized as u64);
         span.record("hydradb.query.rows_returned", self.rows_returned as u64);
         span.record(
             "hydradb.query.capability",
-            if self.plan_identity.is_some() {
-                "supported"
-            } else {
-                "unsupported"
-            },
+            if self.plan_identity.is_some() { "supported" } else { "unsupported" },
         );
         if let Err(error) = result {
             span.record("error.class", error.class());
@@ -484,14 +432,8 @@ impl RequestObservation {
             (&metrics.query_experimental_parse_us, micros(parse)),
             (&metrics.query_experimental_lower_us, micros(lower)),
             (&metrics.query_experimental_bind_us, micros(bind)),
-            (
-                &metrics.query_experimental_snapshot_us,
-                micros(self.snapshot),
-            ),
-            (
-                &metrics.query_experimental_statistics_us,
-                micros(self.statistics),
-            ),
+            (&metrics.query_experimental_snapshot_us, micros(self.snapshot)),
+            (&metrics.query_experimental_statistics_us, micros(self.statistics)),
             (&metrics.query_experimental_plan_us, micros(self.plan)),
             (&metrics.query_experimental_execute_us, micros(self.execute)),
             (&metrics.query_experimental_storage_us, micros(storage)),
@@ -513,13 +455,9 @@ impl RequestObservation {
                 .fetch_add(report.entries_read, Ordering::Relaxed);
             let (estimated, actual) = (report.estimated_rows.max(1), report.entries_read.max(1));
             if actual > estimated.saturating_mul(2) {
-                metrics
-                    .query_experimental_access_underestimates
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.query_experimental_access_underestimates.fetch_add(1, Ordering::Relaxed);
             } else if actual.saturating_mul(2) < estimated {
-                metrics
-                    .query_experimental_access_overestimates
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.query_experimental_access_overestimates.fetch_add(1, Ordering::Relaxed);
             }
         }
         // The same request split by what chose its access path, so the mean
@@ -568,21 +506,13 @@ impl RequestObservation {
         let plan_hash = format!("{:016x}", plan.hash);
         // The plan says a scan is possible; the profile says whether one ran.
         // A range probe that answers never runs its fallback's scan.
-        let full_scan = plan.full_scan
-            && self
-                .profile
-                .as_ref()
-                .is_none_or(ExecutionProfile::ran_full_scan);
+        let full_scan = plan.may_scan_inventory && self.profile.as_ref().is_none_or(ExecutionProfile::ran_full_scan);
         span.record("hydradb.query.plan_hash", plan_hash.as_str());
         span.record("hydradb.query.full_scan", full_scan);
-        let Some(reason) =
-            sampling_reason(full_scan, widest_rows, worst_estimate.is_some(), elapsed)
-        else {
+        let Some(reason) = sampling_reason(full_scan, widest_rows, worst_estimate.is_some(), elapsed) else {
             return;
         };
-        metrics
-            .query_experimental_sampled_plans
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.query_experimental_sampled_plans.fetch_add(1, Ordering::Relaxed);
         let shape = plan.shape.as_str();
         span.record("hydradb.sampling.tail_keep", reason);
         span.record("hydradb.query.plan", shape);
@@ -627,10 +557,7 @@ fn record_access_path(span: &tracing::Span, access: &AccessObservation, source: 
     if access.probe_runs > 0 {
         span.record("hydradb.query.access_path.probe_us", access.probe_us);
     }
-    span.record(
-        "hydradb.query.access_path.guard_stopped",
-        access.guard_stops > 0,
-    );
+    span.record("hydradb.query.access_path.guard_stopped", access.guard_stops > 0);
     let Some(report) = &access.widest else {
         return;
     };
@@ -638,22 +565,13 @@ fn record_access_path(span: &tracing::Span, access: &AccessObservation, source: 
     if let Some(property) = &report.property {
         span.record("hydradb.query.access_path.property", property.as_str());
     }
-    span.record(
-        "hydradb.query.access_path.rows_estimated",
-        report.estimated_rows,
-    );
+    span.record("hydradb.query.access_path.rows_estimated", report.estimated_rows);
     span.record("hydradb.query.access_path.rows_actual", report.entries_read);
     // Actual over estimated, so above one is an underestimate and below one
     // an overestimate. Both sides are floored at one, as the operator ratio
     // is, so an empty read is not an infinite miss.
-    let (estimated, actual) = (
-        (report.estimated_rows as f64).max(1.0),
-        (report.entries_read as f64).max(1.0),
-    );
-    span.record(
-        "hydradb.query.access_path.estimate_ratio",
-        actual / estimated,
-    );
+    let (estimated, actual) = ((report.estimated_rows as f64).max(1.0), (report.entries_read as f64).max(1.0));
+    span.record("hydradb.query.access_path.estimate_ratio", actual / estimated);
 }
 
 /// Fold one request's operator profile into the shard's per-operator totals:
@@ -691,11 +609,10 @@ fn request_operator_totals(profile: &ExecutionProfile) -> Vec<ExperimentalOperat
         .iter()
         .filter(|operator| operator.invocations > 0)
         .map(|operator| {
-            let missed = operator.estimated_rows.is_some_and(|estimated| {
-                estimated.max(operator.rows_out) >= ESTIMATE_MISS_MIN_ROWS
-            }) && operator
-                .estimate_error()
-                .is_some_and(|ratio| ratio >= ESTIMATE_MISS_RATIO);
+            let missed = operator
+                .estimated_rows
+                .is_some_and(|estimated| estimated.max(operator.rows_out) >= ESTIMATE_MISS_MIN_ROWS)
+                && operator.estimate_error().is_some_and(|ratio| ratio >= ESTIMATE_MISS_RATIO);
             ExperimentalOperatorMetricsSnapshot {
                 operator: operator.operator,
                 requests: u64::from(seen.insert(operator.operator)),
@@ -730,6 +647,7 @@ fn operator_profile_span(parent: &tracing::Span, operator: &OperatorProfile) -> 
         parent: parent,
         "query.experimental.operator_profile",
         hydradb.query.operator = operator.operator,
+        hydradb.query.operator.access = operator.access,
         hydradb.query.operator.id = operator.id as u64,
         hydradb.query.operator.parent_id = tracing::field::Empty,
         hydradb.query.operator.invocations = operator.invocations,

@@ -162,9 +162,7 @@ pub enum HistogramError {
     },
 
     /// The snapshot did not have one count per bound plus one overflow bucket.
-    #[error(
-        "histogram {name}: expected {expected} bucket counts (bounds + overflow), got {found}"
-    )]
+    #[error("histogram {name}: expected {expected} bucket counts (bounds + overflow), got {found}")]
     BucketCount {
         /// The metric name stem.
         name: &'static str,
@@ -193,9 +191,10 @@ pub enum HistogramError {
 
 /// The unit an exported counter is reported in.
 ///
-/// Two values, and the vocabulary is closed on purpose. Every kernel counter is
-/// either a count of events or a **cumulative sum of microseconds** — the `_us`
-/// fields that `rate(sum) / rate(count)` turns into a mean. There is no
+/// Three values, and the vocabulary is closed on purpose. Every kernel counter is
+/// a count of events, a **cumulative sum of microseconds** — the `_us`
+/// fields that `rate(sum) / rate(count)` turns into a mean — or a cumulative sum
+/// of bytes, reported unscaled for the same reason microseconds are. There is no
 /// `Seconds`, and its absence is the design: [`HistogramUnit::Seconds`] exists
 /// because one semantic convention fixes one *histogram* in seconds, whereas
 /// scaling a counter here would make it disagree with the `_microseconds` series
@@ -207,6 +206,8 @@ pub enum CounterUnit {
     Count,
     /// A cumulative sum of microseconds. UCUM `us`.
     Microseconds,
+    /// A cumulative sum of bytes. UCUM `By`.
+    Bytes,
 }
 
 impl CounterUnit {
@@ -215,6 +216,7 @@ impl CounterUnit {
         match self {
             Self::Count => "1",
             Self::Microseconds => "us",
+            Self::Bytes => "By",
         }
     }
 }
@@ -376,19 +378,12 @@ impl ObservableCounter {
     /// Sorted on the key so two callers passing the same labels in different
     /// orders address one series rather than two.
     fn series_key(&self, labels: &[(MetricLabel, &str)]) -> Result<SeriesKey, CounterError> {
-        let mut key: SeriesKey = labels
-            .iter()
-            .map(|(label, value)| (label.key(), (*value).to_string()))
-            .collect();
+        let mut key: SeriesKey = labels.iter().map(|(label, value)| (label.key(), (*value).to_string())).collect();
         if key.iter().any(|(name, _)| *name == LE) {
             return Err(CounterError::ReservedLabel { name: self.name });
         }
         key.sort_unstable();
-        if let Some(duplicate) = key
-            .windows(2)
-            .find(|pair| pair[0].0 == pair[1].0)
-            .map(|pair| pair[0].0)
-        {
+        if let Some(duplicate) = key.windows(2).find(|pair| pair[0].0 == pair[1].0).map(|pair| pair[0].0) {
             return Err(CounterError::DuplicateLabel {
                 name: self.name,
                 key: duplicate,
@@ -409,15 +404,11 @@ impl ObservableCounter {
     /// histogram's accessor gives: a metrics pipeline that stops for the life of
     /// the process because something else panicked is worse than a stale series.
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<SeriesKey, u64>> {
-        self.state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.state.read().unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<SeriesKey, u64>> {
-        self.state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.state.write().unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -478,19 +469,12 @@ impl ObservableHistogram {
     /// here because the kernel owns it — exporting it once from there is what
     /// stops the Prometheus rendering and the OTLP rendering from disagreeing
     /// about where a bucket ends.
-    pub fn register(
-        meter: &Meter,
-        spec: HistogramSpec,
-        bounds: &[u64],
-    ) -> Result<Self, HistogramError> {
+    pub fn register(meter: &Meter, spec: HistogramSpec, bounds: &[u64]) -> Result<Self, HistogramError> {
         if bounds.is_empty() || bounds.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(HistogramError::Bounds { name: spec.name });
         }
 
-        let mut le_values: Vec<String> = bounds
-            .iter()
-            .map(|bound| spec.unit.render_bound(*bound))
-            .collect();
+        let mut le_values: Vec<String> = bounds.iter().map(|bound| spec.unit.render_bound(*bound)).collect();
         le_values.push(LE_INFINITY.to_string());
         let le_values: Arc<[String]> = le_values.into();
 
@@ -555,12 +539,7 @@ impl ObservableHistogram {
     /// signature.
     ///
     /// Callers must not pass [`crate::semconv::LE`]; this module owns it.
-    pub fn record_snapshot(
-        &self,
-        labels: &[(MetricLabel, &str)],
-        buckets: &[u64],
-        sum_us: u64,
-    ) -> Result<(), HistogramError> {
+    pub fn record_snapshot(&self, labels: &[(MetricLabel, &str)], buckets: &[u64], sum_us: u64) -> Result<(), HistogramError> {
         if buckets.len() != self.bucket_count {
             return Err(HistogramError::BucketCount {
                 name: self.name,
@@ -569,19 +548,12 @@ impl ObservableHistogram {
             });
         }
 
-        let mut key: SeriesKey = labels
-            .iter()
-            .map(|(label, value)| (label.key(), (*value).to_string()))
-            .collect();
+        let mut key: SeriesKey = labels.iter().map(|(label, value)| (label.key(), (*value).to_string())).collect();
         if key.iter().any(|(name, _)| *name == LE) {
             return Err(HistogramError::ReservedLabel { name: self.name });
         }
         key.sort_unstable();
-        if let Some(duplicate) = key
-            .windows(2)
-            .find(|pair| pair[0].0 == pair[1].0)
-            .map(|pair| pair[0].0)
-        {
+        if let Some(duplicate) = key.windows(2).find(|pair| pair[0].0 == pair[1].0).map(|pair| pair[0].0) {
             return Err(HistogramError::DuplicateLabel {
                 name: self.name,
                 key: duplicate,
@@ -659,11 +631,7 @@ impl ObservableHistogram {
             .iter()
             .map(|(key, entry)| Observation {
                 attributes: attributes_of(key),
-                value: entry
-                    .buckets
-                    .iter()
-                    .copied()
-                    .fold(0u64, u64::saturating_add),
+                value: entry.buckets.iter().copied().fold(0u64, u64::saturating_add),
             })
             .collect()
     }
@@ -684,22 +652,16 @@ impl ObservableHistogram {
     /// metrics pipeline that stops for the life of the process because
     /// something else panicked is a worse outcome than a stale series.
     fn read(&self) -> std::sync::RwLockReadGuard<'_, SeriesMap> {
-        self.state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.state.read().unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, SeriesMap> {
-        self.state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.state.write().unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
 fn attributes_of(key: &SeriesKey) -> Vec<KeyValue> {
-    key.iter()
-        .map(|(name, value)| KeyValue::new(*name, value.clone()))
-        .collect()
+    key.iter().map(|(name, value)| KeyValue::new(*name, value.clone())).collect()
 }
 
 /// A cached non-monotonic measurement for a bounded set of metric labels.
@@ -710,12 +672,7 @@ pub struct ObservableGauge {
 }
 impl ObservableGauge {
     /// Register a gauge; the collection task must publish current values.
-    pub fn register(
-        meter: &Meter,
-        name: &'static str,
-        description: &'static str,
-        unit: &'static str,
-    ) -> Self {
+    pub fn register(meter: &Meter, name: &'static str, description: &'static str, unit: &'static str) -> Self {
         let state = Arc::new(RwLock::new(HashMap::<SeriesKey, f64>::new()));
         let observed = Arc::clone(&state);
         let _ = meter
@@ -732,29 +689,35 @@ impl ObservableGauge {
     }
     /// Replace one series, including zeroes when its tracked objects drain.
     pub fn record(&self, labels: &[(MetricLabel, &str)], value: f64) -> Result<(), CounterError> {
-        let mut key: SeriesKey = labels
-            .iter()
-            .map(|(label, value)| (label.key(), (*value).to_string()))
-            .collect();
+        let key = self.series_key(labels)?;
+        self.state.write().unwrap_or_else(|p| p.into_inner()).insert(key, value);
+        Ok(())
+    }
+
+    /// Stop reporting one series, for a measurement that can no longer be
+    /// taken. A gauge's last value is a claim about now, so repeating it after
+    /// its source went away would report a reading nobody took. Forgetting a
+    /// series that was never recorded does nothing.
+    pub fn forget(&self, labels: &[(MetricLabel, &str)]) -> Result<(), CounterError> {
+        let key = self.series_key(labels)?;
+        self.state.write().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        Ok(())
+    }
+
+    /// Canonicalise a label set into a series key, rejecting `le` and duplicates.
+    fn series_key(&self, labels: &[(MetricLabel, &str)]) -> Result<SeriesKey, CounterError> {
+        let mut key: SeriesKey = labels.iter().map(|(label, value)| (label.key(), (*value).to_string())).collect();
         if key.iter().any(|(name, _)| *name == LE) {
             return Err(CounterError::ReservedLabel { name: self.name });
         }
         key.sort_unstable();
-        if let Some(duplicate) = key
-            .windows(2)
-            .find(|pair| pair[0].0 == pair[1].0)
-            .map(|pair| pair[0].0)
-        {
+        if let Some(duplicate) = key.windows(2).find(|pair| pair[0].0 == pair[1].0).map(|pair| pair[0].0) {
             return Err(CounterError::DuplicateLabel {
                 name: self.name,
                 key: duplicate,
             });
         }
-        self.state
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, value);
-        Ok(())
+        Ok(key)
     }
     /// The latest values, also used to verify reset and attribute semantics.
     pub fn observations(&self) -> Vec<Observation<f64>> {

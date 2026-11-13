@@ -8,8 +8,195 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 hydradb-cypher-ast = { path = "../cypher-ast" }
+hydradb-cypher-date = { path = "../cypher-date" }
 indexmap = { workspace = true }
 hydradb-cypher-parser-antlr = { path = "../cypher-parser-antlr" }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+unicode-normalization = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[test]]
+name = "gql_conformance"
+path = "../../query-language/gql/tests/engine/gql_conformance.rs"
+
+[[test]]
+name = "gql_features"
+path = "../../query-language/gql/tests/engine/gql_features.rs"
+
+[[test]]
+name = "aggregates"
+path = "../../query-language/shared/tests/engine/aggregates.rs"
+
+[[test]]
+name = "anchor_bound_binding"
+path = "../../query-language/shared/tests/engine/anchor_bound_binding.rs"
+
+[[test]]
+name = "auxiliary_by_chunks"
+path = "../../query-language/shared/tests/engine/auxiliary_by_chunks.rs"
+
+[[test]]
+name = "capability"
+path = "../../query-language/shared/tests/engine/capability.rs"
+
+[[test]]
+name = "case_expressions"
+path = "../../query-language/shared/tests/engine/case_expressions.rs"
+
+[[test]]
+name = "clause_combinations"
+path = "../../query-language/shared/tests/engine/clause_combinations.rs"
+
+[[test]]
+name = "composition_budget"
+path = "../../query-language/shared/tests/engine/composition_budget.rs"
+
+[[test]]
+name = "connected_match_batching"
+path = "../../query-language/shared/tests/engine/connected_match_batching.rs"
+
+[[test]]
+name = "dedup"
+path = "../../query-language/shared/tests/engine/dedup.rs"
+
+[[test]]
+name = "equality_probe"
+path = "../../query-language/shared/tests/engine/equality_probe.rs"
+
+[[test]]
+name = "expand_limit"
+path = "../../query-language/shared/tests/engine/expand_limit.rs"
+
+[[test]]
+name = "filter_merge"
+path = "../../query-language/shared/tests/engine/filter_merge.rs"
+
+[[test]]
+name = "first_query"
+path = "../../query-language/shared/tests/engine/first_query.rs"
+
+[[test]]
+name = "group_by"
+path = "../../query-language/shared/tests/engine/group_by.rs"
+
+[[test]]
+name = "hydration"
+path = "../../query-language/shared/tests/engine/hydration.rs"
+
+[[test]]
+name = "iteration_record_copies"
+path = "../../query-language/shared/tests/engine/iteration_record_copies.rs"
+
+[[test]]
+name = "let_filter"
+path = "../../query-language/shared/tests/engine/let_filter.rs"
+
+[[test]]
+name = "nested_scope"
+path = "../../query-language/shared/tests/engine/nested_scope.rs"
+
+[[test]]
+name = "no_match"
+path = "../../query-language/shared/tests/engine/no_match.rs"
+
+[[test]]
+name = "operator_profile"
+path = "../../query-language/shared/tests/engine/operator_profile.rs"
+
+[[test]]
+name = "ordered_relationship_window"
+path = "../../query-language/shared/tests/engine/ordered_relationship_window.rs"
+
+[[test]]
+name = "ordered_residual"
+path = "../../query-language/shared/tests/engine/ordered_residual.rs"
+
+[[test]]
+name = "ordered_window"
+path = "../../query-language/shared/tests/engine/ordered_window.rs"
+
+[[test]]
+name = "pattern_predicates"
+path = "../../query-language/shared/tests/engine/pattern_predicates.rs"
+
+[[test]]
+name = "probe_pass_through"
+path = "../../query-language/shared/tests/engine/probe_pass_through.rs"
+
+[[test]]
+name = "relationship_id_property"
+path = "../../query-language/shared/tests/engine/relationship_id_property.rs"
+
+[[test]]
+name = "relationship_multi_seek"
+path = "../../query-language/shared/tests/engine/relationship_multi_seek.rs"
+
+[[test]]
+name = "relationship_uniqueness"
+path = "../../query-language/shared/tests/engine/relationship_uniqueness.rs"
+
+[[test]]
+name = "repeated_binding"
+path = "../../query-language/shared/tests/engine/repeated_binding.rs"
+
+[[test]]
+name = "repeated_seed_lookups"
+path = "../../query-language/shared/tests/engine/repeated_seed_lookups.rs"
+
+[[test]]
+name = "scalar_functions"
+path = "../../query-language/shared/tests/engine/scalar_functions.rs"
+
+[[test]]
+name = "star_projections"
+path = "../../query-language/shared/tests/engine/star_projections.rs"
+
+[[test]]
+name = "statistics_access"
+path = "../../query-language/shared/tests/engine/statistics_access.rs"
+
+[[test]]
+name = "string_conversion_functions"
+path = "../../query-language/shared/tests/engine/string_conversion_functions.rs"
+
+[[test]]
+name = "top_k"
+path = "../../query-language/shared/tests/engine/top_k.rs"
+
+[[test]]
+name = "unbounded_variable_length"
+path = "../../query-language/shared/tests/engine/unbounded_variable_length.rs"
+
+[[test]]
+name = "undirected_variable_length"
+path = "../../query-language/shared/tests/engine/undirected_variable_length.rs"
+
+[[test]]
+name = "unwind"
+path = "../../query-language/shared/tests/engine/unwind.rs"
+
+[[test]]
+name = "variable_length_binding"
+path = "../../query-language/shared/tests/engine/variable_length_binding.rs"
+
+[[test]]
+name = "with_aggregation"
+path = "../../query-language/shared/tests/engine/with_aggregation.rs"
+
+[[test]]
+name = "with_clause"
+path = "../../query-language/shared/tests/engine/with_clause.rs"
+
+[[test]]
+name = "identity_pushdown"
+path = "../../query-language/shared/tests/engine/identity_pushdown.rs"
+
+[[test]]
+name = "byog_identity"
+path = "../../query-language/shared/tests/engine/byog_identity.rs"

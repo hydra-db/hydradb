@@ -2,49 +2,102 @@ name: openCypher TCK compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
 
-jobs:
-  compatibility-report:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout kernel
-        uses: actions/checkout@v7
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-      # The kernel links libgraphblas unconditionally, so this job needs it even
-      # though the report itself only exercises the parser.
+env:
+  GRAPH_USAGE_REPORT_ENABLED: "false"
+
+jobs:
+  corpus:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [legacy, experimental]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_MIN_STACK: 33554432
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
+    steps:
+      - uses: useblacksmith/checkout@v1
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcypher-parser-dev libgraphblas-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # This job's `cargo run` compiled the whole opencypher feature set from
-      # scratch every time. `save-if` restricts writes to main for the same
-      # cache-budget reason as ci.yml.
+          sudo apt-get install -y libcypher-parser-dev libgraphblas-dev pkg-config just
+      - name: LAGraph
+        uses: ./.github/actions/lagraph
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: opencypher-tck
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Deliberately outside `target/`: rust-cache saves the target directory,
-      # so a corpus checkout parked in there would be packed into the cache
-      # entry on every run.
-      - name: Checkout official openCypher corpus
+          cache-targets: false
+          save-if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Fetch and verify pinned corpus
+        run: python3 query-language/cypher/scripts/fetch_opencypher_tck.py fetch "$RUNNER_TEMP/openCypher"
+      - name: Validate harness, corpus import, and migration ledger
+        run: just tck-harness "$RUNNER_TEMP/openCypher/tck/features"
+      - name: Execute official corpus
         run: |
-          git clone --depth 1 https://github.com/opencypher/openCypher.git "${RUNNER_TEMP}/openCypher"
-
-      - name: Generate compatibility report
-        run: |
-          cargo run --features opencypher --example opencypher_tck_report -- \
-            "${RUNNER_TEMP}/openCypher/tck/features" \
-            > "${RUNNER_TEMP}/opencypher-tck-compatibility.json"
-
-      - name: Upload compatibility report
+          mkdir -p "$RUNNER_TEMP/tck-report"
+          # Runner integration must implement this recipe; absence is a hard failure.
+          just tck-run "${{ matrix.engine }}" "$RUNNER_TEMP/openCypher/tck/features" "$RUNNER_TEMP/tck-report"
+      - name: Upload complete or partial report
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: opencypher-tck-compatibility
-          path: ${{ runner.temp }}/opencypher-tck-compatibility.json
+          name: opencypher-tck-${{ matrix.engine }}
+          path: ${{ runner.temp }}/tck-report/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  aggregate:
+    if: always() && needs.corpus.result != 'skipped'
+    needs: corpus
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: 33554432
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcypher-parser-dev libgraphblas-dev pkg-config just
+      - name: LAGraph
+        uses: ./.github/actions/lagraph
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Execute checked-in HydraDB declarative cases
+        run: just tck-local
+      - name: Download shards
+        uses: actions/download-artifact@v8
+        with:
+          pattern: opencypher-tck-*
+          path: ${{ runner.temp }}/tck-shards
+      - name: Validate and aggregate shard inventories and policy
+        run: |
+          mkdir -p "$RUNNER_TEMP/tck-aggregate"
+          # Must reject missing/duplicate cases, wrong provenance, stale policy and failures.
+          just tck-aggregate "$RUNNER_TEMP/tck-shards" "$RUNNER_TEMP/tck-aggregate"
+      - name: Require both execution jobs to succeed
+        if: always()
+        env:
+          CORPUS_RESULT: ${{ needs.corpus.result }}
+        run: test "$CORPUS_RESULT" = success
+      - name: Upload aggregate or partial diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: opencypher-tck-aggregate
+          path: ${{ runner.temp }}/tck-aggregate/
+          if-no-files-found: warn

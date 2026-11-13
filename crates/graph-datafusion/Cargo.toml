@@ -1,0 +1,16 @@
+[package]
+name = "hydradb-graph-datafusion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "DataFusion graph logical and physical execution extensions"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+hydradb-graph-plan = { path = "../graph-plan" }
+hydradb-graph-provider = { path = "../graph-provider" }
+hydradb-graph-types = { path = "../graph-types" }
+sha2 = { workspace = true }

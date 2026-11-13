@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-06
+
+### Added
+
+- **ISO GQL query surface.** The standard GQL dialect is parsed and planned
+  alongside OpenCypher, sharing one engine and one storage path.
+- **Bolt proxy.** A standalone proxy routes Bolt 5.x traffic across query nodes
+  without linking the native graph libraries.
+- **MCP server.** A Model Context Protocol server exposes graph queries to agent
+  clients.
+- **DataFusion execution.** A DataFusion-backed Cypher path, including list and
+  map element access.
+- **FalkorDB import.** A dedicated path for importing a FalkorDB dump into an
+  object-store image.
+- **Query telemetry.** Per-query telemetry with OTLP export in the server
+  runtime.
+
+### Changed
+
+- **Experimental Cypher engine.** Batched vertex identity seeks, concurrent
+  UNION arms, ordered relationship seeding, and bound-edge endpoint pushdown.
+- **Read path.** Owner strong reads and firmer writer fencing on takeover.
+- **Graph data science.** Degree and traversal procedures exercised at
+  100M-edge scale.
+
+### Notes
+
+Exclusions are unchanged from 0.3.0 (internal documentation, benchmark and
+parity scripts, test suites, the Jepsen suite, the Quint specification models,
+the Typst/interactive textbook, CI workflows, and editor/agent tooling).
+
 ## [0.3.0] - 2026-10-22
 
 ### Added
@@ -85,6 +116,7 @@ the Quint specification models, the Typst/interactive textbook, CI workflows, an
 editor/agent tooling configuration. Full source and the three public-facing docs
 above are included.
 
-[Unreleased]: https://github.com/hydra-db/hydradb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/hydra-db/hydradb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hydra-db/hydradb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hydra-db/hydradb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hydra-db/hydradb/releases/tag/v0.2.0

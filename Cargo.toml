@@ -7,16 +7,46 @@
 # which are gitignored but present in working trees.
 [workspace]
 members = [
+    "crates/bolt-server",
     "crates/cypher-engine",
+    "crates/cypher-df",
     "crates/cypher-parser-antlr",
     "crates/cypher-ast",
+    "crates/cypher-date",
+    "crates/graph-datafusion",
     "crates/graph-plan",
+    "crates/graph-provider",
+    "crates/graph-slate",
+    "crates/graph-types",
     "crates/falkordb-rdb",
     "crates/falkor-dump-import",
     "crates/object-publication",
+    "crates/mcp",
+    "crates/query-telemetry",
+    "crates/usage-report",
     "crates/placement",
+    "crates/buddy-wal",
+    "crates/protocol",
+    "crates/scope",
     "crates/telemetry",
+    "query-language/shared/harness",
+    # The turbolay proxy. Many small crates on purpose: heavy third-party
+    # dependencies sit in leaf crates (`http` for pingora, `k8s` for kube), so
+    # an edit rebuilds only its crate and what sits above it. None of them
+    # links slatedb or the native graph libraries.
+    "crates/proxy/types",
+    "crates/proxy/topology",
+    "crates/proxy/core",
+    "crates/proxy/bolt",
+    "crates/proxy/http",
+    "crates/proxy/k8s",
+    "crates/proxy/bin",
+    "crates/pg-graph-core",
+    "crates/pg-graph-csr",
+    "crates/pg-graph-query",
+    "crates/pg-usage-report",
 ]
+exclude = ["docs", "crates/pg-hydradb"]
 
 # One place for every third-party version, so a member cannot drift from the
 # root. Members inherit with `{ workspace = true }`. Two rules worth knowing
@@ -26,6 +56,10 @@ members = [
 [workspace.dependencies]
 antlr-rust-codegen = "0.34.0"
 antlr-rust-runtime = "0.34.0"
+arc-swap = "1.9.2"
+arrow-array = "59.2"
+arrow-buffer = "59.2"
+arrow-schema = "59.2"
 async-trait = "0.1.92"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
@@ -33,17 +67,39 @@ base64 = "0.22"
 boltr = "0.2.0"
 blake2 = "0.10"
 bytes = "1"
+bytesize = "2.7.0"
 # `serde` is declared rather than inherited. It does arrive anyway through
 # feature unification with `object_store`, but placement's heartbeat body
 # derives Serialize/Deserialize on a `DateTime<Utc>`, and a dependency that
 # compiles only because something else happens to turn a feature on breaks the
 # day that something else stops.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+compact_str = "0.9.1"
+deadpool = { version = "0.13.1", default-features = false, features = ["managed"] }
+datafusion = { version = "55.2", default-features = false }
+# Tokio runtime traces for graph-node, recorded only when `DIAL9_ENABLED` is
+# set. No `worker-s3`: it would pull the AWS SDK into every build, and the node
+# already reaches S3 through `object_store` (graph_node/dial9_trace.rs).
+dial9 = { version = "0.5.7", default-features = false, features = ["tokio"] }
+form_urlencoded = "1.2.2"
 futures = "0.3"
+gherkin = "0.16.0"
+percent-encoding = "2.3.2"
+hdrhistogram = { version = "7.6.0", default-features = false }
+http = "1"
 indexmap = "2"
 foyer = "0.22.3"
+k8s-openapi = { version = "0.28.0", default-features = false, features = ["v1_33"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 libc = "0.2"
+prometheus = { version = "0.14", default-features = false }
+proptest = "1"
 libcypher-parser-sys = "0.6.1-1"
+matchit = "0.8.4"
+mimalloc = { version = "0.1.52", default-features = false }
+moka = { version = "0.12.16", features = ["sync"] }
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # The OpenTelemetry set is used only by `crates/telemetry`, behind its
 # off-by-default `otlp` feature, so nothing here reaches the kernel or a bare
 # `cargo test`. They live in this table anyway because the versions are paired,
@@ -69,17 +125,23 @@ opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "metrics", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+pingora-core = { version = "0.9.0", default-features = false }
+pingora-error = "0.9.0"
+pingora-http = "0.9.0"
+pingora-proxy = { version = "0.9.0", default-features = false }
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
 rmp-serde = "1"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-slatedb = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46", default-features = false, features = ["aws", "foyer"] }
-slatedb-common = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46" }
-slatedb-txn-obj = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46" }
+slatedb = { git = "https://github.com/hydra-db/slatedb.git", rev = "93239f30166ddc7fffd5a76f049cef0740bdb005", default-features = false, features = ["aws", "foyer", "zstd"] }
+slatedb-common = { git = "https://github.com/hydra-db/slatedb.git", rev = "93239f30166ddc7fffd5a76f049cef0740bdb005" }
+slatedb-txn-obj = { git = "https://github.com/hydra-db/slatedb.git", rev = "93239f30166ddc7fffd5a76f049cef0740bdb005" }
+smallvec = "1.15.2"
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
@@ -89,10 +151,11 @@ tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 ulid = "1"
+unicode-normalization = "0.1.25"
 
 [package]
 name = "hydradb"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Object-store-native distributed graph database"
@@ -103,23 +166,44 @@ publish = false
 
 [features]
 default = []
-opencypher = ["dep:libcypher-parser-sys"]
-experimental-cypher-engine = ["opencypher", "dep:hydradb-cypher-engine"]
+# serde_json encodes the `gds.graph.project` record, which the native
+# procedures read and write under this feature.
+opencypher = ["dep:libcypher-parser-sys", "dep:serde_json", "hydradb-graph-slate/opencypher"]
+experimental-cypher-engine = ["hydradb-graph-slate/experimental-cypher-engine", "opencypher", "dep:hydradb-cypher-engine"]
+datafusion-cypher-engine = [
+    "opencypher",
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+    "dep:datafusion",
+    "dep:hydradb-cypher-df",
+    "dep:hydradb-graph-datafusion",
+    "dep:hydradb-graph-provider",
+    "hydradb-graph-slate/datafusion-cypher-engine",
+    "dep:hydradb-graph-types",
+]
 chaos-harness = []
-json-properties = ["dep:serde_json"]
-query-transport = ["opencypher", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
+json-properties = ["dep:serde_json", "hydradb-graph-slate/json-properties"]
+query-transport = ["hydradb-graph-slate/query-transport", "opencypher", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net", "hydradb-scope/serde"]
 query-transport-tls = ["query-transport", "dep:tokio-rustls"]
 query-service-discovery = ["query-transport", "dep:reqwest"]
-client-api = ["query-transport"]
-bolt-server = ["client-api", "query-transport-tls", "dep:boltr"]
+client-api = ["query-transport", "hydradb-graph-slate/client-api"]
+query-telemetry = ["client-api", "dep:hydradb-query-telemetry"]
+bolt-server = ["client-api", "query-transport-tls", "dep:boltr", "dep:hydradb-bolt-server", "hydradb-protocol/bolt"]
 http-api = ["client-api", "query-transport-tls", "dep:axum", "dep:axum-server"]
 public-client-protocols = ["bolt-server", "http-api"]
 server-runtime = [
     "public-client-protocols",
+    "hydradb-buddy-wal/server",
+    "hydradb-buddy-wal/client",
     "query-service-discovery",
     "dep:rustls-pemfile",
     "dep:tracing-subscriber",
     "dep:hydradb-telemetry",
+    "dep:dial9",
+    "dep:pprof",
+    "dep:getrandom",
+    "dep:hydradb-usage-report",
 ]
 indexer-runtime = [
     "dep:axum",
@@ -149,18 +233,38 @@ path = "src/bin/graph-indexer.rs"
 required-features = ["indexer-runtime"]
 
 [[example]]
+name = "ordered_relationship_fetch_bench"
+path = "examples/ordered_relationship_fetch_bench.rs"
+required-features = ["experimental-cypher-engine"]
+
+[[example]]
 name = "fence_worker"
 path = "examples/fence_worker.rs"
 required-features = ["chaos-harness"]
 
 [[example]]
 name = "opencypher_tck_report"
-path = "examples/opencypher_tck_report.rs"
+path = "query-language/cypher/examples/opencypher_tck_report.rs"
+required-features = ["opencypher"]
+
+[[example]]
+name = "query_bench"
+path = "examples/query_bench.rs"
+required-features = ["opencypher"]
+
+[[example]]
+name = "mspaths_cold_bench"
+path = "examples/mspaths_cold_bench.rs"
 required-features = ["opencypher"]
 
 [[example]]
 name = "query_correctness"
 path = "examples/query_correctness.rs"
+required-features = ["opencypher"]
+
+[[example]]
+name = "multigraph_bench"
+path = "examples/multigraph_bench.rs"
 required-features = ["opencypher"]
 
 [[example]]
@@ -170,7 +274,7 @@ required-features = ["json-properties"]
 
 [[example]]
 name = "cypher_query"
-path = "examples/cypher_query.rs"
+path = "query-language/cypher/examples/cypher_query.rs"
 required-features = ["opencypher"]
 
 [[example]]
@@ -179,16 +283,47 @@ path = "examples/match_create_repro.rs"
 required-features = ["opencypher"]
 
 [[example]]
+name = "where_vs_inline_bench"
+path = "examples/where_vs_inline_bench.rs"
+required-features = ["opencypher"]
+
+[[example]]
 name = "point_lookup_vs_range_scan"
 path = "examples/point_lookup_vs_range_scan.rs"
+
+[[example]]
+name = "falkor_query_bench"
+path = "examples/falkor_query_bench.rs"
+required-features = ["opencypher"]
 
 [[example]]
 name = "bolt_compat_server"
 path = "examples/bolt_compat_server.rs"
 required-features = ["bolt-server"]
 
+[[example]]
+name = "bolt_benchmark"
+path = "examples/bolt_benchmark.rs"
+required-features = ["public-client-protocols"]
+
+[[example]]
+name = "s3_bolt_benchmark_server"
+path = "examples/s3_bolt_benchmark_server.rs"
+required-features = ["server-runtime"]
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+pprof = { version = "0.15", optional = true, default-features = false, features = ["prost-codec"] }
+
 [dependencies]
+arc-swap = { workspace = true }
+getrandom = { version = "0.3.4", optional = true }
+hydradb-query-telemetry = { path = "crates/query-telemetry", optional = true }
+hydradb-usage-report = { path = "crates/usage-report", optional = true }
 async-trait = { workspace = true }
+arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
 hydradb-cypher-ast = { path = "crates/cypher-ast" }
 axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
@@ -202,12 +337,14 @@ base64 = { workspace = true }
 # `SystemTime::now().into()` and leaning on inference to pick the conversion,
 # which is the same instant by the same clock but says so nowhere.
 chrono = { workspace = true }
+dial9 = { workspace = true, optional = true }
 futures = { workspace = true }
 foyer = { workspace = true }
 # Direct rather than transitive: graph-node reads the glibc allocator snapshot
 # for its Linux-only `/metrics` diagnostics. The metrics are what distinguish
 # live application allocations from bytes retained inside glibc arenas.
 libc = { workspace = true }
+prometheus = { workspace = true }
 libcypher-parser-sys = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
@@ -224,8 +361,20 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 hydradb-object-publication = { path = "crates/object-publication" }
 hydradb-placement = { path = "crates/placement" }
+hydradb-buddy-wal = { path = "crates/buddy-wal" }
+hydradb-graph-provider = { path = "crates/graph-provider", optional = true }
+hydradb-graph-slate = { path = "crates/graph-slate" }
+hydradb-graph-types = { path = "crates/graph-types", optional = true }
+hydradb-scope = { path = "crates/scope" }
+# Owner-hint format and status codes in every build; the Bolt wire code only
+# with `bolt-server`, which turns on its `bolt` feature.
+hydradb-protocol = { path = "crates/protocol", default-features = false }
+# The Bolt connection session, shared with the turbolay proxy.
+hydradb-bolt-server = { path = "crates/bolt-server", optional = true }
 hydradb-graph-plan = { path = "crates/graph-plan" }
 hydradb-cypher-engine = { path = "crates/cypher-engine", optional = true }
+hydradb-cypher-df = { path = "crates/cypher-df", optional = true }
+hydradb-graph-datafusion = { path = "crates/graph-datafusion", optional = true }
 ulid = { workspace = true }
 # Optional, because only `src/bin/` uses it: the library half of this package
 # emits through the plain `tracing` facade and must keep compiling — and
@@ -239,3 +388,29 @@ ulid = { workspace = true }
 # `otlp` feature below, and nothing enables it implicitly.
 hydradb-telemetry = { path = "crates/telemetry", optional = true }
 
+[dev-dependencies]
+hydradb-graph-slate = { path = "crates/graph-slate" }
+slatedb-common = { workspace = true, features = ["test-util"] }
+# The engine parity matrix is JSON so a plain-stdlib reader can consume it
+# too, which is how the AB client will read it once that coupling lands.
+# Dev-only: `json-properties` still owns the optional dependency for production
+# builds.
+serde_json = { workspace = true }
+boltr = { workspace = true, features = ["client"] }
+hydradb-cypher-parser-antlr = { path = "crates/cypher-parser-antlr" }
+serde = { workspace = true }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs, and the fence
+# backoff tests in `src/core/state.rs` are built on it. It does arrive anyway
+# through feature unification with `fail-parallel`, a slatedb dependency, but
+# those tests would stop compiling the day that transitive path changes.
+tokio = { workspace = true, features = ["test-util"] }
+serde_yaml = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+hydradb-cypher-tck-harness = { path = "query-language/shared/harness" }
+
+[[test]]
+name = "cypher_tck_conformance"
+path = "query-language/shared/tests/conformance.rs"
+required-features = ["opencypher", "experimental-cypher-engine"]

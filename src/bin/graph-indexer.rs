@@ -15,11 +15,9 @@ use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
 use hydradb::{
-    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
-    GraphIndexGeneration, GraphLimits, GraphOpenOptions, GraphReaderMode, GraphScope,
-    GraphScopeChange, NamespaceId, NamespacePath, ObjectStoreGraphScopeDirectory,
-    PlannerStatisticsBuildLimits, PlannerStatisticsPublish, PlannerStatisticsPublisher,
-    PlannerStatisticsRequest,
+    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath, GraphIndexGeneration, GraphLimits, GraphOpenOptions,
+    GraphScope, GraphScopeChange, NamespacePath, ObjectStoreGraphScopeDirectory, PlannerStatistics, PlannerStatisticsBuildLimits,
+    PlannerStatisticsPublish, PlannerStatisticsPublisher, PlannerStatisticsRequest,
 };
 use hydradb_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 use slatedb::object_store::path::Path;
@@ -42,9 +40,26 @@ const MAX_SCOPES_PER_CYCLE: usize = 16_384;
 const MIN_SCOPE_CURSOR_CHECKPOINT_SCOPES: usize = 64;
 const DEFAULT_MAX_OPEN_SCOPES: usize = 128;
 const MAX_OPEN_SCOPES: usize = 16_384;
-const DEFAULT_DIRTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the change lane lists hints when no wake arrives. A graph node
+/// wakes the indexer after every durable hint, so this poll only bounds how
+/// long a lost wake, an indexer restart or a client that never wakes can wait.
+/// It is a backstop, and each poll is an object-store LIST.
+const DEFAULT_DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MIN_DIRTY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Minimum spacing between change passes. Wakes cannot list the hint prefix
+/// faster than this; a wake that lands inside it is coalesced into the next
+/// pass rather than dropped, so throttling never delays a hint to the poll.
+const DEFAULT_CHANGE_PASS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_CHANGE_PASS_MIN_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_CHANGE_PASS_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// The least time one rotation of the fair sweep takes. Every scope visit
+/// refreshes that scope's SlateDB reader (a manifest LIST and GET, and a WAL
+/// LIST), so a sweep that ran back to back re-read every registered scope
+/// about once a minute whether or not it changed. Changed scopes arrive
+/// through hints; the sweep is the recovery path for a hint that never
+/// landed, so it is paced to this period.
+const DEFAULT_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CHANGE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the statistics worker lists request markers when no wake
 /// arrives: a node's wake is the fast path, this is the backstop.
@@ -57,24 +72,6 @@ const PLANNER_STATISTICS_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(3
 /// Slack on a build claim's lease beyond the build timeout, covering the
 /// refresh before the deadline starts and the release after it.
 const PLANNER_STATISTICS_CLAIM_SLACK: Duration = Duration::from_secs(30);
-const INDEXER_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-fn indexer_open_options(max_wal_tail_files: u64, slatedb_cache_bytes: usize) -> GraphOpenOptions {
-    let mut options = GraphOpenOptions::default();
-    options.limits = GraphLimits {
-        max_wal_tail_files,
-        ..GraphLimits::default()
-    };
-    // Cached indexer readers explicitly refresh before every build. Keeping a
-    // managed checkpoint per cached scope creates thousands of periodic S3
-    // writes, while frequent background polls duplicate the explicit refresh.
-    // FollowLatest makes these readers read-only at the object-store level;
-    // failed reads invalidate the scope and reopen it on the next pass.
-    options.reader_mode = GraphReaderMode::FollowLatest;
-    options.reader_manifest_poll_interval = INDEXER_READER_MANIFEST_POLL_INTERVAL;
-    options.cache.slatedb_cache_bytes = slatedb_cache_bytes;
-    options
-}
 const DEFAULT_READINESS_FAILURE_THRESHOLD: u64 = 3;
 const MAX_READINESS_FAILURE_THRESHOLD: u64 = 100;
 const HOT_SCOPE_BUDGET_DIVISOR: usize = 4;
@@ -91,9 +88,98 @@ enum ScopeCursorAdvance {
     LostRace,
 }
 
+/// What a scheduler cycle visited, and what failed while visiting it. A
+/// failing scope still cost its reads and still moved the fair cursor, so the
+/// sweep pacer is fed `progress` whatever `failures` holds.
+#[derive(Debug, Default)]
+struct RegisteredScopesCycleOutcome {
+    progress: RegisteredScopesCycle,
+    failures: CycleFailures,
+}
+
+impl RegisteredScopesCycleOutcome {
+    fn failed(failures: CycleFailures) -> Self {
+        Self {
+            progress: RegisteredScopesCycle::default(),
+            failures,
+        }
+    }
+
+    fn into_result(self) -> Result<RegisteredScopesCycle, CycleFailures> {
+        self.failures.into_result().map(|()| self.progress)
+    }
+}
+
 #[derive(Debug, Default)]
 struct RegisteredScopesCycle {
     full_sweep_completed: bool,
+    /// Fair-slice scopes this cycle finished visiting. Pacing charges these
+    /// reads; whether the rotation is over is `full_sweep_completed`'s call,
+    /// which follows the cursor.
+    fair_scopes: usize,
+    /// Registered scopes in the rotation this cycle belongs to.
+    registered_scopes: usize,
+}
+
+/// The wait before the next scheduler cycle. Every cycle, failed or not, is
+/// paced by the scopes it visited; a failed one also waits at least the retry
+/// interval. Pacing only successful cycles let a scope that failed every
+/// rotation stop the rotation clock, after which every cycle ran back to back.
+fn next_cycle_delay(pacer: &mut SweepPacer, outcome: &RegisteredScopesCycleOutcome, retry_interval: Duration, now: Instant) -> Duration {
+    let paced = pacer.delay_after(&outcome.progress, now);
+    if outcome.failures.is_empty() {
+        paced
+    } else {
+        paced.max(retry_interval)
+    }
+}
+
+/// Paces the fair sweep's object-store reads to one rotation's worth per
+/// [`DEFAULT_FULL_SWEEP_INTERVAL`] (or `GRAPH_INDEXER_FULL_SWEEP_INTERVAL_MS`).
+///
+/// Each cycle earns a wait proportional to the scopes it visited: visiting a
+/// tenth of the registered scopes moves the next cycle's earliest start a
+/// tenth of the period past the start of this one. The budget is counted in
+/// reads, not in rotations, so nothing has to complete for it to renew: a
+/// cycle whose cursor checkpoint failed or lost a race is paced exactly like
+/// one that advanced. A sweep that falls behind its pace is not slowed
+/// further, and its lag is not banked as a burst: the next cycle is paced
+/// from when it actually starts.
+struct SweepPacer {
+    period: Duration,
+    cycle_started: Option<Instant>,
+    next_due: Option<Instant>,
+}
+
+impl SweepPacer {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            cycle_started: None,
+            next_due: None,
+        }
+    }
+
+    fn cycle_started(&mut self, now: Instant) {
+        self.cycle_started = Some(now);
+    }
+
+    /// How long to wait after a cycle before the next one. Called for every
+    /// cycle, failed or not; a cycle that visited nothing earns no wait.
+    fn delay_after(&mut self, cycle: &RegisteredScopesCycle, now: Instant) -> Duration {
+        if cycle.registered_scopes == 0 {
+            // Nothing is registered: look at the registry again in a period.
+            // A cycle that failed before listing it earns nothing.
+            return if cycle.full_sweep_completed { self.period } else { Duration::ZERO };
+        }
+        let started = self.cycle_started.unwrap_or(now);
+        let base = self.next_due.map_or(started, |due| due.max(started));
+        let visited = cycle.fair_scopes.min(cycle.registered_scopes) as u128;
+        let nanos = self.period.as_nanos() * visited / cycle.registered_scopes as u128;
+        let due = base + Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+        self.next_due = Some(due);
+        due.saturating_duration_since(now)
+    }
 }
 
 #[derive(Default)]
@@ -169,6 +255,8 @@ struct IndexerScopeCache {
     planner_statistics_headers: Mutex<PlannerStatisticsHeaders>,
     /// Where due statistics go. Weak: the worker holds this cache.
     planner_statistics_worker: std::sync::OnceLock<Weak<PlannerStatisticsWorker>>,
+    /// When the change lane next tries each type refused for its edge count.
+    edge_cap_retries: EdgeCapRetries,
 }
 
 impl IndexerScopeCache {
@@ -181,9 +269,7 @@ impl IndexerScopeCache {
         scope_concurrency: usize,
         metrics: Arc<IndexerMetrics>,
     ) -> Self {
-        metrics
-            .scope_cache_capacity
-            .store(max_open_scopes as u64, Ordering::Release);
+        metrics.scope_cache_capacity.store(max_open_scopes as u64, Ordering::Release);
         Self {
             data_path,
             cells,
@@ -198,11 +284,19 @@ impl IndexerScopeCache {
             planner_statistics: PlannerStatisticsPolicy::default(),
             planner_statistics_headers: Mutex::new(BTreeMap::new()),
             planner_statistics_worker: std::sync::OnceLock::new(),
+            edge_cap_retries: EdgeCapRetries::new(DEFAULT_FULL_SWEEP_INTERVAL),
         }
     }
 
     fn with_planner_statistics(mut self, policy: PlannerStatisticsPolicy) -> Self {
         self.planner_statistics = policy;
+        self
+    }
+
+    /// The longest the change lane waits to retry a type refused for its edge
+    /// count: the full sweep interval, at which the sweep visits it anyway.
+    fn with_edge_cap_retry_ceiling(mut self, ceiling: Duration) -> Self {
+        self.edge_cap_retries = EdgeCapRetries::new(ceiling);
         self
     }
 
@@ -224,35 +318,20 @@ impl IndexerScopeCache {
         let Some(worker) = self.planner_statistics_worker.get().and_then(Weak::upgrade) else {
             return;
         };
-        let due = planner_statistics_due_cells(
-            self,
-            scope,
-            cluster,
-            scope_name,
-            sequences,
-            metrics,
-            DueMode::Refresh,
-        )
-        .await;
+        let due = planner_statistics_due_cells(self, scope, cluster, scope_name, sequences, metrics, DueMode::Refresh).await;
         for cell in due {
             worker.enqueue(scope.clone(), cell.cell_id, BuildReason::Refresh, None);
         }
     }
 
     fn planner_statistics_headers(&self) -> std::sync::MutexGuard<'_, PlannerStatisticsHeaders> {
-        self.planner_statistics_headers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.planner_statistics_headers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A reader of `scope`'s `cell_id` alone, owned by the caller and never
     /// cached: refreshing or closing it cannot move the sweep's reader, nor
     /// the sweep's moves this one. `None` when the cell is not configured.
-    async fn open_cell_reader(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-    ) -> hydradb::Result<Option<GraphCluster>> {
+    async fn open_cell_reader(&self, scope: &GraphScope, cell_id: &str) -> hydradb::Result<Option<GraphCluster>> {
         if !self.cells.iter().any(|cell| cell == cell_id) {
             return Ok(None);
         }
@@ -283,17 +362,11 @@ impl IndexerScopeCache {
         let mut clusters = self.clusters.lock().await;
         let entry = clusters.get_mut(scope)?;
         entry.last_used = access;
-        self.metrics
-            .scope_cache_hits
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.scope_cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(Arc::clone(&entry.cluster))
     }
 
-    async fn covered_sequences_for_scope(
-        &self,
-        scope: &GraphScope,
-        expected: &Arc<GraphCluster>,
-    ) -> BTreeMap<String, u64> {
+    async fn covered_sequences_for_scope(&self, scope: &GraphScope, expected: &Arc<GraphCluster>) -> BTreeMap<String, u64> {
         let clusters = self.clusters.lock().await;
         clusters
             .get(scope)
@@ -302,17 +375,9 @@ impl IndexerScopeCache {
             .unwrap_or_default()
     }
 
-    async fn update_covered_sequences(
-        &self,
-        scope: &GraphScope,
-        expected: &Arc<GraphCluster>,
-        covered_sequences: &BTreeMap<String, u64>,
-    ) {
+    async fn update_covered_sequences(&self, scope: &GraphScope, expected: &Arc<GraphCluster>, covered_sequences: &BTreeMap<String, u64>) {
         let mut clusters = self.clusters.lock().await;
-        let Some(entry) = clusters
-            .get_mut(scope)
-            .filter(|entry| Arc::ptr_eq(&entry.cluster, expected))
-        else {
+        let Some(entry) = clusters.get_mut(scope).filter(|entry| Arc::ptr_eq(&entry.cluster, expected)) else {
             return;
         };
         for (cell_id, sequence) in covered_sequences {
@@ -320,18 +385,13 @@ impl IndexerScopeCache {
         }
     }
 
-    async fn cluster_for_scope(
-        &self,
-        scope: &GraphScope,
-    ) -> hydradb::Result<(Arc<GraphCluster>, ScopeCacheDisposition)> {
+    async fn cluster_for_scope(&self, scope: &GraphScope) -> hydradb::Result<(Arc<GraphCluster>, ScopeCacheDisposition)> {
         if let Some(cluster) = self.resident_cluster_for_scope(scope).await {
             return Ok((cluster, ScopeCacheDisposition::Hit));
         }
 
         let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
-        self.metrics
-            .scope_cache_misses
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.scope_cache_misses.fetch_add(1, Ordering::Relaxed);
         let opened = Arc::new(
             GraphCluster::open_cells_scoped_with_options(
                 self.data_path.clone(),
@@ -349,9 +409,7 @@ impl IndexerScopeCache {
                 entry.last_used = access;
                 (Arc::clone(&entry.cluster), ScopeCacheDisposition::Hit)
             } else if clusters.len() >= self.max_open_scopes {
-                self.metrics
-                    .scope_cache_admission_bypasses
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.scope_cache_admission_bypasses.fetch_add(1, Ordering::Relaxed);
                 (Arc::clone(&opened), ScopeCacheDisposition::Bypassed)
             } else {
                 clusters.insert(
@@ -364,9 +422,7 @@ impl IndexerScopeCache {
                         covered_sequences: BTreeMap::new(),
                     },
                 );
-                self.metrics
-                    .scope_cache_entries
-                    .store(clusters.len() as u64, Ordering::Release);
+                self.metrics.scope_cache_entries.store(clusters.len() as u64, Ordering::Release);
                 (Arc::clone(&opened), ScopeCacheDisposition::Admitted)
             }
         };
@@ -387,19 +443,10 @@ impl IndexerScopeCache {
             .map(|(scope, entry)| (scope.clone(), entry.last_used))
             .collect::<Vec<_>>();
         hot.sort_by_key(|(_, last_used)| std::cmp::Reverse(*last_used));
-        hot.into_iter()
-            .take(limit)
-            .map(|(scope, _)| scope)
-            .collect()
+        hot.into_iter().take(limit).map(|(scope, _)| scope).collect()
     }
 
-    async fn finish_scope(
-        &self,
-        scope: &GraphScope,
-        expected: &Arc<GraphCluster>,
-        disposition: ScopeCacheDisposition,
-        built: bool,
-    ) {
+    async fn finish_scope(&self, scope: &GraphScope, expected: &Arc<GraphCluster>, disposition: ScopeCacheDisposition, built: bool) {
         if disposition == ScopeCacheDisposition::Bypassed {
             if built {
                 self.admit_built_scope(scope, expected).await;
@@ -417,11 +464,7 @@ impl IndexerScopeCache {
                     entry.hot = true;
                     entry.idle_rechecks = 0;
                 }
-                Some(entry)
-                    if Arc::ptr_eq(&entry.cluster, expected)
-                        && disposition == ScopeCacheDisposition::Hit
-                        && entry.hot =>
-                {
+                Some(entry) if Arc::ptr_eq(&entry.cluster, expected) && disposition == ScopeCacheDisposition::Hit && entry.hot => {
                     entry.idle_rechecks = entry.idle_rechecks.saturating_add(1);
                     if entry.idle_rechecks >= HOT_SCOPE_IDLE_RECHECKS {
                         entry.hot = false;
@@ -433,9 +476,7 @@ impl IndexerScopeCache {
             }
         }
         if demoted {
-            self.metrics
-                .scope_cache_idle_demotions
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.scope_cache_idle_demotions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -471,9 +512,7 @@ impl IndexerScopeCache {
                         .map(|(scope, _)| scope.clone());
                     if let Some(candidate) = candidate {
                         evicted = clusters.remove(&candidate).map(|entry| entry.cluster);
-                        self.metrics
-                            .scope_cache_evictions
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.scope_cache_evictions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 if clusters.len() >= self.max_open_scopes {
@@ -489,12 +528,8 @@ impl IndexerScopeCache {
                             covered_sequences: BTreeMap::new(),
                         },
                     );
-                    self.metrics
-                        .scope_cache_entries
-                        .store(clusters.len() as u64, Ordering::Release);
-                    self.metrics
-                        .scope_cache_promotions
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.scope_cache_entries.store(clusters.len() as u64, Ordering::Release);
+                    self.metrics.scope_cache_promotions.fetch_add(1, Ordering::Relaxed);
                     true
                 }
             }
@@ -512,20 +547,12 @@ impl IndexerScopeCache {
         }
     }
 
-    async fn invalidate(
-        &self,
-        scope: &GraphScope,
-        expected: &Arc<GraphCluster>,
-    ) -> hydradb::Result<()> {
+    async fn invalidate(&self, scope: &GraphScope, expected: &Arc<GraphCluster>) -> hydradb::Result<()> {
         let removed = {
             let mut clusters = self.clusters.lock().await;
-            let matches = clusters
-                .get(scope)
-                .is_some_and(|entry| Arc::ptr_eq(&entry.cluster, expected));
+            let matches = clusters.get(scope).is_some_and(|entry| Arc::ptr_eq(&entry.cluster, expected));
             let removed = matches.then(|| clusters.remove(scope)).flatten();
-            self.metrics
-                .scope_cache_entries
-                .store(clusters.len() as u64, Ordering::Release);
+            self.metrics.scope_cache_entries.store(clusters.len() as u64, Ordering::Release);
             removed.map(|entry| entry.cluster)
         };
         if let Some(cluster) = removed {
@@ -535,14 +562,11 @@ impl IndexerScopeCache {
     }
 
     async fn invalidate_scope(&self, scope: &GraphScope) -> hydradb::Result<()> {
-        self.planner_statistics_headers()
-            .retain(|(known, _), _| known != scope);
+        self.planner_statistics_headers().retain(|(known, _), _| known != scope);
         let removed = {
             let mut clusters = self.clusters.lock().await;
             let removed = clusters.remove(scope).map(|entry| entry.cluster);
-            self.metrics
-                .scope_cache_entries
-                .store(clusters.len() as u64, Ordering::Release);
+            self.metrics.scope_cache_entries.store(clusters.len() as u64, Ordering::Release);
             removed
         };
         if let Some(cluster) = removed {
@@ -552,24 +576,19 @@ impl IndexerScopeCache {
     }
 
     async fn retain_registered(&self, registered: &BTreeSet<GraphScope>) {
-        self.planner_statistics_headers()
-            .retain(|(scope, _), _| registered.contains(scope));
+        self.planner_statistics_headers().retain(|(scope, _), _| registered.contains(scope));
         let removed = {
             let mut clusters = self.clusters.lock().await;
             let stale = clusters
                 .iter()
-                .filter(|(scope, entry)| {
-                    !registered.contains(*scope) && Arc::strong_count(&entry.cluster) == 1
-                })
+                .filter(|(scope, entry)| !registered.contains(*scope) && Arc::strong_count(&entry.cluster) == 1)
                 .map(|(scope, _)| scope.clone())
                 .collect::<Vec<_>>();
             let removed = stale
                 .into_iter()
                 .filter_map(|scope| clusters.remove(&scope).map(|entry| (scope, entry.cluster)))
                 .collect::<Vec<_>>();
-            self.metrics
-                .scope_cache_entries
-                .store(clusters.len() as u64, Ordering::Release);
+            self.metrics.scope_cache_entries.store(clusters.len() as u64, Ordering::Release);
             removed
         };
         for (scope, cluster) in removed {
@@ -599,9 +618,7 @@ impl IndexerScopeCache {
     }
 
     fn record_close_failure(&self, scope: &GraphScope, reason: &str, error: &GraphError) {
-        self.metrics
-            .scope_cache_close_failures
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.scope_cache_close_failures.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             hydradb.scope = %scope,
             reason,
@@ -632,6 +649,11 @@ struct IndexFailure {
     context: String,
     /// The underlying error's `Display`, when there was one.
     detail: Option<String>,
+    /// A build refused because its type holds more edges than
+    /// `max_artifact_build_edges` admits. It fails the same way on every
+    /// attempt until the configuration or the type's edges change, so it is
+    /// neither retried at the transient pace nor counted against readiness.
+    over_edge_cap: bool,
 }
 
 impl IndexFailure {
@@ -646,6 +668,7 @@ impl IndexFailure {
             edge_type: None,
             context,
             detail: None,
+            over_edge_cap: false,
         }
     }
 
@@ -659,6 +682,28 @@ impl IndexFailure {
             edge_type: None,
             context,
             detail: Some(error.to_string()),
+            over_edge_cap: over_edge_cap_limit(error).is_some(),
+        }
+    }
+
+    /// A type the change lane did not build because it was refused for its
+    /// edge count and its retry is not yet due. It holds the cell's coverage
+    /// back, as the refusal did, so the change stays pending until the type
+    /// builds or the fair sweep covers it.
+    fn deferred_over_edge_cap(context: String, retry: &EdgeCapRetry, now: tokio::time::Instant) -> Self {
+        Self {
+            stage: "artifact_build_deferred",
+            class: retry.class,
+            scope: None,
+            cell_id: None,
+            edge_type: None,
+            context,
+            detail: Some(format!(
+                "refused above the edge cap of {}; retried in {}s",
+                retry.limit,
+                retry.retry_at.saturating_duration_since(now).as_secs()
+            )),
+            over_edge_cap: true,
         }
     }
 
@@ -687,6 +732,19 @@ impl IndexFailure {
 
     fn edge_type(&self) -> &str {
         self.edge_type.as_deref().unwrap_or_default()
+    }
+}
+
+/// The cap a build was refused under, when `error` refuses a type for holding
+/// more edges than `max_artifact_build_edges` admits.
+fn over_edge_cap_limit(error: &GraphError) -> Option<u64> {
+    match error {
+        GraphError::AdmissionRejected {
+            operation: "build_graph_index_edges" | "build_matrix_tiles_edges",
+            limit,
+            ..
+        } => Some(*limit),
+        _ => None,
     }
 }
 
@@ -727,6 +785,11 @@ struct FairScopeRun {
     cursor: Option<ScopeCursor>,
     ending_cursor: Option<String>,
     cursor_progressed: bool,
+    /// Scopes from the slice whose visit finished, whether or not the cursor
+    /// then advanced past them. The sweep is paced on the object-store reads
+    /// it made, so a stream that stops at a failed or lost checkpoint is
+    /// charged for what it read: not the whole slice, and not nothing.
+    visited_scopes: usize,
 }
 
 struct ScopeChangeRun {
@@ -752,6 +815,12 @@ impl CycleFailures {
 
     fn len(&self) -> usize {
         self.failures.len()
+    }
+
+    /// Whether every failure is a type refused for its edge count, which a
+    /// retry cannot change (see [`IndexFailure::over_edge_cap`]).
+    fn all_over_edge_cap(&self) -> bool {
+        !self.failures.is_empty() && self.failures.iter().all(|failure| failure.over_edge_cap)
     }
 
     /// The failure a readiness transition should be attributed to. First rather
@@ -903,10 +972,7 @@ impl DimensionedCounters {
             ("graph_indexer_generation_failures", generation_failures),
             ("graph_indexer_generations_deleted", generations_deleted),
             ("graph_indexer_full_build_edges", full_build_edges),
-            (
-                "graph_indexer_incremental_delta_edges",
-                incremental_delta_edges,
-            ),
+            ("graph_indexer_incremental_delta_edges", incremental_delta_edges),
             ("graph_indexer_incremental_fallbacks", incremental_fallbacks),
         ]
     }
@@ -941,7 +1007,6 @@ struct IndexerMetrics {
     change_notification_failures: AtomicU64,
     change_push_wakes: AtomicU64,
     change_push_rejections: AtomicU64,
-    change_push_throttles: AtomicU64,
     pending_change_notifications: AtomicU64,
     last_change_success_ms: AtomicU64,
     last_change_lag_ms: AtomicU64,
@@ -950,6 +1015,8 @@ struct IndexerMetrics {
     planner_statistics_hints_received: AtomicU64,
     planner_statistics_queue_depth: AtomicU64,
     planner_statistics_builds_timed_out: AtomicU64,
+    /// Builds that ran out of entries or time: published partially where the
+    /// cell had no object, otherwise dropped so the fuller object stays.
     planner_statistics_builds_too_large: AtomicU64,
     /// Builds dropped at publish: another indexer published a snapshot at
     /// least as new while this one ran, or took the cell's claim over.
@@ -1053,8 +1120,7 @@ struct StageTimer<'a> {
 
 impl Drop for StageTimer<'_> {
     fn drop(&mut self) {
-        self.metrics
-            .record_stage(self.work, self.stage, self.started.elapsed());
+        self.metrics.record_stage(self.work, self.stage, self.started.elapsed());
     }
 }
 
@@ -1070,10 +1136,7 @@ impl IndexerMetrics {
 
     fn record_stage(&self, work: IndexWorkKind, stage: IndexStage, elapsed: Duration) {
         let elapsed_micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        let mut timings = self
-            .stage_timings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut timings = self.stage_timings.lock().unwrap_or_else(PoisonError::into_inner);
         let timing = timings.entry((work, stage)).or_default();
         timing.count = timing.count.saturating_add(1);
         timing.elapsed_micros = timing.elapsed_micros.saturating_add(elapsed_micros);
@@ -1081,34 +1144,19 @@ impl IndexerMetrics {
     }
 
     fn stage_timings_snapshot(&self) -> BTreeMap<(IndexWorkKind, IndexStage), StageTiming> {
-        self.stage_timings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.stage_timings.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    fn record_scope_cache_population(
-        &self,
-        registered_scopes: usize,
-        capacity: usize,
-    ) -> Option<usize> {
-        self.registered_scopes
-            .store(registered_scopes as u64, Ordering::Release);
+    fn record_scope_cache_population(&self, registered_scopes: usize, capacity: usize) -> Option<usize> {
+        self.registered_scopes.store(registered_scopes as u64, Ordering::Release);
         let shortfall = registered_scopes.saturating_sub(capacity);
-        let previous = self
-            .scope_cache_last_warned_shortfall
-            .swap(shortfall as u64, Ordering::AcqRel);
+        let previous = self.scope_cache_last_warned_shortfall.swap(shortfall as u64, Ordering::AcqRel);
         (shortfall > 0 && previous != shortfall as u64).then_some(shortfall)
     }
 
     /// Apply `record` to the counters for one `{cell_id, edge_type}` pair,
     /// folding into [`OVERFLOW_LABEL`] once the map is full.
-    fn dimension<F: FnOnce(&mut DimensionedCounters)>(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        record: F,
-    ) {
+    fn dimension<F: FnOnce(&mut DimensionedCounters)>(&self, cell_id: &str, edge_type: &str, record: F) {
         let mut counters = self.lock_dimensioned();
         let key = (cell_id.to_string(), edge_type.to_string());
         // A pair already being tracked keeps its own series however full the
@@ -1149,8 +1197,7 @@ impl IndexerMetrics {
 
     fn record_incremental_delta_edges(&self, cell_id: &str, edge_type: &str, delta_edges: u64) {
         self.dimension(cell_id, edge_type, |counters| {
-            counters.incremental_delta_edges =
-                counters.incremental_delta_edges.saturating_add(delta_edges);
+            counters.incremental_delta_edges = counters.incremental_delta_edges.saturating_add(delta_edges);
         });
     }
 
@@ -1167,28 +1214,50 @@ impl IndexerMetrics {
     /// A poisoned metrics mutex must not take the indexer down with it. The map
     /// holds counters and nothing else, so the worst a panicking writer can
     /// leave behind is a half-applied increment.
-    fn lock_dimensioned(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), DimensionedCounters>> {
-        self.dimensioned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn lock_dimensioned(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), DimensionedCounters>> {
+        self.dimensioned.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-fn record_failed_cycle_readiness(
-    metrics: &IndexerMetrics,
-    readiness_failure_threshold: u64,
-) -> (u64, bool) {
-    let consecutive_failures = metrics
-        .consecutive_failed_cycles
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
+fn record_failed_cycle_readiness(metrics: &IndexerMetrics, readiness_failure_threshold: u64) -> (u64, bool) {
+    let consecutive_failures = metrics.consecutive_failed_cycles.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     let readiness_lost = consecutive_failures >= readiness_failure_threshold;
     if readiness_lost {
         metrics.ready.store(false, Ordering::Release);
     }
     (consecutive_failures, readiness_lost)
+}
+
+/// A cycle that counts as successful for readiness: the streak ends and the
+/// indexer is ready.
+fn record_ready_cycle(metrics: &IndexerMetrics) {
+    metrics.consecutive_failed_cycles.store(0, Ordering::Release);
+    metrics.ready.store(true, Ordering::Release);
+}
+
+/// The event for readiness coming back: only the transition, never the
+/// steady state.
+fn log_readiness_regained(cycle_span: &tracing::Span, root_scope: &impl fmt::Display) {
+    cycle_span.in_scope(|| {
+        tracing::info!(
+            hydradb.scope = %root_scope,
+            hydradb.outcome = Outcome::Success.as_str(),
+            "graph indexer readiness regained"
+        );
+    });
+}
+
+/// [`record_failed_cycle_readiness`] for a cycle that failed with `failures`.
+/// A cycle that failed only on types above the edge cap counts as successful
+/// for readiness, ending any streak and restoring readiness: the indexer built
+/// every type it may build, and a Pod restart would refuse the same types
+/// again.
+fn record_cycle_failures_readiness(metrics: &IndexerMetrics, readiness_failure_threshold: u64, failures: &CycleFailures) -> (u64, bool) {
+    if failures.all_over_edge_cap() {
+        record_ready_cycle(metrics);
+        return (0, false);
+    }
+    record_failed_cycle_readiness(metrics, readiness_failure_threshold)
 }
 
 struct IndexerAdminServer {
@@ -1203,37 +1272,6 @@ struct IndexerAdminState {
     /// The statistics worker lists request markers on the same wake.
     statistics_wake: Arc<Notify>,
     wake_token: Arc<str>,
-    wake_limiter: Arc<WakeRateLimiter>,
-}
-
-struct WakeRateLimiter {
-    min_interval: Duration,
-    last_accepted: Mutex<Option<Instant>>,
-}
-
-impl WakeRateLimiter {
-    fn new(min_interval: Duration) -> Self {
-        Self {
-            min_interval,
-            last_accepted: Mutex::new(None),
-        }
-    }
-
-    fn try_accept(&self) -> bool {
-        let now = Instant::now();
-        let mut last_accepted = self
-            .last_accepted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if last_accepted
-            .as_ref()
-            .is_some_and(|last| now.duration_since(*last) < self.min_interval)
-        {
-            return false;
-        }
-        *last_accepted = Some(now);
-        true
-    }
 }
 
 #[tokio::main]
@@ -1255,8 +1293,7 @@ async fn main() -> RuntimeResult<()> {
     // booting. The guard is held to the end of `main` because dropping it is
     // what flushes batched spans and logs — without that flush the last seconds
     // before a pod restart are lost, which is exactly the window that matters.
-    let telemetry =
-        hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphIndexer))?;
+    let telemetry = hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphIndexer))?;
     hydradb_telemetry::build_info::log();
 
     let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
@@ -1270,8 +1307,7 @@ async fn main() -> RuntimeResult<()> {
     if cells.is_empty() {
         return Err("GRAPH_CELLS must contain at least one cell".into());
     }
-    let interval =
-        Duration::from_millis(env_value("GRAPH_INDEXER_INTERVAL_MS", "5000").parse::<u64>()?);
+    let interval = Duration::from_millis(env_value("GRAPH_INDEXER_INTERVAL_MS", "5000").parse::<u64>()?);
     if interval.is_zero() {
         return Err("GRAPH_INDEXER_INTERVAL_MS must be greater than zero".into());
     }
@@ -1290,6 +1326,31 @@ async fn main() -> RuntimeResult<()> {
         )
         .into());
     }
+    let change_pass_min_interval = Duration::from_millis(
+        env_value(
+            "GRAPH_INDEXER_CHANGE_MIN_INTERVAL_MS",
+            &DEFAULT_CHANGE_PASS_MIN_INTERVAL.as_millis().to_string(),
+        )
+        .parse::<u64>()?,
+    );
+    if !(MIN_CHANGE_PASS_MIN_INTERVAL..=MAX_CHANGE_PASS_MIN_INTERVAL).contains(&change_pass_min_interval) {
+        return Err(format!(
+            "GRAPH_INDEXER_CHANGE_MIN_INTERVAL_MS must be between {} and {}",
+            MIN_CHANGE_PASS_MIN_INTERVAL.as_millis(),
+            MAX_CHANGE_PASS_MIN_INTERVAL.as_millis()
+        )
+        .into());
+    }
+    let full_sweep_interval = Duration::from_millis(
+        env_value(
+            "GRAPH_INDEXER_FULL_SWEEP_INTERVAL_MS",
+            &DEFAULT_FULL_SWEEP_INTERVAL.as_millis().to_string(),
+        )
+        .parse::<u64>()?,
+    );
+    if full_sweep_interval.is_zero() {
+        return Err("GRAPH_INDEXER_FULL_SWEEP_INTERVAL_MS must be greater than zero".into());
+    }
     let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
     let build_mode = IndexBuildMode::from_env()?;
     let planner_statistics = PlannerStatisticsPolicy::from_env()?;
@@ -1299,24 +1360,12 @@ async fn main() -> RuntimeResult<()> {
     // reads). Measured in `examples/incremental_index_bench.rs` against
     // MinIO: a 200k-edge graph rebuilt 2x faster full, a 1M-edge graph 3.8x
     // faster incrementally. Tune per deployment cache size.
-    let incremental_min_edges =
-        env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
-    let scope_concurrency = env_value(
-        "GRAPH_INDEXER_SCOPE_CONCURRENCY",
-        &DEFAULT_SCOPE_CONCURRENCY.to_string(),
-    )
-    .parse::<usize>()?;
+    let incremental_min_edges = env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
+    let scope_concurrency = env_value("GRAPH_INDEXER_SCOPE_CONCURRENCY", &DEFAULT_SCOPE_CONCURRENCY.to_string()).parse::<usize>()?;
     if !(1..=MAX_SCOPE_CONCURRENCY).contains(&scope_concurrency) {
-        return Err(format!(
-            "GRAPH_INDEXER_SCOPE_CONCURRENCY must be between 1 and {MAX_SCOPE_CONCURRENCY}"
-        )
-        .into());
+        return Err(format!("GRAPH_INDEXER_SCOPE_CONCURRENCY must be between 1 and {MAX_SCOPE_CONCURRENCY}").into());
     }
-    let scopes_per_cycle = env_value(
-        "GRAPH_INDEXER_SCOPES_PER_CYCLE",
-        &DEFAULT_SCOPES_PER_CYCLE.to_string(),
-    )
-    .parse::<usize>()?;
+    let scopes_per_cycle = env_value("GRAPH_INDEXER_SCOPES_PER_CYCLE", &DEFAULT_SCOPES_PER_CYCLE.to_string()).parse::<usize>()?;
     if !(scope_concurrency..=MAX_SCOPES_PER_CYCLE).contains(&scopes_per_cycle) {
         return Err(format!(
             "GRAPH_INDEXER_SCOPES_PER_CYCLE must be between GRAPH_INDEXER_SCOPE_CONCURRENCY ({scope_concurrency}) and {MAX_SCOPES_PER_CYCLE}"
@@ -1331,11 +1380,7 @@ async fn main() -> RuntimeResult<()> {
     if !(1..=MAX_READINESS_FAILURE_THRESHOLD).contains(&readiness_failure_threshold) {
         return Err(format!("GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD must be between 1 and {MAX_READINESS_FAILURE_THRESHOLD}").into());
     }
-    let max_open_scopes = env_value(
-        "GRAPH_INDEXER_MAX_OPEN_SCOPES",
-        &DEFAULT_MAX_OPEN_SCOPES.to_string(),
-    )
-    .parse::<usize>()?;
+    let max_open_scopes = env_value("GRAPH_INDEXER_MAX_OPEN_SCOPES", &DEFAULT_MAX_OPEN_SCOPES.to_string()).parse::<usize>()?;
     if !(scope_concurrency..=MAX_OPEN_SCOPES).contains(&max_open_scopes) {
         return Err(format!(
             "GRAPH_INDEXER_MAX_OPEN_SCOPES must be between GRAPH_INDEXER_SCOPE_CONCURRENCY ({scope_concurrency}) and {MAX_OPEN_SCOPES}"
@@ -1346,7 +1391,7 @@ async fn main() -> RuntimeResult<()> {
     // generation and the durable head is one object-store round trip, and the
     // span grows with write activity, not graph size — an uncapped walk can
     // spend minutes deriving a delta of a few edges (the staging regression
-    // behind the incremental build-cost analysis). Past the cap the
+    // behind the incremental build cost analysis). Past the cap the
     // incremental attempt declines and the full rebuild runs instead, which
     // past that point is the cheaper of the two.
     let max_wal_tail_files = env_value(
@@ -1354,12 +1399,18 @@ async fn main() -> RuntimeResult<()> {
         &GraphLimits::default().max_wal_tail_files.to_string(),
     )
     .parse::<u64>()?;
-    let slatedb_cache_bytes = env_value(
-        "GRAPH_SLATE_DB_CACHE_BYTES",
-        &(640usize * 1024 * 1024).to_string(),
+    let slatedb_cache_bytes = env_value("GRAPH_SLATE_DB_CACHE_BYTES", &(640usize * 1024 * 1024).to_string()).parse::<usize>()?;
+    // Cached readers refresh before every build, and a failed read invalidates
+    // the scope and reopens it on the next pass.
+    let mut open_options = GraphOpenOptions::follow_latest_reader(max_wal_tail_files, slatedb_cache_bytes);
+    // The most edges one type's generation may hold. A type above it is
+    // refused before its build allocates anything, and the change lane backs
+    // off from it rather than retrying it every few seconds.
+    open_options.limits.max_artifact_build_edges = env_value(
+        "GRAPH_INDEXER_MAX_ARTIFACT_BUILD_EDGES",
+        &GraphLimits::default().max_artifact_build_edges.to_string(),
     )
-    .parse::<usize>()?;
-    let open_options = indexer_open_options(max_wal_tail_files, slatedb_cache_bytes);
+    .parse::<u64>()?;
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
     let wake_token = read_indexer_wake_token()?;
 
@@ -1372,7 +1423,6 @@ async fn main() -> RuntimeResult<()> {
         Arc::clone(&change_wake),
         Arc::clone(&statistics_wake),
         wake_token,
-        dirty_poll_interval,
     )
     .await?;
     // An empty graph has no SlateDB manifest yet. The indexer is healthy and
@@ -1395,7 +1445,8 @@ async fn main() -> RuntimeResult<()> {
             scope_concurrency,
             Arc::clone(&metrics),
         )
-        .with_planner_statistics(planner_statistics),
+        .with_planner_statistics(planner_statistics)
+        .with_edge_cap_retry_ceiling(full_sweep_interval),
     );
     let planner_statistics_worker = Arc::new(PlannerStatisticsWorker::new(
         Arc::clone(&scope_cache),
@@ -1408,6 +1459,7 @@ async fn main() -> RuntimeResult<()> {
     let (planner_statistics_stop, planner_statistics_task) = start_planner_statistics_worker(
         Arc::clone(&planner_statistics_worker),
         PLANNER_STATISTICS_REQUEST_POLL_INTERVAL,
+        change_pass_min_interval,
     );
     let (scope_change_stop, scope_change_task) = start_scope_change_worker(
         scope_directory.clone(),
@@ -1415,7 +1467,10 @@ async fn main() -> RuntimeResult<()> {
         build_mode,
         incremental_min_edges,
         scope_concurrency,
-        dirty_poll_interval,
+        ChangePolling {
+            min_interval: change_pass_min_interval,
+            poll_interval: dirty_poll_interval,
+        },
         Arc::clone(&scope_cache),
         Arc::clone(&metrics),
         change_wake,
@@ -1437,6 +1492,8 @@ async fn main() -> RuntimeResult<()> {
         scopes_per_cycle,
         max_open_scopes,
         dirty_poll_interval_ms = dirty_poll_interval.as_millis() as u64,
+        change_min_interval_ms = change_pass_min_interval.as_millis() as u64,
+        full_sweep_interval_ms = full_sweep_interval.as_millis() as u64,
         reader_mode = open_options.reader_mode.as_str(),
         reader_manifest_poll_interval_ms = open_options
             .reader_manifest_poll_interval
@@ -1453,9 +1510,11 @@ async fn main() -> RuntimeResult<()> {
     // every registered scope before each bounded pass would replace one large
     // S3 LIST with many identical large S3 LISTs.
     let mut registered_scopes = RegisteredScopeSchedule::default();
+    let mut sweep_pacer = SweepPacer::new(full_sweep_interval);
 
     loop {
         metrics.cycles.fetch_add(1, Ordering::Relaxed);
+        sweep_pacer.cycle_started(Instant::now());
         // The indexer has no client parent, so this is a trace root.
         let cycle_span = tracing::info_span!(
             "index.cycle",
@@ -1481,43 +1540,34 @@ async fn main() -> RuntimeResult<()> {
         .instrument(cycle_span.clone())
         .await;
 
-        let mut continue_sweep_immediately = false;
-        match outcome {
+        let next_cycle_delay = next_cycle_delay(&mut sweep_pacer, &outcome, interval, Instant::now());
+        match outcome.into_result() {
             Ok(cycle) => {
                 metrics.successful_cycles.fetch_add(1, Ordering::Relaxed);
                 let completed_at = unix_time_ms();
-                metrics
-                    .last_success_ms
-                    .store(completed_at, Ordering::Relaxed);
+                metrics.last_success_ms.store(completed_at, Ordering::Relaxed);
                 if cycle.full_sweep_completed {
                     metrics.full_sweeps.fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .last_full_sweep_ms
-                        .store(completed_at, Ordering::Relaxed);
-                } else {
-                    continue_sweep_immediately = true;
+                    metrics.last_full_sweep_ms.store(completed_at, Ordering::Relaxed);
                 }
-                metrics
-                    .consecutive_failed_cycles
-                    .store(0, Ordering::Release);
-                metrics.ready.store(true, Ordering::Release);
+                record_ready_cycle(&metrics);
                 record_success(&cycle_span);
                 if !ready {
-                    // Only the transition, never the steady state.
-                    cycle_span.in_scope(|| {
-                        tracing::info!(
-                            hydradb.scope = %root_scope,
-                            hydradb.outcome = Outcome::Success.as_str(),
-                            "graph indexer readiness regained"
-                        );
-                    });
+                    log_readiness_regained(&cycle_span, &root_scope);
                 }
                 ready = true;
             }
             Err(failures) => {
                 metrics.failed_cycles.fetch_add(1, Ordering::Relaxed);
                 let (consecutive_failures, readiness_lost) =
-                    record_failed_cycle_readiness(&metrics, readiness_failure_threshold);
+                    record_cycle_failures_readiness(&metrics, readiness_failure_threshold, &failures);
+                if failures.all_over_edge_cap() {
+                    // Successful for readiness; see `record_cycle_failures_readiness`.
+                    if !ready {
+                        log_readiness_regained(&cycle_span, &root_scope);
+                    }
+                    ready = true;
+                }
                 cycle_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                 cycle_span.record("failure_count", failures.len());
                 if let Some(first) = failures.first() {
@@ -1535,8 +1585,7 @@ async fn main() -> RuntimeResult<()> {
                         tracing::error!(
                             hydradb.scope = first.map(IndexFailure::scope).unwrap_or_default(),
                             hydradb.cell_id = first.map(IndexFailure::cell_id).unwrap_or_default(),
-                            hydradb.edge_type =
-                                first.map(IndexFailure::edge_type).unwrap_or_default(),
+                            hydradb.edge_type = first.map(IndexFailure::edge_type).unwrap_or_default(),
                             error.class = first.map(|failure| failure.class).unwrap_or_default(),
                             stage = first.map(|failure| failure.stage).unwrap_or_default(),
                             failure_count = failures.len(),
@@ -1570,11 +1619,7 @@ async fn main() -> RuntimeResult<()> {
                 result?;
                 break;
             }
-            _ = tokio::time::sleep(if continue_sweep_immediately {
-                Duration::ZERO
-            } else {
-                interval
-            }) => {}
+            _ = tokio::time::sleep(next_cycle_delay) => {}
         }
     }
     metrics.ready.store(false, Ordering::Release);
@@ -1589,6 +1634,150 @@ async fn main() -> RuntimeResult<()> {
     Ok(())
 }
 
+/// Spaces wake-driven work by a minimum interval without dropping a wake: a
+/// wake inside the interval is remembered and served when it ends.
+struct WakePacer {
+    min_interval: Duration,
+    last_run: Option<tokio::time::Instant>,
+    due: bool,
+}
+
+impl WakePacer {
+    /// Due at once, so the first pass runs at start.
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            last_run: None,
+            due: true,
+        }
+    }
+
+    fn wake(&mut self) {
+        self.due = true;
+    }
+
+    /// Whether the work runs now; if so, it counts as run.
+    fn take_due(&mut self, now: tokio::time::Instant) -> bool {
+        let spaced = self.last_run.is_none_or(|last| now >= last + self.min_interval);
+        if self.due && spaced {
+            self.due = false;
+            self.last_run = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// When a wake that arrived inside the interval becomes due.
+    fn deferred_until(&self) -> Option<tokio::time::Instant> {
+        self.due.then(|| {
+            self.last_run
+                .map_or_else(tokio::time::Instant::now, |last| last + self.min_interval)
+        })
+    }
+}
+
+/// When the change lane runs: after a wake, but no sooner than `min_interval`
+/// after the previous pass started, and every `poll_interval` without one.
+/// A type refused for its edge count is retried on its own deadline; see
+/// [`EdgeCapRetries`].
+#[derive(Clone, Copy, Debug)]
+struct ChangePolling {
+    min_interval: Duration,
+    poll_interval: Duration,
+}
+
+/// One (scope, cell, edge type) refused for holding more edges than
+/// `max_artifact_build_edges` admits.
+#[derive(Clone, Copy, Debug)]
+struct EdgeCapRetry {
+    /// The type's dirty sequence when it was refused. A later one means its
+    /// edges changed, and the refusal no longer says anything about them.
+    dirty_sequence: u64,
+    /// The cap it was refused under.
+    limit: u64,
+    /// The refusal's `error.class`, carried by each deferral it causes.
+    class: &'static str,
+    interval: Duration,
+    retry_at: tokio::time::Instant,
+}
+
+type EdgeCapKey = (String, String, String);
+
+/// When the change lane next tries each type refused for its edge count.
+///
+/// A refusal repeats until the cap or the type's edges change, and each try
+/// reads up to the cap's worth of edges before it is refused, so the change
+/// lane skips only that type until its deadline and serves every other type
+/// and scope as usual. The wait doubles from the transient retry interval on
+/// each refusal of the same edges under the same cap, and stops at the full
+/// sweep interval, at which the sweep visits the type anyway. A type that
+/// builds, or is found current, is forgotten.
+struct EdgeCapRetries {
+    max_interval: Duration,
+    entries: Mutex<BTreeMap<EdgeCapKey, EdgeCapRetry>>,
+}
+
+impl EdgeCapRetries {
+    fn new(max_interval: Duration) -> Self {
+        Self {
+            max_interval: max_interval.max(CHANGE_FAILURE_RETRY_INTERVAL),
+            entries: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn key(scope: &str, cell_id: &str, edge_type: &str) -> EdgeCapKey {
+        (scope.to_string(), cell_id.to_string(), edge_type.to_string())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<EdgeCapKey, EdgeCapRetry>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The refusal the change lane is still waiting out for this type at
+    /// `dirty_sequence`, or `None` to build it now. A refusal of edges that
+    /// have since changed is forgotten.
+    fn deferred(&self, key: &EdgeCapKey, dirty_sequence: u64, now: tokio::time::Instant) -> Option<EdgeCapRetry> {
+        let mut entries = self.lock();
+        let retry = *entries.get(key)?;
+        if retry.dirty_sequence != dirty_sequence {
+            entries.remove(key);
+            return None;
+        }
+        (now < retry.retry_at).then_some(retry)
+    }
+
+    /// Record a refusal under `limit` and set the type's next deadline.
+    fn refused(&self, key: EdgeCapKey, dirty_sequence: u64, limit: u64, class: &'static str, now: tokio::time::Instant) -> EdgeCapRetry {
+        let mut entries = self.lock();
+        let interval = entries
+            .get(&key)
+            .filter(|previous| previous.dirty_sequence == dirty_sequence && previous.limit == limit)
+            .map_or(CHANGE_FAILURE_RETRY_INTERVAL, |previous| previous.interval.saturating_mul(2))
+            .min(self.max_interval);
+        let retry = EdgeCapRetry {
+            dirty_sequence,
+            limit,
+            class,
+            interval,
+            retry_at: now + interval,
+        };
+        entries.insert(key, retry);
+        retry
+    }
+
+    /// The type built, or was found current.
+    fn clear(&self, key: &EdgeCapKey) {
+        self.lock().remove(key);
+    }
+
+    /// The earliest deadline still ahead of `now`. One already past is the
+    /// next pass's to retry, if a change still names its scope, and must not
+    /// wake the lane again on its own.
+    fn next_retry_at(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.lock().values().map(|retry| retry.retry_at).filter(|at| *at > now).min()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_scope_change_worker(
     scope_directory: ObjectStoreGraphScopeDirectory,
@@ -1596,7 +1785,7 @@ fn start_scope_change_worker(
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
     scope_concurrency: usize,
-    poll_interval: Duration,
+    polling: ChangePolling,
     scope_cache: Arc<IndexerScopeCache>,
     metrics: Arc<IndexerMetrics>,
     change_wake: Arc<Notify>,
@@ -1604,6 +1793,7 @@ fn start_scope_change_worker(
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
+            let pass_started = tokio::time::Instant::now();
             let failures = run_scope_change_pass(
                 &scope_directory,
                 retain_previous,
@@ -1614,9 +1804,7 @@ fn start_scope_change_worker(
                 &metrics,
             )
             .await;
-            let retry_delay = if failures.is_empty() {
-                poll_interval
-            } else {
+            if !failures.is_empty() {
                 metrics
                     .change_notification_failures
                     .fetch_add(failures.len() as u64, Ordering::Relaxed);
@@ -1625,28 +1813,48 @@ fn start_scope_change_worker(
                     error = %failures,
                     "graph index change fast lane failed; fair sweep will retry"
                 );
-                poll_interval.max(CHANGE_FAILURE_RETRY_INTERVAL)
-            };
+                // Types refused for their edge count wait on their own
+                // deadlines, so they must not hold the lane from other scopes.
+                if !failures.all_over_edge_cap() {
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                return Ok(());
+                            }
+                        }
+                        _ = tokio::time::sleep(polling.min_interval.max(CHANGE_FAILURE_RETRY_INTERVAL)) => {}
+                    }
+                    continue;
+                }
+            }
 
-            if failures.is_empty() {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            return Ok(());
-                        }
+            // The next pass starts on a wake, once the poll interval has run
+            // from the end of this pass, or when a type refused for its edge
+            // count is due again, and in any case no sooner than the minimum
+            // spacing from this pass's start. The waits overlap: a quiet poll
+            // takes the poll interval, not the sum of both.
+            let spaced_until = pass_started + polling.min_interval;
+            let now = tokio::time::Instant::now();
+            let poll_at = scope_cache
+                .edge_cap_retries
+                .next_retry_at(now)
+                .map_or(now + polling.poll_interval, |retry_at| retry_at.min(now + polling.poll_interval));
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return Ok(());
                     }
-                    _ = change_wake.notified() => {}
-                    _ = tokio::time::sleep(retry_delay) => {}
                 }
-            } else {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            return Ok(());
-                        }
+                _ = change_wake.notified() => {}
+                _ = tokio::time::sleep_until(poll_at) => {}
+            }
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return Ok(());
                     }
-                    _ = tokio::time::sleep(retry_delay) => {}
                 }
+                _ = tokio::time::sleep_until(spaced_until) => {}
             }
         }
     });
@@ -1679,9 +1887,7 @@ async fn run_scope_change_pass(
             return failures;
         }
     };
-    metrics
-        .pending_change_notifications
-        .store(changes.len() as u64, Ordering::Release);
+    metrics.pending_change_notifications.store(changes.len() as u64, Ordering::Release);
     if changes.is_empty() {
         return CycleFailures::default();
     }
@@ -1691,27 +1897,23 @@ async fn run_scope_change_pass(
 
     let mut grouped = BTreeMap::<GraphScope, Vec<GraphScopeChange>>::new();
     for change in changes {
-        grouped
-            .entry(change.scope.clone())
-            .or_default()
-            .push(change);
+        grouped.entry(change.scope.clone()).or_default().push(change);
     }
 
     let runs = futures::stream::iter(grouped)
         .map(|(scope, changes)| async move {
-            let (already_covered, pending) =
-                match partition_scope_changes(scope_directory, &changes).await {
-                    Ok(partition) => partition,
-                    Err(error) => {
-                        return ScopeChangeRun {
-                            scope,
-                            already_covered: Vec::new(),
-                            pending: changes,
-                            outcome: None,
-                            coverage_error: Some(error),
-                        };
-                    }
-                };
+            let (already_covered, pending) = match partition_scope_changes(scope_directory, &changes).await {
+                Ok(partition) => partition,
+                Err(error) => {
+                    return ScopeChangeRun {
+                        scope,
+                        already_covered: Vec::new(),
+                        pending: changes,
+                        outcome: None,
+                        coverage_error: Some(error),
+                    };
+                }
+            };
             let outcome = if pending.is_empty() {
                 None
             } else {
@@ -1773,19 +1975,14 @@ async fn run_scope_change_pass(
                 };
                 let mut acknowledged = BTreeMap::new();
                 for (cell_id, sequence) in coverage {
-                    match scope_directory
-                        .acknowledge_sequence(&scope, &cell_id, sequence)
-                        .await
-                    {
+                    match scope_directory.acknowledge_sequence(&scope, &cell_id, sequence).await {
                         Ok(()) => {
                             acknowledged.insert(cell_id, sequence);
                         }
                         Err(error) => failures.push(
                             IndexFailure::kernel(
                                 "scope_change_coverage_write",
-                                format!(
-                                    "persist graph index change coverage for {scope}/{cell_id}"
-                                ),
+                                format!("persist graph index change coverage for {scope}/{cell_id}"),
                                 &error,
                             )
                             .with_scope(&scope.to_string())
@@ -1793,14 +1990,10 @@ async fn run_scope_change_pass(
                         ),
                     }
                 }
-                already_covered.extend(pending.into_iter().filter(|change| {
-                    match (&change.cell_id, change.sequence) {
-                        (Some(cell_id), Some(sequence)) => acknowledged
-                            .get(cell_id)
-                            .is_some_and(|covered| *covered >= sequence),
-                        (None, None) => true,
-                        _ => false,
-                    }
+                already_covered.extend(pending.into_iter().filter(|change| match (&change.cell_id, change.sequence) {
+                    (Some(cell_id), Some(sequence)) => acknowledged.get(cell_id).is_some_and(|covered| *covered >= sequence),
+                    (None, None) => true,
+                    _ => false,
                 }));
             }
         }
@@ -1830,25 +2023,17 @@ async fn run_scope_change_pass(
                 .map(|change| change.created_at.timestamp_millis().max(0) as u64)
                 .min()
                 .unwrap_or(completed_at);
-            metrics
-                .last_change_success_ms
-                .store(completed_at, Ordering::Relaxed);
+            metrics.last_change_success_ms.store(completed_at, Ordering::Relaxed);
             metrics
                 .last_change_lag_ms
                 .store(completed_at.saturating_sub(oldest), Ordering::Relaxed);
-            metrics
-                .changed_scopes_processed
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.changed_scopes_processed.fetch_add(1, Ordering::Relaxed);
         }
     }
-    metrics
-        .change_notifications_cleared
-        .fetch_add(cleared, Ordering::Relaxed);
+    metrics.change_notifications_cleared.fetch_add(cleared, Ordering::Relaxed);
     metrics
         .pending_change_notifications
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            Some(pending.saturating_sub(cleared))
-        })
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| Some(pending.saturating_sub(cleared)))
         .ok();
     failures
 }
@@ -1861,12 +2046,7 @@ async fn partition_scope_changes(
     for change in changes {
         if let Some(cell_id) = change.cell_id.as_ref() {
             if !watermarks.contains_key(cell_id) {
-                watermarks.insert(
-                    cell_id.clone(),
-                    scope_directory
-                        .covered_sequence(&change.scope, cell_id)
-                        .await?,
-                );
+                watermarks.insert(cell_id.clone(), scope_directory.covered_sequence(&change.scope, cell_id).await?);
             }
         }
     }
@@ -1916,21 +2096,21 @@ async fn run_registered_scopes_cycle(
     scopes_per_cycle: usize,
     scope_cache: &Arc<IndexerScopeCache>,
     metrics: &IndexerMetrics,
-) -> Result<RegisteredScopesCycle, CycleFailures> {
+) -> RegisteredScopesCycleOutcome {
     let mut failures = CycleFailures::default();
     if !(1..=MAX_SCOPE_CONCURRENCY).contains(&scope_concurrency) {
         failures.push(IndexFailure::config(
             "scope_scheduler",
             format!("scope concurrency must be between 1 and {MAX_SCOPE_CONCURRENCY}"),
         ));
-        return Err(failures);
+        return RegisteredScopesCycleOutcome::failed(failures);
     }
     if !(scope_concurrency..=MAX_SCOPES_PER_CYCLE).contains(&scopes_per_cycle) {
         failures.push(IndexFailure::config(
             "scope_scheduler",
             format!("scopes per cycle must be between scope concurrency ({scope_concurrency}) and {MAX_SCOPES_PER_CYCLE}"),
         ));
-        return Err(failures);
+        return RegisteredScopesCycleOutcome::failed(failures);
     }
 
     if schedule.scopes.is_empty() {
@@ -1940,11 +2120,7 @@ async fn run_registered_scopes_cycle(
             hydradb.outcome = Empty,
             error.class = Empty,
         );
-        schedule.scopes = match scope_directory
-            .list()
-            .instrument(discovery_span.clone())
-            .await
-        {
+        schedule.scopes = match scope_directory.list().instrument(discovery_span.clone()).await {
             Ok(mut scopes) => {
                 scopes.sort();
                 discovery_span.record("scope_count", scopes.len());
@@ -1952,20 +2128,14 @@ async fn run_registered_scopes_cycle(
                 scopes
             }
             Err(error) => {
-                let failure = IndexFailure::kernel(
-                    "scope_discovery",
-                    "list registered scopes".to_string(),
-                    &error,
-                );
+                let failure = IndexFailure::kernel("scope_discovery", "list registered scopes".to_string(), &error);
                 record_failure(&discovery_span, &failure);
                 failures.push(failure);
-                return Err(failures);
+                return RegisteredScopesCycleOutcome::failed(failures);
             }
         };
         schedule.scope_names = schedule.scopes.iter().map(ToString::to_string).collect();
-        if let Some(capacity_shortfall) = metrics
-            .record_scope_cache_population(schedule.scopes.len(), scope_cache.max_open_scopes)
-        {
+        if let Some(capacity_shortfall) = metrics.record_scope_cache_population(schedule.scopes.len(), scope_cache.max_open_scopes) {
             tracing::warn!(
                 registered_scopes = schedule.scopes.len(),
                 scope_cache_capacity = scope_cache.max_open_scopes,
@@ -1978,9 +2148,13 @@ async fn run_registered_scopes_cycle(
         scope_cache.retain_registered(&registered).await;
     }
     if schedule.scopes.is_empty() {
-        return Ok(RegisteredScopesCycle {
-            full_sweep_completed: true,
-        });
+        return RegisteredScopesCycleOutcome {
+            progress: RegisteredScopesCycle {
+                full_sweep_completed: true,
+                ..RegisteredScopesCycle::default()
+            },
+            failures,
+        };
     }
 
     let cursor_path = scope_cursor_path(data_path, scope_directory.root_scope());
@@ -1990,13 +2164,9 @@ async fn run_registered_scopes_cycle(
         match load_scope_cursor(&object_store, &cursor_path).await {
             Ok(cursor) => cursor,
             Err(error) => {
-                let failure = IndexFailure::kernel(
-                    "scope_cursor_load",
-                    format!("load indexer scope cursor {cursor_path}"),
-                    &error,
-                );
+                let failure = IndexFailure::kernel("scope_cursor_load", format!("load indexer scope cursor {cursor_path}"), &error);
                 failures.push(failure);
-                return Err(failures);
+                return RegisteredScopesCycleOutcome::failed(failures);
             }
         }
     };
@@ -2021,8 +2191,7 @@ async fn run_registered_scopes_cycle(
     };
     let mut hot_scopes = scope_cache.hot_scopes(hot_budget).await;
     let cold_budget = scopes_per_cycle.saturating_sub(hot_scopes.len());
-    let start_index =
-        starting_position.map_or(0, |position| (position + 1) % schedule.scopes.len());
+    let start_index = starting_position.map_or(0, |position| (position + 1) % schedule.scopes.len());
     let mut scopes = Vec::with_capacity(cold_budget.min(schedule.scopes.len()));
     for offset in 0..schedule.scopes.len() {
         let scope = &schedule.scopes[(start_index + offset) % schedule.scopes.len()];
@@ -2034,17 +2203,13 @@ async fn run_registered_scopes_cycle(
     let fair_set = scopes.iter().cloned().collect::<BTreeSet<_>>();
     hot_scopes.retain(|scope| !fair_set.contains(scope));
 
+    let registered_scopes = schedule.scopes.len();
     let processed = hot_scopes.len().saturating_add(scopes.len());
+    metrics.scopes_processed.fetch_add(processed as u64, Ordering::Relaxed);
+    metrics.hot_scope_rechecks.fetch_add(hot_scopes.len() as u64, Ordering::Relaxed);
     metrics
-        .scopes_processed
-        .fetch_add(processed as u64, Ordering::Relaxed);
-    metrics
-        .hot_scope_rechecks
-        .fetch_add(hot_scopes.len() as u64, Ordering::Relaxed);
-    metrics.scopes_deferred.fetch_add(
-        schedule.scopes.len().saturating_sub(processed) as u64,
-        Ordering::Relaxed,
-    );
+        .scopes_deferred
+        .fetch_add(schedule.scopes.len().saturating_sub(processed) as u64, Ordering::Relaxed);
 
     for batch in hot_scopes.chunks(scope_concurrency) {
         failures.absorb(
@@ -2066,6 +2231,7 @@ async fn run_registered_scopes_cycle(
         cursor,
         ending_cursor,
         cursor_progressed,
+        visited_scopes: fair_scopes,
     } = run_fair_scope_stream(
         &scopes,
         retain_previous,
@@ -2089,15 +2255,20 @@ async fn run_registered_scopes_cycle(
         starting_cursor_registered,
     );
     schedule.cursor = cursor;
-    failures.into_result().map(|()| {
-        if full_sweep_completed {
-            schedule.scopes.clear();
-            schedule.scope_names.clear();
-        }
-        RegisteredScopesCycle {
+    // A rotation that completed with failures is still complete: the next
+    // cycle starts a new one against a fresh registry listing.
+    if full_sweep_completed {
+        schedule.scopes.clear();
+        schedule.scope_names.clear();
+    }
+    RegisteredScopesCycleOutcome {
+        progress: RegisteredScopesCycle {
             full_sweep_completed,
-        }
-    })
+            fair_scopes,
+            registered_scopes,
+        },
+        failures,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2145,16 +2316,16 @@ async fn run_fair_scope_stream(
     mut cursor: Option<ScopeCursor>,
 ) -> FairScopeRun {
     let mut failures = CycleFailures::default();
-    let mut ending_cursor = cursor
-        .as_ref()
-        .and_then(|current| current.last_scope.clone());
+    let mut ending_cursor = cursor.as_ref().and_then(|current| current.last_scope.clone());
     let mut cursor_progressed = false;
+    let mut visited_scopes = 0;
     if scopes.is_empty() {
         return FairScopeRun {
             failures,
             cursor,
             ending_cursor,
             cursor_progressed,
+            visited_scopes,
         };
     }
 
@@ -2189,20 +2360,17 @@ async fn run_fair_scope_stream(
     'results: while let Some((index, scope_outcome)) = runs.next().await {
         failures.absorb(scope_outcome.failures);
         completed[index] = true;
+        visited_scopes += 1;
         while contiguous_completed < completed.len() && completed[contiguous_completed] {
             contiguous_completed += 1;
         }
 
-        while let Some(checkpoint) =
-            next_checkpoint.filter(|checkpoint| contiguous_completed >= *checkpoint)
-        {
+        while let Some(checkpoint) = next_checkpoint.filter(|checkpoint| contiguous_completed >= *checkpoint) {
             let last_scope = scopes[checkpoint - 1].to_string();
             match advance_scope_cursor(
                 object_store,
                 cursor_path,
-                cursor
-                    .take()
-                    .expect("a valid cursor must precede every fair-scan checkpoint"),
+                cursor.take().expect("a valid cursor must precede every fair-scan checkpoint"),
                 &last_scope,
             )
             .await
@@ -2211,11 +2379,7 @@ async fn run_fair_scope_stream(
                     ending_cursor.clone_from(&next.last_scope);
                     cursor = Some(next);
                     cursor_progressed = true;
-                    next_checkpoint = (checkpoint < scopes.len()).then(|| {
-                        checkpoint
-                            .saturating_add(checkpoint_stride)
-                            .min(scopes.len())
-                    });
+                    next_checkpoint = (checkpoint < scopes.len()).then(|| checkpoint.saturating_add(checkpoint_stride).min(scopes.len()));
                 }
                 Ok(ScopeCursorAdvance::LostRace) => {
                     tracing::info!(
@@ -2242,6 +2406,7 @@ async fn run_fair_scope_stream(
         cursor,
         ending_cursor,
         cursor_progressed,
+        visited_scopes,
     }
 }
 
@@ -2287,14 +2452,9 @@ async fn run_registered_scope(
                 error.class = Empty,
             );
             let has_data_timer = metrics.time_stage(work, IndexStage::ScopeHasData);
-            let has_data_result = scope_has_data(
-                &scope_cache.data_path,
-                &scope,
-                &scope_cache.cells,
-                &scope_cache.object_store,
-            )
-            .instrument(has_data_span.clone())
-            .await;
+            let has_data_result = scope_has_data(&scope_cache.data_path, &scope, &scope_cache.cells, &scope_cache.object_store)
+                .instrument(has_data_span.clone())
+                .await;
             drop(has_data_timer);
             match has_data_result {
                 Ok(true) => {
@@ -2308,12 +2468,8 @@ async fn run_registered_scope(
                     has_data_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
                     scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
                     if let Err(error) = scope_cache.invalidate_scope(&scope).await {
-                        let failure = IndexFailure::kernel(
-                            "cluster_close",
-                            format!("close empty scope {scope_name}"),
-                            &error,
-                        )
-                        .with_scope(&scope_name);
+                        let failure = IndexFailure::kernel("cluster_close", format!("close empty scope {scope_name}"), &error)
+                            .with_scope(&scope_name);
                         record_failure(&scope_span, &failure);
                         failures.push(failure);
                     }
@@ -2324,12 +2480,8 @@ async fn run_registered_scope(
                     };
                 }
                 Err(error) => {
-                    let failure = IndexFailure::kernel(
-                        "scope_has_data",
-                        format!("scan scope {scope_name}"),
-                        &error,
-                    )
-                    .with_scope(&scope_name);
+                    let failure =
+                        IndexFailure::kernel("scope_has_data", format!("scan scope {scope_name}"), &error).with_scope(&scope_name);
                     record_failure(&has_data_span, &failure);
                     scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                     failures.push(failure);
@@ -2353,10 +2505,7 @@ async fn run_registered_scope(
         let cluster_result = if let Some(cluster) = cached_cluster {
             Ok((cluster, ScopeCacheDisposition::Hit))
         } else {
-            scope_cache
-                .cluster_for_scope(&scope)
-                .instrument(open_span.clone())
-                .await
+            scope_cache.cluster_for_scope(&scope).instrument(open_span.clone()).await
         };
         drop(open_timer);
         let (cluster, cache_disposition) = match cluster_result {
@@ -2366,12 +2515,7 @@ async fn run_registered_scope(
             }
             Err(error) => {
                 metrics.open_failures.fetch_add(1, Ordering::Relaxed);
-                let failure = IndexFailure::kernel(
-                    "cluster_open",
-                    format!("open scope {scope_name}"),
-                    &error,
-                )
-                .with_scope(&scope_name);
+                let failure = IndexFailure::kernel("cluster_open", format!("open scope {scope_name}"), &error).with_scope(&scope_name);
                 record_failure(&open_span, &failure);
                 scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                 failures.push(failure);
@@ -2383,41 +2527,29 @@ async fn run_registered_scope(
         };
 
         let mut scope_failed = false;
+        let mut failed_only_over_edge_cap = false;
         let mut scope_built = false;
-        let known_covered_sequences = scope_cache
-            .covered_sequences_for_scope(&scope, &cluster)
-            .await;
+        let known_covered_sequences = scope_cache.covered_sequences_for_scope(&scope, &cluster).await;
 
-        if work == IndexWorkKind::Sweep && known_covered_sequences.len() == scope_cache.cells.len()
-        {
+        if work == IndexWorkKind::Sweep && known_covered_sequences.len() == scope_cache.cells.len() {
             match refresh_covered_scope(&cluster, &scope_name, &scope_cache.cells, metrics, work)
                 .instrument(scope_span.clone())
                 .await
             {
                 Ok(sequences)
-                    if sequences.iter().all(|(cell_id, sequence)| {
-                        known_covered_sequences.get(cell_id) == Some(sequence)
-                    }) =>
+                    if sequences
+                        .iter()
+                        .all(|(cell_id, sequence)| known_covered_sequences.get(cell_id) == Some(sequence)) =>
                 {
                     covered_sequences = sequences;
                     // Before `finish_scope`, which closes a bypassed cluster; the
                     // due check reads the header through this cluster.
                     scope_cache
-                        .queue_due_statistics(
-                            &scope,
-                            &cluster,
-                            &scope_name,
-                            &covered_sequences,
-                            metrics,
-                        )
+                        .queue_due_statistics(&scope, &cluster, &scope_name, &covered_sequences, metrics)
                         .instrument(scope_span.clone())
                         .await;
-                    scope_cache
-                        .finish_scope(&scope, &cluster, cache_disposition, false)
-                        .await;
-                    scope_cache
-                        .update_covered_sequences(&scope, &cluster, &covered_sequences)
-                        .await;
+                    scope_cache.finish_scope(&scope, &cluster, cache_disposition, false).await;
+                    scope_cache.update_covered_sequences(&scope, &cluster, &covered_sequences).await;
                     scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
                     return RegisteredScopeOutcome {
                         failures,
@@ -2428,17 +2560,10 @@ async fn run_registered_scope(
                 Ok(sequences) => refreshed_sequences = sequences,
                 Err(inner) => {
                     failures.absorb(inner);
-                    if let Err(error) = scope_cache
-                        .finish_failed_scope(&scope, &cluster, cache_disposition)
-                        .await
-                    {
+                    if let Err(error) = scope_cache.finish_failed_scope(&scope, &cluster, cache_disposition).await {
                         failures.push(
-                            IndexFailure::kernel(
-                                "cluster_close",
-                                format!("close failed scope {scope_name}"),
-                                &error,
-                            )
-                            .with_scope(&scope_name),
+                            IndexFailure::kernel("cluster_close", format!("close failed scope {scope_name}"), &error)
+                                .with_scope(&scope_name),
                         );
                     }
                     scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
@@ -2469,6 +2594,7 @@ async fn run_registered_scope(
             incremental_min_edges,
             &known_covered_sequences,
             &refreshed_sequences,
+            &scope_cache.edge_cap_retries,
             metrics,
             work,
         )
@@ -2481,21 +2607,20 @@ async fn run_registered_scope(
             }
             Err(inner) => {
                 scope_failed = true;
+                failed_only_over_edge_cap = inner.all_over_edge_cap();
                 failures.absorb(inner);
             }
         }
 
-        if scope_failed {
-            if let Err(error) = scope_cache
-                .finish_failed_scope(&scope, &cluster, cache_disposition)
-                .await
-            {
-                let failure = IndexFailure::kernel(
-                    "cluster_close",
-                    format!("close failed scope {scope_name}"),
-                    &error,
-                )
-                .with_scope(&scope_name);
+        if failed_only_over_edge_cap {
+            // The cluster read everything it was asked to; only the cap refused
+            // a build. Closing it would make every change pass that lists the
+            // scope reopen it while its refused types wait out their retries.
+            scope_cache.finish_scope(&scope, &cluster, cache_disposition, false).await;
+        } else if scope_failed {
+            if let Err(error) = scope_cache.finish_failed_scope(&scope, &cluster, cache_disposition).await {
+                let failure =
+                    IndexFailure::kernel("cluster_close", format!("close failed scope {scope_name}"), &error).with_scope(&scope_name);
                 record_failure(&scope_span, &failure);
                 failures.push(failure);
             }
@@ -2510,12 +2635,8 @@ async fn run_registered_scope(
                 .queue_due_statistics(&scope, &cluster, &scope_name, &covered_sequences, metrics)
                 .instrument(scope_span.clone())
                 .await;
-            scope_cache
-                .finish_scope(&scope, &cluster, cache_disposition, scope_built)
-                .await;
-            scope_cache
-                .update_covered_sequences(&scope, &cluster, &covered_sequences)
-                .await;
+            scope_cache.finish_scope(&scope, &cluster, cache_disposition, scope_built).await;
+            scope_cache.update_covered_sequences(&scope, &cluster, &covered_sequences).await;
             record_success(&scope_span);
         }
     }
@@ -2539,12 +2660,9 @@ async fn refresh_covered_scope(
     for cell_id in cells {
         let Some(shard) = cluster.shard(cell_id) else {
             failures.push(
-                IndexFailure::config(
-                    "missing_cell",
-                    format!("index scope {scope}: missing configured cell {cell_id}"),
-                )
-                .with_scope(scope)
-                .with_cell(cell_id),
+                IndexFailure::config("missing_cell", format!("index scope {scope}: missing configured cell {cell_id}"))
+                    .with_scope(scope)
+                    .with_cell(cell_id),
             );
             continue;
         };
@@ -2557,10 +2675,7 @@ async fn refresh_covered_scope(
             error.class = Empty,
         );
         let refresh_timer = metrics.time_stage(work, IndexStage::RefreshSequence);
-        let refresh_result = shard
-            .refresh_storage_sequence(cell_id)
-            .instrument(refresh_span.clone())
-            .await;
+        let refresh_result = shard.refresh_storage_sequence(cell_id).instrument(refresh_span.clone()).await;
         drop(refresh_timer);
         match refresh_result {
             Ok(sequence) => {
@@ -2569,13 +2684,9 @@ async fn refresh_covered_scope(
                 refreshed_sequences.insert(cell_id.clone(), sequence);
             }
             Err(error) => {
-                let failure = IndexFailure::kernel(
-                    "refresh_sequence",
-                    format!("index scope {scope}: refresh {cell_id}"),
-                    &error,
-                )
-                .with_scope(scope)
-                .with_cell(cell_id);
+                let failure = IndexFailure::kernel("refresh_sequence", format!("index scope {scope}: refresh {cell_id}"), &error)
+                    .with_scope(scope)
+                    .with_cell(cell_id);
                 record_failure(&refresh_span, &failure);
                 failures.push(failure);
             }
@@ -2596,18 +2707,9 @@ async fn refresh_covered_scope(
 /// header says: a build that keeps failing would otherwise rescan the whole
 /// cell under the scope permit on every sweep, since nothing published (or
 /// an old header) always looks due.
-fn planner_statistics_due(
-    memo: PlannerStatisticsMemo,
-    current_sequence: u64,
-    now_ms: u64,
-    min_interval: Duration,
-) -> bool {
-    let elapsed =
-        |since_ms: u64| u128::from(now_ms.saturating_sub(since_ms)) >= min_interval.as_millis();
-    if memo
-        .failed_at_ms
-        .is_some_and(|failed_at_ms| !elapsed(failed_at_ms))
-    {
+fn planner_statistics_due(memo: PlannerStatisticsMemo, current_sequence: u64, now_ms: u64, min_interval: Duration) -> bool {
+    let elapsed = |since_ms: u64| u128::from(now_ms.saturating_sub(since_ms)) >= min_interval.as_millis();
+    if memo.failed_at_ms.is_some_and(|failed_at_ms| !elapsed(failed_at_ms)) {
         return false;
     }
     match memo.header {
@@ -2642,18 +2744,16 @@ fn merge_read_memo(
         };
     };
     let published_meanwhile = before.map(|memo| memo.header) != Some(current.header)
-        && current.header.is_some_and(|(sequence, _)| {
-            read.header
-                .is_none_or(|(read_sequence, _)| sequence >= read_sequence)
-        });
+        && current
+            .header
+            .is_some_and(|(sequence, _)| read.header.is_none_or(|(read_sequence, _)| sequence >= read_sequence));
     if published_meanwhile {
         PlannerStatisticsMemo {
             read_at_ms: read.read_at_ms.max(current.read_at_ms),
             ..current
         }
     } else {
-        let corrupt_meanwhile =
-            before != Some(current) && current.unreadable && current.header == read.header;
+        let corrupt_meanwhile = before != Some(current) && current.unreadable && current.header == read.header;
         PlannerStatisticsMemo {
             unreadable: read.unreadable || corrupt_meanwhile,
             failed_at_ms: current.failed_at_ms,
@@ -2698,9 +2798,7 @@ async fn planner_statistics_due_cells(
         let now_ms = unix_time_ms();
         let known = scope_cache.planner_statistics_headers().get(&key).copied();
         let fresh = |memo: &PlannerStatisticsMemo| {
-            mode == DueMode::Refresh
-                && u128::from(now_ms.saturating_sub(memo.read_at_ms))
-                    < policy.min_interval.as_millis()
+            mode == DueMode::Refresh && u128::from(now_ms.saturating_sub(memo.read_at_ms)) < policy.min_interval.as_millis()
         };
         let memo = match known {
             Some(memo) if fresh(&memo) => memo,
@@ -2710,13 +2808,8 @@ async fn planner_statistics_due_cells(
                 };
                 let span = planner_statistics_span(scope_name, cell_id, sequence);
                 let mut unreadable = false;
-                let header = match shard
-                    .read_planner_statistics(cell_id)
-                    .instrument(span.clone())
-                    .await
-                {
-                    Ok(statistics) => statistics
-                        .map(|statistics| (statistics.storage_sequence, statistics.built_at_ms)),
+                let header = match shard.read_planner_statistics(cell_id).instrument(span.clone()).await {
+                    Ok(statistics) => statistics.map(|statistics| (statistics.storage_sequence, statistics.built_at_ms)),
                     Err(error @ GraphError::CorruptValue { .. }) => {
                         unreadable = true;
                         span.in_scope(|| {
@@ -2730,14 +2823,10 @@ async fn planner_statistics_due_cells(
                         None
                     }
                     Err(error) => {
-                        metrics
-                            .planner_statistics_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics.planner_statistics_failures.fetch_add(1, Ordering::Relaxed);
                         let failure = IndexFailure::kernel(
                             "planner_statistics",
-                            format!(
-                                "index scope {scope_name}: read planner statistics of {cell_id}"
-                            ),
+                            format!("index scope {scope_name}: read planner statistics of {cell_id}"),
                             &error,
                         )
                         .with_scope(scope_name)
@@ -2782,6 +2871,7 @@ fn planner_statistics_span(scope_name: &str, cell_id: &str, sequence: u64) -> tr
         reason = Empty,
         labels = Empty,
         vertex_properties = Empty,
+        truncated = Empty,
         hydradb.outcome = Empty,
         error.class = Empty,
     )
@@ -2819,10 +2909,25 @@ async fn refresh_planner_statistics(
     span.record("reason", reason.as_str());
     let timer = metrics.time_stage(IndexWorkKind::Statistics, IndexStage::PlannerStatistics);
     let started = Instant::now();
+    // The build stops itself a little before the hard deadline, keeping
+    // what it counted, so the publish still fits inside it.
+    let limits = PlannerStatisticsBuildLimits {
+        deadline: Some(deadline.checked_sub(policy.build_timeout / 10).unwrap_or(deadline).into_std()),
+        ..policy.limits
+    };
     let result = tokio::time::timeout_at(deadline, async {
-        let statistics = shard
-            .build_planner_statistics_with(cell_id, &policy.limits)
-            .await?;
+        let statistics = shard.build_planner_statistics_with(cell_id, &limits).await?;
+        // A partial build replaces only an object it covers: nothing, or an
+        // earlier partial build of the same reach, so a cell past its budget
+        // keeps getting fresh counts. It never replaces one that counted more.
+        let narrower = |published: &PlannerStatistics| !statistics.covers(published);
+        if statistics.truncated && !replace_unreadable && shard.read_planner_statistics(cell_id).await?.as_ref().is_some_and(narrower) {
+            return Err(GraphError::AdmissionRejected {
+                operation: "planner_statistics_build",
+                actual: policy.limits.max_entries.saturating_add(1),
+                limit: policy.limits.max_entries,
+            });
+        }
         let publish = if replace_unreadable {
             publisher.republish(&statistics).await?
         } else {
@@ -2837,10 +2942,12 @@ async fn refresh_planner_statistics(
         Ok(Ok((statistics, PlannerStatisticsPublish::Published))) => {
             span.record("labels", statistics.labels.len());
             span.record("vertex_properties", statistics.vertex_properties.len());
+            span.record("truncated", statistics.truncated);
+            if statistics.truncated {
+                metrics.planner_statistics_builds_too_large.fetch_add(1, Ordering::Relaxed);
+            }
             record_success(&span);
-            metrics
-                .planner_statistics_published
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.planner_statistics_published.fetch_add(1, Ordering::Relaxed);
             scope_cache.planner_statistics_headers().insert(
                 key,
                 PlannerStatisticsMemo {
@@ -2856,14 +2963,8 @@ async fn refresh_planner_statistics(
         // this one ran, or it took the claim over because this one outlived
         // its lease. Nothing of this build is kept, and the header is
         // forgotten so the next due check reads what is current.
-        Ok(Ok((
-            _,
-            outcome @ (PlannerStatisticsPublish::Superseded { .. }
-            | PlannerStatisticsPublish::Fenced),
-        ))) => {
-            metrics
-                .planner_statistics_superseded
-                .fetch_add(1, Ordering::Relaxed);
+        Ok(Ok((_, outcome @ (PlannerStatisticsPublish::Superseded { .. } | PlannerStatisticsPublish::Fenced)))) => {
+            metrics.planner_statistics_superseded.fetch_add(1, Ordering::Relaxed);
             scope_cache.planner_statistics_headers().remove(&key);
             span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
             match outcome {
@@ -2891,16 +2992,12 @@ async fn refresh_planner_statistics(
                     ..
                 }
             ) {
-                metrics
-                    .planner_statistics_builds_too_large
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.planner_statistics_builds_too_large.fetch_add(1, Ordering::Relaxed);
             }
             error
         }
         Err(_elapsed) => {
-            metrics
-                .planner_statistics_builds_timed_out
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.planner_statistics_builds_timed_out.fetch_add(1, Ordering::Relaxed);
             GraphError::AdmissionRejected {
                 operation: "planner_statistics_build_timeout",
                 actual: started.elapsed().as_millis() as u64,
@@ -2910,14 +3007,8 @@ async fn refresh_planner_statistics(
     };
     // The old object, if any, stays; the memo backs off for the interval
     // so a build that cannot finish is not retried on every wake.
-    metrics
-        .planner_statistics_failures
-        .fetch_add(1, Ordering::Relaxed);
-    scope_cache
-        .planner_statistics_headers()
-        .entry(key)
-        .or_default()
-        .failed_at_ms = Some(unix_time_ms());
+    metrics.planner_statistics_failures.fetch_add(1, Ordering::Relaxed);
+    scope_cache.planner_statistics_headers().entry(key).or_default().failed_at_ms = Some(unix_time_ms());
     let failure = IndexFailure::kernel(
         "planner_statistics",
         format!("index scope {scope_name}: refresh planner statistics of {cell_id}"),
@@ -2995,10 +3086,7 @@ impl PlannerStatisticsQueue {
     /// The next build to run, or `None`. `held` names keys that must stay
     /// pending for now: a key whose last attempt could not start waits out
     /// its retry delay here too, however it was queued.
-    fn pop(
-        &mut self,
-        held: impl Fn(&(GraphScope, String)) -> bool,
-    ) -> Option<((GraphScope, String), QueuedBuild)> {
+    fn pop(&mut self, held: impl Fn(&(GraphScope, String)) -> bool) -> Option<((GraphScope, String), QueuedBuild)> {
         // Hinted first: scan the arrival order for the first hinted key that
         // is not running, else the first key of any reason not running.
         for wanted in [Some(BuildReason::Hinted), None] {
@@ -3011,14 +3099,8 @@ impl PlannerStatisticsQueue {
                         .is_some_and(|build| wanted.is_none_or(|reason| build.reason == reason))
             });
             if let Some(position) = position {
-                let key = self
-                    .order
-                    .remove(position)
-                    .expect("position came from the queue");
-                let build = self
-                    .pending
-                    .remove(&key)
-                    .expect("every ordered key is pending");
+                let key = self.order.remove(position).expect("position came from the queue");
+                let build = self.pending.remove(&key).expect("every ordered key is pending");
                 self.running.insert(key.clone());
                 return Some((key, build));
             }
@@ -3096,28 +3178,18 @@ impl PlannerStatisticsWorker {
 
     /// Whether `key` is still held back at `now`; expired entries are dropped.
     fn in_transient_backoff(&self, key: &(GraphScope, String), now: Instant) -> bool {
-        let mut backoff = self
-            .transient_backoff
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut backoff = self.transient_backoff.lock().unwrap_or_else(PoisonError::into_inner);
         backoff.retain(|_, until| *until > now);
         backoff.contains_key(key)
     }
 
     /// The next build that is not held back at `now`.
     fn pop_ready(&self, now: Instant) -> Option<((GraphScope, String), QueuedBuild)> {
-        self.lock_queue()
-            .pop(|key| self.in_transient_backoff(key, now))
+        self.lock_queue().pop(|key| self.in_transient_backoff(key, now))
     }
 
     /// Queue a build. Nothing happens with the flag off.
-    fn enqueue(
-        &self,
-        scope: GraphScope,
-        cell_id: String,
-        reason: BuildReason,
-        request: Option<PlannerStatisticsRequest>,
-    ) {
+    fn enqueue(&self, scope: GraphScope, cell_id: String, reason: BuildReason, request: Option<PlannerStatisticsRequest>) {
         if !self.policy.enabled {
             return;
         }
@@ -3126,9 +3198,7 @@ impl PlannerStatisticsWorker {
             queue.push(scope, cell_id, QueuedBuild { reason, request });
             queue.depth()
         };
-        self.metrics
-            .planner_statistics_queue_depth
-            .store(depth as u64, Ordering::Release);
+        self.metrics.planner_statistics_queue_depth.store(depth as u64, Ordering::Release);
         self.wake.notify_one();
     }
 
@@ -3141,10 +3211,7 @@ impl PlannerStatisticsWorker {
         if !self.policy.enabled {
             return Ok(());
         }
-        let requests = self
-            .scope_directory
-            .list_planner_statistics_requests()
-            .await?;
+        let requests = self.scope_directory.list_planner_statistics_requests().await?;
         let now = Instant::now();
         for request in requests {
             if self.in_transient_backoff(&(request.scope.clone(), request.cell_id.clone()), now) {
@@ -3162,15 +3229,11 @@ impl PlannerStatisticsWorker {
                 )
             };
             if fresh {
-                self.metrics
-                    .planner_statistics_hints_received
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.planner_statistics_hints_received.fetch_add(1, Ordering::Relaxed);
             }
         }
         let depth = self.lock_queue().depth();
-        self.metrics
-            .planner_statistics_queue_depth
-            .store(depth as u64, Ordering::Release);
+        self.metrics.planner_statistics_queue_depth.store(depth as u64, Ordering::Release);
         Ok(())
     }
 
@@ -3180,9 +3243,7 @@ impl PlannerStatisticsWorker {
     async fn build(self: &Arc<Self>, key: (GraphScope, String), queued: QueuedBuild) {
         let (scope, cell_id) = key.clone();
         let scope_name = scope.to_string();
-        let outcome = self
-            .build_inner(&scope, &cell_id, &scope_name, queued.reason)
-            .await;
+        let outcome = self.build_inner(&scope, &cell_id, &scope_name, queued.reason).await;
         if matches!(outcome, BuildOutcome::Transient | BuildOutcome::Claimed) {
             self.record_transient(key.clone(), Instant::now());
         }
@@ -3211,9 +3272,7 @@ impl PlannerStatisticsWorker {
             queue.finish(&key);
             queue.depth()
         };
-        self.metrics
-            .planner_statistics_queue_depth
-            .store(depth as u64, Ordering::Release);
+        self.metrics.planner_statistics_queue_depth.store(depth as u64, Ordering::Release);
     }
 
     /// One deadline covers the whole attempt: opening the cell, claiming
@@ -3230,20 +3289,13 @@ impl PlannerStatisticsWorker {
     /// the holder, and the claim is released after. A lease bounds a crashed
     /// holder; the publish covers what a lease cannot, two builds that both
     /// ran, by refusing a snapshot at or below the published one.
-    async fn build_inner(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        scope_name: &str,
-        reason: BuildReason,
-    ) -> BuildOutcome {
+    async fn build_inner(&self, scope: &GraphScope, cell_id: &str, scope_name: &str, reason: BuildReason) -> BuildOutcome {
         let scope_cache = &self.scope_cache;
         let metrics = &self.metrics;
         let deadline = tokio::time::Instant::now() + self.policy.build_timeout;
         let _scope_timer = metrics.time_stage(IndexWorkKind::Statistics, IndexStage::ScopeTotal);
         let open_timer = metrics.time_stage(IndexWorkKind::Statistics, IndexStage::ClusterOpen);
-        let opened =
-            tokio::time::timeout_at(deadline, scope_cache.open_cell_reader(scope, cell_id)).await;
+        let opened = tokio::time::timeout_at(deadline, scope_cache.open_cell_reader(scope, cell_id)).await;
         drop(open_timer);
         let cluster = match opened {
             Ok(Ok(Some(cluster))) => cluster,
@@ -3254,9 +3306,7 @@ impl PlannerStatisticsWorker {
                 return BuildOutcome::Transient;
             }
             Err(_elapsed) => {
-                metrics
-                    .planner_statistics_builds_timed_out
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.planner_statistics_builds_timed_out.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(hydradb.scope = %scope_name, "planner statistics build timed out opening the scope");
                 return BuildOutcome::Transient;
             }
@@ -3319,12 +3369,8 @@ impl PlannerStatisticsWorker {
             // The refresh or due check ran out the deadline before counting
             // began: the same backoff as a build that did.
             Err(_elapsed) => {
-                metrics
-                    .planner_statistics_builds_timed_out
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .planner_statistics_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.planner_statistics_builds_timed_out.fetch_add(1, Ordering::Relaxed);
+                metrics.planner_statistics_failures.fetch_add(1, Ordering::Relaxed);
                 scope_cache
                     .planner_statistics_headers()
                     .entry((scope.clone(), cell_id.to_string()))
@@ -3338,10 +3384,7 @@ impl PlannerStatisticsWorker {
         // own: a store that stops answering must not hold the build slot past
         // it. A claim not given back expires with its lease.
         if let Some(publisher) = claim.take() {
-            let bound = self
-                .policy
-                .build_timeout
-                .min(PLANNER_STATISTICS_CLAIM_SLACK);
+            let bound = self.policy.build_timeout.min(PLANNER_STATISTICS_CLAIM_SLACK);
             match tokio::time::timeout(bound, publisher.release()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -3359,8 +3402,10 @@ impl PlannerStatisticsWorker {
     }
 
     /// Drain the queue with `concurrency` builds in flight, and ingest the
-    /// request markers whenever woken (a node's wake or the poll interval).
-    async fn run(self: Arc<Self>, mut stop_rx: watch::Receiver<bool>, poll_interval: Duration) {
+    /// request markers whenever woken (a node's wake, a finished build or the
+    /// poll interval), but list them no more than once per `min_interval`:
+    /// every change wake also wakes this worker.
+    async fn run(self: Arc<Self>, mut stop_rx: watch::Receiver<bool>, poll_interval: Duration, min_interval: Duration) {
         if !self.policy.enabled {
             // Nothing to build and nothing to list: the markers stay for an
             // indexer that has the flag on.
@@ -3374,9 +3419,12 @@ impl PlannerStatisticsWorker {
         let concurrency = self.policy.concurrency.max(1);
         let in_flight = Arc::new(Semaphore::new(concurrency));
         let mut tasks = tokio::task::JoinSet::new();
+        let mut ingest = WakePacer::new(min_interval);
         loop {
-            if let Err(error) = self.ingest_requests().await {
-                metrics_warn_ingest(&self.metrics, &error);
+            if ingest.take_due(tokio::time::Instant::now()) {
+                if let Err(error) = self.ingest_requests().await {
+                    metrics_warn_ingest(&self.metrics, &error);
+                }
             }
             loop {
                 let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
@@ -3394,18 +3442,18 @@ impl PlannerStatisticsWorker {
             }
             // What is waiting, not what is running: a started build left the queue.
             let depth = self.lock_queue().depth();
-            self.metrics
-                .planner_statistics_queue_depth
-                .store(depth as u64, Ordering::Release);
+            self.metrics.planner_statistics_queue_depth.store(depth as u64, Ordering::Release);
+            let deferred = ingest.deferred_until();
             tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         break;
                     }
                 }
-                _ = self.wake.notified() => {}
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
-                _ = tokio::time::sleep(poll_interval) => {}
+                _ = self.wake.notified() => ingest.wake(),
+                _ = tasks.join_next(), if !tasks.is_empty() => ingest.wake(),
+                _ = tokio::time::sleep(poll_interval) => ingest.wake(),
+                _ = tokio::time::sleep_until(deferred.unwrap_or_else(tokio::time::Instant::now)), if deferred.is_some() => {}
             }
         }
         while tasks.join_next().await.is_some() {}
@@ -3413,9 +3461,7 @@ impl PlannerStatisticsWorker {
 }
 
 fn metrics_warn_ingest(metrics: &IndexerMetrics, error: &GraphError) {
-    metrics
-        .planner_statistics_failures
-        .fetch_add(1, Ordering::Relaxed);
+    metrics.planner_statistics_failures.fetch_add(1, Ordering::Relaxed);
     tracing::warn!(error = %error, "could not list planner statistics requests");
 }
 
@@ -3439,9 +3485,10 @@ enum BuildOutcome {
 fn start_planner_statistics_worker(
     worker: Arc<PlannerStatisticsWorker>,
     poll_interval: Duration,
+    min_interval: Duration,
 ) -> (watch::Sender<bool>, JoinHandle<()>) {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let task = tokio::spawn(worker.run(stop_rx, poll_interval));
+    let task = tokio::spawn(worker.run(stop_rx, poll_interval, min_interval));
     (stop_tx, task)
 }
 
@@ -3462,9 +3509,7 @@ fn scope_probe_concurrency(scope_concurrency: usize) -> usize {
 }
 
 fn scope_cursor_path(data_path: &str, root_scope: GraphScope) -> Path {
-    Path::from(format!(
-        "{data_path}/_graph_indexer/v1/{root_scope}/scope-cursor"
-    ))
+    Path::from(format!("{data_path}/_graph_indexer/v1/{root_scope}/scope-cursor"))
 }
 
 fn completed_scope_sweep(
@@ -3495,10 +3540,7 @@ fn completed_scope_sweep(
         )
 }
 
-async fn load_scope_cursor(
-    object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
-    path: &Path,
-) -> hydradb::Result<ScopeCursor> {
+async fn load_scope_cursor(object_store: &Arc<dyn slatedb::object_store::ObjectStore>, path: &Path) -> hydradb::Result<ScopeCursor> {
     match object_store.get(path).await {
         Ok(result) => {
             let update_version = UpdateVersion {
@@ -3509,17 +3551,13 @@ async fn load_scope_cursor(
             if value.len() > MAX_SCOPE_CURSOR_BYTES {
                 return Err(GraphError::CorruptValue {
                     key: path.to_string(),
-                    reason: format!(
-                        "indexer scope cursor is {} bytes; maximum is {MAX_SCOPE_CURSOR_BYTES}",
-                        value.len()
-                    ),
+                    reason: format!("indexer scope cursor is {} bytes; maximum is {MAX_SCOPE_CURSOR_BYTES}", value.len()),
                 });
             }
-            let last_scope =
-                std::str::from_utf8(&value).map_err(|error| GraphError::CorruptValue {
-                    key: path.to_string(),
-                    reason: format!("indexer scope cursor is not UTF-8: {error}"),
-                })?;
+            let last_scope = std::str::from_utf8(&value).map_err(|error| GraphError::CorruptValue {
+                key: path.to_string(),
+                reason: format!("indexer scope cursor is not UTF-8: {error}"),
+            })?;
             Ok(ScopeCursor {
                 last_scope: Some(last_scope.to_string()),
                 update_version: Some(update_version),
@@ -3539,15 +3577,9 @@ async fn advance_scope_cursor(
     cursor: ScopeCursor,
     last_scope: &str,
 ) -> hydradb::Result<ScopeCursorAdvance> {
-    let mode = cursor
-        .update_version
-        .map_or(PutMode::Create, PutMode::Update);
+    let mode = cursor.update_version.map_or(PutMode::Create, PutMode::Update);
     match object_store
-        .put_opts(
-            path,
-            Bytes::copy_from_slice(last_scope.as_bytes()).into(),
-            mode.into(),
-        )
+        .put_opts(path, Bytes::copy_from_slice(last_scope.as_bytes()).into(), mode.into())
         .await
     {
         Ok(result) => Ok(ScopeCursorAdvance::Advanced(ScopeCursor {
@@ -3573,13 +3605,7 @@ async fn scope_has_data(
     let scope_path = scope.scoped_store_path(data_path);
     for cell_id in cells {
         let prefix = Path::from(format!("{scope_path}/{cell_id}"));
-        if object_store
-            .list(Some(&prefix))
-            .next()
-            .await
-            .transpose()?
-            .is_some()
-        {
+        if object_store.list(Some(&prefix)).next().await.transpose()?.is_some() {
             return Ok(true);
         }
     }
@@ -3596,6 +3622,7 @@ async fn run_index_cycle(
     incremental_min_edges: u64,
     known_covered_sequences: &BTreeMap<String, u64>,
     refreshed_sequences: &BTreeMap<String, u64>,
+    edge_cap_retries: &EdgeCapRetries,
     metrics: &IndexerMetrics,
     work: IndexWorkKind,
 ) -> Result<IndexCycleOutcome, CycleFailures> {
@@ -3613,12 +3640,9 @@ async fn run_index_cycle(
         );
 
         let Some(shard) = cluster.shard(cell_id) else {
-            let failure = IndexFailure::config(
-                "missing_cell",
-                format!("index scope {scope}: missing configured cell {cell_id}"),
-            )
-            .with_scope(scope)
-            .with_cell(cell_id);
+            let failure = IndexFailure::config("missing_cell", format!("index scope {scope}: missing configured cell {cell_id}"))
+                .with_scope(scope)
+                .with_cell(cell_id);
             record_failure(&cell_span, &failure);
             failures.push(failure);
             continue;
@@ -3637,10 +3661,7 @@ async fn run_index_cycle(
                 error.class = Empty,
             );
             let refresh_timer = metrics.time_stage(work, IndexStage::RefreshSequence);
-            let refresh_result = shard
-                .refresh_storage_sequence(cell_id)
-                .instrument(refresh_span.clone())
-                .await;
+            let refresh_result = shard.refresh_storage_sequence(cell_id).instrument(refresh_span.clone()).await;
             drop(refresh_timer);
             match refresh_result {
                 Ok(sequence) => {
@@ -3649,13 +3670,9 @@ async fn run_index_cycle(
                     sequence
                 }
                 Err(error) => {
-                    let failure = IndexFailure::kernel(
-                        "refresh_sequence",
-                        format!("index scope {scope}: refresh {cell_id}"),
-                        &error,
-                    )
-                    .with_scope(scope)
-                    .with_cell(cell_id);
+                    let failure = IndexFailure::kernel("refresh_sequence", format!("index scope {scope}: refresh {cell_id}"), &error)
+                        .with_scope(scope)
+                        .with_cell(cell_id);
                     record_failure(&refresh_span, &failure);
                     cell_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                     failures.push(failure);
@@ -3683,10 +3700,7 @@ async fn run_index_cycle(
             error.class = Empty,
         );
         let discover_timer = metrics.time_stage(work, IndexStage::DiscoverDirty);
-        let dirty_result = shard
-            .dirty_graph_index_edge_types(cell_id)
-            .instrument(discover_span.clone())
-            .await;
+        let dirty_result = shard.dirty_graph_index_edge_types(cell_id).instrument(discover_span.clone()).await;
         drop(discover_timer);
         let dirty = match dirty_result {
             Ok(dirty) => {
@@ -3726,6 +3740,27 @@ async fn run_index_cycle(
                 error.class = Empty,
             );
 
+            // Only the change lane defers: the sweep is the fair visit that
+            // retries every type on its own slow pace.
+            let retry_key = EdgeCapRetries::key(scope, cell_id, &edge_type);
+            if work == IndexWorkKind::Change {
+                let now = tokio::time::Instant::now();
+                if let Some(retry) = edge_cap_retries.deferred(&retry_key, dirty_sequence, now) {
+                    let failure = IndexFailure::deferred_over_edge_cap(
+                        format!("index scope {scope}: build index {cell_id}/{edge_type}"),
+                        &retry,
+                        now,
+                    )
+                    .with_scope(scope)
+                    .with_cell(cell_id)
+                    .with_edge_type(&edge_type);
+                    record_failure(&edge_span, &failure);
+                    cell_failed = true;
+                    failures.push(failure);
+                    continue;
+                }
+            }
+
             let read_span = tracing::info_span!(
                 parent: &edge_span,
                 "index.read_current",
@@ -3739,10 +3774,7 @@ async fn run_index_cycle(
                 error.class = Empty,
             );
             let read_timer = metrics.time_stage(work, IndexStage::ReadCurrent);
-            let current_result = shard
-                .current_graph_index(cell_id, &edge_type)
-                .instrument(read_span.clone())
-                .await;
+            let current_result = shard.current_graph_index(cell_id, &edge_type).instrument(read_span.clone()).await;
             drop(read_timer);
             let current = match current_result {
                 Ok(current) => {
@@ -3771,10 +3803,7 @@ async fn run_index_cycle(
                 }
             };
 
-            if let Some(generation) = current
-                .as_ref()
-                .filter(|generation| generation.base_sequence >= dirty_sequence)
-            {
+            if let Some(generation) = current.as_ref().filter(|generation| generation.base_sequence >= dirty_sequence) {
                 // The normal case, and until now completely invisible: an idle
                 // but healthy indexer and a stopped one produced identical
                 // output, which is nothing. An explicit `skipped` outcome is
@@ -3795,6 +3824,7 @@ async fn run_index_cycle(
                         "graph index generation already current"
                     );
                 });
+                edge_cap_retries.clear(&retry_key);
                 continue;
             }
 
@@ -3824,22 +3854,21 @@ async fn run_index_cycle(
                     .as_ref()
                     .is_some_and(|generation| generation.edge_count >= incremental_min_edges);
             let build_timer = metrics.time_stage(work, IndexStage::ArtifactBuild);
-            let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> =
-                if attempt_incremental {
-                    shard
-                        .build_graph_index_auto(cell_id, &edge_type)
-                        .instrument(build_span.clone())
-                        .await
-                } else {
-                    shard
-                        .build_graph_index(cell_id, &edge_type)
-                        .instrument(build_span.clone())
-                        .await
-                        .map(|generated| {
-                            let edge_count = generated.edge_count;
-                            (generated, GraphIndexBuildPath::Full { edges: edge_count })
-                        })
-                };
+            let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> = if attempt_incremental {
+                shard
+                    .build_graph_index_auto(cell_id, &edge_type)
+                    .instrument(build_span.clone())
+                    .await
+            } else {
+                shard
+                    .build_graph_index(cell_id, &edge_type)
+                    .instrument(build_span.clone())
+                    .await
+                    .map(|generated| {
+                        let edge_count = generated.edge_count;
+                        (generated, GraphIndexBuildPath::Full { edges: edge_count })
+                    })
+            };
             drop(build_timer);
             let generation = match outcome {
                 Ok((generation, build_path)) => {
@@ -3856,19 +3885,19 @@ async fn run_index_cycle(
                             }
                         }
                         GraphIndexBuildPath::Incremental { delta_edges } => {
-                            metrics.record_incremental_delta_edges(
-                                cell_id,
-                                &edge_type,
-                                delta_edges,
-                            );
+                            metrics.record_incremental_delta_edges(cell_id, &edge_type, delta_edges);
                         }
                         GraphIndexBuildPath::Current => {}
                     }
                     record_success(&build_span);
+                    edge_cap_retries.clear(&retry_key);
                     generation
                 }
                 Err(error) => {
                     metrics.record_generation_failure(cell_id, &edge_type);
+                    if let Some(limit) = over_edge_cap_limit(&error) {
+                        edge_cap_retries.refused(retry_key, dirty_sequence, limit, error.class(), tokio::time::Instant::now());
+                    }
                     let failure = IndexFailure::kernel(
                         "artifact_build",
                         format!("index scope {scope}: build index {cell_id}/{edge_type}"),
@@ -3896,14 +3925,8 @@ async fn run_index_cycle(
             // that ended up current, so a returned generation identical to the
             // one `index.read_current` saw means the pointer never moved and
             // some other writer's generation is ahead of ours.
-            let pointer_advanced = current
-                .as_ref()
-                .is_none_or(|previous| previous.generation != generation.generation);
-            let publish_outcome = if pointer_advanced {
-                Outcome::Success
-            } else {
-                Outcome::Skipped
-            };
+            let pointer_advanced = current.as_ref().is_none_or(|previous| previous.generation != generation.generation);
+            let publish_outcome = if pointer_advanced { Outcome::Success } else { Outcome::Skipped };
             let publish_span = tracing::info_span!(
                 parent: &edge_span,
                 "artifact.publish",
@@ -3973,14 +3996,11 @@ async fn run_index_cycle(
                     // Unchanged in effect: cleanup that fails has never failed
                     // the cycle, because the generation it was tidying up after
                     // is already published and readable.
-                    let failure = IndexFailure::kernel(
-                        "artifact_gc",
-                        format!("index scope {scope}: cleanup {cell_id}/{edge_type}"),
-                        &error,
-                    )
-                    .with_scope(scope)
-                    .with_cell(cell_id)
-                    .with_edge_type(&edge_type);
+                    let failure =
+                        IndexFailure::kernel("artifact_gc", format!("index scope {scope}: cleanup {cell_id}/{edge_type}"), &error)
+                            .with_scope(scope)
+                            .with_cell(cell_id)
+                            .with_edge_type(&edge_type);
                     record_failure(&gc_span, &failure);
                 }
             }
@@ -4060,7 +4080,6 @@ impl IndexerAdminServer {
         change_wake: Arc<Notify>,
         statistics_wake: Arc<Notify>,
         wake_token: String,
-        wake_min_interval: Duration,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let router = Router::new()
@@ -4073,7 +4092,6 @@ impl IndexerAdminServer {
                 change_wake,
                 statistics_wake,
                 wake_token: Arc::from(wake_token),
-                wake_limiter: Arc::new(WakeRateLimiter::new(wake_min_interval)),
             });
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -4116,46 +4134,28 @@ async fn indexer_metrics(State(state): State<IndexerAdminState>) -> Response {
         .into_response()
 }
 
-async fn process_index_changes(
-    State(state): State<IndexerAdminState>,
-    headers: HeaderMap,
-) -> StatusCode {
+async fn process_index_changes(State(state): State<IndexerAdminState>, headers: HeaderMap) -> StatusCode {
     if !valid_wake_bearer(&headers, &state.wake_token) {
-        state
-            .metrics
-            .change_push_rejections
-            .fetch_add(1, Ordering::Relaxed);
+        state.metrics.change_push_rejections.fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED;
     }
-    if !state.wake_limiter.try_accept() {
-        state
-            .metrics
-            .change_push_throttles
-            .fetch_add(1, Ordering::Relaxed);
-        return StatusCode::ACCEPTED;
-    }
-    state
-        .metrics
-        .change_push_wakes
-        .fetch_add(1, Ordering::Relaxed);
+    // `Notify` holds at most one permit, so a burst of wakes coalesces into
+    // one pending pass, and the change worker spaces passes by its minimum
+    // interval. Neither drops a wake.
+    state.metrics.change_push_wakes.fetch_add(1, Ordering::Relaxed);
     state.change_wake.notify_one();
     state.statistics_wake.notify_one();
     StatusCode::ACCEPTED
 }
 
 fn valid_wake_bearer(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(value) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(value) = headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
         return false;
     };
     let Some((scheme, supplied)) = value.split_once(' ') else {
         return false;
     };
-    scheme.eq_ignore_ascii_case("bearer")
-        && !supplied.is_empty()
-        && bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
+    scheme.eq_ignore_ascii_case("bearer") && !supplied.is_empty() && bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// The `/metrics` body.
@@ -4224,8 +4224,6 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
             "graph_indexer_change_push_wakes {}\n",
             "# TYPE graph_indexer_change_push_rejections counter\n",
             "graph_indexer_change_push_rejections {}\n",
-            "# TYPE graph_indexer_change_push_throttles counter\n",
-            "graph_indexer_change_push_throttles {}\n",
             "# TYPE graph_indexer_pending_change_notifications gauge\n",
             "graph_indexer_pending_change_notifications {}\n",
             "# TYPE graph_indexer_last_change_success_ms gauge\n",
@@ -4262,47 +4260,30 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
         metrics.scope_cache_hits.load(Ordering::Relaxed),
         metrics.scope_cache_misses.load(Ordering::Relaxed),
         metrics.scope_cache_evictions.load(Ordering::Relaxed),
-        metrics
-            .scope_cache_admission_bypasses
-            .load(Ordering::Relaxed),
+        metrics.scope_cache_admission_bypasses.load(Ordering::Relaxed),
         metrics.scope_cache_promotions.load(Ordering::Relaxed),
         metrics.scope_cache_idle_demotions.load(Ordering::Relaxed),
         metrics.scope_cache_close_failures.load(Ordering::Relaxed),
         metrics.scope_cache_entries.load(Ordering::Acquire),
         metrics.scope_cache_capacity.load(Ordering::Acquire),
         metrics.registered_scopes.load(Ordering::Acquire),
-        metrics
-            .change_notifications_observed
-            .load(Ordering::Relaxed),
+        metrics.change_notifications_observed.load(Ordering::Relaxed),
         metrics.change_notifications_cleared.load(Ordering::Relaxed),
         metrics.changed_scopes_processed.load(Ordering::Relaxed),
         metrics.change_notification_failures.load(Ordering::Relaxed),
         metrics.change_push_wakes.load(Ordering::Relaxed),
         metrics.change_push_rejections.load(Ordering::Relaxed),
-        metrics.change_push_throttles.load(Ordering::Relaxed),
         metrics.pending_change_notifications.load(Ordering::Acquire),
         metrics.last_change_success_ms.load(Ordering::Relaxed),
         metrics.last_change_lag_ms.load(Ordering::Relaxed),
         metrics.planner_statistics_published.load(Ordering::Relaxed),
         metrics.planner_statistics_failures.load(Ordering::Relaxed),
-        metrics
-            .planner_statistics_hints_received
-            .load(Ordering::Relaxed),
-        metrics
-            .planner_statistics_queue_depth
-            .load(Ordering::Acquire),
-        metrics
-            .planner_statistics_builds_timed_out
-            .load(Ordering::Relaxed),
-        metrics
-            .planner_statistics_builds_too_large
-            .load(Ordering::Relaxed),
-        metrics
-            .planner_statistics_superseded
-            .load(Ordering::Relaxed),
-        metrics
-            .planner_statistics_builds_claimed_elsewhere
-            .load(Ordering::Relaxed),
+        metrics.planner_statistics_hints_received.load(Ordering::Relaxed),
+        metrics.planner_statistics_queue_depth.load(Ordering::Acquire),
+        metrics.planner_statistics_builds_timed_out.load(Ordering::Relaxed),
+        metrics.planner_statistics_builds_too_large.load(Ordering::Relaxed),
+        metrics.planner_statistics_superseded.load(Ordering::Relaxed),
+        metrics.planner_statistics_builds_claimed_elsewhere.load(Ordering::Relaxed),
     ));
     append_dimensioned(&mut output, &metrics.dimensioned_snapshot());
     append_stage_timings(&mut output, &metrics.stage_timings_snapshot());
@@ -4319,10 +4300,7 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
     output
 }
 
-fn append_stage_timings(
-    output: &mut String,
-    timings: &BTreeMap<(IndexWorkKind, IndexStage), StageTiming>,
-) {
+fn append_stage_timings(output: &mut String, timings: &BTreeMap<(IndexWorkKind, IndexStage), StageTiming>) {
     output.push_str("# TYPE graph_indexer_stage_duration_seconds summary\n");
     for ((work, stage), timing) in timings {
         let labels = format!("work=\"{}\",stage=\"{}\"", work.as_str(), stage.as_str());
@@ -4352,10 +4330,7 @@ fn append_stage_timings(
 /// Family-major, and the `# TYPE` line comes from the same enumeration the
 /// samples do, so a family with no pairs yet still declares itself instead of
 /// vanishing from the scrape until the first generation is built.
-fn append_dimensioned(
-    output: &mut String,
-    counters: &BTreeMap<(String, String), DimensionedCounters>,
-) {
+fn append_dimensioned(output: &mut String, counters: &BTreeMap<(String, String), DimensionedCounters>) {
     let cell = CELL_ID_LABEL.0;
     let edge = EDGE_TYPE_LABEL.0;
     for (slot, (name, _)) in DimensionedCounters::default().series().iter().enumerate() {
@@ -4364,19 +4339,14 @@ fn append_dimensioned(
             let (_, count) = value.series()[slot];
             let cell_value = escape_label_value(cell_id);
             let edge_value = escape_label_value(edge_type);
-            output.push_str(&format!(
-                "{name}{{{cell}=\"{cell_value}\",{edge}=\"{edge_value}\"}} {count}\n"
-            ));
+            output.push_str(&format!("{name}{{{cell}=\"{cell_value}\",{edge}=\"{edge_value}\"}} {count}\n"));
         }
     }
     // Additive, and the reason the cap is safe to have: without it, a fleet
     // that has quietly saturated `MAX_DIMENSIONS` and is folding everything
     // into `__overflow__` looks exactly like one that has not.
     output.push_str(&format!(
-        concat!(
-            "# TYPE graph_indexer_dimensions gauge\n",
-            "graph_indexer_dimensions {}\n",
-        ),
+        concat!("# TYPE graph_indexer_dimensions gauge\n", "graph_indexer_dimensions {}\n",),
         counters.len(),
     ));
 }
@@ -4390,10 +4360,7 @@ fn append_dimensioned(
 /// being wrong — an unescaped `"` in a label value does not error, it produces
 /// an exposition the scraper rejects wholesale.
 fn escape_label_value(value: &str) -> Cow<'_, str> {
-    if !value
-        .bytes()
-        .any(|byte| matches!(byte, b'\\' | b'"' | b'\n'))
-    {
+    if !value.bytes().any(|byte| matches!(byte, b'\\' | b'"' | b'\n')) {
         return Cow::Borrowed(value);
     }
     let mut escaped = String::with_capacity(value.len() + 8);
@@ -4418,16 +4385,8 @@ fn unix_time_ms() -> u64 {
 }
 
 fn graph_scope() -> RuntimeResult<GraphScope> {
-    let namespace = NamespacePath::new(
-        env_value("GRAPH_NAMESPACE", "default")
-            .split('/')
-            .map(|segment| NamespaceId::new(segment.to_string()))
-            .collect::<hydradb::Result<Vec<_>>>()?,
-    )?;
-    Ok(GraphScope::new(
-        namespace,
-        GraphId::new(env_value("GRAPH_ID", "default"))?,
-    ))
+    let namespace = NamespacePath::parse(&env_value("GRAPH_NAMESPACE", "default"))?;
+    Ok(GraphScope::new(namespace, GraphId::new(env_value("GRAPH_ID", "default"))?))
 }
 
 fn env_value(name: &str, default: &str) -> String {
@@ -4435,16 +4394,10 @@ fn env_value(name: &str, default: &str) -> String {
 }
 
 fn read_indexer_wake_token() -> RuntimeResult<String> {
-    let path = env_value(
-        "GRAPH_AUTH_TOKEN_FILE",
-        "/var/run/secrets/slatedb-graph/auth-token",
-    );
+    let path = env_value("GRAPH_AUTH_TOKEN_FILE", "/var/run/secrets/slatedb-graph/auth-token");
     let token = std::fs::read_to_string(&path)?.trim().to_string();
     if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
-        return Err(format!(
-            "GRAPH_AUTH_TOKEN_FILE {path} must contain at least 32 non-placeholder characters"
-        )
-        .into());
+        return Err(format!("GRAPH_AUTH_TOKEN_FILE {path} must contain at least 32 non-placeholder characters").into());
     }
     Ok(token)
 }
@@ -4480,11 +4433,7 @@ impl IndexBuildMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "incremental" => Ok(Self::Incremental),
-            other => Err(format!(
-                "{} must be `full` or `incremental`, got `{other}`",
-                Self::VAR
-            )
-            .into()),
+            other => Err(format!("{} must be `full` or `incremental`, got `{other}`", Self::VAR).into()),
         }
     }
 
@@ -4539,32 +4488,17 @@ impl PlannerStatisticsPolicy {
         let defaults = PlannerStatisticsBuildLimits::default();
         Self::parse(
             &env_value(Self::VAR, "false"),
-            &env_value(
-                Self::INTERVAL_VAR,
-                &Self::DEFAULT_INTERVAL.as_millis().to_string(),
-            ),
+            &env_value(Self::INTERVAL_VAR, &Self::DEFAULT_INTERVAL.as_millis().to_string()),
         )?
         .with_build_settings(
-            &env_value(
-                Self::CONCURRENCY_VAR,
-                &Self::DEFAULT_CONCURRENCY.to_string(),
-            ),
-            &env_value(
-                Self::TIMEOUT_VAR,
-                &Self::DEFAULT_BUILD_TIMEOUT.as_millis().to_string(),
-            ),
+            &env_value(Self::CONCURRENCY_VAR, &Self::DEFAULT_CONCURRENCY.to_string()),
+            &env_value(Self::TIMEOUT_VAR, &Self::DEFAULT_BUILD_TIMEOUT.as_millis().to_string()),
             &env_value(Self::MAX_ENTRIES_VAR, &defaults.max_entries.to_string()),
             &env_value(Self::EXACT_CAP_VAR, &defaults.exact_entries.to_string()),
         )
     }
 
-    fn with_build_settings(
-        mut self,
-        concurrency: &str,
-        timeout_ms: &str,
-        max_entries: &str,
-        exact_cap: &str,
-    ) -> RuntimeResult<Self> {
+    fn with_build_settings(mut self, concurrency: &str, timeout_ms: &str, max_entries: &str, exact_cap: &str) -> RuntimeResult<Self> {
         let positive = |name: &str, value: &str| -> RuntimeResult<u64> {
             let parsed = value
                 .trim()
@@ -4577,11 +4511,7 @@ impl PlannerStatisticsPolicy {
         };
         let concurrency = positive(Self::CONCURRENCY_VAR, concurrency)? as usize;
         if concurrency > MAX_PLANNER_STATISTICS_CONCURRENCY {
-            return Err(format!(
-                "{} must be at most {MAX_PLANNER_STATISTICS_CONCURRENCY}",
-                Self::CONCURRENCY_VAR
-            )
-            .into());
+            return Err(format!("{} must be at most {MAX_PLANNER_STATISTICS_CONCURRENCY}", Self::CONCURRENCY_VAR).into());
         }
         self.concurrency = concurrency;
         self.build_timeout = Duration::from_millis(positive(Self::TIMEOUT_VAR, timeout_ms)?);
@@ -4596,18 +4526,12 @@ impl PlannerStatisticsPolicy {
         let enabled = match enabled.trim().to_ascii_lowercase().as_str() {
             "true" | "1" => true,
             "false" | "0" => false,
-            other => {
-                return Err(
-                    format!("{} must be `true` or `false`, got `{other}`", Self::VAR).into(),
-                )
-            }
+            other => return Err(format!("{} must be `true` or `false`, got `{other}`", Self::VAR).into()),
         };
-        let interval_ms = interval_ms.trim().parse::<u64>().map_err(|error| {
-            format!(
-                "{} must be a whole number of milliseconds: {error}",
-                Self::INTERVAL_VAR
-            )
-        })?;
+        let interval_ms = interval_ms
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("{} must be a whole number of milliseconds: {error}", Self::INTERVAL_VAR))?;
         Ok(Self {
             enabled,
             min_interval: Duration::from_millis(interval_ms),
@@ -4619,8 +4543,7 @@ impl PlannerStatisticsPolicy {
 async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(unix)]
     {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
             _ = terminate.recv() => {}

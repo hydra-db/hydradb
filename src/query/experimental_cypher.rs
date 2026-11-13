@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use hydradb_cypher_engine::{
-    EngineError, ListParameterMap, LogicalQuery, LowerTimings, LoweredTemplate, ParameterMap,
-    PreparedQuery, ScalarValue, UnknownStatistics,
+    EngineError, ListParameterMap, LogicalQuery, LowerTimings, LoweredTemplate, ParameterMap, PreparedQuery, ScalarValue, UnknownStatistics,
 };
 
 use crate::QueryFailureReason;
@@ -23,18 +22,22 @@ pub(crate) fn prepare_experimental_cypher(
     // Column discovery refuses at the same boundary the shard does. Otherwise a
     // client can be told a query has columns and then be refused when it runs
     // it, which is a worse answer than the refusal it should have had here.
-    logical
-        .capability()
-        .into_result()
-        .map_err(experimental_engine_error)?;
+    logical.capability().into_result().map_err(experimental_engine_error)?;
     let prepared = logical
         .plan_with_statistics(&UnknownStatistics)
         .map_err(experimental_engine_error)?;
-    prepared
-        .capability()
-        .into_result()
-        .map_err(experimental_engine_error)?;
+    prepared.capability().into_result().map_err(experimental_engine_error)?;
     Ok(ExperimentalCypherRequest { explain, prepared })
+}
+
+/// Validate the complete production preparation boundary without executing it.
+#[cfg(feature = "experimental-cypher-engine")]
+pub fn validate_experimental_cypher_preparation(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
+) -> Result<()> {
+    prepare_experimental_cypher(query, parameters, lists).map(|_| ())
 }
 
 pub(crate) fn lower_experimental_cypher(
@@ -53,7 +56,7 @@ pub(crate) fn lower_experimental_cypher_cached(
     parameters: &BTreeMap<String, VertexPropertyValue>,
     lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
 ) -> Result<(bool, LogicalQuery, bool)> {
-    let (explain, logical, lowering) = lower_experimental_cypher_timed(query, parameters, lists)?;
+    let (explain, logical, lowering) = lower_experimental_cypher_timed(query, parameters, lists, None)?;
     Ok((explain, logical, lowering.cache_hit))
 }
 
@@ -67,16 +70,29 @@ pub(crate) struct TemplateLowering {
 
 /// Like [`lower_experimental_cypher_cached`], also reporting the parse and
 /// lower split of a cache miss.
+/// `session_user` is what GQL's `SESSION_USER` reads; it is bound per
+/// request, never into the cached template.
 pub(crate) fn lower_experimental_cypher_timed(
     query: &str,
     parameters: &BTreeMap<String, VertexPropertyValue>,
     lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
+    session_user: Option<&str>,
+) -> Result<(bool, LogicalQuery, TemplateLowering)> {
+    lower_experimental_cypher_with_id_properties(query, parameters, lists, session_user, false)
+}
+
+pub(crate) fn lower_experimental_cypher_with_id_properties(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
+    session_user: Option<&str>,
+    id_properties: bool,
 ) -> Result<(bool, LogicalQuery, TemplateLowering)> {
     let (explain, query) = split_explain(query)?;
     let parameters = experimental_parameter_map(parameters)?;
     let lists = experimental_list_parameter_map(lists);
-    let (template, lowering) = lowered_template(query)?;
-    Ok((explain, template.bind(&parameters, &lists), lowering))
+    let (template, lowering) = lowered_template_with_id_properties(query, id_properties)?;
+    Ok((explain, template.bind_as(&parameters, &lists, session_user), lowering))
 }
 
 /// Upper bound on cached templates. Each holds one AST and one logical plan
@@ -194,10 +210,7 @@ impl LoweredTemplateCache {
         self.remove_entry(query);
         // Evict least recently used until both the entry and byte budgets
         // hold. Each eviction is one pop from the ordered index.
-        while !self.entries.is_empty()
-            && (self.entries.len() >= self.max_entries
-                || self.resident_bytes + bytes > self.max_bytes)
-        {
+        while !self.entries.is_empty() && (self.entries.len() >= self.max_entries || self.resident_bytes + bytes > self.max_bytes) {
             if !self.evict_least_recently_used() {
                 break;
             }
@@ -228,12 +241,25 @@ fn lowered_template_cache() -> &'static Mutex<LoweredTemplateCache> {
 }
 
 fn lowered_template(query: &str) -> Result<(LoweredTemplate, TemplateLowering)> {
+    lowered_template_with_id_properties(query, false)
+}
+
+fn lowered_template_with_id_properties(query: &str, id_properties: bool) -> Result<(LoweredTemplate, TemplateLowering)> {
+    // A separate bounded cache prevents cross-layout reuse of the same text.
+    static PROPERTY_CACHE: OnceLock<Mutex<LoweredTemplateCache>> = OnceLock::new();
+    let cache = if id_properties {
+        PROPERTY_CACHE.get_or_init(|| {
+            Mutex::new(LoweredTemplateCache::new(
+                LOWERED_TEMPLATE_CACHE_ENTRIES,
+                LOWERED_TEMPLATE_CACHE_MAX_BYTES,
+            ))
+        })
+    } else {
+        lowered_template_cache()
+    };
     let cacheable = query.len() <= LOWERED_TEMPLATE_CACHE_MAX_QUERY_BYTES;
     if cacheable {
-        let cached = lowered_template_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(query);
+        let cached = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(query);
         if let Some(template) = cached {
             return Ok((
                 template.map_err(|error| experimental_query_error(error.reason, error.message))?,
@@ -244,7 +270,7 @@ fn lowered_template(query: &str) -> Result<(LoweredTemplate, TemplateLowering)> 
             ));
         }
     }
-    let (template, timings) = match LoweredTemplate::lower_timed(query) {
+    let (template, timings) = match LoweredTemplate::lower_timed_with_id_properties(query, id_properties) {
         Ok(lowered) => lowered,
         Err(error) => {
             // Lowering depends only on query text, never parameters or graph
@@ -252,34 +278,25 @@ fn lowered_template(query: &str) -> Result<(LoweredTemplate, TemplateLowering)> 
             // entry and byte limits so routing layers do not parse them again.
             if cacheable {
                 if let Some(reason) = error.failure_reason() {
-                    lowered_template_cache()
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert_outcome(
-                            query,
-                            Err(CachedLoweringFailure {
-                                reason,
-                                message: error.to_string(),
-                            }),
-                        );
+                    cache.lock().unwrap_or_else(|p| p.into_inner()).insert_outcome(
+                        query,
+                        Err(CachedLoweringFailure {
+                            reason,
+                            message: error.to_string(),
+                        }),
+                    );
                 }
             }
             return Err(experimental_engine_error(error));
         }
     };
     if cacheable {
-        lowered_template_cache()
+        cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(query, template.clone());
     }
-    Ok((
-        template,
-        TemplateLowering {
-            cache_hit: false,
-            timings,
-        },
-    ))
+    Ok((template, TemplateLowering { cache_hit: false, timings }))
 }
 
 pub(crate) fn experimental_query_columns(
@@ -316,9 +333,7 @@ pub(crate) fn is_experimental_explain(query: &str) -> bool {
         .is_some_and(|keyword| keyword.eq_ignore_ascii_case("EXPLAIN"))
 }
 
-pub(crate) fn experimental_parameter_map(
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<ParameterMap> {
+pub(crate) fn experimental_parameter_map(parameters: &BTreeMap<String, VertexPropertyValue>) -> Result<ParameterMap> {
     parameters
         .iter()
         .map(|(name, value)| Ok((name.clone(), property_to_scalar(value))))
@@ -328,17 +343,10 @@ pub(crate) fn experimental_parameter_map(
 /// The list sidecar the engine's `IN` reads. Element conversion is the same
 /// one scalars go through, so a list of strings binds exactly as fifty separate
 /// string parameters would.
-pub(crate) fn experimental_list_parameter_map(
-    lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
-) -> ListParameterMap {
+pub(crate) fn experimental_list_parameter_map(lists: &BTreeMap<String, Vec<VertexPropertyValue>>) -> ListParameterMap {
     lists
         .iter()
-        .map(|(name, values)| {
-            (
-                name.clone(),
-                values.iter().map(property_to_scalar).collect::<Vec<_>>(),
-            )
-        })
+        .map(|(name, values)| (name.clone(), values.iter().map(property_to_scalar).collect::<Vec<_>>()))
         .collect()
 }
 
@@ -349,6 +357,21 @@ pub(crate) fn property_to_scalar(value: &VertexPropertyValue) -> ScalarValue {
         VertexPropertyValue::Bool(value) => ScalarValue::Boolean(*value),
         VertexPropertyValue::Float(value) => ScalarValue::Float(value.0.to_string().into()),
         VertexPropertyValue::String(value) => ScalarValue::String(value.clone().into()),
+        VertexPropertyValue::Date(value) => ScalarValue::Date(*value),
+        VertexPropertyValue::List(values) => ScalarValue::List(match values {
+            crate::VertexPropertyList::Empty => Vec::new(),
+            crate::VertexPropertyList::Integer(values) => values
+                .iter()
+                .map(|value| match value {
+                    crate::VertexPropertyInteger::Unsigned(value) => ScalarValue::Integer(i128::from(*value)),
+                    crate::VertexPropertyInteger::Signed(value) => ScalarValue::Integer(i128::from(*value)),
+                })
+                .collect(),
+            crate::VertexPropertyList::Bool(values) => values.iter().copied().map(ScalarValue::Boolean).collect(),
+            crate::VertexPropertyList::Float(values) => values.iter().map(|value| ScalarValue::Float(value.0.to_string().into())).collect(),
+            crate::VertexPropertyList::String(values) => values.iter().map(|value| ScalarValue::String(value.clone().into())).collect(),
+            crate::VertexPropertyList::Date(values) => values.iter().copied().map(ScalarValue::Date).collect(),
+        }),
     }
 }
 
@@ -372,7 +395,12 @@ pub(crate) fn experimental_engine_error(error: EngineError) -> GraphError {
         Err(error) => error,
     };
     match error.failure_reason() {
-        Some(reason) => experimental_query_error(reason, error),
+        Some(reason) => GraphError::GqlQuery {
+            dialect: "Cypher25",
+            status: Box::new(gql_status_report(&error.status_object())),
+            feature: error.to_string(),
+            reason,
+        },
         // A storage failure that carried no typed error: its real class is
         // lost, so it keeps the wording clients always saw and is left
         // uncounted.
@@ -383,10 +411,29 @@ pub(crate) fn experimental_engine_error(error: EngineError) -> GraphError {
     }
 }
 
-pub(crate) fn experimental_query_error(
-    reason: QueryFailureReason,
-    error: impl std::fmt::Display,
-) -> GraphError {
+/// The engine's GQL-status object as the transports carry it.
+pub(crate) fn gql_status_report(object: &hydradb_cypher_engine::GqlStatusObject) -> crate::GqlStatusReport {
+    let mut diagnostic = std::collections::BTreeMap::new();
+    if let Some(record) = &object.diagnostic {
+        diagnostic.insert("OPERATION".to_string(), record.operation.to_string());
+        diagnostic.insert("OPERATION_CODE".to_string(), record.operation_code.to_string());
+        diagnostic.insert(
+            "CURRENT_SCHEMA".to_string(),
+            record.current_schema.clone().unwrap_or_else(|| "/".to_string()),
+        );
+        if let Some(reference) = &record.invalid_reference {
+            diagnostic.insert("INVALID_REFERENCE".to_string(), reference.clone());
+        }
+        diagnostic.extend(record.additional.iter().cloned());
+    }
+    crate::GqlStatusReport {
+        gql_status: object.status.to_string(),
+        description: object.description.clone(),
+        diagnostic,
+    }
+}
+
+pub(crate) fn experimental_query_error(reason: QueryFailureReason, error: impl std::fmt::Display) -> GraphError {
     GraphError::UnsupportedQuery {
         dialect: "Cypher25",
         feature: error.to_string(),
@@ -397,10 +444,7 @@ pub(crate) fn experimental_query_error(
 fn split_explain(query: &str) -> Result<(bool, &str)> {
     let query = query.trim();
     let Some(first) = query.split_whitespace().next() else {
-        return Err(experimental_query_error(
-            QueryFailureReason::ParseError,
-            "query is empty",
-        ));
+        return Err(experimental_query_error(QueryFailureReason::ParseError, "query is empty"));
     };
     if !is_experimental_explain(query) {
         return Ok((false, query));

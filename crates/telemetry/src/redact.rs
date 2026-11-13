@@ -60,12 +60,9 @@ const DENYLIST: &[&str] = &[
 /// than substring matching is deliberate: substring would swallow
 /// `parameter_count`, which is a harmless integer and genuinely useful.
 pub fn is_redacted(name: &str) -> bool {
-    DENYLIST.iter().any(|denied| {
-        name == *denied
-            || name
-                .strip_suffix(denied)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    DENYLIST
+        .iter()
+        .any(|denied| name == *denied || name.strip_suffix(denied).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 /// A [`Visit`] wrapper that substitutes [`REDACTED`] for denylisted values and

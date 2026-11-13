@@ -10,9 +10,7 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_write_authority(cell_id, "delete_graph_artifacts_before")?;
-        let _permit = self
-            .acquire_gc_permit("delete_graph_artifacts_before")
-            .await?;
+        let _permit = self.acquire_gc_permit("delete_graph_artifacts_before").await?;
         let started = Instant::now();
         let mut result = ArtifactGcResult::default();
         let mut batch = GraphWriteBatch::new();
@@ -30,38 +28,27 @@ impl GraphShard {
                     result.deleted_keys = result.deleted_keys.saturating_add(1);
                     pending_deletes = pending_deletes.saturating_add(1);
                     if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS {
-                        flush_artifact_gc_batch(
-                            self,
-                            cell_id,
-                            "delete_graph_artifacts_before",
-                            &mut batch,
-                            &mut pending_deletes,
-                        )
-                        .await?;
+                        flush_artifact_gc_batch(self, cell_id, "delete_graph_artifacts_before", &mut batch, &mut pending_deletes).await?;
                     }
                 } else {
                     result.retained_keys = result.retained_keys.saturating_add(1);
                 }
             }
         }
-        flush_artifact_gc_batch(
-            self,
-            cell_id,
-            "delete_graph_artifacts_before",
-            &mut batch,
-            &mut pending_deletes,
-        )
-        .await?;
+        flush_artifact_gc_batch(self, cell_id, "delete_graph_artifacts_before", &mut batch, &mut pending_deletes).await?;
 
-        self.matrix_artifact_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
-        });
-        self.matrix_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
-        });
-        self.graphblas_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
-        });
+        self.matrix_artifact_cache
+            .lock()
+            .await
+            .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch);
+        self.matrix_cache
+            .lock()
+            .await
+            .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch);
+        self.graphblas_cache
+            .lock()
+            .await
+            .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch);
         self.record_gc_completed(result.deleted_keys, started.elapsed());
         Ok(result)
     }

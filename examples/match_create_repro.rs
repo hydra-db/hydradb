@@ -40,25 +40,13 @@ fn main() {
     println!("\n== WRITES (mutation engine) ==\n");
     let writes = [
         // Works: a whole subgraph created fresh in one shot.
-        (
-            "create-fresh-subgraph",
-            "CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})",
-        ),
+        ("create-fresh-subgraph", "CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})"),
         // THE BUG: attach a new edge/node to already-existing data.
-        (
-            "match-then-create",
-            "MATCH (x {id: 1}) CREATE (x)-[:REL2]->(z {id: 3})",
-        ),
+        ("match-then-create", "MATCH (x {id: 1}) CREATE (x)-[:REL2]->(z {id: 3})"),
         // Reported: string id property instead of integer.
-        (
-            "create-string-id",
-            "CREATE (a {key: \"abc\"})-[:REL]->(b {key: \"xyz\"})",
-        ),
+        ("create-string-id", "CREATE (a {key: \"abc\"})-[:REL]->(b {key: \"xyz\"})"),
         // Reported: two CREATE clauses chained in one query.
-        (
-            "create-then-create",
-            "CREATE (a {id: 1}) CREATE (b {id: 2})",
-        ),
+        ("create-then-create", "CREATE (a {id: 1}) CREATE (b {id: 2})"),
         // For contrast: MATCH ... SET / DELETE *is* accepted post-MATCH.
         ("match-then-set", "MATCH (x {id: 1}) SET x.seen = 1"),
         // WORKAROUND for match-then-create: vertices are addressed by their
@@ -68,14 +56,8 @@ fn main() {
         // MERGE probes: which shapes does the mutation engine accept?
         ("merge-edge", "MERGE (a {id: 1})-[:REL2]->(b {id: 3})"),
         ("merge-single-node", "MERGE (a {id: 1})"),
-        (
-            "merge-on-create",
-            "MERGE (a {id: 1})-[:REL2]->(b {id: 3}) ON CREATE SET b.new = 1",
-        ),
-        (
-            "merge-string-id",
-            "MERGE (a {key: \"abc\"})-[:REL2]->(b {key: \"xyz\"})",
-        ),
+        ("merge-on-create", "MERGE (a {id: 1})-[:REL2]->(b {id: 3}) ON CREATE SET b.new = 1"),
+        ("merge-string-id", "MERGE (a {key: \"abc\"})-[:REL2]->(b {key: \"xyz\"})"),
     ];
 
     for (name, query) in writes {

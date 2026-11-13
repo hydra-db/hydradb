@@ -52,11 +52,7 @@ pub trait StatisticsProvider: Send + Sync {
     /// The numeric domain of a vertex property's index entries, for
     /// estimating the share of entries a range keeps. `None` when unknown, or
     /// when the property holds no number.
-    fn property_numeric_range(
-        &self,
-        _labels: &[Symbol],
-        _property: &Symbol,
-    ) -> Option<PropertyNumericRange> {
+    fn property_numeric_range(&self, _labels: &[Symbol], _property: &Symbol) -> Option<PropertyNumericRange> {
         None
     }
 
@@ -64,11 +60,7 @@ pub trait StatisticsProvider: Send + Sync {
         None
     }
 
-    fn property_statistics(
-        &self,
-        _labels: &[Symbol],
-        _property: &Symbol,
-    ) -> Option<PropertyStatistics> {
+    fn property_statistics(&self, _labels: &[Symbol], _property: &Symbol) -> Option<PropertyStatistics> {
         None
     }
 
@@ -76,12 +68,7 @@ pub trait StatisticsProvider: Send + Sync {
     /// `property_statistics`, this can consume a persisted point-frequency
     /// record and avoids assuming a uniform histogram when a hot value is
     /// known explicitly.
-    fn property_value_count(
-        &self,
-        _labels: &[Symbol],
-        _property: &Symbol,
-        _value: &ScalarValue,
-    ) -> Option<u64> {
+    fn property_value_count(&self, _labels: &[Symbol], _property: &Symbol, _value: &ScalarValue) -> Option<u64> {
         None
     }
 
@@ -105,40 +92,21 @@ pub trait StatisticsProvider: Send + Sync {
         None
     }
 
-    fn relationship_property_statistics(
-        &self,
-        _relationship_types: &[Symbol],
-        _property: &Symbol,
-    ) -> Option<PropertyStatistics> {
+    fn relationship_property_statistics(&self, _relationship_types: &[Symbol], _property: &Symbol) -> Option<PropertyStatistics> {
         None
     }
 
-    fn relationship_property_value_count(
-        &self,
-        _relationship_types: &[Symbol],
-        _property: &Symbol,
-        _value: &ScalarValue,
-    ) -> Option<u64> {
+    fn relationship_property_value_count(&self, _relationship_types: &[Symbol], _property: &Symbol, _value: &ScalarValue) -> Option<u64> {
         None
     }
 
-    fn relationship_bloom_may_contain(
-        &self,
-        _relationship_types: &[Symbol],
-        _property: &Symbol,
-        _value: &ScalarValue,
-    ) -> Option<bool> {
+    fn relationship_bloom_may_contain(&self, _relationship_types: &[Symbol], _property: &Symbol, _value: &ScalarValue) -> Option<bool> {
         None
     }
 
     /// `Some(false)` means definitely absent; `Some(true)` means possibly
     /// present. `None` means no compatible bloom filter was loaded.
-    fn bloom_may_contain(
-        &self,
-        _labels: &[Symbol],
-        _property: &Symbol,
-        _value: &ScalarValue,
-    ) -> Option<bool> {
+    fn bloom_may_contain(&self, _labels: &[Symbol], _property: &Symbol, _value: &ScalarValue) -> Option<bool> {
         None
     }
 }

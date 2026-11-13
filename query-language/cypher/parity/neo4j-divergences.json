@@ -1,0 +1,12 @@
+{
+  "about": [
+    "Known, argued differences between HydraDB's recorded answer for a parity",
+    "matrix row and what Neo4j returns for the same query on the same graph.",
+    "Read by query-language/cypher/scripts/neo4j_parity_oracle.py. A listed row may differ from Neo4j;",
+    "an unlisted row may not. A listed row that agrees with Neo4j again fails",
+    "the run, so an entry cannot outlive the difference it excuses.",
+    "Each entry names the row, the kind of difference (semantics, type,",
+    "ordering, error), why HydraDB keeps it, and who reviewed that reasoning."
+  ],
+  "divergences": []
+}

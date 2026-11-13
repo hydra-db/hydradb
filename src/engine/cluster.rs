@@ -1,5 +1,7 @@
 use super::*;
 use crate::keys;
+#[cfg(feature = "datafusion-cypher-engine")]
+use crate::QueryFailureReason;
 
 use chrono::Utc;
 use hydradb_placement::cell_writer::{self, CellWriterRecord};
@@ -34,14 +36,7 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_cells_scoped_with_options(
-            base_path,
-            scope,
-            cell_ids,
-            object_store,
-            GraphOpenOptions::default(),
-        )
-        .await
+        Self::open_cells_scoped_with_options(base_path, scope, cell_ids, object_store, GraphOpenOptions::default()).await
     }
 
     pub async fn open_cells_scoped_with_options(
@@ -60,13 +55,7 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_cells_standalone_writers_scoped(
-            base_path,
-            GraphScope::default(),
-            cell_ids,
-            object_store,
-        )
-        .await
+        Self::open_cells_standalone_writers_scoped(base_path, GraphScope::default(), cell_ids, object_store).await
     }
 
     pub async fn open_cells_standalone_writers_scoped(
@@ -76,15 +65,7 @@ impl GraphCluster {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         let store_path = scope.scoped_store_path(&base_path.into());
-        Self::open_cells_at_path(
-            store_path,
-            scope,
-            cell_ids,
-            object_store,
-            true,
-            GraphOpenOptions::default(),
-        )
-        .await
+        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, true, GraphOpenOptions::default()).await
     }
 
     async fn open_cells_at_path(
@@ -95,10 +76,7 @@ impl GraphCluster {
         writable: bool,
         options: GraphOpenOptions,
     ) -> Result<Self> {
-        let cell_ids = cell_ids
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<String>>();
+        let cell_ids = cell_ids.into_iter().map(Into::into).collect::<Vec<String>>();
         for cell_id in &cell_ids {
             validate_component("cell_id", cell_id)?;
         }
@@ -106,15 +84,9 @@ impl GraphCluster {
         for cell_id in cell_ids {
             let path = format!("{base_path}/{cell_id}");
             let opened = if writable {
-                GraphShard::open_standalone_writer_with_options(
-                    path,
-                    Arc::clone(&object_store),
-                    options.clone(),
-                )
-                .await
+                GraphShard::open_standalone_writer_with_options(path, Arc::clone(&object_store), options.clone()).await
             } else {
-                GraphShard::open_with_options(path, Arc::clone(&object_store), options.clone())
-                    .await
+                GraphShard::open_with_options(path, Arc::clone(&object_store), options.clone()).await
             };
             let shard = match opened {
                 Ok(shard) => shard,
@@ -123,6 +95,9 @@ impl GraphCluster {
                     return Err(err);
                 }
             };
+            let shard = Arc::new(shard);
+            #[cfg(feature = "datafusion-cypher-engine")]
+            shard.register_datafusion_self(&shard);
             shards.insert(cell_id, shard);
         }
         Ok(Self { scope, shards })
@@ -133,11 +108,44 @@ impl GraphCluster {
     }
 
     pub fn shard(&self, cell_id: &str) -> Option<&GraphShard> {
-        self.shards.get(cell_id)
+        self.shards.get(cell_id).map(Arc::as_ref)
+    }
+
+    #[cfg(any(feature = "opencypher", feature = "datafusion-cypher-engine"))]
+    pub(crate) fn shard_arc(&self, cell_id: &str) -> Option<Arc<GraphShard>> {
+        self.shards.get(cell_id).cloned()
     }
 
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher(&self, context: crate::QueryContext, query: &str) -> Result<crate::QueryOutput> {
+        if context.scope != self.scope {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope.to_string(),
+                actual: context.scope.to_string(),
+            });
+        }
+        let shard = self.shard_arc(&context.cell_id).ok_or_else(|| GraphError::UnknownShard {
+            cell_id: context.cell_id.clone(),
+        })?;
+        shard.execute_cypher(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows(&self, context: crate::QueryContext, query: &str) -> Result<crate::QueryResultSet> {
+        if context.scope != self.scope {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope.to_string(),
+                actual: context.scope.to_string(),
+            });
+        }
+        let shard = self.shard_arc(&context.cell_id).ok_or_else(|| GraphError::UnknownShard {
+            cell_id: context.cell_id.clone(),
+        })?;
+        shard.execute_cypher_rows(context, query).await
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -234,15 +242,7 @@ impl RoutedGraphCluster {
         placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_readers_scoped(
-            base_path,
-            GraphScope::default(),
-            local_node_id,
-            directory,
-            placement,
-            object_store,
-        )
-        .await
+        Self::open_readers_scoped(base_path, GraphScope::default(), local_node_id, directory, placement, object_store).await
     }
 
     pub async fn open_promotable(
@@ -327,11 +327,8 @@ impl RoutedGraphCluster {
     ) -> Result<Self> {
         let writer_registry = process_writer_registry(&object_store);
         let base_path = base_path.into();
-        let writer_leases = super::writer_lease::process_writer_lease_directory(
-            base_path.clone(),
-            Arc::clone(&object_store),
-            Duration::from_secs(30),
-        );
+        let writer_leases =
+            super::writer_lease::process_writer_lease_directory(base_path.clone(), Arc::clone(&object_store), Duration::from_secs(30));
         Self::open_promotable_scoped_with_writer_registry(
             base_path,
             scope,
@@ -440,21 +437,11 @@ impl RoutedGraphCluster {
                     options.clone(),
                     memory.clone(),
                     &local_node_id,
-                    Arc::clone(
-                        writer_registry
-                            .as_ref()
-                            .expect("promotable cluster must retain a writer registry"),
-                    ),
+                    Arc::clone(writer_registry.as_ref().expect("promotable cluster must retain a writer registry")),
                 )
                 .await
             } else {
-                GraphShard::open_with_memory_options(
-                    path,
-                    Arc::clone(&object_store),
-                    options.clone(),
-                    memory.clone(),
-                )
-                .await
+                GraphShard::open_with_memory_options(path, Arc::clone(&object_store), options.clone(), memory.clone()).await
             };
             let mut shard = match opened {
                 Ok(shard) => shard,
@@ -466,24 +453,20 @@ impl RoutedGraphCluster {
                     return Err(err);
                 }
             };
-            if !promotable
-                && shard
-                    .read_remote(&keys::cell_drop_marker(&cell_id))
-                    .await?
-                    .is_some()
-            {
+            if !promotable && shard.read_remote(&keys::cell_drop_marker(&cell_id)).await?.is_some() {
                 shard.close().await?;
                 continue;
             }
             if let Some(totals) = cache_totals.get(&cell_id) {
-                shard.cache_metrics =
-                    Arc::new(crate::GraphCacheMetrics::with_totals(Arc::clone(totals)));
+                shard.cache_metrics = Arc::new(crate::GraphCacheMetrics::with_totals(Arc::clone(totals)));
             }
             if let Some(totals) = &operational_totals {
-                operational_registrations
-                    .push(totals.register(cell_id.clone(), Arc::clone(&shard.operation_metrics)));
+                operational_registrations.push(totals.register(cell_id.clone(), Arc::clone(&shard.operation_metrics)));
             }
-            shards.insert(cell_id, Arc::new(shard));
+            let shard = shard.into_shared();
+            #[cfg(feature = "datafusion-cypher-engine")]
+            shard.register_datafusion_self(&shard);
+            shards.insert(cell_id, shard);
         }
         Ok(Self {
             scope,
@@ -522,8 +505,11 @@ impl RoutedGraphCluster {
     pub async fn local_shard_runtime_metrics(&self) -> Vec<GraphShardRuntimeMetrics> {
         let mut metrics = Vec::with_capacity(self.shards.len());
         for (cell_id, shard) in &self.shards {
+            let write_permit_capacity = shard.graph_write_permit_capacity;
             metrics.push(GraphShardRuntimeMetrics {
                 cell_id: cell_id.clone(),
+                write_permits_in_use: write_permit_capacity.saturating_sub(shard.graph_write_gate.available_permits()),
+                write_permit_capacity,
                 operational: shard.graph_operational_metrics(),
                 cache: shard.graph_cache_metrics(),
                 cache_entries: shard.graph_cache_entry_counts().await,
@@ -536,12 +522,18 @@ impl RoutedGraphCluster {
 
     pub fn shard(&self, cell_id: &str) -> Result<&GraphShard> {
         validate_component("cell_id", cell_id)?;
-        self.shards
-            .get(cell_id)
-            .map(Arc::as_ref)
-            .ok_or_else(|| GraphError::UnknownShard {
-                cell_id: cell_id.to_string(),
-            })
+        self.shards.get(cell_id).map(Arc::as_ref).ok_or_else(|| GraphError::UnknownShard {
+            cell_id: cell_id.to_string(),
+        })
+    }
+
+    /// [`Self::shard`] as an owned handle, for work that outlives the call.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn shard_arc(&self, cell_id: &str) -> Result<Arc<GraphShard>> {
+        validate_component("cell_id", cell_id)?;
+        self.shards.get(cell_id).cloned().ok_or_else(|| GraphError::UnknownShard {
+            cell_id: cell_id.to_string(),
+        })
     }
 
     #[cfg(feature = "query-transport")]
@@ -552,10 +544,11 @@ impl RoutedGraphCluster {
     #[cfg(feature = "query-transport")]
     fn holds_unowned_writer(&self) -> bool {
         self.shards.iter().any(|(cell_id, shard)| {
-            shard.db.writer_epoch().is_some()
-                && !self.writer_leases.as_ref().is_some_and(|leases| {
-                    leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id)
-                })
+            shard.storage.writer_epoch().is_some()
+                && !self
+                    .writer_leases
+                    .as_ref()
+                    .is_some_and(|leases| leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id))
         })
     }
 
@@ -601,9 +594,7 @@ impl RoutedGraphCluster {
             hydradb.writer.lease_generation = tracing::field::Empty,
             error.class = tracing::field::Empty,
         );
-        self.ensure_local_writer_traced(cell_id)
-            .instrument(span)
-            .await
+        self.ensure_local_writer_traced(cell_id).instrument(span).await
     }
 
     /// The body of [`Self::ensure_local_writer`], running inside its span.
@@ -641,17 +632,13 @@ impl RoutedGraphCluster {
             })
             .inspect_err(record_error_class)?;
 
-        let writer_leases = self
-            .writer_leases
-            .as_ref()
-            .expect("promotable routed clusters have writer leases");
+        let writer_leases = self.writer_leases.as_ref().expect("promotable routed clusters have writer leases");
         // Placement is the stable routing preference, while the object-store
         // lease is the authority. An existing lease holder must keep serving
         // through a temporarily divergent heartbeat view; a node without a
         // lease may contend only when rendezvous currently selects it.
-        let can_resume_durable_lease =
-            writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id)
-                || writer_leases.holds_abandoned_local(&self.scope, cell_id, &self.local_node_id);
+        let can_resume_durable_lease = writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id)
+            || writer_leases.holds_abandoned_local(&self.scope, cell_id, &self.local_node_id);
         if !can_resume_durable_lease {
             self.resolve_placement(cell_id)?;
         }
@@ -672,12 +659,9 @@ impl RoutedGraphCluster {
         // this check the record would be rewritten on every single write, which
         // is precisely the object-store request on the write path that decision
         // 3 refuses to add.
-        let already_writing = shard.db.writer_epoch().is_some();
+        let already_writing = shard.storage.writer_epoch().is_some();
         if let Err(error) = shard.promote_to_writer(cell_id, "routed_write").await {
-            if let Err(release_error) = writer_leases
-                .release_cell(&self.scope, cell_id, &self.local_node_id)
-                .await
-            {
+            if let Err(release_error) = writer_leases.release_cell(&self.scope, cell_id, &self.local_node_id).await {
                 tracing::warn!(
                     %release_error,
                     %cell_id,
@@ -702,7 +686,7 @@ impl RoutedGraphCluster {
             record_error_class(&error);
             return Err(error);
         }
-        if let Some(epoch) = shard.db.writer_epoch() {
+        if let Some(epoch) = shard.storage.writer_epoch() {
             // The climbing value in the ping-pong query. Taken from the
             // manifest, which is the authority; the advisory record written
             // below only ever repeats it.
@@ -792,7 +776,7 @@ impl RoutedGraphCluster {
     ///   from the manifest of the writer just opened, which remains the only
     ///   authority on who holds it.
     async fn record_cell_writer(&self, shard: &GraphShard, cell_id: &str) {
-        let Some(epoch) = shard.db.writer_epoch() else {
+        let Some(epoch) = shard.storage.writer_epoch() else {
             // Racing a fence between the promotion and this line. The record
             // would name an epoch this node no longer holds, so write nothing.
             tracing::debug!(
@@ -802,11 +786,11 @@ impl RoutedGraphCluster {
             );
             return;
         };
-        let Some((base, _)) = shard.db.cell_location() else {
+        let Some((base, _)) = shard.storage.cell_location() else {
             tracing::warn!(
                 node_id = %self.local_node_id,
                 cell_id,
-                path = %shard.db.store_path(),
+                path = %shard.storage.store_path(),
                 "no base path to write the advisory cell-writer record under"
             );
             return;
@@ -814,10 +798,7 @@ impl RoutedGraphCluster {
         // The one clock read on this path, and it is here rather than inside
         // `CellWriterRecord` by decision 10.
         let record = CellWriterRecord::new(&self.local_node_id, epoch, Utc::now());
-        if let Err(error) =
-            cell_writer::put_cell_writer(shard.db.object_store().as_ref(), &base, cell_id, &record)
-                .await
-        {
+        if let Err(error) = cell_writer::put_cell_writer(shard.storage.object_store().as_ref(), &base, cell_id, &record).await {
             // Advisory: the write path is already past this point.
             tracing::warn!(
                 node_id = %self.local_node_id,
@@ -855,10 +836,10 @@ impl RoutedGraphCluster {
         // A shard that already holds its writer is not re-opening anything, so
         // the gate does not apply to it — only a promotion that would really
         // open a writer is paced.
-        if shard.db.writer().is_ok() {
+        if shard.storage.writer().is_ok() {
             return Ok(());
         }
-        let Some(delay) = shard.db.writer_reopen_delay() else {
+        let Some(delay) = shard.storage.writer_reopen_delay() else {
             return Ok(());
         };
         let cap = self.placement.config().heartbeat_interval;
@@ -931,9 +912,7 @@ impl RoutedGraphCluster {
     ) -> Result<crate::EdgeDeleteBatchResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .delete_edges_batch(cell_id, edge_type, edges, idempotency_key)
-            .await
+        shard.delete_edges_batch(cell_id, edge_type, edges, idempotency_key).await
     }
 
     pub async fn delete_edges_batch_chunked(
@@ -969,9 +948,7 @@ impl RoutedGraphCluster {
     ) -> Result<crate::VertexDeleteResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .delete_vertex(cell_id, vertex_id, idempotency_key)
-            .await
+        shard.delete_vertex(cell_id, vertex_id, idempotency_key).await
     }
 
     pub async fn detach_delete_vertex(
@@ -982,16 +959,10 @@ impl RoutedGraphCluster {
     ) -> Result<crate::VertexDeleteResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .detach_delete_vertex(cell_id, vertex_id, idempotency_key)
-            .await
+        shard.detach_delete_vertex(cell_id, vertex_id, idempotency_key).await
     }
 
-    pub async fn drop_cell(
-        &self,
-        cell_id: &str,
-        idempotency_key: &str,
-    ) -> Result<crate::GraphCellDropResult> {
+    pub async fn drop_cell(&self, cell_id: &str, idempotency_key: &str) -> Result<crate::GraphCellDropResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
         shard.drop_cell(cell_id, idempotency_key).await
@@ -1005,9 +976,7 @@ impl RoutedGraphCluster {
     ) -> Result<crate::EdgeIngestResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .ingest_edge_mutations(cell_id, mutations, options)
-            .await
+        shard.ingest_edge_mutations(cell_id, mutations, options).await
     }
 
     pub async fn bulk_import_edges(
@@ -1019,9 +988,7 @@ impl RoutedGraphCluster {
     ) -> Result<crate::BulkImportResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .bulk_import_edges(cell_id, edge_type, edges, idempotency_key)
-            .await
+        shard.bulk_import_edges(cell_id, edge_type, edges, idempotency_key).await
     }
 
     pub async fn write_edges_batch(
@@ -1033,9 +1000,7 @@ impl RoutedGraphCluster {
     ) -> Result<crate::BulkImportResult> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .write_edges_batch(cell_id, edge_type, edges, idempotency_key)
-            .await
+        shard.write_edges_batch(cell_id, edge_type, edges, idempotency_key).await
     }
 
     pub async fn write_edges_batch_chunked(
@@ -1053,17 +1018,10 @@ impl RoutedGraphCluster {
             .await
     }
 
-    pub async fn set_vertex_metadata(
-        &self,
-        cell_id: &str,
-        vertex_id: crate::VertexId,
-        metadata: crate::VertexMetadata,
-    ) -> Result<()> {
+    pub async fn set_vertex_metadata(&self, cell_id: &str, vertex_id: crate::VertexId, metadata: crate::VertexMetadata) -> Result<()> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .set_vertex_metadata(cell_id, vertex_id, metadata)
-            .await
+        shard.set_vertex_metadata(cell_id, vertex_id, metadata).await
     }
 
     pub async fn set_vertex_metadata_batch(
@@ -1096,9 +1054,7 @@ impl RoutedGraphCluster {
     ) -> Result<bool> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
-            .await
+        shard.set_edge_metadata(cell_id, edge_type, src, dst, metadata).await
     }
 
     pub async fn set_edge_metadata_batch(
@@ -1109,9 +1065,7 @@ impl RoutedGraphCluster {
     ) -> Result<usize> {
         let shard = self.shard(cell_id)?;
         self.ensure_local_writer(cell_id).await?;
-        shard
-            .set_edge_metadata_batch(cell_id, edge_type, updates)
-            .await
+        shard.set_edge_metadata_batch(cell_id, edge_type, updates).await
     }
 
     pub async fn import_relationships_batch(
@@ -1144,9 +1098,7 @@ impl RoutedGraphCluster {
         edge_type: &str,
         sources: impl IntoIterator<Item = VertexId>,
     ) -> Result<Vec<crate::NeighborBatchEntry>> {
-        self.shard(cell_id)?
-            .out_neighbors_batch(cell_id, edge_type, sources)
-            .await
+        self.shard(cell_id)?.out_neighbors_batch(cell_id, edge_type, sources).await
     }
 
     pub async fn in_neighbors_batch(
@@ -1155,9 +1107,7 @@ impl RoutedGraphCluster {
         edge_type: &str,
         destinations: impl IntoIterator<Item = VertexId>,
     ) -> Result<Vec<crate::NeighborBatchEntry>> {
-        self.shard(cell_id)?
-            .in_neighbors_batch(cell_id, edge_type, destinations)
-            .await
+        self.shard(cell_id)?.in_neighbors_batch(cell_id, edge_type, destinations).await
     }
 
     pub async fn edge_exists_batch(
@@ -1166,9 +1116,7 @@ impl RoutedGraphCluster {
         edge_type: &str,
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
     ) -> Result<Vec<crate::EdgeExistenceBatchEntry>> {
-        self.shard(cell_id)?
-            .edge_exists_batch(cell_id, edge_type, edges)
-            .await
+        self.shard(cell_id)?.edge_exists_batch(cell_id, edge_type, edges).await
     }
 
     pub async fn execute_query_statement(
@@ -1194,12 +1142,17 @@ impl RoutedGraphCluster {
     }
 
     #[cfg(feature = "opencypher")]
-    pub async fn execute_cypher(
-        &self,
-        context: crate::QueryContext,
-        query: &str,
-    ) -> Result<crate::QueryOutput> {
+    pub async fn execute_cypher(&self, context: crate::QueryContext, query: &str) -> Result<crate::QueryOutput> {
         self.ensure_query_scope(&context.scope)?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == crate::CypherEngineMode::DataFusion {
+            let shard = self.shard_arc(&context.cell_id)?;
+            let prepared = shard.prepare_datafusion_cypher(&context, query).await?;
+            if prepared.effect == crate::PreparedCypherEffect::Write {
+                self.ensure_local_writer(&context.cell_id).await?;
+            }
+            return shard.execute_datafusion_cypher(context, query).await;
+        }
         let shard = self.shard(&context.cell_id)?;
         let requires_writer = matches!(
             crate::query::opencypher::classify_opencypher_query_access(query)?,
@@ -1207,17 +1160,25 @@ impl RoutedGraphCluster {
         );
         if requires_writer {
             self.ensure_local_writer(&context.cell_id).await?;
+            let shard = self.shard_arc(&context.cell_id)?;
+            let query = query.to_string();
+            return run_write_to_completion(async move { shard.execute_cypher(context, &query).await }).await;
         }
         shard.execute_cypher(context, query).await
     }
 
     #[cfg(feature = "opencypher")]
-    pub async fn execute_cypher_rows(
-        &self,
-        context: crate::QueryContext,
-        query: &str,
-    ) -> Result<crate::QueryResultSet> {
+    pub async fn execute_cypher_rows(&self, context: crate::QueryContext, query: &str) -> Result<crate::QueryResultSet> {
         self.ensure_query_scope(&context.scope)?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == crate::CypherEngineMode::DataFusion {
+            let shard = self.shard_arc(&context.cell_id)?;
+            let prepared = shard.prepare_datafusion_cypher(&context, query).await?;
+            if prepared.effect == crate::PreparedCypherEffect::Write {
+                self.ensure_local_writer(&context.cell_id).await?;
+            }
+            return shard.execute_datafusion_cypher_rows(context, query).await;
+        }
         let shard = self.shard(&context.cell_id)?;
         shard.execute_cypher_rows(context, query).await
     }
@@ -1231,10 +1192,24 @@ impl RoutedGraphCluster {
         page_size: usize,
     ) -> Result<crate::QueryResultPage> {
         self.ensure_query_scope(&context.scope)?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == crate::CypherEngineMode::DataFusion {
+            let shard = self.shard_arc(&context.cell_id)?;
+            let prepared = shard.prepare_datafusion_cypher(&context, query).await?;
+            if prepared.effect == crate::PreparedCypherEffect::Write {
+                if cursor.is_some() {
+                    return Err(GraphError::UnsupportedQuery {
+                        reason: QueryFailureReason::InvalidRequest,
+                        dialect: "ClientProtocol",
+                        feature: "mutation queries cannot continue from a result cursor".to_string(),
+                    });
+                }
+                self.ensure_local_writer(&context.cell_id).await?;
+            }
+            return shard.execute_datafusion_cypher_rows_page(context, query, cursor, page_size).await;
+        }
         let shard = self.shard(&context.cell_id)?;
-        shard
-            .execute_cypher_rows_page(context, query, cursor, page_size)
-            .await
+        shard.execute_cypher_rows_page(context, query, cursor, page_size).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -1261,7 +1236,7 @@ impl RoutedGraphCluster {
         Ok(result_sets)
     }
 
-    fn ensure_query_scope(&self, scope: &GraphScope) -> Result<()> {
+    pub(crate) fn ensure_query_scope(&self, scope: &GraphScope) -> Result<()> {
         if scope == &self.scope {
             return Ok(());
         }
@@ -1313,6 +1288,46 @@ impl RoutedGraphCluster {
                 reason: failures.join("; "),
             })
         }
+    }
+}
+
+/// Evicted scopes that may finish closing in the background at once. Each
+/// one still holds its SlateDB handles (a writer's memtable among them) until
+/// it closes, so this is how far open-or-closing scopes may exceed
+/// `max_open_scopes`; past it, the evicting request closes the scope itself.
+#[cfg(feature = "query-transport")]
+const BACKGROUND_SCOPE_CLOSES: u32 = 8;
+
+/// Background scope closes that failed, held for `close` to report. Each
+/// failure is also logged when it happens, so a long-running node with a
+/// failing store keeps only a count past the first few messages.
+#[cfg(feature = "query-transport")]
+#[derive(Debug, Default)]
+pub(super) struct BackgroundCloseFailures {
+    count: u64,
+    first: Vec<String>,
+}
+
+#[cfg(feature = "query-transport")]
+impl BackgroundCloseFailures {
+    const KEPT: usize = 8;
+
+    fn record(&mut self, failure: String) {
+        self.count += 1;
+        if self.first.len() < Self::KEPT {
+            self.first.push(failure);
+        }
+    }
+
+    /// The kept messages, then how many more failed: what `close` reports.
+    fn take_report(&mut self) -> Vec<String> {
+        let taken = std::mem::take(self);
+        let mut report = taken.first;
+        let omitted = taken.count - report.len() as u64;
+        if omitted > 0 {
+            report.push(format!("{omitted} more background scope closes failed; each is in the error log"));
+        }
+        report
     }
 }
 
@@ -1385,34 +1400,24 @@ impl ScopedRoutedGraphCluster {
                 limit: 1,
             });
         }
-        let possible_cache_handles = max_open_scopes
-            .saturating_mul(directory.cells().count())
-            .saturating_mul(2);
-        if options.cache.object_store_cache_dir.is_some()
-            && options.cache.object_store_cache_max_open_file_handles < possible_cache_handles
-        {
-            return Err(GraphError::AdmissionRejected {
-                operation: "data_cache_file_handle_budget",
-                actual: possible_cache_handles as u64,
-                limit: options.cache.object_store_cache_max_open_file_handles as u64,
+        // Every scope reads through one disk cache the caller built over
+        // `object_store` (`SharedDiskCache`). A cache in the options would be
+        // one per scope, each with the whole budget or a slice of it, which is
+        // the thrash the shared cache replaces.
+        if options.cache.object_store_cache_dir.is_some() {
+            return Err(GraphError::CorruptValue {
+                key: "options/cache/object_store_cache_dir".to_string(),
+                reason: "a scoped runtime shares one disk cache; fix: build it with SharedDiskCache::take and pass its object store"
+                    .to_string(),
             });
         }
         let writer_registry = process_writer_registry(&object_store);
-        let slatedb_cache =
-            crate::process_slate_db_cache(&object_store, options.cache.slatedb_cache_bytes)?;
-        let writer_leases = super::writer_lease::process_writer_lease_directory(
-            base_path.clone(),
-            Arc::clone(&object_store),
-            writer_lease_duration,
-        );
+        let slatedb_cache = crate::process_slate_db_cache_with_config(&object_store, options.cache.slatedb_cache_config())?;
+        let writer_leases =
+            super::writer_lease::process_writer_lease_directory(base_path.clone(), Arc::clone(&object_store), writer_lease_duration);
         let cache_totals = directory
             .cells()
-            .map(|cell| {
-                (
-                    cell.to_owned(),
-                    Arc::new(crate::GraphCacheMetrics::default()),
-                )
-            })
+            .map(|cell| (cell.to_owned(), Arc::new(crate::GraphCacheMetrics::default())))
             .collect();
         let operational_totals = Arc::new(crate::CumulativeOperationalCounters::default());
         Ok(Self {
@@ -1422,13 +1427,9 @@ impl ScopedRoutedGraphCluster {
             local_node_id,
             directory,
             placement,
-            scope_directory: ObjectStoreGraphScopeDirectory::new(
-                base_path,
-                root_namespace,
-                graph_id,
-                Arc::clone(&object_store),
-            ),
+            scope_directory: ObjectStoreGraphScopeDirectory::new(base_path, root_namespace, graph_id, Arc::clone(&object_store)),
             indexer_change_wake: None,
+            shared_disk_cache: None,
             object_store,
             slatedb_cache,
             cache_totals,
@@ -1446,6 +1447,9 @@ impl ScopedRoutedGraphCluster {
             scope_capacity_gate: tokio::sync::Mutex::new(()),
             scope_capacity_available: Arc::new(tokio::sync::Notify::new()),
             scope_open_reservations: Arc::new(AtomicUsize::new(0)),
+            scope_close_budget: Arc::new(tokio::sync::Semaphore::new(BACKGROUND_SCOPE_CLOSES as usize)),
+            background_close_failures: Arc::new(std::sync::Mutex::new(BackgroundCloseFailures::default())),
+            background_scope_closes: BACKGROUND_SCOPE_CLOSES,
         })
     }
 
@@ -1464,6 +1468,19 @@ impl ScopedRoutedGraphCluster {
     /// unless the caller closes it; see [`crate::WriterGate`].
     pub fn writer_gate(&self) -> crate::WriterGate {
         self.writer_gate.clone()
+    }
+
+    /// Report `cache`'s counters as the node's disk cache. The runtime's
+    /// object store must be `cache.object_store()`, which is what the scopes
+    /// read through.
+    pub fn with_shared_disk_cache(mut self, cache: SharedDiskCache) -> Self {
+        self.shared_disk_cache = Some(cache);
+        self
+    }
+
+    /// The node's disk cache counters; `None` when it keeps no disk cache.
+    pub fn shared_disk_cache_metrics(&self) -> Option<crate::SharedDiskCacheMetrics> {
+        self.shared_disk_cache.as_ref().map(SharedDiskCache::metrics)
     }
 
     pub fn with_indexer_change_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
@@ -1486,9 +1503,7 @@ impl ScopedRoutedGraphCluster {
     /// Cumulative operational counters for this runtime, per cell, including
     /// closed scopes — the counter totals an export must render so a scope
     /// closing never makes one fall. See [`crate::CumulativeOperationalCounters`].
-    pub fn cell_operational_counter_totals(
-        &self,
-    ) -> BTreeMap<String, crate::CellOperationalCounterTotals> {
+    pub fn cell_operational_counter_totals(&self) -> BTreeMap<String, crate::CellOperationalCounterTotals> {
         self.operational_totals.totals()
     }
 
@@ -1527,53 +1542,24 @@ impl ScopedRoutedGraphCluster {
     }
 
     fn validate_scope(&self, scope: &GraphScope) -> Result<()> {
-        if scope.graph_id == self.graph_id && scope.namespace.is_descendant_of(&self.root_namespace)
-        {
+        if scope.graph_id == self.graph_id && scope.namespace.is_descendant_of(&self.root_namespace) {
             return Ok(());
         }
         Err(GraphError::GraphScopeMismatch {
-            expected: format!(
-                "{}/graphs/{} and descendants",
-                self.root_namespace, self.graph_id
-            ),
+            expected: format!("{}/graphs/{} and descendants", self.root_namespace, self.graph_id),
             actual: scope.to_string(),
         })
     }
 
-    fn options_for_scope(&self, scope: &GraphScope) -> GraphOpenOptions {
-        let mut options = self.options.clone();
-        if let Some(root) = &options.cache.object_store_cache_dir {
-            let mut scoped_root = root.join("scopes");
-            for segment in scope.namespace.segments() {
-                scoped_root.push(segment.as_str());
-            }
-            scoped_root.push("graphs");
-            scoped_root.push(scope.graph_id.as_str());
-            options.cache.object_store_cache_dir = Some(scoped_root);
-        }
-        if let Some(bytes) = options.cache.object_store_cache_bytes {
-            options.cache.object_store_cache_bytes = Some((bytes / self.max_open_scopes).max(1));
-        }
-        // SlateDB builds an independent file-handle cache for every reader and
-        // writer. A retained graph scope can open both for each cell, so its
-        // upstream per-handle default would multiply into tens of thousands of
-        // descriptors and eventually turn cache reads, TLS reloads, and S3
-        // connections into EMFILE failures. Partition the process budget by
-        // the worst-case number of handles the scoped runtime can retain.
-        let possible_handles = self
-            .max_open_scopes
-            .saturating_mul(self.directory.cells().count())
-            .saturating_mul(2)
-            .max(1);
-        options.cache.object_store_cache_max_open_file_handles /= possible_handles;
-        options
+    /// The options a scope opens with: the runtime's own. The disk cache is
+    /// not among them; every scope reads through the shared one in the
+    /// runtime's object store.
+    fn options_for_scope(&self, _scope: &GraphScope) -> GraphOpenOptions {
+        self.options.clone()
     }
 
     #[tracing::instrument(name = "graph.scope_acquire", skip_all)]
-    pub(crate) async fn cluster_for_scope(
-        &self,
-        scope: &GraphScope,
-    ) -> Result<Arc<RoutedGraphCluster>> {
+    pub(crate) async fn cluster_for_scope(&self, scope: &GraphScope) -> Result<Arc<RoutedGraphCluster>> {
         self.cluster_for_scope_once(scope).await
     }
 
@@ -1617,9 +1603,7 @@ impl ScopedRoutedGraphCluster {
             }
             let (evicted, reservation) = {
                 let mut clusters = self.clusters.lock().await;
-                let occupied = clusters
-                    .len()
-                    .saturating_add(self.scope_open_reservations.load(Ordering::Acquire));
+                let occupied = clusters.len().saturating_add(self.scope_open_reservations.load(Ordering::Acquire));
                 let evicted = if occupied >= self.max_open_scopes {
                     let candidate = clusters
                         .iter()
@@ -1631,49 +1615,95 @@ impl ScopedRoutedGraphCluster {
                             actual: occupied.saturating_add(1) as u64,
                             limit: self.max_open_scopes as u64,
                         })?;
-                    let entry = clusters
-                        .remove(&candidate)
-                        .expect("selected scoped cluster must still exist");
-                    let close = ScopeCloseReservation::new(
-                        Arc::clone(&self.scope_closures),
-                        candidate.clone(),
-                    );
-                    Some((candidate, entry.cluster, close))
+                    let entry = clusters.remove(&candidate).expect("selected scoped cluster must still exist");
+                    let close = ScopeCloseReservation::new(Arc::clone(&self.scope_closures), candidate.clone());
+                    Some((candidate, entry, close))
                 } else {
                     None
                 };
                 self.scope_open_reservations.fetch_add(1, Ordering::AcqRel);
-                (
-                    evicted,
-                    ScopedOpenReservation::new(Arc::clone(&self.scope_open_reservations)),
-                )
+                (evicted, ScopedOpenReservation::new(Arc::clone(&self.scope_open_reservations)))
             };
             drop(capacity_guard);
-            let reservation = if let Some((candidate, cluster, close)) = evicted {
-                let cluster = Arc::try_unwrap(cluster).map_err(|_| GraphError::CorruptValue {
-                    key: format!("scoped-cluster/{candidate}"),
-                    reason: "idle scoped cluster acquired a concurrent owner during eviction"
-                        .to_string(),
-                })?;
-                // Closing outlives the request that triggered eviction. If the
-                // request is cancelled, this task still drains the old writer
-                // and only then releases same-scope reopeners. It also owns
-                // capacity until cleanup finishes, even if its caller leaves.
-                tokio::spawn(
-                    async move {
-                        let result = cluster.close_for_eviction().await;
-                        drop(cluster);
-                        close.release();
-                        result?;
-                        Ok::<_, GraphError>(reservation)
+            let reservation = if let Some((candidate, entry, close)) = evicted {
+                let last_used = entry.last_used;
+                let cluster = match Arc::try_unwrap(entry.cluster) {
+                    Ok(cluster) => cluster,
+                    Err(cluster) => {
+                        // A background reader (metrics collection, index
+                        // discovery) upgraded its `Weak` to this scope between
+                        // the idle check above and here: the scope is in use
+                        // after all, and nothing is wrong with it. Put it back
+                        // before ending its close reservation, so a reopen
+                        // that waited on the close finds it cached, then give
+                        // up the slot and choose again. The reader's hold is
+                        // brief; failing the request instead reported an
+                        // ordinary race as corruption.
+                        // Under the `clusters` lock, so no other opener can
+                        // evict it again and publish a new close marker in
+                        // between; and the reservation removes only its own.
+                        let mut clusters = self.clusters.lock().await;
+                        clusters.insert(candidate.clone(), ScopedRoutedClusterEntry { cluster, last_used });
+                        drop(close);
+                        drop(clusters);
+                        tracing::debug!(scope = %candidate, "eviction candidate was in use; choosing again");
+                        drop(reservation);
+                        drop(scope_open_guard);
+                        tokio::task::yield_now().await;
+                        continue;
                     }
-                    .instrument(tracing::info_span!("graph.scope_evict")),
-                )
-                .await
-                .map_err(|error| GraphError::CorruptValue {
-                    key: format!("scoped-cluster/{candidate}"),
-                    reason: format!("scope close task failed: {error}"),
-                })??
+                };
+                // Draining the evicted scope's writer is a flush to object
+                // storage: tens of milliseconds the request that needs the slot
+                // has no reason to wait for. With a close permit free, the old
+                // scope closes on its own task and this request opens its scope
+                // now. Reopening the old scope still waits for that close (its
+                // `scope_closures` entry), so two writers never overlap.
+                if let Ok(permit) = Arc::clone(&self.scope_close_budget).try_acquire_owned() {
+                    let failures = Arc::clone(&self.background_close_failures);
+                    tokio::spawn(
+                        async move {
+                            if let Err(error) = cluster.close_for_eviction().await {
+                                tracing::error!(
+                                    scope = %candidate,
+                                    %error,
+                                    "an evicted graph scope failed to close in the background"
+                                );
+                                failures
+                                    .lock()
+                                    .expect("background close failures lock poisoned")
+                                    .record(format!("{candidate}: {error}"));
+                            }
+                            drop(cluster);
+                            close.release();
+                            drop(permit);
+                        }
+                        .instrument(tracing::info_span!("graph.scope_evict", hydradb.scope_close = "background")),
+                    );
+                    reservation
+                } else {
+                    // Closing outlives the request that triggered eviction. If the
+                    // request is cancelled, this task still drains the old writer
+                    // and only then releases same-scope reopeners. It also owns
+                    // capacity until cleanup finishes, even if its caller leaves.
+                    // Every close permit is held: close it here, as the request
+                    // always did, so closing scopes stay bounded.
+                    tokio::spawn(
+                        async move {
+                            let result = cluster.close_for_eviction().await;
+                            drop(cluster);
+                            close.release();
+                            result?;
+                            Ok::<_, GraphError>(reservation)
+                        }
+                        .instrument(tracing::info_span!("graph.scope_evict", hydradb.scope_close = "inline")),
+                    )
+                    .await
+                    .map_err(|error| GraphError::CorruptValue {
+                        key: format!("scoped-cluster/{candidate}"),
+                        reason: format!("scope close task failed: {error}"),
+                    })??
+                }
             } else {
                 reservation
             };
@@ -1723,10 +1753,7 @@ impl ScopedRoutedGraphCluster {
     /// cancellation token; callers outside that runtime keep the immediate
     /// `cluster_for_scope` behavior so maintenance code cannot wait forever.
     #[tracing::instrument(name = "graph.scope_capacity_wait", skip_all)]
-    pub(crate) async fn cluster_for_scope_wait(
-        &self,
-        scope: &GraphScope,
-    ) -> Result<Arc<RoutedGraphCluster>> {
+    pub(crate) async fn cluster_for_scope_wait(&self, scope: &GraphScope) -> Result<Arc<RoutedGraphCluster>> {
         let Some(cancellation) = crate::QueryCancellationToken::current() else {
             return self.cluster_for_scope(scope).await;
         };
@@ -1774,22 +1801,14 @@ impl ScopedRoutedGraphCluster {
             .cloned()
     }
 
-    async fn cached_scope(
-        &self,
-        scope: &GraphScope,
-        access: u64,
-    ) -> Option<Arc<RoutedGraphCluster>> {
+    async fn cached_scope(&self, scope: &GraphScope, access: u64) -> Option<Arc<RoutedGraphCluster>> {
         let mut clusters = self.clusters.lock().await;
         let entry = clusters.get_mut(scope)?;
         entry.last_used = access;
         Some(Arc::clone(&entry.cluster))
     }
 
-    pub(crate) async fn cluster_for_scope_write_wait(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-    ) -> Result<Arc<RoutedGraphCluster>> {
+    pub(crate) async fn cluster_for_scope_write_wait(&self, scope: &GraphScope, cell_id: &str) -> Result<Arc<RoutedGraphCluster>> {
         let cluster = self.cluster_for_scope_wait(scope).await?;
         cluster.ensure_local_writer(cell_id).await?;
         cluster
@@ -1846,12 +1865,7 @@ impl ScopedRoutedGraphCluster {
     /// The notification is deliberately outside the client latency path. The
     /// durable graph write remains authoritative and the indexer's fair sweep
     /// repairs a notification lost during process shutdown.
-    pub(crate) fn notify_graph_index_change(
-        &self,
-        scope: GraphScope,
-        cell_id: String,
-        sequence: crate::StorageSequence,
-    ) {
+    pub(crate) fn notify_graph_index_change(&self, scope: GraphScope, cell_id: String, sequence: crate::StorageSequence) {
         let directory = self.scope_directory.clone();
         let wake = self.indexer_change_wake.clone();
         tokio::spawn(async move {
@@ -1887,9 +1901,7 @@ impl ScopedRoutedGraphCluster {
             let clusters = self.clusters.lock().await;
             clusters
                 .iter()
-                .filter(|(_, entry)| {
-                    Arc::strong_count(&entry.cluster) == 1 && entry.cluster.holds_unowned_writer()
-                })
+                .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1 && entry.cluster.holds_unowned_writer())
                 .map(|(scope, _)| scope.clone())
                 .collect::<Vec<_>>()
         };
@@ -1907,8 +1919,7 @@ impl ScopedRoutedGraphCluster {
                 let Some(entry) = clusters.remove(&scope) else {
                     continue;
                 };
-                let close =
-                    ScopeCloseReservation::new(Arc::clone(&self.scope_closures), scope.clone());
+                let close = ScopeCloseReservation::new(Arc::clone(&self.scope_closures), scope.clone());
                 match Arc::try_unwrap(entry.cluster) {
                     Ok(cluster) => retiring.push((scope, cluster, close)),
                     Err(cluster) => {
@@ -1949,6 +1960,13 @@ impl ScopedRoutedGraphCluster {
 
     pub async fn loaded_scopes(&self) -> Vec<GraphScope> {
         self.clusters.lock().await.keys().cloned().collect()
+    }
+
+    /// Every writer this node holds, across all scopes, for the buddy WAL
+    /// feed. Reads the process writer registry, so it sees exactly the writers
+    /// this node's scopes have installed and never opens a scope to answer.
+    pub fn writer_directory(&self) -> crate::NodeWriters {
+        self.writer_registry.node_writers(self.local_node_id.clone())
     }
 
     /// Non-owning handles to every open scope's cluster.
@@ -2032,8 +2050,22 @@ impl ScopedRoutedGraphCluster {
     }
 
     pub async fn close(&self) -> Result<()> {
+        // Background closes of evicted scopes finish before the runtime does:
+        // shutdown must not cut off a writer drain.
+        let _drained = self
+            .scope_close_budget
+            .acquire_many(self.background_scope_closes)
+            .await
+            .map_err(|error| GraphError::CorruptValue {
+                key: "runtime/scoped_clusters/close".to_string(),
+                reason: format!("background scope closes: {error}"),
+            })?;
         let entries = std::mem::take(&mut *self.clusters.lock().await);
-        let mut failures = Vec::new();
+        let mut failures = self
+            .background_close_failures
+            .lock()
+            .expect("background close failures lock poisoned")
+            .take_report();
         for (scope, entry) in entries {
             match Arc::try_unwrap(entry.cluster) {
                 Ok(cluster) => {
@@ -2076,10 +2108,7 @@ impl Drop for ScopeCapacityRelease {
 #[cfg(feature = "query-transport")]
 impl ScopedOpenReservation {
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self {
-            counter,
-            active: true,
-        }
+        Self { counter, active: true }
     }
 
     fn release(mut self) {
@@ -2102,24 +2131,25 @@ struct ScopeCloseReservation {
     closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
     scope: GraphScope,
     completed: tokio::sync::watch::Sender<bool>,
+    /// This reservation's own marker, so finishing removes it and never a
+    /// later close's marker for the same scope.
+    marker: tokio::sync::watch::Receiver<bool>,
     active: bool,
 }
 
 #[cfg(feature = "query-transport")]
 impl ScopeCloseReservation {
-    fn new(
-        closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
-        scope: GraphScope,
-    ) -> Self {
+    fn new(closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>, scope: GraphScope) -> Self {
         let (completed, receiver) = tokio::sync::watch::channel(false);
         closures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(scope.clone(), receiver);
+            .insert(scope.clone(), receiver.clone());
         Self {
             closures,
             scope,
             completed,
+            marker: receiver,
             active: true,
         }
     }
@@ -2133,10 +2163,10 @@ impl ScopeCloseReservation {
             return;
         }
         let _ = self.completed.send(true);
-        self.closures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.scope);
+        let mut closures = self.closures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if closures.get(&self.scope).is_some_and(|marker| marker.same_channel(&self.marker)) {
+            closures.remove(&self.scope);
+        }
         self.active = false;
     }
 }
@@ -2148,7 +2178,37 @@ impl Drop for ScopeCloseReservation {
     }
 }
 
-async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
+/// Run a write statement on its own task, so it finishes even when the
+/// future awaiting it is dropped. A Bolt RESET, GOODBYE or closed connection
+/// drops the client's future wherever it is; a statement whose effects span
+/// more than one batch transaction must not stop between them because its
+/// caller went away. Cancellation stays cooperative: the request's token is
+/// re-entered on the task, so a cancelled statement still stops during its
+/// read-only matching, before anything is written.
+#[cfg(any(feature = "opencypher", feature = "query-transport"))]
+pub(crate) async fn run_write_to_completion<T, F>(write: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let token = crate::QueryCancellationToken::current();
+    let estimated_bytes = crate::core::memory_diagnostics::request_estimated_bytes();
+    let task = tokio::spawn(
+        crate::core::memory_diagnostics::REQUEST_ESTIMATED_BYTES
+            .scope(estimated_bytes, crate::QueryCancellationToken::reenter(token, write))
+            .instrument(tracing::Span::current()),
+    );
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(GraphError::CorruptValue {
+            key: "cluster/write_task".to_string(),
+            reason: format!("write task did not complete: {error}"),
+        }),
+    }
+}
+
+async fn close_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard>>) {
     for shard in shards.into_values() {
         let _ = shard.close().await;
     }

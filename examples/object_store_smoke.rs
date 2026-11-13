@@ -25,9 +25,7 @@ async fn main() -> Result<()> {
         }
 
         let base_epoch = shard.current_epoch(cell_id).await?;
-        shard
-            .build_matrix_tiles(cell_id, edge_type, base_epoch, 4)
-            .await?;
+        shard.build_matrix_tiles(cell_id, edge_type, base_epoch, 4).await?;
 
         shard
             .write_edge(EdgeMutation {
@@ -50,14 +48,7 @@ async fn main() -> Result<()> {
 
         let read_epoch = shard.current_epoch(cell_id).await?;
         let matrix = shard
-            .matrix_reachable_with_kernel(
-                cell_id,
-                edge_type,
-                &[100],
-                1,
-                read_epoch,
-                selected_matrix_kernel(),
-            )
+            .matrix_reachable_with_kernel(cell_id, edge_type, &[100], 1, read_epoch, selected_matrix_kernel())
             .await?;
         assert_eq!(matrix.vertices, vec![10, 12, 13, 14, 15, 16]);
         shard.close().await?;
@@ -69,10 +60,7 @@ async fn main() -> Result<()> {
     let snapshot = reopened.snapshot_at(cell_id, read_epoch).await?;
     assert!(!snapshot.edge_exists(edge_type, 100, 11).await?);
     assert!(snapshot.edge_exists(edge_type, 100, 16).await?);
-    assert_eq!(
-        snapshot.out_neighbors(edge_type, 100).await?,
-        vec![10, 12, 13, 14, 15, 16]
-    );
+    assert_eq!(snapshot.out_neighbors(edge_type, 100).await?, vec![10, 12, 13, 14, 15, 16]);
     reopened.close().await?;
 
     println!("graph object-store smoke passed at epoch {read_epoch}");

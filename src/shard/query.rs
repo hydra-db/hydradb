@@ -6,11 +6,13 @@ use futures::{stream, StreamExt as _, TryStreamExt as _};
 #[cfg(feature = "opencypher")]
 use std::sync::atomic::AtomicU64;
 #[cfg(feature = "opencypher")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::Instrument as _;
 
 #[cfg(feature = "opencypher")]
 use crate::core::metrics::CypherRoute;
+#[cfg(feature = "opencypher")]
+use crate::query::opencypher::RowInList;
 
 /// Carries one scan allowance across outgoing readers and frontier vertices.
 pub(super) struct StorageNeighborScanBudget<'a> {
@@ -33,6 +35,12 @@ impl StorageNeighborScanBudget<'_> {
 #[cfg(feature = "opencypher")]
 pub(super) const QUERY_METADATA_HYDRATION_CONCURRENCY: usize = 16;
 
+/// Smallest batch of candidate records a bounded, unanchored node scan reads
+/// at once. A `LIMIT` smaller than this still reads one batch, so a selective
+/// `WHERE` costs a few batched reads rather than a round trip per candidate.
+#[cfg(feature = "opencypher")]
+const LIMITED_NODE_SCAN_BATCH: usize = 256;
+
 #[cfg(feature = "opencypher")]
 pub(super) const ORDERED_RELATIONSHIP_FETCH_BATCH: usize = 128;
 #[cfg(feature = "opencypher")]
@@ -50,6 +58,17 @@ pub(super) struct IndexedRelationshipBatch<'a> {
     pub memo: &'a mut IndexedRelationshipPairMemo,
 }
 
+/// What a relationship property equality reads from its two indexes: the
+/// endpoint pairs the structural index names (their properties may be
+/// inherited by every relationship on the pair), and each relationship-index
+/// entry as (src, dst, relationship id, encoded value).
+#[cfg(feature = "experimental-cypher-engine")]
+#[derive(Debug, Default)]
+pub(super) struct RelationshipPropertyEntries {
+    pub structural_pairs: BTreeSet<(VertexId, VertexId)>,
+    pub identified: Vec<(VertexId, VertexId, RelationshipId, String)>,
+}
+
 /// Cache only liveness and the absence of structural properties. The entry
 /// bound is also a memory bound: no arbitrary user property blobs are retained.
 #[cfg(feature = "opencypher")]
@@ -58,9 +77,6 @@ pub(super) struct IndexedRelationshipPairMemo {
     scope: Option<(String, String, StorageSequence, bool)>,
     pairs: BTreeMap<(VertexId, VertexId), bool>,
 }
-
-#[cfg(feature = "opencypher")]
-const QUERY_STATS_ANCHOR_READ_CONCURRENCY: usize = 8;
 
 #[cfg(feature = "opencypher")]
 pub(crate) const QUERY_NODE_EQUALITY_PROBE_ALTERNATIVES: usize = 512;
@@ -95,12 +111,7 @@ struct EdgeCandidateBitmap(BTreeMap<VertexId, BTreeMap<u64, u64>>);
 #[cfg(feature = "experimental-cypher-engine")]
 impl EdgeCandidateBitmap {
     fn insert(&mut self, source: VertexId, target: VertexId) {
-        *self
-            .0
-            .entry(source)
-            .or_default()
-            .entry(target / 64)
-            .or_default() |= 1_u64 << (target % 64);
+        *self.0.entry(source).or_default().entry(target / 64).or_default() |= 1_u64 << (target % 64);
     }
 
     fn into_pairs(self) -> Vec<(VertexId, VertexId)> {
@@ -138,11 +149,7 @@ pub(crate) struct RelationshipTypeProbe<'a> {
     pub max_entries: usize,
 }
 
-async fn run_graph_compute<T, F>(
-    metrics: Arc<GraphOperationalMetrics>,
-    operation: &'static str,
-    compute: F,
-) -> Result<T>
+pub(super) async fn run_graph_compute<T, F>(metrics: Arc<GraphOperationalMetrics>, operation: &'static str, compute: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -156,25 +163,15 @@ where
     let span = tracing::info_span!("kernel.expand", hydradb.kernel = operation);
     let queued_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
-        let queue_us = queued_at
-            .elapsed()
-            .as_micros()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        metrics
-            .graph_compute_tasks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let queue_us = queued_at.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+        metrics.graph_compute_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         metrics
             .graph_compute_queue_us
             .fetch_add(queue_us, std::sync::atomic::Ordering::Relaxed);
         let compute_started = std::time::Instant::now();
         let result = compute();
         metrics.graph_compute_duration_us.fetch_add(
-            compute_started
-                .elapsed()
-                .as_micros()
-                .try_into()
-                .unwrap_or(u64::MAX),
+            compute_started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::Relaxed,
         );
         result
@@ -192,17 +189,11 @@ fn run_graph_compute_inline<T, F>(metrics: Arc<GraphOperationalMetrics>, compute
 where
     F: FnOnce() -> Result<T>,
 {
-    metrics
-        .graph_compute_tasks
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metrics.graph_compute_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let compute_started = std::time::Instant::now();
     let result = compute();
     metrics.graph_compute_duration_us.fetch_add(
-        compute_started
-            .elapsed()
-            .as_micros()
-            .try_into()
-            .unwrap_or(u64::MAX),
+        compute_started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
         std::sync::atomic::Ordering::Relaxed,
     );
     result
@@ -224,26 +215,60 @@ where
 /// query that cannot be classified keeps the old behaviour, so nothing that
 /// used to reach the mutation parser stops reaching it.
 #[cfg(feature = "opencypher")]
-fn parse_experimental_route_mutation(
-    query: &str,
-    context: &QueryContext,
-) -> Result<Option<ParsedMutationQuery>> {
+fn parse_experimental_route_mutation(query: &str, context: &QueryContext) -> Result<Option<ParsedMutationQuery>> {
     use crate::query::opencypher::{classify_opencypher_query_access, OpenCypherQueryAccess};
 
-    if matches!(
-        classify_opencypher_query_access(query),
-        Ok(OpenCypherQueryAccess::Read)
-    ) {
+    if matches!(classify_opencypher_query_access(query), Ok(OpenCypherQueryAccess::Read)) {
         return Ok(None);
     }
-    parse_opencypher_mutation_query_with_list_parameters(
-        query,
-        &context.parameters,
-        &context.list_parameters,
-    )
+    parse_opencypher_mutation_query_with_list_parameters(query, &context.parameters, &context.list_parameters)
 }
 
 impl GraphShard {
+    pub(crate) async fn uses_id_properties(&self) -> Result<bool> {
+        self.cypher_id_properties
+            .get_or_try_init(|| async {
+                let snapshot = self.storage.snapshot().await?;
+                match snapshot
+                    .get_with_options(keys::CYPHER_ID_SEMANTICS.as_bytes(), &remote_read_options())
+                    .await?
+                {
+                    None => Ok(false),
+                    Some(value) if value.as_ref() == keys::CYPHER_ID_PROPERTIES_V1 => Ok(true),
+                    Some(_) => Err(GraphError::UnsupportedQuery {
+                        reason: QueryFailureReason::InvalidRequest,
+                        dialect: "Cypher",
+                        feature: "unrecognized collection id semantics".to_owned(),
+                    }),
+                }
+            })
+            .await
+            .copied()
+    }
+
+    async fn ensure_cypher_layout(&self, context: &QueryContext) -> Result<()> {
+        if self.uses_id_properties().await? && context.cypher_engine != CypherEngineMode::Experimental {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "Cypher",
+                feature: "BYOG collections require the experimental Cypher engine for property id semantics".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn ensure_managed_cypher_layout(&self) -> Result<()> {
+        if self.uses_id_properties().await? {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "Cypher",
+                feature: "BYOG collections do not support the managed Cypher fallback".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn edge_exists_in_storage_snapshot(
         &self,
         snapshot: &GraphStorageSnapshot,
@@ -256,19 +281,12 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let key = keys::out_edge(cell_id, edge_type, src, dst);
-        if snapshot
-            .get_with_options(key.as_bytes(), &remote_read_options())
-            .await?
-            .is_some()
-        {
+        if snapshot.get_with_options(key.as_bytes(), &remote_read_options()).await?.is_some() {
             return Ok(true);
         }
 
         let tombstone_key = keys::out_segment_tombstone(cell_id, edge_type, src, dst);
-        let tombstone_epoch = match snapshot
-            .get_with_options(tombstone_key.as_bytes(), &remote_read_options())
-            .await?
-        {
+        let tombstone_epoch = match snapshot.get_with_options(tombstone_key.as_bytes(), &remote_read_options()).await? {
             Some(value) => {
                 let epoch = decode_u64(&tombstone_key, &value)?;
                 (epoch <= topology_sequence).then_some(epoch)
@@ -285,9 +303,12 @@ impl GraphShard {
             if segment.storage_sequence > topology_sequence {
                 break;
             }
-            if segment.destinations.iter().copied().any(|candidate| {
-                candidate == dst && segment_edge_visible(segment.storage_sequence, tombstone_epoch)
-            }) {
+            if segment
+                .destinations
+                .iter()
+                .copied()
+                .any(|candidate| candidate == dst && segment_edge_visible(segment.storage_sequence, tombstone_epoch))
+            {
                 return Ok(true);
             }
         }
@@ -302,15 +323,8 @@ impl GraphShard {
         src: VertexId,
         topology_sequence: StorageSequence,
     ) -> Result<Vec<VertexId>> {
-        self.out_neighbors_in_storage_snapshot_inner(
-            snapshot,
-            cell_id,
-            edge_type,
-            src,
-            topology_sequence,
-            None,
-        )
-        .await
+        self.out_neighbors_in_storage_snapshot_inner(snapshot, cell_id, edge_type, src, topology_sequence, None)
+            .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -340,6 +354,66 @@ impl GraphShard {
         .await
     }
 
+    /// The canonical adjacency keys end in zero-padded numeric target order,
+    /// including in existing SSTs. Segment-backed sources also have destinations
+    /// outside this range and must use the ordinary segment/tombstone merge.
+    #[cfg(feature = "experimental-cypher-engine")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn out_neighbor_page(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        after: Option<VertexId>,
+        size: usize,
+        budget: &QueryBudget,
+    ) -> Result<Option<Vec<VertexId>>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        budget
+            .read_only_io("query_out_neighbor_page", async {
+                if after.is_none() {
+                    let prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
+                    let mut segments = snapshot
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options_for_expected_items(1))
+                        .await?;
+                    if segments.next().await?.is_some() {
+                        return Ok(None);
+                    }
+                }
+                // A selective predicate can exhaust a hub across many small pages.
+                // Use the same cache admission as the full outgoing adjacency scan.
+                let options = remote_scan_options_for_expected_items(
+                    self.degree_for_cache_admission(snapshot, &keys::degree_out(cell_id, edge_type, src))
+                        .await?,
+                );
+                let prefix = keys::out_prefix(cell_id, edge_type, src);
+                let start = after
+                    .map(|id| std::ops::Bound::Excluded(format!("{id:020}").into_bytes()))
+                    .unwrap_or(std::ops::Bound::Unbounded);
+                let mut edges = snapshot
+                    .scan_prefix_with_options(prefix.as_bytes(), (start, std::ops::Bound::Unbounded), &options)
+                    .await?;
+                let mut page = Vec::new();
+                while page.len() < size {
+                    budget.check("query_out_neighbor_page")?;
+                    let Some(kv) = edges.next().await? else { break };
+                    let key = String::from_utf8_lossy(&kv.key);
+                    let dst = decode_edge_record(&key, &kv.value)?.dst;
+                    if !key.strip_prefix(&prefix).is_some_and(|suffix| suffix == format!("{dst:020}")) {
+                        return Err(GraphError::CorruptValue {
+                            key: key.into_owned(),
+                            reason: "outgoing adjacency key and target disagree".to_owned(),
+                        });
+                    }
+                    page.push(dst);
+                }
+                Ok(Some(page))
+            })
+            .await
+    }
+
     pub(super) async fn out_neighbors_in_storage_snapshot_inner(
         &self,
         snapshot: &GraphStorageSnapshot,
@@ -347,123 +421,122 @@ impl GraphShard {
         edge_type: &str,
         src: VertexId,
         topology_sequence: StorageSequence,
-        mut scan_budget: Option<StorageNeighborScanBudget<'_>>,
+        scan_budget: Option<StorageNeighborScanBudget<'_>>,
     ) -> Result<Vec<VertexId>> {
         let budget = scan_budget.as_ref().map(|scan| scan.query);
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         check_optional_query_budget(budget, "query_out_neighbors_storage_scan")?;
-        let mut neighbors = BTreeSet::new();
-        let scan_options = remote_scan_options_for_expected_items(
-            self.degree_for_cache_admission(snapshot, &keys::degree_out(cell_id, edge_type, src))
-                .await?,
-        );
-        check_optional_query_budget(budget, "query_out_neighbors_storage_scan")?;
-
-        let prefix = keys::out_prefix(cell_id, edge_type, src);
-        let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
-            .await?;
-        loop {
-            check_optional_query_budget(budget, "query_out_neighbors_edge_scan")?;
-            let Some(kv) = iter.next().await? else {
-                break;
-            };
-            check_optional_query_budget(budget, "query_out_neighbors_edge_scan")?;
-            if let Some(scan) = scan_budget.as_mut() {
+        // The edge keys, the segment tombstones and the segments are three
+        // independent ranges; only the edge scan's cache admission waits for
+        // the degree. Read side by side, a listing is two round trips deep
+        // rather than four. Every record still charges the scan allowance as
+        // it is read, so a hub stops at the limit wherever it is reached.
+        let scan_budget = std::sync::Mutex::new(scan_budget);
+        let charge = || -> Result<()> {
+            if let Some(scan) = scan_budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
                 scan.charge(self.limits.max_query_scan_edges)?;
             }
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            neighbors.insert(decode_edge_record(&key, &kv.value)?.dst);
-            self.ensure_optional_query_intermediate_limit(
-                budget,
-                "query_out_neighbors_vertices",
-                neighbors.len(),
-            )?;
-        }
-
-        let tombstone_prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
-        let mut tombstone_iter = snapshot
-            .scan_prefix_with_options(tombstone_prefix.as_bytes(), .., &remote_scan_options())
-            .await?;
-        let mut tombstones = BTreeMap::new();
-        loop {
-            check_optional_query_budget(budget, "query_out_neighbors_tombstone_scan")?;
-            let Some(kv) = tombstone_iter.next().await? else {
-                break;
-            };
-            check_optional_query_budget(budget, "query_out_neighbors_tombstone_scan")?;
-            if let Some(scan) = scan_budget.as_mut() {
-                scan.charge(self.limits.max_query_scan_edges)?;
+            Ok(())
+        };
+        let edges = async {
+            let scan_options = remote_scan_options_for_expected_items(
+                self.degree_for_cache_admission(snapshot, &keys::degree_out(cell_id, edge_type, src))
+                    .await?,
+            );
+            check_optional_query_budget(budget, "query_out_neighbors_storage_scan")?;
+            let prefix = keys::out_prefix(cell_id, edge_type, src);
+            let mut iter = snapshot.scan_prefix_with_options(prefix.as_bytes(), .., &scan_options).await?;
+            let mut neighbors = BTreeSet::new();
+            loop {
+                check_optional_query_budget(budget, "query_out_neighbors_edge_scan")?;
+                let Some(kv) = iter.next().await? else {
+                    break;
+                };
+                check_optional_query_budget(budget, "query_out_neighbors_edge_scan")?;
+                charge()?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                neighbors.insert(decode_edge_record(&key, &kv.value)?.dst);
+                self.ensure_optional_query_intermediate_limit(budget, "query_out_neighbors_vertices", neighbors.len())?;
             }
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, key_src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
-            if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
-                return Err(GraphError::CorruptValue {
-                    key,
-                    reason: "segment tombstone identity does not match snapshot prefix".to_string(),
-                });
-            }
-            let epoch = decode_u64(&key, &kv.value)?;
-            if epoch <= topology_sequence {
-                tombstones.insert(dst, epoch);
-                self.ensure_optional_query_intermediate_limit(
-                    budget,
-                    "query_out_neighbors_tombstones",
-                    tombstones.len(),
-                )?;
-            }
-        }
-
-        let segment_prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
-        let mut segment_iter = snapshot
-            .scan_prefix_with_options(segment_prefix.as_bytes(), .., &remote_scan_options())
-            .await?;
-        loop {
-            check_optional_query_budget(budget, "query_out_neighbors_segment_scan")?;
-            let Some(kv) = segment_iter.next().await? else {
-                break;
-            };
-            check_optional_query_budget(budget, "query_out_neighbors_segment_scan")?;
-            if let Some(scan) = scan_budget.as_mut() {
-                scan.charge(self.limits.max_query_scan_edges)?;
-            }
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let segment = decode_out_edge_segment(&key, &kv.value)?;
-            if segment.storage_sequence > topology_sequence {
-                break;
-            }
-            for dst in segment.destinations.iter().copied() {
-                check_optional_query_budget(budget, "query_out_neighbors_segment_edges")?;
-                if let Some(scan) = scan_budget.as_mut() {
-                    scan.charge(self.limits.max_query_scan_edges)?;
+            Ok::<_, GraphError>(neighbors)
+        };
+        let tombstones = async {
+            let tombstone_prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
+            let mut tombstone_iter = snapshot
+                .scan_prefix_with_options(tombstone_prefix.as_bytes(), .., &remote_scan_options())
+                .await?;
+            let mut tombstones = BTreeMap::new();
+            loop {
+                check_optional_query_budget(budget, "query_out_neighbors_tombstone_scan")?;
+                let Some(kv) = tombstone_iter.next().await? else {
+                    break;
+                };
+                check_optional_query_budget(budget, "query_out_neighbors_tombstone_scan")?;
+                charge()?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (key_cell_id, key_edge_type, key_src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
+                if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
+                    return Err(GraphError::CorruptValue {
+                        key,
+                        reason: "segment tombstone identity does not match snapshot prefix".to_string(),
+                    });
                 }
-                if segment_edge_visible(segment.storage_sequence, tombstones.get(&dst).copied()) {
-                    neighbors.insert(dst);
-                    self.ensure_optional_query_intermediate_limit(
-                        budget,
-                        "query_out_neighbors_vertices",
-                        neighbors.len(),
-                    )?;
+                let epoch = decode_u64(&key, &kv.value)?;
+                if epoch <= topology_sequence {
+                    tombstones.insert(dst, epoch);
+                    self.ensure_optional_query_intermediate_limit(budget, "query_out_neighbors_tombstones", tombstones.len())?;
                 }
+            }
+            Ok::<_, GraphError>(tombstones)
+        };
+        // Segment destinations are judged against the tombstones once both are
+        // read. A destination is visible when any segment holding it is newer
+        // than its tombstone, which is when its newest one is, so only that is
+        // kept: the destinations, not the segments, are held. Each is charged
+        // to the scan allowance as it is read, which bounds what is held; the
+        // row limit applies only to the visible neighbours, as before, so a
+        // deleted destination never counts against it.
+        let segments = async {
+            let segment_prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
+            let mut segment_iter = snapshot
+                .scan_prefix_with_options(segment_prefix.as_bytes(), .., &remote_scan_options())
+                .await?;
+            let mut newest = BTreeMap::<VertexId, StorageSequence>::new();
+            loop {
+                check_optional_query_budget(budget, "query_out_neighbors_segment_scan")?;
+                let Some(kv) = segment_iter.next().await? else {
+                    break;
+                };
+                check_optional_query_budget(budget, "query_out_neighbors_segment_scan")?;
+                charge()?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let segment = decode_out_edge_segment(&key, &kv.value)?;
+                if segment.storage_sequence > topology_sequence {
+                    break;
+                }
+                for dst in segment.destinations.iter().copied() {
+                    check_optional_query_budget(budget, "query_out_neighbors_segment_edges")?;
+                    charge()?;
+                    let sequence = newest.entry(dst).or_insert(segment.storage_sequence);
+                    *sequence = (*sequence).max(segment.storage_sequence);
+                }
+            }
+            Ok::<_, GraphError>(newest)
+        };
+        let (mut neighbors, tombstones, segment_destinations) = futures::try_join!(edges, tombstones, segments)?;
+        for (dst, sequence) in segment_destinations {
+            if segment_edge_visible(sequence, tombstones.get(&dst).copied()) {
+                neighbors.insert(dst);
+                self.ensure_optional_query_intermediate_limit(budget, "query_out_neighbors_vertices", neighbors.len())?;
             }
         }
         Ok(neighbors.into_iter().collect())
     }
 
-    fn ensure_optional_query_intermediate_limit(
-        &self,
-        budget: Option<&QueryBudget>,
-        operation: &'static str,
-        rows: usize,
-    ) -> Result<()> {
+    fn ensure_optional_query_intermediate_limit(&self, budget: Option<&QueryBudget>, operation: &'static str, rows: usize) -> Result<()> {
         if budget.is_some() {
-            ensure_limit(
-                operation,
-                rows as u64,
-                self.limits.max_query_intermediate_rows as u64,
-            )?;
+            ensure_limit(operation, rows as u64, self.limits.max_query_intermediate_rows as u64)?;
         }
         Ok(())
     }
@@ -478,10 +551,7 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let key = keys::degree_out(cell_id, edge_type, src);
-        match snapshot
-            .get_with_options(key.as_bytes(), &remote_read_options())
-            .await?
-        {
+        match snapshot.get_with_options(key.as_bytes(), &remote_read_options()).await? {
             Some(value) => decode_u64(&key, &value),
             None => Ok(0),
         }
@@ -498,10 +568,7 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let key = keys::degree_in(cell_id, edge_type, dst);
-        match snapshot
-            .get_with_options(key.as_bytes(), &remote_read_options())
-            .await?
-        {
+        match snapshot.get_with_options(key.as_bytes(), &remote_read_options()).await? {
             Some(value) => decode_u64(&key, &value),
             None => Ok(0),
         }
@@ -521,9 +588,7 @@ impl GraphShard {
                 .await?,
         );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
-        let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
-            .await?;
+        let mut iter = snapshot.scan_prefix_with_options(prefix.as_bytes(), .., &scan_options).await?;
         let mut neighbors = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -532,15 +597,8 @@ impl GraphShard {
         Ok(neighbors.into_iter().collect())
     }
 
-    async fn degree_for_cache_admission(
-        &self,
-        snapshot: &GraphStorageSnapshot,
-        key: &str,
-    ) -> Result<u64> {
-        match snapshot
-            .get_with_options(key.as_bytes(), &remote_read_options())
-            .await?
-        {
+    async fn degree_for_cache_admission(&self, snapshot: &GraphStorageSnapshot, key: &str) -> Result<u64> {
+        match snapshot.get_with_options(key.as_bytes(), &remote_read_options()).await? {
             Some(value) => decode_u64(key, &value),
             // Missing counters must fail closed for cache admission. The scan
             // remains correct; it simply cannot displace known hot blocks.
@@ -549,86 +607,76 @@ impl GraphShard {
     }
 
     pub async fn execute_cypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {
+        self.ensure_cypher_layout(&context).await?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == CypherEngineMode::DataFusion {
+            let shard = self.shared_datafusion_self()?;
+            return shard.execute_datafusion_cypher(context, query).await;
+        }
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
-                if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                    query,
-                    &context.parameters,
-                    self.limits.max_traversal_hops,
-                )? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::NativePathFallback);
+                if let Some(procedure) =
+                    crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+                {
+                    self.ensure_managed_cypher_layout().await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::NativePathFallback);
                     return Box::pin(self.execute_native_procedure_rows(context, procedure))
                         .await
                         .map(QueryOutput::Rows);
                 }
                 if let Some(parsed) = parse_experimental_route_mutation(query, &context)? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::MutationFallback);
-                    let result =
-                        Box::pin(self.execute_parsed_opencypher_mutation(context, parsed)).await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::MutationFallback);
+                    let result = Box::pin(self.execute_parsed_opencypher_mutation_with_receipt(context, query, parsed)).await?;
                     return Ok(QueryOutput::Mutation(result));
                 }
             }
-            return self
-                .execute_cypher_rows(context, query)
-                .await
-                .map(QueryOutput::Rows);
+            return self.execute_cypher_rows(context, query).await.map(QueryOutput::Rows);
         }
         #[cfg(feature = "opencypher")]
-        self.operation_metrics
-            .record_cypher_route(CypherRoute::Legacy);
+        self.operation_metrics.record_cypher_route(CypherRoute::Legacy);
         Box::pin(self.execute_opencypher(context, query)).await
     }
 
-    pub async fn execute_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet> {
+    pub async fn execute_cypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
+        self.ensure_cypher_layout(&context).await?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == CypherEngineMode::DataFusion {
+            let shard = self.shared_datafusion_self()?;
+            return shard.execute_datafusion_cypher_rows(context, query).await;
+        }
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
-                if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                    query,
-                    &context.parameters,
-                    self.limits.max_traversal_hops,
-                )? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::NativePathFallback);
+                if let Some(procedure) =
+                    crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+                {
+                    self.ensure_managed_cypher_layout().await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::NativePathFallback);
                     return Box::pin(self.execute_native_procedure_rows(context, procedure)).await;
                 }
                 if let Some(parsed) = parse_experimental_route_mutation(query, &context)? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::MutationFallback);
-                    let mutation =
-                        Box::pin(self.execute_parsed_opencypher_mutation(context, parsed)).await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::MutationFallback);
+                    let mutation = Box::pin(self.execute_parsed_opencypher_mutation_with_receipt(context, query, parsed)).await?;
                     return Ok(mutation.into_result_set());
                 }
             }
             #[cfg(feature = "experimental-cypher-engine")]
             {
-                self.operation_metrics
-                    .record_cypher_route(CypherRoute::Experimental);
-                return super::experimental_cypher::execute_experimental_cypher_rows(
-                    self, context, query,
-                )
-                .await;
+                self.operation_metrics.record_cypher_route(CypherRoute::Experimental);
+                return super::experimental_cypher::execute_experimental_cypher_rows(self, context, query).await;
             }
             #[cfg(not(feature = "experimental-cypher-engine"))]
             {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::Other,
                     dialect: "Cypher25",
-                    feature: "the experimental-cypher-engine Cargo feature is not enabled"
-                        .to_string(),
+                    feature: "the experimental-cypher-engine Cargo feature is not enabled".to_string(),
                 });
             }
         }
         #[cfg(feature = "opencypher")]
-        self.operation_metrics
-            .record_cypher_route(CypherRoute::Legacy);
+        self.operation_metrics.record_cypher_route(CypherRoute::Legacy);
         Box::pin(self.execute_opencypher_rows(context, query)).await
     }
 
@@ -639,29 +687,28 @@ impl GraphShard {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
+        self.ensure_cypher_layout(&context).await?;
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if context.cypher_engine == CypherEngineMode::DataFusion {
+            let shard = self.shared_datafusion_self()?;
+            return shard.execute_datafusion_cypher_rows_page(context, query, cursor, page_size).await;
+        }
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
-                if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                    query,
-                    &context.parameters,
-                    self.limits.max_traversal_hops,
-                )? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::NativePathFallback);
-                    return Box::pin(self.execute_native_path_rows_page(
-                        context, query, procedure, cursor, page_size,
-                    ))
-                    .await;
+                if let Some(procedure) =
+                    crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+                {
+                    self.ensure_managed_cypher_layout().await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::NativePathFallback);
+                    return Box::pin(self.execute_native_path_rows_page(context, query, procedure, cursor, page_size)).await;
                 }
             }
             #[cfg(feature = "opencypher")]
             if cursor.is_none() {
                 if let Some(parsed) = parse_experimental_route_mutation(query, &context)? {
-                    self.operation_metrics
-                        .record_cypher_route(CypherRoute::MutationFallback);
-                    let mutation =
-                        Box::pin(self.execute_parsed_opencypher_mutation(context, parsed)).await?;
+                    self.operation_metrics.record_cypher_route(CypherRoute::MutationFallback);
+                    let mutation = Box::pin(self.execute_parsed_opencypher_mutation_with_receipt(context, query, parsed)).await?;
                     let rows = mutation.into_result_set();
                     return Ok(QueryResultPage::new(rows.columns, rows.rows, None));
                 }
@@ -678,47 +725,33 @@ impl GraphShard {
             });
         }
         #[cfg(feature = "opencypher")]
-        self.operation_metrics
-            .record_cypher_route(CypherRoute::Legacy);
+        self.operation_metrics.record_cypher_route(CypherRoute::Legacy);
         Box::pin(self.execute_opencypher_rows_page(context, query, cursor, page_size)).await
     }
 
-    pub async fn execute_opencypher(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryOutput> {
+    pub async fn execute_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {
+        #[cfg(feature = "opencypher")]
+        self.ensure_managed_cypher_layout().await?;
         #[cfg(feature = "opencypher")]
         {
-            if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                query,
-                &context.parameters,
-                self.limits.max_traversal_hops,
-            )? {
+            if let Some(procedure) =
+                crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+            {
                 return Box::pin(self.execute_native_procedure_rows(context, procedure))
                     .await
                     .map(QueryOutput::Rows);
             }
-            if let Some(parsed) = parse_opencypher_mutation_query_with_list_parameters(
-                query,
-                &context.parameters,
-                &context.list_parameters,
-            )? {
-                let result =
-                    Box::pin(self.execute_parsed_opencypher_mutation(context, parsed)).await?;
+            if let Some(parsed) =
+                parse_opencypher_mutation_query_with_list_parameters(query, &context.parameters, &context.list_parameters)?
+            {
+                let result = Box::pin(self.execute_parsed_opencypher_mutation_with_receipt(context, query, parsed)).await?;
                 return Ok(QueryOutput::Mutation(result));
             }
             let parsed = self
-                .parsed_opencypher_row_query(
-                    &context.cell_id,
-                    query,
-                    &context.parameters,
-                    &context.list_parameters,
-                )
+                .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
-            let result_set =
-                Box::pin(self.execute_parsed_opencypher_rows(context, parsed.clone())).await?;
+            let result_set = Box::pin(self.execute_parsed_opencypher_rows(context, parsed.clone())).await?;
             Ok(query_result_set_to_output(&parsed, result_set))
         }
         #[cfg(not(feature = "opencypher"))]
@@ -732,27 +765,18 @@ impl GraphShard {
         }
     }
 
-    pub async fn execute_opencypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet> {
+    pub async fn execute_opencypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
+        #[cfg(feature = "opencypher")]
+        self.ensure_managed_cypher_layout().await?;
         #[cfg(feature = "opencypher")]
         {
-            if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                query,
-                &context.parameters,
-                self.limits.max_traversal_hops,
-            )? {
+            if let Some(procedure) =
+                crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+            {
                 return Box::pin(self.execute_native_procedure_rows(context, procedure)).await;
             }
             let parsed = self
-                .parsed_opencypher_row_query(
-                    &context.cell_id,
-                    query,
-                    &context.parameters,
-                    &context.list_parameters,
-                )
+                .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
             Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await
@@ -776,26 +800,16 @@ impl GraphShard {
         page_size: usize,
     ) -> Result<QueryResultPage> {
         #[cfg(feature = "opencypher")]
+        self.ensure_managed_cypher_layout().await?;
+        #[cfg(feature = "opencypher")]
         {
-            if let Some(procedure) = crate::query::path_procedure::parse_native_procedure(
-                query,
-                &context.parameters,
-                self.limits.max_traversal_hops,
-            )? {
-                return Box::pin(
-                    self.execute_native_path_rows_page(
-                        context, query, procedure, cursor, page_size,
-                    ),
-                )
-                .await;
+            if let Some(procedure) =
+                crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
+            {
+                return Box::pin(self.execute_native_path_rows_page(context, query, procedure, cursor, page_size)).await;
             }
             let parsed = self
-                .parsed_opencypher_row_query(
-                    &context.cell_id,
-                    query,
-                    &context.parameters,
-                    &context.list_parameters,
-                )
+                .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
             if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
@@ -807,24 +821,19 @@ impl GraphShard {
             }
             if context.read_epoch.is_none() {
                 let snapshot = if context.uses_refreshed_reader() {
-                    self.db.reader_snapshot().await?
+                    self.storage.strong_snapshot().await?
                 } else {
-                    self.db.snapshot().await?
+                    self.storage.snapshot().await?
                 };
                 let read_epoch = snapshot.seq();
                 let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
-                return GraphStore::scope_snapshot(
+                return SlateGraphStore::scope_snapshot(
                     snapshot,
-                    Box::pin(
-                        self.execute_parsed_opencypher_rows_page(
-                            context, parsed, cursor, page_size,
-                        ),
-                    ),
+                    Box::pin(self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size)),
                 )
                 .await;
             }
-            Box::pin(self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size))
-                .await
+            Box::pin(self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size)).await
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -853,12 +862,7 @@ impl GraphShard {
         )
         .with_max_result_bytes(context.max_result_bytes);
         match self
-            .try_execute_source_relationship_id_rows_page(
-                &context,
-                &parsed,
-                cursor_offset,
-                page_size,
-            )
+            .try_execute_source_relationship_id_rows_page(&context, &parsed, cursor_offset, page_size)
             .await
         {
             Ok(Some(page)) => {
@@ -875,14 +879,7 @@ impl GraphShard {
                 return Err(err);
             }
         }
-        match Box::pin(self.try_execute_graph_kernel_opencypher_rows_page(
-            &context,
-            &parsed,
-            cursor_offset,
-            page_size,
-        ))
-        .await
-        {
+        match Box::pin(self.try_execute_graph_kernel_opencypher_rows_page(&context, &parsed, cursor_offset, page_size)).await {
             Ok(Some(page)) => {
                 if let Err(error) = result_budget.account_result_rows(&page.rows) {
                     self.record_streaming_query_rows_failure(started, &error);
@@ -925,46 +922,32 @@ impl GraphShard {
         let mut result_set = Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await?;
         let next_cursor = if result_set.rows.len() > page_size {
             result_set.rows.truncate(page_size);
-            Some(QueryCursorToken::new(
-                cursor_offset.checked_add(page_size as u64).ok_or_else(|| {
-                    GraphError::AdmissionRejected {
-                        operation: "query_cursor_offset",
-                        actual: u64::MAX,
-                        limit: u64::MAX - 1,
-                    }
-                })?,
-            ))
+            Some(QueryCursorToken::new(cursor_offset.checked_add(page_size as u64).ok_or_else(
+                || GraphError::AdmissionRejected {
+                    operation: "query_cursor_offset",
+                    actual: u64::MAX,
+                    limit: u64::MAX - 1,
+                },
+            )?))
         } else {
             None
         };
-        let page = QueryResultPage::new(result_set.columns, result_set.rows, next_cursor);
+        let page = QueryResultPage::new(result_set.columns, result_set.rows, next_cursor).with_statuses(result_set.statuses);
         result_budget.account_result_rows(&page.rows)?;
         Ok(page)
     }
 
-    pub async fn execute_query_statement(
-        &self,
-        context: QueryContext,
-        statement: QueryStatement,
-    ) -> Result<QueryOutput> {
+    pub async fn execute_query_statement(&self, context: QueryContext, statement: QueryStatement) -> Result<QueryOutput> {
         let plan = self.plan_query_statement(context, statement)?;
         self.execute_query_plan(plan).await
     }
 
-    pub fn plan_query_statement(
-        &self,
-        context: QueryContext,
-        statement: QueryStatement,
-    ) -> Result<QueryPlan> {
+    pub fn plan_query_statement(&self, context: QueryContext, statement: QueryStatement) -> Result<QueryPlan> {
         QueryPlanner::plan(&context, &statement)
     }
 
     #[cfg(feature = "opencypher")]
-    pub async fn explain_opencypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<RowQueryPlan> {
+    pub async fn explain_opencypher_rows(&self, context: QueryContext, query: &str) -> Result<RowQueryPlan> {
         validate_component("cell_id", &context.cell_id)?;
         if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
             return Err(GraphError::UnsupportedQuery {
@@ -974,17 +957,11 @@ impl GraphShard {
             });
         }
         let parsed = self
-            .parsed_opencypher_row_query(
-                &context.cell_id,
-                query,
-                &context.parameters,
-                &context.list_parameters,
-            )
+            .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
             .await?;
         let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
         let read_epoch = self.query_read_epoch(&context).await?;
-        self.explain_row_query_plan_with_stats(&context.cell_id, read_epoch, &parsed)
-            .await
+        self.explain_row_query_plan_with_stats(&context.cell_id, read_epoch, &parsed).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -1002,21 +979,16 @@ impl GraphShard {
         }
         let key = ParsedRowQueryCacheKey::new(query);
         if let Some(parsed) = self.parsed_row_query_cache.lock().await.get(&key) {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::ParsedRowQuery);
+            self.cache_metrics.record_hit(GraphCacheKind::ParsedRowQuery);
             return Ok(parsed);
         }
 
-        self.cache_metrics
-            .record_miss(GraphCacheKind::ParsedRowQuery);
+        self.cache_metrics.record_miss(GraphCacheKind::ParsedRowQuery);
         let parsed = parse_opencypher_row_query_with_list_parameters(query, parameters, lists)?;
-        self.parsed_row_query_cache.lock().await.insert(
-            key,
-            parsed.clone(),
-            cell_id.to_string(),
-            false,
-            &self.cache_metrics,
-        );
+        self.parsed_row_query_cache
+            .lock()
+            .await
+            .insert(key, parsed.clone(), cell_id.to_string(), false, &self.cache_metrics);
         Ok(parsed)
     }
 
@@ -1033,16 +1005,17 @@ impl GraphShard {
             hydradb.read_epoch = tracing::field::Empty,
             hydradb.query.rows_returned = tracing::field::Empty,
             hydradb.query.runtime_property_index = tracing::field::Empty,
+            hydradb.storage.remote_gets = tracing::field::Empty,
+            hydradb.storage.remote_get_bytes = tracing::field::Empty,
+            hydradb.storage.ranged_gets = tracing::field::Empty,
+            hydradb.storage.puts = tracing::field::Empty,
+            hydradb.storage.put_bytes = tracing::field::Empty,
             error.class = tracing::field::Empty,
             error.operation = tracing::field::Empty,
             hydradb.sampling.tail_keep = tracing::field::Empty,
         )
     )]
-    async fn execute_parsed_opencypher_rows(
-        &self,
-        context: QueryContext,
-        query: ParsedRowQuery,
-    ) -> Result<QueryResultSet> {
+    async fn execute_parsed_opencypher_rows(&self, context: QueryContext, query: ParsedRowQuery) -> Result<QueryResultSet> {
         if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
@@ -1050,19 +1023,18 @@ impl GraphShard {
                 feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot".to_string(),
             });
         }
-        self.operation_metrics
-            .query_rows_started
-            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics.query_rows_started.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
+        let remote_io = crate::engine::remote_io::RemoteIoWindow::open();
         let result = if context.read_epoch.is_none() {
             // The epoch every freshness bug is an argument about is decided
             // here, by whichever of the two readers the context selected — so
             // the choice is a field, not an inference from which code path ran.
             let snapshot = async {
                 if context.uses_refreshed_reader() {
-                    self.db.reader_snapshot().await
+                    self.storage.strong_snapshot().await
                 } else {
-                    self.db.snapshot().await
+                    self.storage.snapshot().await
                 }
             }
             .instrument(tracing::info_span!(
@@ -1076,26 +1048,19 @@ impl GraphShard {
                     let read_epoch = snapshot.seq();
                     tracing::Span::current().record("hydradb.read_epoch", read_epoch);
                     let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
-                    GraphStore::scope_snapshot(
-                        snapshot,
-                        Box::pin(self.execute_parsed_opencypher_rows_inner(context, query)),
-                    )
-                    .await
+                    SlateGraphStore::scope_snapshot(snapshot, Box::pin(self.execute_parsed_opencypher_rows_inner(context, query))).await
                 }
                 Err(err) => Err(err),
             }
         } else {
             Box::pin(self.execute_parsed_opencypher_rows_inner(context, query)).await
         };
-        self.operation_metrics
-            .query_rows_latency
-            .record(started.elapsed());
+        self.operation_metrics.query_rows_latency.record(started.elapsed());
         let span = tracing::Span::current();
+        remote_io.record(&span);
         match &result {
             Ok(result_set) => {
-                self.operation_metrics
-                    .query_rows_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                self.operation_metrics.query_rows_completed.fetch_add(1, Ordering::Relaxed);
                 self.operation_metrics
                     .query_rows_returned
                     .fetch_add(result_set.rows.len() as u64, Ordering::Relaxed);
@@ -1117,11 +1082,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn execute_parsed_opencypher_rows_inner(
-        &self,
-        context: QueryContext,
-        query: ParsedRowQuery,
-    ) -> Result<QueryResultSet> {
+    async fn execute_parsed_opencypher_rows_inner(&self, context: QueryContext, query: ParsedRowQuery) -> Result<QueryResultSet> {
         validate_component("cell_id", &context.cell_id)?;
         let budget = QueryBudget::new(
             context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
@@ -1133,23 +1094,11 @@ impl GraphShard {
         let read_epoch = self.query_read_epoch(&context).await?;
 
         let result = if !query.union_arms.is_empty() {
-            self.execute_union_opencypher_rows(
-                &context.cell_id,
-                read_epoch,
-                query,
-                context.result_window,
-                &budget,
-            )
-            .await
+            self.execute_union_opencypher_rows(&context.cell_id, read_epoch, query, context.result_window, &budget)
+                .await
         } else {
-            self.execute_single_opencypher_rows(
-                &context.cell_id,
-                read_epoch,
-                query,
-                context.result_window,
-                &budget,
-            )
-            .await
+            self.execute_single_opencypher_rows(&context.cell_id, read_epoch, query, context.result_window, &budget)
+                .await
         }?;
         budget.account_result_rows(&result.rows)?;
         let result = result.with_read_epoch(read_epoch);
@@ -1227,9 +1176,7 @@ impl GraphShard {
             return Ok(result);
         }
         if let Some(result) = self
-            .try_execute_source_relationship_id_rows_query(
-                cell_id, read_epoch, &query, window, budget,
-            )
+            .try_execute_source_relationship_id_rows_query(cell_id, read_epoch, &query, window, budget)
             .await?
         {
             return Ok(result);
@@ -1241,9 +1188,7 @@ impl GraphShard {
             return Ok(result);
         }
         if let Some(result) = self
-            .try_execute_ordered_relationship_property_rows_query(
-                cell_id, read_epoch, &query, window, budget,
-            )
+            .try_execute_ordered_relationship_property_rows_query(cell_id, read_epoch, &query, window, budget)
             .await?
         {
             return Ok(result);
@@ -1254,10 +1199,8 @@ impl GraphShard {
         {
             return Ok(result);
         }
-        if let Some(result) = Box::pin(self.try_execute_ordered_string_vertex_rows_query(
-            cell_id, read_epoch, &query, window, budget,
-        ))
-        .await?
+        if let Some(result) =
+            Box::pin(self.try_execute_ordered_string_vertex_rows_query(cell_id, read_epoch, &query, window, budget)).await?
         {
             return Ok(result);
         }
@@ -1269,13 +1212,7 @@ impl GraphShard {
                 optional: false,
             };
             let seeds = self
-                .node_equality_predicate_seed_rows(
-                    cell_id,
-                    &group,
-                    read_epoch,
-                    budget,
-                    &BindingRow::default(),
-                )
+                .node_equality_predicate_seed_rows(cell_id, &group, read_epoch, budget, &BindingRow::default())
                 .await?
                 .unwrap_or_else(|| vec![BindingRow::default()]);
             let mut bindings = self
@@ -1298,21 +1235,8 @@ impl GraphShard {
         };
 
         if row_projections_have_aggregates(&query.projections) {
-            let projected = aggregate_projected_rows(
-                bindings,
-                &query.projections,
-                &query.columns,
-                &query.order_by,
-                budget,
-            )?;
-            return self.finish_projected_rows(
-                query.columns,
-                projected,
-                &query.order_by,
-                query.distinct,
-                window,
-                budget,
-            );
+            let projected = aggregate_projected_rows(bindings, &query.projections, &query.columns, &query.order_by, budget)?;
+            return self.finish_projected_rows(query.columns, projected, &query.order_by, query.distinct, window, budget);
         }
 
         let mut projected = Vec::with_capacity(bindings.len());
@@ -1322,14 +1246,7 @@ impl GraphShard {
             let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
             push_projected_query_row(&mut projected, row, sort_keys);
         }
-        self.finish_projected_rows(
-            query.columns,
-            projected,
-            &query.order_by,
-            query.distinct,
-            window,
-            budget,
-        )
+        self.finish_projected_rows(query.columns, projected, &query.order_by, query.distinct, window, budget)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1361,13 +1278,11 @@ impl GraphShard {
             actual: window.skip,
             limit: usize::MAX as u64,
         })?;
-        let required = skip
-            .checked_add(limit)
-            .ok_or(GraphError::AdmissionRejected {
-                operation: "query_result_window",
-                actual: u64::MAX,
-                limit: usize::MAX as u64,
-            })?;
+        let required = skip.checked_add(limit).ok_or(GraphError::AdmissionRejected {
+            operation: "query_result_window",
+            actual: u64::MAX,
+            limit: usize::MAX as u64,
+        })?;
         // A complete equality union can filter the ordered index before any
         // metadata I/O. Retained IDs obey the existing index-candidate cap;
         // metadata rows still obey the independent intermediate-row cap.
@@ -1379,10 +1294,7 @@ impl GraphShard {
         let hydrate_seed = |vertices: Vec<VertexId>| async move {
             let mut projected = OrderedRowWindow::new(required, &query.order_by);
             for batch in vertices.chunks(QUERY_METADATA_HYDRATION_CONCURRENCY) {
-                for (vertex, metadata) in self
-                    .vertex_metadata_batch_at(cell_id, batch, read_epoch, budget)
-                    .await?
-                {
+                for (vertex, metadata) in self.vertex_metadata_batch_at(cell_id, batch, read_epoch, budget).await? {
                     budget.check("cypher_ordered_vertex_equality_project")?;
                     let Some(mut row) = BindingRow::from_node(node, vertex) else {
                         continue;
@@ -1392,23 +1304,12 @@ impl GraphShard {
                         continue;
                     }
                     let result = project_binding_row(&row, &query.projections)?;
-                    let sort_keys =
-                        sort_keys_for_row(&row, &result, &query.columns, &query.order_by)?;
+                    let sort_keys = sort_keys_for_row(&row, &result, &query.columns, &query.order_by)?;
                     projected.push(result, sort_keys);
-                    self.ensure_query_intermediate_rows(
-                        "cypher_ordered_vertex_window",
-                        projected.len(),
-                    )?;
+                    self.ensure_query_intermediate_rows("cypher_ordered_vertex_window", projected.len())?;
                 }
             }
-            self.finish_projected_rows(
-                query.columns.clone(),
-                projected.into_rows(),
-                &query.order_by,
-                false,
-                window,
-                budget,
-            )
+            self.finish_projected_rows(query.columns.clone(), projected.into_rows(), &query.order_by, false, window, budget)
         };
         // The equality probe is speculative: a broad cold prefix must not
         // delay an ordered page that can already produce the exact result.
@@ -1434,10 +1335,7 @@ impl GraphShard {
             let mut examined = 0_usize;
             let mut rejected = 0_usize;
 
-            let prefix = format!(
-                "{}s",
-                keys::vertex_property_index_property_prefix(cell_id, property)
-            );
+            let prefix = format!("{}s", self.vertex_property_index_prefix_at(cell_id, property, budget).await?);
             let order = if ascending {
                 slatedb::IterationOrder::Ascending
             } else {
@@ -1463,18 +1361,13 @@ impl GraphShard {
             // make a small LIMIT walk a large index. A short warm-up avoids paying
             // the same first-block S3 reads on every ordered page without admitting
             // the complete long scan or changing its result/scan-limit semantics.
-            if self.db.has_block_cache() {
-                let warm_options = remote_scan_options()
-                    .with_order(order)
-                    .with_cache_blocks(true);
+            if self.storage.has_block_cache() {
+                let warm_options = remote_scan_options().with_order(order).with_cache_blocks(true);
                 let mut warm = budget
                     .read_only_io(
                         "cypher_ordered_vertex_index_warm",
-                        self.db.scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            start_suffix.clone(),
-                            &warm_options,
-                        ),
+                        self.storage
+                            .scan_prefix_with_options(prefix.as_bytes(), start_suffix.clone(), &warm_options),
                     )
                     .await?;
                 for _ in 0..required.saturating_add(1).min(256) {
@@ -1493,11 +1386,8 @@ impl GraphShard {
             let mut iter = budget
                 .read_only_io(
                     "cypher_ordered_vertex_index_seek",
-                    self.db.scan_prefix_with_options(
-                        prefix.as_bytes(),
-                        start_suffix.clone(),
-                        &ordered_scan_options,
-                    ),
+                    self.storage
+                        .scan_prefix_with_options(prefix.as_bytes(), start_suffix.clone(), &ordered_scan_options),
                 )
                 .await?;
             let mut projected = OrderedRowWindow::new(required, &query.order_by);
@@ -1513,12 +1403,7 @@ impl GraphShard {
                         .saturating_sub(projected.len())
                         .clamp(1, QUERY_METADATA_HYDRATION_CONCURRENCY)
                 })
-                .min(
-                    self.limits
-                        .max_query_index_candidates
-                        .saturating_sub(scanned)
-                        .max(1),
-                );
+                .min(self.limits.max_query_index_candidates.saturating_sub(scanned).max(1));
                 let mut candidates = Vec::with_capacity(batch_capacity);
                 while candidates.len() < batch_capacity {
                     let Some(kv) = budget
@@ -1532,13 +1417,11 @@ impl GraphShard {
                     };
                     budget.check("cypher_ordered_vertex_property_index")?;
                     let key = String::from_utf8_lossy(&kv.key).into_owned();
-                    let (_cell, indexed_property, encoded, vertex_id) =
-                        parse_vertex_property_index_key(&key)?;
+                    let (_cell, indexed_property, encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
                     if indexed_property != *property {
                         continue;
                     }
-                    if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str())
-                    {
+                    if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
                         exhausted = true;
                         break;
                     }
@@ -1548,14 +1431,8 @@ impl GraphShard {
                         exhausted = true;
                         break;
                     }
-                    self.ensure_query_index_candidates(
-                        "cypher_ordered_vertex_property_candidates",
-                        scanned,
-                    )?;
-                    if seed
-                        .as_ref()
-                        .is_some_and(|vertices| vertices.binary_search(&vertex_id).is_err())
-                    {
+                    self.ensure_query_index_candidates("cypher_ordered_vertex_property_candidates", scanned)?;
+                    if seed.as_ref().is_some_and(|vertices| vertices.binary_search(&vertex_id).is_err()) {
                         continue;
                     }
                     candidates.push((encoded, vertex_id));
@@ -1563,16 +1440,10 @@ impl GraphShard {
                 if seed_fallback {
                     break;
                 }
-                let vertex_ids = candidates
-                    .iter()
-                    .map(|(_, vertex_id)| *vertex_id)
-                    .collect::<Vec<_>>();
-                let metadata = self
-                    .vertex_metadata_batch_at(cell_id, &vertex_ids, read_epoch, budget)
-                    .await?;
+                let vertex_ids = candidates.iter().map(|(_, vertex_id)| *vertex_id).collect::<Vec<_>>();
+                let metadata = self.vertex_metadata_batch_at(cell_id, &vertex_ids, read_epoch, budget).await?;
                 for ((encoded, vertex_id), (_, metadata)) in candidates.into_iter().zip(metadata) {
-                    if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str())
-                    {
+                    if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
                         exhausted = true;
                         break;
                     }
@@ -1595,15 +1466,11 @@ impl GraphShard {
                         continue;
                     }
                     let result_row = project_binding_row(&row, &query.projections)?;
-                    let sort_keys =
-                        sort_keys_for_row(&row, &result_row, &query.columns, &query.order_by)?;
+                    let sort_keys = sort_keys_for_row(&row, &result_row, &query.columns, &query.order_by)?;
                     projected.push(result_row, sort_keys);
                     // Consume the complete primary-key tie for secondary ordering,
                     // but retain only the best window, not the whole tie population.
-                    self.ensure_query_intermediate_rows(
-                        "cypher_ordered_vertex_property_rows",
-                        projected.len(),
-                    )?;
+                    self.ensure_query_intermediate_rows("cypher_ordered_vertex_property_rows", projected.len())?;
                     if projected.len() == required {
                         boundary = Some(encoded);
                     }
@@ -1613,8 +1480,7 @@ impl GraphShard {
                 // selectivity, or when the ordered access reaches its scan bound.
                 if !seed_probed
                     && !exhausted
-                    && ((rejected >= QUERY_METADATA_HYDRATION_CONCURRENCY
-                        && rejected.saturating_mul(2) > examined)
+                    && ((rejected >= QUERY_METADATA_HYDRATION_CONCURRENCY && rejected.saturating_mul(2) > examined)
                         || scanned >= self.limits.max_query_index_candidates)
                 {
                     seed_probed = true;
@@ -1641,11 +1507,8 @@ impl GraphShard {
                         iter = budget
                             .read_only_io(
                                 "cypher_ordered_vertex_index_seek",
-                                self.db.scan_prefix_with_options(
-                                    prefix.as_bytes(),
-                                    start_suffix.clone(),
-                                    &ordered_scan_options,
-                                ),
+                                self.storage
+                                    .scan_prefix_with_options(prefix.as_bytes(), start_suffix.clone(), &ordered_scan_options),
                             )
                             .await?;
                     }
@@ -1672,7 +1535,12 @@ impl GraphShard {
             )?))
         };
         tokio::pin!(equality, ordered);
+        // Polled in order, the cheap equality probe first: when SlateDB serves
+        // both from memory, each can finish in its first poll, and an unbiased
+        // select would pick the ordered page's wider hydration at random. A
+        // pending probe still never holds the ordered page back.
         tokio::select! {
+            biased;
             seed = &mut equality => match seed? {
                 Some(result) => Ok(Some(result)),
                 None => ordered.await,
@@ -1701,14 +1569,7 @@ impl GraphShard {
         };
         if request.projection == GraphKernelProjection::CountAll && request.edge.dst.id.is_none() {
             let (count, edge_visits) = self
-                .reachable_count_in_hop_range_at(
-                    cell_id,
-                    &request.edge.edge_type,
-                    request.src,
-                    request.hop_range,
-                    read_epoch,
-                    budget,
-                )
+                .reachable_count_in_hop_range_at(cell_id, &request.edge.edge_type, request.src, request.hop_range, read_epoch, budget)
                 .await?;
             self.ensure_query_scan_edges("cypher_graph_kernel_count_edge_visits", edge_visits)?;
             let row = QueryRow::new(vec![QueryValue::Count(count)]);
@@ -1718,11 +1579,7 @@ impl GraphShard {
                 self.apply_query_row_window(rows, window)?,
             )));
         }
-        if request.projection == GraphKernelProjection::NodeId
-            && request.edge.dst.id.is_none()
-            && !window.is_default()
-            && !query.distinct
-        {
+        if request.projection == GraphKernelProjection::NodeId && request.edge.dst.id.is_none() && !window.is_default() && !query.distinct {
             let (vertices, edge_visits) = self
                 .reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
                     cell_id,
@@ -1742,14 +1599,7 @@ impl GraphShard {
         }
 
         let (mut vertices, edge_visits) = self
-            .reachable_vertices_in_hop_range_at(
-                cell_id,
-                &request.edge.edge_type,
-                request.src,
-                request.hop_range,
-                read_epoch,
-                budget,
-            )
+            .reachable_vertices_in_hop_range_at(cell_id, &request.edge.edge_type, request.src, request.hop_range, read_epoch, budget)
             .await?;
         self.ensure_query_scan_edges("cypher_graph_kernel_edge_visits", edge_visits)?;
         if let Some(dst) = request.edge.dst.id {
@@ -1797,19 +1647,14 @@ impl GraphShard {
             return Ok(None);
         };
         if !relationship_rows_projection_supported(edge, &query.projections)
-            || !relationship_rows_order_supported(
-                edge,
-                &query.projections,
-                &query.columns,
-                &query.order_by,
-            )
+            || !relationship_rows_order_supported(edge, &query.projections, &query.columns, &query.order_by)
         {
             return Ok(None);
         }
         let (Some(src), Some(dst)) = (edge.src.id, edge.dst.id) else {
             return Ok(None);
         };
-        let relationships = if let Some((property, value)) = edge.properties.iter().next() {
+        let relationships = if let Some((property, value)) = first_indexable_property(&edge.properties) {
             self.relationships_for_edge_property_at(RelationshipPropertyLookup {
                 cell_id,
                 edge_type: &edge.edge_type,
@@ -1832,13 +1677,9 @@ impl GraphShard {
                 continue;
             }
             let row = project_relationship_row(edge, &relationship, &metadata, &query.projections)?;
-            let sort_keys =
-                sort_keys_for_relationship_row(edge, &relationship, &metadata, &row, query)?;
+            let sort_keys = sort_keys_for_relationship_row(edge, &relationship, &metadata, &row, query)?;
             push_projected_query_row(&mut projected, row, sort_keys);
-            self.ensure_query_intermediate_rows(
-                "cypher_relationship_rows_fast_path",
-                projected.len(),
-            )?;
+            self.ensure_query_intermediate_rows("cypher_relationship_rows_fast_path", projected.len())?;
         }
         Ok(Some(self.finish_projected_rows(
             query.columns.clone(),
@@ -1880,27 +1721,23 @@ impl GraphShard {
             actual: window.skip,
             limit: usize::MAX as u64,
         })?;
-        let required = skip
-            .checked_add(limit)
-            .ok_or(GraphError::AdmissionRejected {
-                operation: "query_result_window",
-                actual: u64::MAX,
-                limit: usize::MAX as u64,
-            })?;
+        let required = skip.checked_add(limit).ok_or(GraphError::AdmissionRejected {
+            operation: "query_result_window",
+            actual: u64::MAX,
+            limit: usize::MAX as u64,
+        })?;
         let order = if ascending {
             slatedb::IterationOrder::Ascending
         } else {
             slatedb::IterationOrder::Descending
         };
-        let edge_prefix =
-            keys::edge_property_index_property_prefix(cell_id, &edge.edge_type, property);
-        let relationship_prefix =
-            keys::relationship_property_index_property_prefix(cell_id, &edge.edge_type, property);
+        let edge_prefix = keys::edge_property_index_property_prefix(cell_id, &edge.edge_type, property);
+        let relationship_prefix = keys::relationship_property_index_property_prefix(cell_id, &edge.edge_type, property);
         let mut edge_iters = Vec::with_capacity(ORDERED_PROPERTY_INDEX_TYPE_PREFIXES.len());
         let mut relationship_iters = Vec::with_capacity(ORDERED_PROPERTY_INDEX_TYPE_PREFIXES.len());
         for value_type in ORDERED_PROPERTY_INDEX_TYPE_PREFIXES {
             edge_iters.push(
-                self.db
+                self.storage
                     .scan_prefix_with_options(
                         format!("{edge_prefix}{value_type}").as_bytes(),
                         None,
@@ -1909,7 +1746,7 @@ impl GraphShard {
                     .await?,
             );
             relationship_iters.push(
-                self.db
+                self.storage
                     .scan_prefix_with_options(
                         format!("{relationship_prefix}{value_type}").as_bytes(),
                         None,
@@ -1951,12 +1788,7 @@ impl GraphShard {
             };
             let mut candidates = Vec::with_capacity(batch_size);
             while candidates.len() < batch_size {
-                let Some(source) = ordered_relationship_property_candidate_source(
-                    &next_edges,
-                    &next_relationships,
-                    ascending,
-                )?
-                else {
+                let Some(source) = ordered_relationship_property_candidate_source(&next_edges, &next_relationships, ascending)? else {
                     done = true;
                     break;
                 };
@@ -1971,8 +1803,7 @@ impl GraphShard {
                         candidate
                     }
                     OrderedRelationshipPropertyCandidateSource::Relationship(index) => {
-                        let candidate =
-                            next_relationships[index].take().expect("relationship head");
+                        let candidate = next_relationships[index].take().expect("relationship head");
                         next_relationships[index] = relationship_iters[index]
                             .next()
                             .await?
@@ -1983,13 +1814,9 @@ impl GraphShard {
                 };
                 budget.check("cypher_ordered_relationship_property_index")?;
                 scanned += 1;
-                self.ensure_query_index_candidates(
-                    "cypher_ordered_relationship_property_candidates",
-                    scanned,
-                )?;
+                self.ensure_query_index_candidates("cypher_ordered_relationship_property_candidates", scanned)?;
                 if top.len() == required {
-                    let value =
-                        QueryValue::Property(decode_vertex_property_value_key(&candidate.encoded)?);
+                    let value = QueryValue::Property(decode_vertex_property_value_key(&candidate.encoded)?);
                     let boundary = &top.rows.peek().expect("full window").projected.sort_keys[0];
                     let cmp = compare_query_values(&value, boundary);
                     if (if ascending { cmp } else { cmp.reverse() }).is_gt() {
@@ -2004,10 +1831,7 @@ impl GraphShard {
             }
             let identified = candidates
                 .iter()
-                .filter_map(|c| {
-                    c.relationship_id
-                        .map(|id| (c.src, c.dst, id, c.encoded.clone()))
-                })
+                .filter_map(|c| c.relationship_id.map(|id| (c.src, c.dst, id, c.encoded.clone())))
                 .collect::<Vec<_>>();
             let identified_metadata = if identified.is_empty() {
                 Vec::new()
@@ -2024,31 +1848,19 @@ impl GraphShard {
                 })
                 .await?
             };
-            let structural = stream::iter(
-                candidates
-                    .iter()
-                    .filter(|c| c.relationship_id.is_none())
-                    .map(|c| {
-                        let snapshot = &snapshot;
-                        async move {
-                            let (exists, metadata) = futures::try_join!(
-                                budget.read_only_io(
-                                    "cypher_ordered_structural_exists",
-                                    snapshot.edge_exists(&edge.edge_type, c.src, c.dst)
-                                ),
-                                self.edge_metadata_at(
-                                    cell_id,
-                                    &edge.edge_type,
-                                    c.src,
-                                    c.dst,
-                                    read_epoch,
-                                    budget
-                                ),
-                            )?;
-                            Ok::<_, GraphError>(exists.then_some(metadata))
-                        }
-                    }),
-            )
+            let structural = stream::iter(candidates.iter().filter(|c| c.relationship_id.is_none()).map(|c| {
+                let snapshot = &snapshot;
+                async move {
+                    let (exists, metadata) = futures::try_join!(
+                        budget.read_only_io(
+                            "cypher_ordered_structural_exists",
+                            snapshot.edge_exists(&edge.edge_type, c.src, c.dst)
+                        ),
+                        self.edge_metadata_at(cell_id, &edge.edge_type, c.src, c.dst, read_epoch, budget),
+                    )?;
+                    Ok::<_, GraphError>(exists.then_some(metadata))
+                }
+            }))
             .buffered(ORDERED_RELATIONSHIP_FETCH_CONCURRENCY)
             .boxed()
             .try_collect::<Vec<_>>()
@@ -2082,27 +1894,12 @@ impl GraphShard {
                     bindings.push(binding);
                 }
             }
-            let wanted = bindings
-                .iter()
-                .flat_map(|row| row.values.values().copied())
-                .collect::<Vec<_>>();
-            self.hydrate_vertex_metadata_cache_at(
-                cell_id,
-                &wanted,
-                read_epoch,
-                &mut metadata_cache,
-                budget,
-            )
-            .await?;
-            for mut row in bindings {
-                self.hydrate_binding_metadata(
-                    cell_id,
-                    read_epoch,
-                    &mut row,
-                    &mut metadata_cache,
-                    budget,
-                )
+            let wanted = bindings.iter().flat_map(|row| row.values.values().copied()).collect::<Vec<_>>();
+            self.hydrate_vertex_metadata_cache_at(cell_id, &wanted, read_epoch, &mut metadata_cache, budget)
                 .await?;
+            for mut row in bindings {
+                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache, budget)
+                    .await?;
                 if !row_matches_edge_pattern(&row, edge)? {
                     continue;
                 }
@@ -2114,10 +1911,7 @@ impl GraphShard {
                 let projected = project_binding_row(&row, &query.projections)?;
                 let keys = sort_keys_for_row(&row, &projected, &query.columns, &query.order_by)?;
                 top.push(projected, keys);
-                self.ensure_query_intermediate_rows(
-                    "cypher_ordered_relationship_window",
-                    top.len(),
-                )?;
+                self.ensure_query_intermediate_rows("cypher_ordered_relationship_window", top.len())?;
             }
         }
         Ok(Some(self.finish_projected_rows(
@@ -2216,11 +2010,7 @@ impl GraphShard {
         let page_context = self.query_page_context(context.clone(), cursor_offset, page_size)?;
         let window = page_context.result_window;
         if window.limit == Some(0) {
-            return Ok(Some(QueryResultPage::new(
-                query.columns.clone(),
-                Vec::new(),
-                None,
-            )));
+            return Ok(Some(QueryResultPage::new(query.columns.clone(), Vec::new(), None)));
         }
         let read_epoch = self.query_read_epoch(context).await?;
         let budget = QueryBudget::new(
@@ -2243,15 +2033,10 @@ impl GraphShard {
             limit: usize::MAX as u64,
         })?;
         let probe_limit = window.limit.unwrap_or(page_size.saturating_add(1));
-        let page_dsts = dsts
-            .into_iter()
-            .skip(skip)
-            .take(probe_limit)
-            .collect::<Vec<_>>();
+        let page_dsts = dsts.into_iter().skip(skip).take(probe_limit).collect::<Vec<_>>();
         let has_next = page_dsts.len() > page_size;
         let page_dsts = &page_dsts[..page_dsts.len().min(page_size)];
-        let bindings =
-            source_relationship_id_bindings_from_dsts(edge, src, page_dsts, self, &budget)?;
+        let bindings = source_relationship_id_bindings_from_dsts(edge, src, page_dsts, self, &budget)?;
         let mut rows = Vec::with_capacity(bindings.len());
         for binding in bindings {
             budget.check("cypher_source_relationship_page_project")?;
@@ -2266,11 +2051,41 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn execute_parsed_opencypher_mutation(
+    async fn execute_parsed_opencypher_mutation_with_receipt(
         &self,
         context: QueryContext,
+        source_query: &str,
         query: ParsedMutationQuery,
     ) -> Result<QueryMutationResult> {
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if !context.idempotency_key.is_empty() {
+            let lookup = crate::shard::datafusion_cypher::statement_receipt_lookup(&context, source_query)?;
+            let result = crate::shard::datafusion_cypher::scope_legacy_statement_receipt(
+                lookup.clone(),
+                self.execute_parsed_opencypher_mutation(context, query),
+            )
+            .await?;
+            // Receipt persistence advances storage, not graph topology. Preserve
+            // the actual mutation's topology signal (including None for metadata
+            // updates and segment-backed relationship deletes).
+            // Execution already succeeded, so its graph writes have happened.
+            // Persisting the completion receipt is part of finishing that write,
+            // not another cancellable admission phase. In particular, the
+            // multi-batch effects shield ends before reaching this wrapper.
+            QueryCancellationToken::shielded(crate::shard::datafusion_cypher::complete_legacy_statement_receipt(
+                self, lookup, &result,
+            ))
+            .await?;
+            return Ok(result);
+        }
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        let _ = source_query;
+        self.execute_parsed_opencypher_mutation(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_mutation(&self, context: QueryContext, query: ParsedMutationQuery) -> Result<QueryMutationResult> {
+        self.ensure_managed_cypher_layout().await?;
         validate_component("cell_id", &context.cell_id)?;
         if context.read_epoch.is_some() {
             return Err(GraphError::UnsupportedQuery {
@@ -2286,226 +2101,394 @@ impl GraphShard {
         budget.check("cypher_mutation")?;
 
         if query.patterns.is_empty() {
-            return self
-                .execute_patternless_mutation(&context, &query.actions, &budget)
-                .await;
+            return self.execute_patternless_mutation(&context, &query.actions, &budget).await;
         }
 
         // Keep the actual storage snapshot, not just its sequence: another
         // write may commit between choosing the sequence and expanding an
         // edge. Every matching read must use the same immutable view. Scope
         // only matching; the write paths below must observe current storage.
-        let snapshot = self.db.snapshot().await?;
-        let read_epoch = snapshot.seq();
-        let mut bindings = GraphStore::scope_snapshot(snapshot, async {
-            self.ensure_cell_readable(&context.cell_id, "cypher_mutation")
-                .await?;
-            self.match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
-                .await
-        })
-        .await?;
-        if let Some(predicate) = &query.predicate {
-            let mut filtered = Vec::with_capacity(bindings.len());
-            for row in bindings {
-                budget.check("cypher_mutation_where")?;
-                if row_predicate_matches(&row, predicate)? {
-                    filtered.push(row);
-                }
+        // A statement computes its updates from a snapshot taken before its
+        // write transactions. If a record it updates changed in between,
+        // nothing is written and the whole statement re-runs on a new
+        // snapshot, as if it had started after the other write.
+        for _attempt in 0..STATEMENT_RACE_ATTEMPTS {
+            let snapshot = self.storage.snapshot().await?;
+            let read_epoch = snapshot.seq();
+            // Match through the same planner as reads, so a `WHERE` equality,
+            // prefix or relationship-property predicate becomes an index seek
+            // instead of a filter over every vertex the label matches. `WITH ...
+            // LIMIT n` applies after the predicate, which is where Cypher puts it;
+            // the matcher stops collecting once n filtered rows exist.
+            let group = RowMatchGroup {
+                patterns: query.patterns.clone(),
+                predicate: query.predicate.clone(),
+                optional: false,
+            };
+            let mut bindings = SlateGraphStore::scope_snapshot(snapshot, async {
+                self.ensure_cell_readable(&context.cell_id, "cypher_mutation").await?;
+                self.match_row_pattern_groups_limited(&context.cell_id, std::slice::from_ref(&group), read_epoch, &budget, query.row_limit)
+                    .await
+            })
+            .await?;
+            if let Some(limit) = query.row_limit {
+                bindings.truncate(limit);
             }
-            bindings = filtered;
+
+            let returned_rows = query.returning.as_ref().map(|returning| mutation_return_rows(returning, &bindings));
+
+            let mut result = QueryMutationResult {
+                matched_rows: bindings.len() as u64,
+                returned_rows,
+                ..QueryMutationResult::default()
+            };
+            let mut effects = StatementEffects::default();
+            self.collect_statement_effects(&context.cell_id, read_epoch, &query.actions, &bindings, &budget, &mut effects)
+                .await?;
+            effects.drop_noops(&mut result);
+
+            // Every check against the deadline happens above: matching and effect
+            // collection are read-only, so a statement that runs out of time there
+            // has written nothing. From here each kind of effect is one batch
+            // transaction with one durable WAL commit, and a commit, once started,
+            // is never raced against cancellation.
+            budget.check("cypher_mutation_commit")?;
+            match self.apply_statement_effects(&context, effects, &mut result).await? {
+                StatementApply::Applied => return Ok(result),
+                StatementApply::LostRace => continue,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "cypher mutation",
+            attempts: STATEMENT_RACE_ATTEMPTS,
+        })
+    }
+
+    /// `UNWIND $rows AS row MATCH ... SET/REMOVE` as one statement. Every row
+    /// is matched against the same snapshot, every row's updates are gathered
+    /// (a later row building on an earlier row's update of the same record),
+    /// and the whole batch is applied as one transaction per kind of effect
+    /// with one durable WAL commit. A batch either applies every row's update
+    /// or none of them, and costs one WAL write rather than one per row.
+    #[cfg(all(feature = "opencypher", feature = "client-api"))]
+    pub(crate) async fn execute_parsed_opencypher_mutation_rows(
+        &self,
+        context: QueryContext,
+        rows: Vec<ParsedMutationQuery>,
+    ) -> Result<QueryMutationResult> {
+        self.ensure_managed_cypher_layout().await?;
+        validate_component("cell_id", &context.cell_id)?;
+        if context.read_epoch.is_some() {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "OpenCypher",
+                feature: "mutation queries cannot run at a historical read epoch".to_string(),
+            });
+        }
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        );
+        budget.check("cypher_unwind_mutation")?;
+        if rows
+            .iter()
+            .any(|row| row.patterns.is_empty() || row.row_limit.is_some() || row.returning.is_some())
+        {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Unwind,
+                dialect: "OpenCypher",
+                feature: "UNWIND MATCH SET requires MATCH and no WITH or RETURN".to_string(),
+            });
         }
 
-        // `WITH ... LIMIT n` caps the rows that reach the write. It applies
-        // after the predicate, which is where Cypher puts it: the barrier sees
-        // the filtered rows, not the raw pattern matches.
-        //
-        // This is a ceiling on rows mutated, not on rows examined. The shapes
-        // that use it anchor on a property seek, so matching already costs the
-        // anchor's degree rather than the graph; an unanchored pattern would
-        // still materialize every match before the truncation. Pushing the
-        // bound into `match_row_patterns` is the follow-up.
-        if let Some(limit) = query.row_limit {
-            budget.check("cypher_mutation_limit")?;
-            bindings.truncate(limit);
+        // The batch re-runs on a new snapshot when a record it updates
+        // changed after its snapshot, as one statement does.
+        for _attempt in 0..STATEMENT_RACE_ATTEMPTS {
+            let snapshot = self.storage.snapshot().await?;
+            let read_epoch = snapshot.seq();
+            let mut result = QueryMutationResult::default();
+            let mut effects = StatementEffects::default();
+            SlateGraphStore::scope_snapshot(snapshot, async {
+                self.ensure_cell_readable(&context.cell_id, "cypher_unwind_mutation").await?;
+                for row in &rows {
+                    budget.check("cypher_unwind_mutation_row")?;
+                    let group = RowMatchGroup {
+                        patterns: row.patterns.clone(),
+                        predicate: row.predicate.clone(),
+                        optional: false,
+                    };
+                    let bindings = self
+                        .match_row_pattern_groups(&context.cell_id, std::slice::from_ref(&group), read_epoch, &budget)
+                        .await?;
+                    result.matched_rows = result.matched_rows.saturating_add(bindings.len() as u64);
+                    self.collect_statement_effects(&context.cell_id, read_epoch, &row.actions, &bindings, &budget, &mut effects)
+                        .await?;
+                }
+                Ok::<_, GraphError>(())
+            })
+            .await?;
+            effects.drop_noops(&mut result);
+
+            budget.check("cypher_unwind_mutation_commit")?;
+            match self.apply_statement_effects(&context, effects, &mut result).await? {
+                StatementApply::Applied => return Ok(result),
+                StatementApply::LostRace => continue,
+            }
         }
+        Err(GraphError::RetryExhausted {
+            operation: "cypher unwind mutation",
+            attempts: STATEMENT_RACE_ATTEMPTS,
+        })
+    }
 
-        let returned_rows = query
-            .returning
-            .as_ref()
-            .map(|returning| mutation_return_rows(returning, &bindings));
-
-        let mut result = QueryMutationResult {
-            matched_rows: bindings.len() as u64,
-            returned_rows,
-            ..QueryMutationResult::default()
-        };
-        let mut pending_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
-        let mut original_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
-        let mut pending_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
-        let mut original_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
-
-        for action in &query.actions {
+    /// Add the writes `actions` make on every matched row to `effects`,
+    /// before any of them is applied. A statement calls this once; an `UNWIND`
+    /// batch calls it once per input row, so later rows build on earlier ones.
+    #[cfg(feature = "opencypher")]
+    async fn collect_statement_effects(
+        &self,
+        cell_id: &str,
+        read_epoch: StorageSequence,
+        actions: &[RowMutationAction],
+        bindings: &[BindingRow],
+        budget: &QueryBudget,
+        effects: &mut StatementEffects,
+    ) -> Result<()> {
+        for action in actions {
             budget.check("cypher_mutation_action")?;
             match action {
                 RowMutationAction::DeleteBinding { binding, detach } => {
-                    let mut relationships = BTreeSet::new();
-                    let mut vertices = BTreeSet::new();
-                    for row in &bindings {
+                    for row in bindings {
                         if let Some(relationship) = row.relationships.get(binding) {
-                            relationships.insert(relationship.clone());
+                            effects.deleted_relationships.insert(relationship.clone());
                         } else {
-                            vertices.insert(row.get(binding)?);
-                        }
-                    }
-                    let deleted = self
-                        .delete_bound_relationships_batch(
-                            &context,
-                            relationships,
-                            Vec::new(),
-                            &budget,
-                        )
-                        .await?;
-                    result.deleted_edges = result.deleted_edges.saturating_add(deleted.deleted);
-                    result.noops = result.noops.saturating_add(deleted.already_deleted);
-                    result.topology_sequence =
-                        result.topology_sequence.max(deleted.topology_sequence);
-                    for vertex_id in vertices {
-                        budget.check("cypher_delete_vertex")?;
-                        let delete = if *detach {
-                            self.detach_delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!(
-                                    "{}.detach-delete-node.{vertex_id}",
-                                    context.idempotency_key
-                                ),
-                            )
-                            .await?
-                        } else {
-                            self.delete_vertex(
-                                &context.cell_id,
-                                vertex_id,
-                                &format!("{}.delete-node.{vertex_id}", context.idempotency_key),
-                            )
-                            .await?
-                        };
-                        result.deleted_edges = result
-                            .deleted_edges
-                            .saturating_add(delete.incident_edges_deleted);
-                        if delete.incident_edges_deleted > 0 {
-                            result.topology_sequence =
-                                result.topology_sequence.max(Some(delete.epoch));
-                        }
-                        if delete.vertex_deleted {
-                            result.updated_vertices = result.updated_vertices.saturating_add(1);
-                        } else if delete.incident_edges_deleted == 0
-                            && delete.relationships_deleted == 0
-                        {
-                            result.noops = result.noops.saturating_add(1);
+                            let deletes = effects.deleted_vertices.entry(row.get(binding)?).or_insert(false);
+                            *deletes |= *detach;
                         }
                     }
                 }
-                RowMutationAction::DeleteRelationship { binding, detach } => {
-                    let _ = detach;
-                    let mut relationships = BTreeSet::new();
-                    for row in &bindings {
+                RowMutationAction::DeleteRelationship { binding, .. } => {
+                    for row in bindings {
                         let Some(relationship) = row.relationships.get(binding) else {
                             return Err(GraphError::UnsupportedQuery {
                                 reason: QueryFailureReason::Mutation,
                                 dialect: "OpenCypher",
-                                feature: format!(
-                                    "DELETE references unbound relationship {binding}"
-                                ),
+                                feature: format!("DELETE references unbound relationship {binding}"),
                             });
                         };
-                        relationships.insert(relationship.clone());
+                        effects.deleted_relationships.insert(relationship.clone());
                     }
-                    let deleted = self
-                        .delete_bound_relationships_batch(
-                            &context,
-                            relationships,
-                            Vec::new(),
-                            &budget,
-                        )
-                        .await?;
-                    result.deleted_edges = result.deleted_edges.saturating_add(deleted.deleted);
-                    result.noops = result.noops.saturating_add(deleted.already_deleted);
-                    result.topology_sequence =
-                        result.topology_sequence.max(deleted.topology_sequence);
                 }
                 RowMutationAction::SetProperty { .. }
                 | RowMutationAction::SetLabels { .. }
                 | RowMutationAction::RemoveProperty { .. }
                 | RowMutationAction::RemoveLabels { .. } => {
                     let mut state = VertexMutationApplyState {
-                        cell_id: &context.cell_id,
+                        cell_id,
                         read_epoch,
-                        pending_metadata: &mut pending_metadata,
-                        original_metadata: &mut original_metadata,
-                        pending_edge_metadata: &mut pending_edge_metadata,
-                        original_edge_metadata: &mut original_edge_metadata,
-                        budget: &budget,
+                        pending_metadata: &mut effects.vertex_metadata,
+                        original_metadata: &mut effects.original_metadata,
+                        pending_edge_metadata: &mut effects.relationship_metadata,
+                        original_edge_metadata: &mut effects.original_edge_metadata,
+                        budget,
                     };
-                    for row in &bindings {
-                        self.apply_vertex_mutation_action(row, action, &mut state)
-                            .await?;
+                    for row in bindings {
+                        self.apply_vertex_mutation_action(row, action, &mut state).await?;
                     }
                 }
-                RowMutationAction::CreateEdge { .. } | RowMutationAction::MergeEdge { .. } => {
+                RowMutationAction::CreateVertex { .. } | RowMutationAction::CreateEdge { .. } | RowMutationAction::MergeEdge { .. } => {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::Mutation,
                         dialect: "OpenCypher",
-                        feature: "CREATE and MERGE are executable only as standalone clauses"
-                            .to_string(),
+                        feature: "CREATE and MERGE are executable only as standalone clauses".to_string(),
                     });
                 }
             }
         }
 
-        for (vertex_id, metadata) in pending_metadata {
-            budget.check("cypher_set_vertex_metadata")?;
-            if original_metadata.get(&vertex_id) == Some(&metadata) {
-                result.noops = result.noops.saturating_add(1);
-                continue;
-            }
-            self.set_vertex_metadata(&context.cell_id, vertex_id, metadata)
-                .await?;
-            result.updated_vertices = result.updated_vertices.saturating_add(1);
+        Ok(())
+    }
+
+    /// Apply a statement's effects as one batch transaction per kind of
+    /// effect: property updates (vertices, then relationships) and deletes
+    /// (relationships, then vertices), in the order `apply_statement_effect_batches`
+    /// gives. A statement that makes one kind of
+    /// change -- every `MATCH ... DELETE`, `DETACH DELETE`, `SET` or `REMOVE`
+    /// -- commits all of it or none of it, with one durable WAL commit.
+    #[cfg(feature = "opencypher")]
+    async fn apply_statement_effects(
+        &self,
+        context: &QueryContext,
+        effects: StatementEffects,
+        result: &mut QueryMutationResult,
+    ) -> Result<StatementApply> {
+        // One transaction keeps the write pipeline's cancellation: a cancelled
+        // client stops waiting for the WAL upload, and the owned commit task
+        // still makes it durable. Several transactions must not stop between
+        // them, so once the deadline check has passed they run unshielded by
+        // cancellation; the cluster also runs them on their own task, so a
+        // dropped caller cannot stop them either.
+        // The statement's deadline was checked once its effects were known;
+        // the batches carry no budget, so none can stop after another commits.
+        if effects.batch_transactions() > 1 {
+            QueryCancellationToken::shielded(self.apply_statement_effect_batches(context, effects, result)).await
+        } else {
+            self.apply_statement_effect_batches(context, effects, result).await
         }
-        for (relationship, metadata) in pending_edge_metadata {
-            budget.check("cypher_set_relationship_metadata")?;
-            if original_edge_metadata.get(&relationship) == Some(&metadata) {
-                result.noops = result.noops.saturating_add(1);
-                continue;
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn apply_statement_effect_batches(
+        &self,
+        context: &QueryContext,
+        effects: StatementEffects,
+        result: &mut QueryMutationResult,
+    ) -> Result<StatementApply> {
+        let StatementEffects {
+            deleted_relationships,
+            deleted_vertices,
+            vertex_metadata,
+            relationship_metadata,
+            original_metadata,
+            original_edge_metadata,
+        } = effects;
+        let updates = StatementUpdates {
+            vertex_metadata,
+            relationship_metadata,
+            original_metadata,
+            original_edge_metadata,
+        };
+        // A plain `DELETE` of a connected vertex is refused, and a refused
+        // statement must leave nothing written: its deletes go first, as
+        // they always did, and a lost race after them is returned, since a
+        // re-run would not find what they deleted. Every other statement
+        // updates first, so a lost race is found before anything is written
+        // and the statement re-runs. Updates of anything this statement
+        // deletes were dropped already.
+        if deleted_vertices.values().any(|detach| !detach) {
+            let written = self
+                .apply_statement_deletes(context, deleted_relationships, &deleted_vertices, result)
+                .await?;
+            self.apply_statement_updates(context, updates, written, result).await
+        } else {
+            if let StatementApply::LostRace = self.apply_statement_updates(context, updates, false, result).await? {
+                return Ok(StatementApply::LostRace);
             }
-            let changed = if let Some(relationship_id) = relationship.relationship_id {
-                self.set_relationship_metadata(
-                    &context.cell_id,
-                    &relationship.edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    relationship_id,
-                    metadata,
-                )
-                .await?
-            } else {
-                self.set_edge_metadata(
-                    &context.cell_id,
-                    &relationship.edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    metadata,
-                )
-                .await?
+            self.apply_statement_deletes(context, deleted_relationships, &deleted_vertices, result)
+                .await?;
+            Ok(StatementApply::Applied)
+        }
+    }
+
+    /// Apply the property updates, each only onto the record the statement
+    /// read. A record changed since the snapshot is a lost race the statement
+    /// can re-run from, until anything has been written (`written`, or the
+    /// vertex updates committing): a re-run would then apply that twice
+    /// (`SET n.c = n.c + 1`), so the conflict goes to the client.
+    #[cfg(feature = "opencypher")]
+    async fn apply_statement_updates(
+        &self,
+        context: &QueryContext,
+        updates: StatementUpdates,
+        mut written: bool,
+        result: &mut QueryMutationResult,
+    ) -> Result<StatementApply> {
+        let StatementUpdates {
+            vertex_metadata,
+            relationship_metadata,
+            original_metadata,
+            original_edge_metadata,
+        } = updates;
+        if !vertex_metadata.is_empty() {
+            let requested = vertex_metadata.len() as u64;
+            let swaps = vertex_metadata
+                .into_iter()
+                .map(|(vertex_id, metadata)| {
+                    let read = original_metadata.get(&vertex_id).cloned().unwrap_or_default();
+                    (vertex_id, (read, metadata))
+                })
+                .collect();
+            let changed = match self.swap_vertex_metadata_batch(&context.cell_id, swaps).await {
+                Err(GraphError::ConditionalWriteConflict { .. }) if !written => return Ok(StatementApply::LostRace),
+                changed => changed? as u64,
             };
-            if changed {
-                result.updated_relationships = result.updated_relationships.saturating_add(1);
-            } else {
-                result.noops = result.noops.saturating_add(1);
-            }
+            written |= changed > 0;
+            result.updated_vertices = result.updated_vertices.saturating_add(changed);
+            result.noops = result.noops.saturating_add(requested.saturating_sub(changed));
         }
 
-        Ok(result)
+        if !relationship_metadata.is_empty() {
+            let requested = relationship_metadata.len() as u64;
+            let updates = relationship_metadata
+                .into_iter()
+                .map(|(relationship, metadata)| RelationshipMetadataUpdate {
+                    read: Some(original_edge_metadata.get(&relationship).cloned().unwrap_or_default()),
+                    edge_type: relationship.edge_type,
+                    src: relationship.src,
+                    dst: relationship.dst,
+                    relationship_id: relationship.relationship_id,
+                    metadata,
+                })
+                .collect();
+            let changed = match self.set_relationship_metadata_batch(&context.cell_id, updates).await {
+                Err(GraphError::ConditionalWriteConflict { .. }) if !written => return Ok(StatementApply::LostRace),
+                changed => changed? as u64,
+            };
+            result.updated_relationships = result.updated_relationships.saturating_add(changed);
+            result.noops = result.noops.saturating_add(requested.saturating_sub(changed));
+        }
+        Ok(StatementApply::Applied)
+    }
+
+    /// Apply the relationship and vertex deletes; true when any wrote.
+    #[cfg(feature = "opencypher")]
+    async fn apply_statement_deletes(
+        &self,
+        context: &QueryContext,
+        deleted_relationships: BTreeSet<BoundRelationship>,
+        deleted_vertices: &BTreeMap<VertexId, bool>,
+        result: &mut QueryMutationResult,
+    ) -> Result<bool> {
+        let unbounded = QueryBudget::new(None, None);
+        let mut written = false;
+        if !deleted_relationships.is_empty() {
+            let deleted = self
+                .delete_bound_relationships_batch(context, deleted_relationships, Vec::new(), &unbounded)
+                .await?;
+            written |= deleted.deleted > 0;
+            result.deleted_edges = result.deleted_edges.saturating_add(deleted.deleted);
+            result.noops = result.noops.saturating_add(deleted.already_deleted);
+            result.topology_sequence = result.topology_sequence.max(deleted.topology_sequence);
+        }
+
+        // One batch per DETACH mode: `DELETE n` must still refuse a connected
+        // vertex while `DETACH DELETE m` in the same statement removes its edges.
+        for detach in [true, false] {
+            let deletions = deleted_vertices
+                .iter()
+                .filter(|(_, vertex_detach)| **vertex_detach == detach)
+                .map(|(vertex_id, _)| {
+                    let operation = if detach { "detach-delete-node" } else { "delete-node" };
+                    (*vertex_id, format!("{}.{operation}.{vertex_id}", context.idempotency_key))
+                })
+                .collect::<Vec<_>>();
+            if deletions.is_empty() {
+                continue;
+            }
+            for delete in self.delete_vertex_mutations_batch(&context.cell_id, deletions, detach).await? {
+                written |= delete.vertex_deleted || delete.incident_edges_deleted > 0 || delete.relationships_deleted > 0;
+                result.deleted_edges = result.deleted_edges.saturating_add(delete.incident_edges_deleted);
+                if delete.incident_edges_deleted > 0 {
+                    result.topology_sequence = result.topology_sequence.max(Some(delete.epoch));
+                }
+                if delete.vertex_deleted {
+                    result.updated_vertices = result.updated_vertices.saturating_add(1);
+                } else if delete.incident_edges_deleted == 0 && delete.relationships_deleted == 0 {
+                    result.noops = result.noops.saturating_add(1);
+                }
+            }
+        }
+        Ok(written)
     }
 
     #[cfg(feature = "opencypher")]
@@ -2532,9 +2515,7 @@ impl GraphShard {
         let mut topology_sequence = None;
         if !structural.is_empty() {
             budget.check("cypher_delete_edge_batch")?;
-            let batch = self
-                .delete_edge_mutations_batch(&context.cell_id, structural)
-                .await?;
+            let batch = self.delete_edge_mutations_batch(&context.cell_id, structural).await?;
             deleted = deleted.saturating_add(batch.deleted);
             noops = noops.saturating_add(batch.already_deleted);
             if batch.deleted > 0 {
@@ -2544,11 +2525,7 @@ impl GraphShard {
         if !identified.is_empty() {
             budget.check("cypher_delete_relationship_batch")?;
             let batch = self
-                .delete_relationship_mutations_batch_with_guards(
-                    &context.cell_id,
-                    identified,
-                    structural_delete_guards,
-                )
+                .delete_relationship_mutations_batch_with_guards(&context.cell_id, identified, structural_delete_guards)
                 .await?;
             deleted = deleted.saturating_add(batch.deleted);
             noops = noops.saturating_add(batch.already_deleted);
@@ -2577,6 +2554,11 @@ impl GraphShard {
             context.cancellation_token.clone(),
         );
         let read_epoch = self.current_epoch(&context.cell_id).await?;
+        let native_values = values
+            .iter()
+            .filter(|value| !value.is_scalar_indexable())
+            .cloned()
+            .collect::<Vec<_>>();
         let scans = values
             .into_iter()
             .flat_map(|value| {
@@ -2591,30 +2573,16 @@ impl GraphShard {
                 async move {
                     budget.check("cypher_delete_relationship_property_batch")?;
                     let (concrete, structural) = tokio::try_join!(
-                        self.scan_relationship_property_index_current(
-                            &context.cell_id,
-                            edge_type,
-                            property,
-                            &encoded,
-                            &budget,
-                        ),
-                        self.scan_edge_property_index_current(
-                            &context.cell_id,
-                            edge_type,
-                            property,
-                            &encoded,
-                            &budget,
-                        ),
+                        self.scan_relationship_property_index_current(&context.cell_id, edge_type, property, &encoded, &budget,),
+                        self.scan_edge_property_index_current(&context.cell_id, edge_type, property, &encoded, &budget,),
                     )?;
                     Ok::<_, GraphError>((value, concrete, structural))
                 }
             })
             .buffer_unordered(QUERY_METADATA_HYDRATION_CONCURRENCY);
 
-        let mut concrete_candidates =
-            BTreeMap::<BoundRelationship, Vec<VertexPropertyValue>>::new();
-        let mut structural_candidates =
-            BTreeMap::<(VertexId, VertexId), Vec<VertexPropertyValue>>::new();
+        let mut concrete_candidates = BTreeMap::<BoundRelationship, Vec<VertexPropertyValue>>::new();
+        let mut structural_candidates = BTreeMap::<(VertexId, VertexId), Vec<VertexPropertyValue>>::new();
         while let Some((value, concrete, structural)) = scan_results.try_next().await? {
             for (src, dst, relationship_id) in concrete {
                 concrete_candidates
@@ -2628,16 +2596,11 @@ impl GraphShard {
                     .push(value.clone());
             }
             for edge in structural {
-                structural_candidates
-                    .entry(edge)
-                    .or_default()
-                    .push(value.clone());
+                structural_candidates.entry(edge).or_default().push(value.clone());
             }
             self.ensure_query_index_candidates(
                 "cypher_delete_relationship_property_candidates",
-                concrete_candidates
-                    .len()
-                    .saturating_add(structural_candidates.len()),
+                concrete_candidates.len().saturating_add(structural_candidates.len()),
             )?;
         }
 
@@ -2646,22 +2609,13 @@ impl GraphShard {
                 let budget = budget.clone();
                 async move {
                     let metadata = self
-                        .relationship_metadata_at(
-                            &context.cell_id,
-                            &relationship,
-                            read_epoch,
-                            &budget,
-                        )
+                        .relationship_metadata_at(&context.cell_id, &relationship, read_epoch, &budget)
                         .await?;
                     Ok::<_, GraphError>(
                         metadata
                             .properties
                             .get(property)
-                            .is_some_and(|existing| {
-                                values
-                                    .iter()
-                                    .any(|value| vertex_property_values_equal(existing, value))
-                            })
+                            .is_some_and(|existing| values.iter().any(|value| vertex_property_values_equal(existing, value)))
                             .then_some(relationship),
                     )
                 }
@@ -2674,37 +2628,19 @@ impl GraphShard {
                 let budget = budget.clone();
                 async move {
                     if self
-                        .relationship_count_for_edge_at(
-                            &context.cell_id,
-                            edge_type,
-                            src,
-                            dst,
-                            read_epoch,
-                            &budget,
-                        )
+                        .relationship_count_for_edge_at(&context.cell_id, edge_type, src, dst, read_epoch, &budget)
                         .await?
                         > 0
                     {
                         return Ok::<_, GraphError>(None);
                     }
                     let metadata = self
-                        .edge_metadata_at(
-                            &context.cell_id,
-                            edge_type,
-                            src,
-                            dst,
-                            read_epoch,
-                            &budget,
-                        )
+                        .edge_metadata_at(&context.cell_id, edge_type, src, dst, read_epoch, &budget)
                         .await?;
                     Ok(metadata
                         .properties
                         .get(property)
-                        .is_some_and(|existing| {
-                            values
-                                .iter()
-                                .any(|value| vertex_property_values_equal(existing, value))
-                        })
+                        .is_some_and(|existing| values.iter().any(|value| vertex_property_values_equal(existing, value)))
                         .then_some(BoundRelationship {
                             edge_type: edge_type.to_string(),
                             src,
@@ -2716,11 +2652,32 @@ impl GraphShard {
             .buffered(QUERY_METADATA_HYDRATION_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
-        let relationships = concrete
-            .into_iter()
-            .chain(structural)
-            .flatten()
-            .collect::<BTreeSet<_>>();
+        let mut relationships = concrete.into_iter().chain(structural).flatten().collect::<BTreeSet<_>>();
+        if !native_values.is_empty() {
+            let edges = self
+                .edges_at_with_budget(&context.cell_id, edge_type, read_epoch, Some(&budget))
+                .await?;
+            for edge in edges {
+                budget.check("cypher_delete_relationship_native_property_scan")?;
+                let rows = self
+                    .relationships_for_edge_at(&context.cell_id, edge_type, edge.src, edge.dst, read_epoch, &budget)
+                    .await?;
+                let has_identified = rows.iter().any(|(relationship, _)| relationship.relationship_id.is_some());
+                for (relationship, metadata) in rows {
+                    if relationship.relationship_id.is_none() && has_identified {
+                        continue;
+                    }
+                    if metadata
+                        .properties
+                        .get(property)
+                        .is_some_and(|existing| native_values.iter().any(|value| vertex_property_values_equal(existing, value)))
+                    {
+                        relationships.insert(relationship);
+                        self.ensure_query_index_candidates("cypher_delete_relationship_native_property_candidates", relationships.len())?;
+                    }
+                }
+            }
+        }
         let structural_delete_guards = relationships
             .iter()
             .filter(|relationship| relationship.relationship_id.is_some())
@@ -2733,13 +2690,8 @@ impl GraphShard {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        self.delete_bound_relationships_batch(
-            context,
-            relationships,
-            structural_delete_guards.into_values().collect(),
-            &budget,
-        )
-        .await
+        self.delete_bound_relationships_batch(context, relationships, structural_delete_guards.into_values().collect(), &budget)
+            .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -2751,12 +2703,37 @@ impl GraphShard {
     ) -> Result<QueryMutationResult> {
         if actions
             .iter()
-            .any(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
+            .any(|action| matches!(action, RowMutationAction::CreateVertex { .. }))
         {
-            if !actions
-                .iter()
-                .all(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
-            {
+            // One standalone node per statement: several would need a batch
+            // writer to stay atomic, as multi-pattern CREATE with metadata does.
+            let [RowMutationAction::CreateVertex { vertex, metadata }] = actions else {
+                return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Mutation,
+                    dialect: "OpenCypher",
+                    feature: "CREATE of a standalone node must be the only pattern in its statement".to_string(),
+                });
+            };
+            let created = self
+                .create_vertex(
+                    &context.cell_id,
+                    *vertex,
+                    metadata.clone(),
+                    &format!("{}.create-vertex.{vertex}", context.idempotency_key),
+                )
+                .await?;
+            // A new vertex reports its commit epoch, so the coordinator wakes
+            // the graph indexer as it does for other writes; a replayed retry
+            // changed nothing and reports none.
+            return Ok(QueryMutationResult {
+                created_vertices: u64::from(!created.already_created),
+                noops: u64::from(created.already_created),
+                topology_sequence: (!created.already_created).then_some(created.epoch),
+                ..QueryMutationResult::default()
+            });
+        }
+        if actions.iter().any(|action| matches!(action, RowMutationAction::CreateEdge { .. })) {
+            if !actions.iter().all(|action| matches!(action, RowMutationAction::CreateEdge { .. })) {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::Mutation,
                     dialect: "OpenCypher",
@@ -2815,23 +2792,13 @@ impl GraphShard {
                     && dst_metadata.properties.is_empty()
                     && edge_metadata.properties.is_empty()
                 {
-                    self.create_relationship(mutation, EdgeMetadata::default())
-                        .await?
+                    self.create_relationship(mutation, EdgeMetadata::default()).await?
                 } else if edge_metadata.properties.is_empty() {
-                    self.create_relationship_with_vertex_metadata(
-                        mutation,
-                        src_metadata.clone(),
-                        dst_metadata.clone(),
-                    )
-                    .await?
+                    self.create_relationship_with_vertex_metadata(mutation, src_metadata.clone(), dst_metadata.clone())
+                        .await?
                 } else {
-                    self.create_relationship_with_full_metadata(
-                        mutation,
-                        src_metadata.clone(),
-                        dst_metadata.clone(),
-                        edge_metadata.clone(),
-                    )
-                    .await?
+                    self.create_relationship_with_full_metadata(mutation, src_metadata.clone(), dst_metadata.clone(), edge_metadata.clone())
+                        .await?
                 };
                 return Ok(QueryMutationResult {
                     created_edges: u64::from(created.structural_edge_inserted),
@@ -2846,13 +2813,7 @@ impl GraphShard {
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
-                    let RowMutationAction::CreateEdge {
-                        edge_type,
-                        src,
-                        dst,
-                        ..
-                    } = action
-                    else {
+                    let RowMutationAction::CreateEdge { edge_type, src, dst, .. } = action else {
                         unreachable!("CREATE batch was validated above")
                     };
                     EdgeMutation {
@@ -2860,16 +2821,11 @@ impl GraphShard {
                         edge_type: edge_type.clone(),
                         src: *src,
                         dst: *dst,
-                        idempotency_key: format!(
-                            "{}.create.{}.{}.{}.{index:020}",
-                            context.idempotency_key, edge_type, src, dst
-                        ),
+                        idempotency_key: format!("{}.create.{}.{}.{}.{index:020}", context.idempotency_key, edge_type, src, dst),
                     }
                 })
                 .collect::<Vec<_>>();
-            let batch = self
-                .write_edge_mutations_batch(&context.cell_id, mutations)
-                .await?;
+            let batch = self.write_edge_mutations_batch(&context.cell_id, mutations).await?;
             return Ok(QueryMutationResult {
                 created_edges: batch.inserted,
                 noops: batch.already_existed,
@@ -2901,10 +2857,7 @@ impl GraphShard {
                 edge_type: edge_type.clone(),
                 src: *src,
                 dst: *dst,
-                idempotency_key: format!(
-                    "{}.merge.{}.{}.{}",
-                    context.idempotency_key, edge_type, src, dst
-                ),
+                idempotency_key: format!("{}.merge.{}.{}.{}", context.idempotency_key, edge_type, src, dst),
             };
             let commit = if src_metadata.labels.is_empty()
                 && src_metadata.properties.is_empty()
@@ -2914,20 +2867,11 @@ impl GraphShard {
             {
                 self.write_edge(mutation).await?
             } else if edge_metadata.properties.is_empty() {
-                self.write_edge_with_vertex_metadata(
-                    mutation,
-                    src_metadata.clone(),
-                    dst_metadata.clone(),
-                )
-                .await?
+                self.write_edge_with_vertex_metadata(mutation, src_metadata.clone(), dst_metadata.clone())
+                    .await?
             } else {
-                self.write_edge_with_full_metadata(
-                    mutation,
-                    src_metadata.clone(),
-                    dst_metadata.clone(),
-                    edge_metadata.clone(),
-                )
-                .await?
+                self.write_edge_with_full_metadata(mutation, src_metadata.clone(), dst_metadata.clone(), edge_metadata.clone())
+                    .await?
             };
             if commit.already_existed {
                 result.noops = result.noops.saturating_add(1);
@@ -2961,9 +2905,7 @@ impl GraphShard {
         };
         if let Some(relationship) = row.relationships.get(binding) {
             match action {
-                RowMutationAction::SetProperty {
-                    property, value, ..
-                } => {
+                RowMutationAction::SetProperty { property, value, .. } => {
                     if state.pending_edge_metadata.get(relationship).is_none() {
                         state.budget.check("cypher_load_relationship_metadata")?;
                         let metadata = match row.relationship_metadata.get(relationship) {
@@ -2980,12 +2922,8 @@ impl GraphShard {
                                 .await?
                             }
                         };
-                        state
-                            .original_edge_metadata
-                            .insert(relationship.clone(), metadata.clone());
-                        state
-                            .pending_edge_metadata
-                            .insert(relationship.clone(), metadata);
+                        state.original_edge_metadata.insert(relationship.clone(), metadata.clone());
+                        state.pending_edge_metadata.insert(relationship.clone(), metadata);
                     }
                     let metadata = state
                         .pending_edge_metadata
@@ -3015,12 +2953,8 @@ impl GraphShard {
                                 .await?
                             }
                         };
-                        state
-                            .original_edge_metadata
-                            .insert(relationship.clone(), metadata.clone());
-                        state
-                            .pending_edge_metadata
-                            .insert(relationship.clone(), metadata);
+                        state.original_edge_metadata.insert(relationship.clone(), metadata.clone());
+                        state.pending_edge_metadata.insert(relationship.clone(), metadata);
                     }
                     let metadata = state
                         .pending_edge_metadata
@@ -3037,8 +2971,7 @@ impl GraphShard {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::Mutation,
                         dialect: "OpenCypher",
-                        feature: "relationship labels are not executable in Query engine"
-                            .to_string(),
+                        feature: "relationship labels are not executable in Query engine".to_string(),
                     });
                 }
                 _ => {}
@@ -3050,29 +2983,23 @@ impl GraphShard {
             let metadata = match row.metadata.get(binding) {
                 Some(metadata) => metadata.clone(),
                 None => {
-                    self.vertex_metadata_at(
-                        state.cell_id,
-                        vertex_id,
-                        state.read_epoch,
-                        state.budget,
-                    )
-                    .await?
+                    self.vertex_metadata_at(state.cell_id, vertex_id, state.read_epoch, state.budget)
+                        .await?
                 }
             };
             state.original_metadata.insert(vertex_id, metadata.clone());
             state.pending_metadata.insert(vertex_id, metadata);
         }
-        let metadata = state.pending_metadata.get_mut(&vertex_id).ok_or_else(|| {
-            GraphError::UnsupportedQuery {
+        let metadata = state
+            .pending_metadata
+            .get_mut(&vertex_id)
+            .ok_or_else(|| GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::Other,
                 dialect: "OpenCypher",
                 feature: format!("metadata for {binding} was not loaded"),
-            }
-        })?;
+            })?;
         match action {
-            RowMutationAction::SetProperty {
-                property, value, ..
-            } => {
+            RowMutationAction::SetProperty { property, value, .. } => {
                 metadata.properties.insert(property.clone(), value.clone());
             }
             RowMutationAction::SetLabels { labels, .. } => {
@@ -3093,17 +3020,10 @@ impl GraphShard {
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
         self.validate_executable_query_plan(&plan).await?;
-        let budget = QueryBudget::new(
-            plan.max_runtime_ms.or(self.limits.max_query_runtime_ms),
-            None,
-        );
+        let budget = QueryBudget::new(plan.max_runtime_ms.or(self.limits.max_query_runtime_ms), None);
         budget.check("query_plan")?;
         match plan.physical {
-            PhysicalQueryPlan::WriteEdge {
-                edge_type,
-                src,
-                dst,
-            } => {
+            PhysicalQueryPlan::WriteEdge { edge_type, src, dst } => {
                 let result = self
                     .create_relationship(
                         EdgeMutation {
@@ -3175,8 +3095,7 @@ impl GraphShard {
             }
             PhysicalQueryPlan::OutDegreeCounter { edge_type, src } => {
                 let count = if let Some(read_epoch) = plan.read_epoch {
-                    self.out_degree_at(&plan.cell_id, &edge_type, src, read_epoch)
-                        .await?
+                    self.out_degree_at(&plan.cell_id, &edge_type, src, read_epoch).await?
                 } else {
                     self.out_degree(&plan.cell_id, &edge_type, src).await?
                 };
@@ -3188,52 +3107,25 @@ impl GraphShard {
                     None => self.current_epoch(&plan.cell_id).await?,
                 };
                 let vertices = self
-                    .out_neighbors_window_at(
-                        &plan.cell_id,
-                        &edge_type,
-                        src,
-                        read_epoch,
-                        plan.result_window,
-                        Some(&budget),
-                    )
+                    .out_neighbors_window_at(&plan.cell_id, &edge_type, src, read_epoch, plan.result_window, Some(&budget))
                     .await?;
                 budget.check("query_out_neighbors")?;
                 Ok(QueryOutput::Vertices(vertices))
             }
-            PhysicalQueryPlan::EdgeExistsToCount {
-                edge_type,
-                src,
-                dst,
-            } => {
-                let exists = self
-                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
-                    .await?;
+            PhysicalQueryPlan::EdgeExistsToCount { edge_type, src, dst } => {
+                let exists = self.query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch).await?;
                 Ok(QueryOutput::Count(u64::from(exists)))
             }
-            PhysicalQueryPlan::EdgeExistsToVertices {
-                edge_type,
-                src,
-                dst,
-            } => {
-                let exists = self
-                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
-                    .await?;
+            PhysicalQueryPlan::EdgeExistsToVertices { edge_type, src, dst } => {
+                let exists = self.query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch).await?;
                 if exists {
-                    Ok(QueryOutput::Vertices(
-                        self.apply_query_window(vec![dst], plan.result_window)?,
-                    ))
+                    Ok(QueryOutput::Vertices(self.apply_query_window(vec![dst], plan.result_window)?))
                 } else {
                     Ok(QueryOutput::Vertices(Vec::new()))
                 }
             }
-            PhysicalQueryPlan::EdgeExistsToBool {
-                edge_type,
-                src,
-                dst,
-            } => {
-                let exists = self
-                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
-                    .await?;
+            PhysicalQueryPlan::EdgeExistsToBool { edge_type, src, dst } => {
+                let exists = self.query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch).await?;
                 Ok(QueryOutput::Bool(exists))
             }
             PhysicalQueryPlan::ReachableVertices {
@@ -3248,23 +3140,14 @@ impl GraphShard {
                     None => self.current_epoch(&plan.cell_id).await?,
                 };
                 let vertices = self
-                    .reachable_vertices_in_hop_range_at(
-                        &plan.cell_id,
-                        &edge_type,
-                        src,
-                        (min_hops, max_hops),
-                        read_epoch,
-                        &budget,
-                    )
+                    .reachable_vertices_in_hop_range_at(&plan.cell_id, &edge_type, src, (min_hops, max_hops), read_epoch, &budget)
                     .await?
                     .0;
                 budget.check("query_reachable")?;
                 if return_count {
                     Ok(QueryOutput::Count(vertices.len() as u64))
                 } else {
-                    Ok(QueryOutput::Vertices(
-                        self.apply_query_window(vertices, plan.result_window)?,
-                    ))
+                    Ok(QueryOutput::Vertices(self.apply_query_window(vertices, plan.result_window)?))
                 }
             }
         }
@@ -3303,1135 +3186,29 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    pub fn start_query_stats_refresh_job(
-        self: Arc<Self>,
-        specs: Vec<QueryStatsRefreshSpec>,
-        interval: Duration,
-    ) -> Result<QueryStatsRefreshHandle> {
-        if specs.is_empty() {
-            return Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Other,
-                dialect: "QueryStats",
-                feature: "stats refresh job requires at least one spec".to_string(),
-            });
-        }
-        if interval.is_zero() {
-            return Err(GraphError::AdmissionRejected {
-                operation: "query_stats_refresh_interval_ms",
-                actual: 0,
-                limit: u64::MAX,
-            });
-        }
-        for spec in &specs {
-            validate_component("cell_id", &spec.cell_id)?;
-            validate_query_stats_refresh_kind(&spec.kind)?;
-        }
-        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(async move {
-            loop {
-                for spec in &specs {
-                    if *stop_rx.borrow() {
-                        return Ok(());
-                    }
-                    if let Err(err) = self.refresh_query_stats_spec(spec).await {
-                        tracing::warn!(
-                            target: "hydradb",
-                            cell_id = %spec.cell_id,
-                            error = %err,
-                            "query stats background refresh failed"
-                        );
-                    }
-                }
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            return Ok(());
-                        }
-                    }
-                    _ = tokio::time::sleep(interval) => {}
-                }
-            }
-        });
-        Ok(QueryStatsRefreshHandle {
-            stop_tx: Some(stop_tx),
-            handle: Some(handle),
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_query_stats_spec(
-        &self,
-        spec: &QueryStatsRefreshSpec,
-    ) -> Result<QueryStatsRefreshResult> {
-        validate_component("cell_id", &spec.cell_id)?;
-        validate_query_stats_refresh_kind(&spec.kind)?;
-        match &spec.kind {
-            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeExpansion {
-                edge_type,
-                direction,
-                source_labels,
-            }) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_edge_expansion_query_stats(
-                    &spec.cell_id,
-                    edge_type,
-                    *direction,
-                    source_labels,
-                )
-                .await?,
-            )),
-            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeType {
-                edge_type,
-            }) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_edge_type_query_stats(&spec.cell_id, edge_type)
-                    .await?,
-            )),
-            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexLabel {
-                label,
-            }) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_vertex_label_query_stats(&spec.cell_id, label)
-                    .await?,
-            )),
-            QueryStatsRefreshKind::Cardinality(
-                QueryCardinalityStatsKind::VertexLabelIntersection { labels },
-            ) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_vertex_label_intersection_query_stats(&spec.cell_id, labels)
-                    .await?,
-            )),
-            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexProperty {
-                property,
-                value,
-            }) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_vertex_property_query_stats(&spec.cell_id, property, value)
-                    .await?,
-            )),
-            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeProperty {
-                edge_type,
-                property,
-                value,
-            }) => Ok(QueryStatsRefreshResult::Cardinality(
-                self.refresh_edge_property_query_stats(&spec.cell_id, edge_type, property, value)
-                    .await?,
-            )),
-            QueryStatsRefreshKind::VertexPropertyHistogram { property } => {
-                Ok(QueryStatsRefreshResult::Histogram(
-                    self.refresh_vertex_property_histogram_query_stats(&spec.cell_id, property)
-                        .await?,
-                ))
-            }
-            QueryStatsRefreshKind::EdgePropertyHistogram {
-                edge_type,
-                property,
-            } => Ok(QueryStatsRefreshResult::Histogram(
-                self.refresh_edge_property_histogram_query_stats(
-                    &spec.cell_id,
-                    edge_type,
-                    property,
-                )
-                .await?,
-            )),
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_edge_type_query_stats(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "refresh_edge_type_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let count = self
-            .edge_type_cardinality_from_degree_counters(cell_id, edge_type, &budget)
-            .await?;
-        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_edge_type_query_stats",
-            read_epoch,
-            keys::query_stats_edge_type(cell_id, edge_type),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::EdgeType {
-                edge_type: edge_type.to_string(),
-            },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_edge_expansion_query_stats(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        direction: QueryStatsDirection,
-        source_labels: &[String],
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        let source_labels = canonical_query_stats_source_labels(source_labels)?;
-        self.ensure_write_authority(cell_id, "refresh_edge_expansion_query_stats")?;
-        let snapshot = self.snapshot(cell_id).await?;
-        let read_epoch = snapshot.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let anchor = self
-            .select_vertex_label_intersection_anchor(cell_id, &source_labels, read_epoch, &budget)
-            .await?;
-        let count = self
-            .count_edge_expansion_at(EdgeExpansionStatsRequest {
-                cell_id,
-                edge_type,
-                direction,
-                anchor: &anchor,
-                source_labels: &source_labels,
-                snapshot: snapshot.storage_snapshot.as_ref(),
-                read_epoch,
-                budget: &budget,
-            })
-            .await?;
-        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
-        let label_refs = source_labels.iter().map(String::as_str).collect::<Vec<_>>();
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_edge_expansion_query_stats",
-            read_epoch,
-            keys::query_stats_edge_expansion(
-                cell_id,
-                edge_type,
-                direction.as_key_component(),
-                &label_refs,
-            ),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::EdgeExpansion {
-                edge_type: edge_type.to_string(),
-                direction,
-                source_labels,
-            },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_vertex_label_query_stats(
-        &self,
-        cell_id: &str,
-        label: &str,
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("label", label)?;
-        self.ensure_write_authority(cell_id, "refresh_vertex_label_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let count = self
-            .count_vertex_label_index_at(cell_id, label, read_epoch, &budget)
-            .await?;
-        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_vertex_label_query_stats",
-            read_epoch,
-            keys::query_stats_vertex_label(cell_id, label),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::VertexLabel {
-                label: label.to_string(),
-            },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_vertex_label_intersection_query_stats(
-        &self,
-        cell_id: &str,
-        labels: &[String],
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        let labels = canonical_query_stats_labels(labels)?;
-        self.ensure_write_authority(cell_id, "refresh_vertex_label_intersection_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let anchor = self
-            .select_vertex_label_intersection_anchor(cell_id, &labels, read_epoch, &budget)
-            .await?;
-        let count = self
-            .count_vertex_label_intersection_at(cell_id, &anchor, &labels, read_epoch, &budget)
-            .await?;
-        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
-        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_vertex_label_intersection_query_stats",
-            read_epoch,
-            keys::query_stats_vertex_label_intersection(cell_id, &label_refs),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::VertexLabelIntersection { labels },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_vertex_property_query_stats(
-        &self,
-        cell_id: &str,
-        property: &str,
-        value: &VertexPropertyValue,
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("property", property)?;
-        self.ensure_write_authority(cell_id, "refresh_vertex_property_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let count = self
-            .count_vertex_property_index_at(cell_id, property, value, read_epoch, &budget)
-            .await?;
-        let encoded = encode_vertex_property_value_key(value);
-        let histogram = self
-            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
-            .await?;
-        let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_vertex_property_query_stats",
-            read_epoch,
-            keys::query_stats_vertex_property(cell_id, property, &encoded),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::VertexProperty {
-                property: property.to_string(),
-                value: value.clone(),
-            },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_edge_property_query_stats(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        value: &VertexPropertyValue,
-    ) -> Result<QueryCardinalityStatsRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        validate_component("property", property)?;
-        self.ensure_write_authority(cell_id, "refresh_edge_property_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let count = self
-            .count_edge_property_index_at(cell_id, edge_type, property, value, read_epoch, &budget)
-            .await?;
-        let encoded = encode_vertex_property_value_key(value);
-        let histogram = self
-            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
-            .await?;
-        let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
-        self.publish_query_stats_record_after_snapshot(
-            cell_id,
-            "refresh_edge_property_query_stats",
-            read_epoch,
-            keys::query_stats_edge_property(cell_id, edge_type, property, &encoded),
-            &stats,
-        )
-        .await?;
-        Ok(QueryCardinalityStatsRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            kind: QueryCardinalityStatsKind::EdgeProperty {
-                edge_type: edge_type.to_string(),
-                property: property.to_string(),
-                value: value.clone(),
-            },
-            count,
-            stats,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_vertex_property_histogram_query_stats(
-        &self,
-        cell_id: &str,
-        property: &str,
-    ) -> Result<QueryStatsHistogramRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("property", property)?;
-        self.ensure_write_authority(cell_id, "refresh_vertex_property_histogram_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let buckets = self
-            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
-            .await?;
-        let stats = stats_record_from_histogram(read_epoch, &buckets);
-        self.publish_query_stats_histogram_after_snapshot(
-            QueryStatsHistogramPublish {
-                cell_id,
-                operation: "refresh_vertex_property_histogram_query_stats",
-                read_epoch,
-                histogram_key: keys::query_stats_vertex_property_histogram(cell_id, property),
-                bucket_prefix: keys::query_stats_vertex_property_prefix(cell_id, property),
-                stats: &stats,
-                buckets: &buckets,
-            },
-            |encoded| keys::query_stats_vertex_property(cell_id, property, encoded),
-        )
-        .await?;
-        Ok(QueryStatsHistogramRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            property: property.to_string(),
-            edge_type: None,
-            stats,
-            buckets,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub async fn refresh_edge_property_histogram_query_stats(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-    ) -> Result<QueryStatsHistogramRefresh> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        validate_component("property", property)?;
-        self.ensure_write_authority(cell_id, "refresh_edge_property_histogram_query_stats")?;
-        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let buckets = self
-            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
-            .await?;
-        let stats = stats_record_from_histogram(read_epoch, &buckets);
-        self.publish_query_stats_histogram_after_snapshot(
-            QueryStatsHistogramPublish {
-                cell_id,
-                operation: "refresh_edge_property_histogram_query_stats",
-                read_epoch,
-                histogram_key: keys::query_stats_edge_property_histogram(
-                    cell_id, edge_type, property,
-                ),
-                bucket_prefix: keys::query_stats_edge_property_prefix(cell_id, edge_type, property),
-                stats: &stats,
-                buckets: &buckets,
-            },
-            |encoded| keys::query_stats_edge_property(cell_id, edge_type, property, encoded),
-        )
-        .await?;
-        Ok(QueryStatsHistogramRefresh {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            property: property.to_string(),
-            edge_type: Some(edge_type.to_string()),
-            stats,
-            buckets,
-        })
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn publish_query_stats_record_after_snapshot(
-        &self,
-        cell_id: &str,
-        operation: &'static str,
-        read_epoch: StorageSequence,
-        key: String,
-        stats: &QueryStatsRecord,
-    ) -> Result<()> {
-        let _permit = self.acquire_graph_write_permit(operation).await?;
-        let lock = self.acquire_local_write_guard(cell_id, operation).await?;
-        let result = async {
-            let current_epoch = self.current_epoch(cell_id).await?;
-            if current_epoch != read_epoch {
-                return Err(GraphError::QueryStatsSnapshotChanged {
-                    operation,
-                    cell_id: cell_id.to_string(),
-                    read_epoch,
-                    current_epoch,
-                });
-            }
-            let mut batch = GraphWriteBatch::new();
-            batch.put(key.as_bytes(), encode_u64(stats.count));
-            batch.put(
-                keys::query_stats_record_key(&key).as_bytes(),
-                encode_query_stats_record(stats),
-            );
-            self.write_graph_batch_strict(cell_id, operation, batch)
-                .await
-        }
-        .await;
-        finish_local_write(lock, result).await
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn publish_query_stats_histogram_after_snapshot(
-        &self,
-        publish: QueryStatsHistogramPublish<'_>,
-        bucket_key: impl Fn(&str) -> String,
-    ) -> Result<()> {
-        let stale_bucket_keys = self.stale_query_stats_bucket_keys(&publish).await?;
-        let _permit = self.acquire_graph_write_permit(publish.operation).await?;
-        let lock = self
-            .acquire_local_write_guard(publish.cell_id, publish.operation)
-            .await?;
-        let result = async {
-            let current_epoch = self.current_epoch(publish.cell_id).await?;
-            if current_epoch != publish.read_epoch {
-                return Err(GraphError::QueryStatsSnapshotChanged {
-                    operation: publish.operation,
-                    cell_id: publish.cell_id.to_string(),
-                    read_epoch: publish.read_epoch,
-                    current_epoch,
-                });
-            }
-            let mut batch = GraphWriteBatch::new();
-            batch.put(
-                publish.histogram_key.as_bytes(),
-                encode_u64(publish.stats.count),
-            );
-            batch.put(
-                keys::query_stats_record_key(&publish.histogram_key).as_bytes(),
-                encode_query_stats_record(publish.stats),
-            );
-            for key in &stale_bucket_keys {
-                batch.delete(key.as_bytes());
-                batch.delete(keys::query_stats_record_key(key).as_bytes());
-            }
-            for (encoded, count) in publish.buckets {
-                let key = bucket_key(encoded);
-                let bucket_stats = QueryStatsRecord {
-                    count: *count,
-                    read_epoch: publish.stats.read_epoch,
-                    refreshed_at_ms: publish.stats.refreshed_at_ms,
-                    distinct_values: publish.stats.distinct_values,
-                    total_values: publish.stats.total_values,
-                    most_common_count: publish.stats.most_common_count,
-                    bloom: None,
-                };
-                batch.put(key.as_bytes(), encode_u64(*count));
-                batch.put(
-                    keys::query_stats_record_key(&key).as_bytes(),
-                    encode_query_stats_record(&bucket_stats),
-                );
-            }
-            self.write_graph_batch_strict(publish.cell_id, publish.operation, batch)
-                .await
-        }
-        .await;
-        finish_local_write(lock, result).await
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn stale_query_stats_bucket_keys(
-        &self,
-        publish: &QueryStatsHistogramPublish<'_>,
-    ) -> Result<Vec<String>> {
-        let mut iter = self.scan_remote_prefix(&publish.bucket_prefix).await?;
-        let mut keys_to_delete = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let Some(encoded) = key.strip_prefix(&publish.bucket_prefix) else {
-                return Err(GraphError::CorruptValue {
-                    key,
-                    reason: "query stats bucket key does not match scan prefix".to_string(),
-                });
-            };
-            if encoded.contains('/') {
-                continue;
-            }
-            if !publish.buckets.contains_key(encoded) {
-                keys_to_delete.push(key);
-            }
-        }
-        Ok(keys_to_delete)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn edge_type_cardinality_from_degree_counters(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        budget.check("query_stats_edge_type_degree_scan")?;
-        let mut iter = self
-            .scan_remote_prefix(&keys::degree_out_prefix(cell_id, edge_type))
-            .await?;
-        let mut count = 0_u64;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_edge_type_degree_scan")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let degree = decode_u64(&key, &kv.value)?;
-            count = count
-                .checked_add(degree)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key,
-                    reason: "edge-type cardinality overflow while summing degree counters"
-                        .to_string(),
-                })?;
-        }
-        Ok(count)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn vertex_property_histogram_counts(
-        &self,
-        cell_id: &str,
-        property: &str,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<BTreeMap<String, u64>> {
-        budget.check("query_stats_vertex_property_histogram")?;
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_property_prefix(
-                cell_id, property,
-            ))
-            .await?;
-        let mut buckets = BTreeMap::<String, u64>::new();
-        let mut total = 0_u64;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_vertex_property_histogram")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _property, encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
-            let metadata = self
-                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
-                .await?;
-            let Some(value) = metadata.properties.get(property) else {
-                continue;
-            };
-            if encode_vertex_property_value_key(value) != encoded {
-                continue;
-            }
-            *buckets.entry(encoded).or_default() += 1;
-            total = total
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key,
-                    reason: "vertex-property histogram count overflow".to_string(),
-                })?;
-            self.ensure_query_index_candidates(
-                "query_stats_vertex_property_histogram_candidates",
-                total as usize,
-            )?;
-        }
-        Ok(buckets)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn edge_property_histogram_counts(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<BTreeMap<String, u64>> {
-        budget.check("query_stats_edge_property_histogram")?;
-        let mut iter = self
-            .scan_remote_prefix(&keys::edge_property_index_property_prefix(
-                cell_id, edge_type, property,
-            ))
-            .await?;
-        let mut buckets = BTreeMap::<String, u64>::new();
-        let mut total = 0_u64;
-        let latest_snapshot = read_epoch == self.current_epoch(cell_id).await?;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_edge_property_histogram")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, encoded, src, dst) =
-                parse_edge_property_index_key(&key)?;
-            let edge_exists = if latest_snapshot {
-                self.edge_exists(cell_id, edge_type, src, dst).await?
-            } else {
-                self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
-                    .await?
-            };
-            if !edge_exists {
-                continue;
-            }
-            let metadata = self
-                .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
-                .await?;
-            let Some(value) = metadata.properties.get(property) else {
-                continue;
-            };
-            if encode_vertex_property_value_key(value) != encoded {
-                continue;
-            }
-            *buckets.entry(encoded).or_default() += 1;
-            total = total
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key,
-                    reason: "edge-property histogram count overflow".to_string(),
-                })?;
-            self.ensure_query_index_candidates(
-                "query_stats_edge_property_histogram_candidates",
-                total as usize,
-            )?;
-        }
-        Ok(buckets)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn count_vertex_label_index_at(
-        &self,
-        cell_id: &str,
-        label: &str,
-        _read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, label))
-            .await?;
-        let mut count = 0_u64;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_vertex_label_count_current")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let _vertex_id = decode_u64(&key, &kv.value)?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key,
-                    reason: "vertex-label stats count overflow".to_string(),
-                })?;
-            self.ensure_query_index_candidates(
-                "query_stats_vertex_label_count_candidates",
-                count as usize,
-            )?;
-        }
-        Ok(count)
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub(super) async fn count_vertex_label_intersection_at(
-        &self,
-        cell_id: &str,
-        anchor: &str,
-        labels: &[String],
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, anchor))
-            .await?;
-        let mut count = 0_u64;
-        let mut candidates = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_vertex_label_intersection")?;
-            candidates = candidates
-                .checked_add(1)
-                .ok_or(GraphError::AdmissionRejected {
-                    operation: "query_stats_vertex_label_intersection_candidates",
-                    actual: u64::MAX,
-                    limit: self.limits.max_query_index_candidates as u64,
-                })?;
-            // Charge every anchor row before metadata hydration. A sparse
-            // intersection must not evade admission merely because most of a
-            // broad anchor fails the remaining labels.
-            self.ensure_query_index_candidates(
-                "query_stats_vertex_label_intersection_candidates",
-                candidates,
-            )?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let vertex_id = decode_u64(&key, &kv.value)?;
-            let metadata = self
-                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
-                .await?;
-            if labels.iter().all(|label| metadata.labels.contains(label)) {
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| GraphError::CorruptValue {
-                        key,
-                        reason: "vertex-label intersection count overflow".to_string(),
-                    })?;
-            }
-        }
-        Ok(count)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn count_edge_expansion_at(&self, request: EdgeExpansionStatsRequest<'_>) -> Result<u64> {
-        let prefix = keys::vertex_label_prefix(request.cell_id, request.anchor);
-        let mut iter = request
-            .snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
-            .await?;
-        let mut candidates = 0_usize;
-        let mut relationships = 0_u64;
-        while let Some(kv) = iter.next().await? {
-            request.budget.check("query_stats_edge_expansion")?;
-            candidates = candidates
-                .checked_add(1)
-                .ok_or(GraphError::AdmissionRejected {
-                    operation: "query_stats_edge_expansion_candidates",
-                    actual: u64::MAX,
-                    limit: self.limits.max_query_index_candidates as u64,
-                })?;
-            self.ensure_query_index_candidates(
-                "query_stats_edge_expansion_candidates",
-                candidates,
-            )?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let vertex_id = decode_u64(&key, &kv.value)?;
-            let metadata = self
-                .vertex_metadata_at(
-                    request.cell_id,
-                    vertex_id,
-                    request.read_epoch,
-                    request.budget,
-                )
-                .await?;
-            if !request
-                .source_labels
-                .iter()
-                .all(|label| metadata.labels.contains(label))
-            {
-                continue;
-            }
-            let degree = match request.direction {
-                QueryStatsDirection::Outgoing => {
-                    self.out_degree_in_storage_snapshot(
-                        request.snapshot,
-                        request.cell_id,
-                        request.edge_type,
-                        vertex_id,
-                    )
-                    .await?
-                }
-                QueryStatsDirection::Incoming => {
-                    self.in_degree_in_storage_snapshot(
-                        request.snapshot,
-                        request.cell_id,
-                        request.edge_type,
-                        vertex_id,
-                    )
-                    .await?
-                }
-                QueryStatsDirection::Undirected => {
-                    let outgoing = self
-                        .out_degree_in_storage_snapshot(
-                            request.snapshot,
-                            request.cell_id,
-                            request.edge_type,
-                            vertex_id,
-                        )
-                        .await?;
-                    let incoming = self
-                        .in_degree_in_storage_snapshot(
-                            request.snapshot,
-                            request.cell_id,
-                            request.edge_type,
-                            vertex_id,
-                        )
-                        .await?;
-                    outgoing
-                        .checked_add(incoming)
-                        .ok_or_else(|| GraphError::CorruptValue {
-                            key: key.clone(),
-                            reason: "undirected edge-expansion degree overflow".to_string(),
-                        })?
-                }
-            };
-            relationships =
-                relationships
-                    .checked_add(degree)
-                    .ok_or_else(|| GraphError::CorruptValue {
-                        key,
-                        reason: "edge-expansion count overflow".to_string(),
-                    })?;
-            self.ensure_query_scan_edges("query_stats_edge_expansion_edges", relationships)?;
-        }
-        Ok(relationships)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn select_vertex_label_intersection_anchor(
-        &self,
-        cell_id: &str,
-        labels: &[String],
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<String> {
-        let now_ms = graph_now_millis();
-        let candidates: Vec<_> = stream::iter(labels.iter().cloned())
-            .map(|label| async move {
-                let key = keys::query_stats_vertex_label(cell_id, &label);
-                let count = budget
-                    .read_only_io(
-                        "query_stats_vertex_label_intersection_anchor",
-                        self.query_stats_record(&key),
-                    )
-                    .await?
-                    .filter(|record| !record.is_unusable_at(read_epoch, now_ms))
-                    .map(|record| record.count);
-                Ok::<_, GraphError>((label, count))
-            })
-            .buffer_unordered(QUERY_STATS_ANCHOR_READ_CONCURRENCY)
-            .try_collect()
-            .await?;
-        candidates
-            .into_iter()
-            .min_by(|(left_label, left_count), (right_label, right_count)| {
-                left_count
-                    .unwrap_or(u64::MAX)
-                    .cmp(&right_count.unwrap_or(u64::MAX))
-                    .then_with(|| left_label.cmp(right_label))
-            })
-            .map(|(label, _)| label)
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Other,
-                dialect: "QueryStats",
-                feature: "a label intersection requires at least one label".to_string(),
-            })
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn count_vertex_property_index_at(
-        &self,
-        cell_id: &str,
-        property: &str,
-        value: &VertexPropertyValue,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        let encoded_keys = equivalent_property_index_keys(value);
-        if encoded_keys.len() == 1 {
-            return self
-                .count_vertex_property_encoded_index_at(
-                    cell_id,
-                    property,
-                    &encoded_keys[0],
-                    read_epoch,
-                    budget,
-                )
-                .await;
-        }
-
-        let mut vertices = BTreeSet::<VertexId>::new();
-        for encoded in encoded_keys {
-            self.collect_vertex_property_encoded_index_at(
-                cell_id,
-                property,
-                &encoded,
-                read_epoch,
-                budget,
-                &mut vertices,
-            )
-            .await?;
-        }
-        Ok(vertices.len() as u64)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn collect_vertex_property_encoded_index_at(
-        &self,
-        cell_id: &str,
-        property: &str,
-        encoded: &str,
-        _read_epoch: StorageSequence,
-        budget: &QueryBudget,
-        vertices: &mut BTreeSet<VertexId>,
-    ) -> Result<()> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_prefix(
-                cell_id, property, encoded,
-            ))
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_vertex_property_collect_current")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _property, _encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
-            vertices.insert(vertex_id);
-            self.ensure_query_index_candidates(
-                "query_stats_vertex_property_collect_candidates",
-                vertices.len(),
-            )?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn count_vertex_property_encoded_index_at(
-        &self,
-        cell_id: &str,
-        property: &str,
-        encoded: &str,
-        _read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_prefix(
-                cell_id, property, encoded,
-            ))
-            .await?;
-        let mut count = 0_u64;
-        while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_vertex_property_count_current")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _property, _encoded, _vertex_id) =
-                parse_vertex_property_index_key(&key)?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key,
-                    reason: "vertex-property stats count overflow".to_string(),
-                })?;
-            self.ensure_query_index_candidates(
-                "query_stats_vertex_property_count_candidates",
-                count as usize,
-            )?;
-        }
-        Ok(count)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn count_edge_property_index_at(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        value: &VertexPropertyValue,
-        _read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<u64> {
-        let mut edges = BTreeSet::<(VertexId, VertexId)>::new();
-        for encoded in equivalent_property_index_keys(value) {
-            let scan = EncodedPropertyIndexScan {
-                cell_id,
-                edge_type,
-                property,
-                encoded: &encoded,
-                budget,
-            };
-            self.collect_edge_property_encoded_index_at(scan, &mut edges)
-                .await?;
-        }
-        Ok(edges.len() as u64)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn collect_edge_property_encoded_index_at(
-        &self,
-        scan: EncodedPropertyIndexScan<'_>,
-        edges: &mut BTreeSet<(VertexId, VertexId)>,
-    ) -> Result<()> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::edge_property_index_prefix(
-                scan.cell_id,
-                scan.edge_type,
-                scan.property,
-                scan.encoded,
-            ))
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            scan.budget
-                .check("query_stats_edge_property_count_current")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, _encoded, src, dst) =
-                parse_edge_property_index_key(&key)?;
-            edges.insert((src, dst));
-            self.ensure_query_index_candidates(
-                "query_stats_edge_property_count_candidates",
-                edges.len(),
-            )?;
-        }
-
-        self.collect_relationship_property_encoded_index_at(scan, edges)
-            .await?;
-        Ok(())
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn collect_relationship_property_encoded_index_at(
-        &self,
-        scan: EncodedPropertyIndexScan<'_>,
-        edges: &mut BTreeSet<(VertexId, VertexId)>,
-    ) -> Result<()> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::relationship_property_index_prefix(
-                scan.cell_id,
-                scan.edge_type,
-                scan.property,
-                scan.encoded,
-            ))
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            scan.budget
-                .check("query_stats_relationship_property_count_current")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, _encoded, src, dst, _relationship_id) =
-                parse_relationship_property_index_key(&key)?;
-            edges.insert((src, dst));
-            self.ensure_query_index_candidates(
-                "query_stats_relationship_property_count_candidates",
-                edges.len(),
-            )?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn match_row_patterns(
-        &self,
-        cell_id: &str,
-        patterns: &[RowPattern],
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<Vec<BindingRow>> {
-        if patterns.is_empty() {
-            return Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Pattern,
-                dialect: "OpenCypher",
-                feature: "MATCH requires at least one executable pattern".to_string(),
-            });
-        }
-
-        self.match_row_patterns_from_rows(
-            cell_id,
-            patterns,
-            read_epoch,
-            budget,
-            vec![BindingRow::default()],
-        )
-        .await
-    }
-
-    #[cfg(feature = "opencypher")]
     async fn match_row_pattern_groups(
         &self,
         cell_id: &str,
         groups: &[RowMatchGroup],
         read_epoch: StorageSequence,
         budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        self.match_row_pattern_groups_limited(cell_id, groups, read_epoch, budget, None)
+            .await
+    }
+
+    /// [`Self::match_row_pattern_groups`] that stops once the last group has
+    /// produced `row_limit` rows. Rows from one seed are counted after the
+    /// group's predicate, so the bound is on filtered rows; the caller still
+    /// truncates, since one seed may contribute several rows past the bound.
+    #[cfg(feature = "opencypher")]
+    async fn match_row_pattern_groups_limited(
+        &self,
+        cell_id: &str,
+        groups: &[RowMatchGroup],
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+        row_limit: Option<usize>,
     ) -> Result<Vec<BindingRow>> {
         if groups.is_empty() {
             return Err(GraphError::UnsupportedQuery {
@@ -4448,7 +3225,9 @@ impl GraphShard {
             )
             .await?;
         let mut rows = vec![BindingRow::default()];
-        for group in &groups {
+        let last_group = groups.len() - 1;
+        for (group_index, group) in groups.iter().enumerate() {
+            let group_limit = row_limit.filter(|_| group_index == last_group);
             budget.check("cypher_match_group")?;
             if group.patterns.is_empty() {
                 return Err(GraphError::UnsupportedQuery {
@@ -4460,56 +3239,94 @@ impl GraphShard {
 
             let mut group_rows = Vec::new();
             for row in rows {
-                let initial_rows = if let Some(seed_rows) =
-                    self.node_id_predicate_seed_rows(group, budget, &row)?
-                {
-                    seed_rows
+                if group_limit.is_some_and(|limit| group_rows.len() >= limit) {
+                    break;
+                }
+                let seeded = if let Some(seed_rows) = self.node_id_predicate_seed_rows(group, budget, &row)? {
+                    Some(seed_rows)
                 } else if let Some(seed_rows) = self
                     .relationship_predicate_seed_rows(cell_id, group, read_epoch, budget, &row)
                     .await?
                 {
-                    seed_rows
+                    Some(seed_rows)
                 } else if let Some(seed_rows) = self
                     .node_equality_predicate_seed_rows(cell_id, group, read_epoch, budget, &row)
                     .await?
                 {
-                    seed_rows
-                } else if let Some(seed_rows) = self
-                    .prefix_predicate_seed_rows(cell_id, group, read_epoch, budget, &row)
-                    .await?
-                {
-                    seed_rows
+                    Some(seed_rows)
                 } else {
-                    vec![row.clone()]
+                    self.prefix_predicate_seed_rows(cell_id, group, read_epoch, budget, &row).await?
                 };
-                let mut matches = self
-                    .match_row_patterns_from_rows(
-                        cell_id,
-                        &group.patterns,
-                        read_epoch,
-                        budget,
-                        initial_rows,
-                    )
-                    .await?;
-                if let Some(predicate) = &group.predicate {
-                    let mut filtered = Vec::with_capacity(matches.len());
-                    for matched in matches {
-                        budget.check("cypher_group_where")?;
-                        if row_predicate_matches(&matched, predicate)? {
-                            filtered.push(matched);
+                let limited_scan = match (&seeded, group_limit) {
+                    (None, Some(_)) => self.limited_node_scan_candidates(cell_id, group, read_epoch, budget, &row).await?,
+                    _ => None,
+                };
+                let wanted = group_limit.map(|limit| limit.saturating_sub(group_rows.len()));
+                let mut matches = Vec::new();
+                if let Some((node, candidates)) = limited_scan {
+                    // An unanchored node under a bound: the index supplied ids
+                    // alone, so read their records a batch at a time and stop
+                    // once enough pass. A batch is at least
+                    // `LIMITED_NODE_SCAN_BATCH` so a selective predicate does
+                    // not degrade into one round trip per candidate.
+                    let batch = wanted.unwrap_or(1).max(LIMITED_NODE_SCAN_BATCH);
+                    for chunk in candidates.chunks(batch) {
+                        let found = self
+                            .match_node_row_candidates(cell_id, node, read_epoch, budget, chunk.to_vec())
+                            .await?;
+                        let joined = found.iter().filter_map(|matched| row.join(matched)).collect();
+                        extend_with_predicate_matches(group.predicate.as_ref(), joined, &mut matches, budget)?;
+                        if wanted.is_some_and(|wanted| matches.len() >= wanted) {
+                            break;
                         }
                     }
-                    matches = filtered;
+                } else if let (Some(wanted), Some(edge)) = (wanted, bounded_edge_group_pattern(group)) {
+                    // A single hop under a bound: each seed expands through a
+                    // traversal that joins, filters and counts the rows itself,
+                    // so `WITH r LIMIT n` stops after about n relationships
+                    // even when one vertex has more than the intermediate-row
+                    // limit.
+                    for seed in seeded.unwrap_or_else(|| vec![row.clone()]) {
+                        let Some(RowPattern::Edge(bound_edge)) = constrain_row_pattern(edge, &seed)? else {
+                            continue;
+                        };
+                        let bound = EdgeRowBound {
+                            input: &seed,
+                            predicate: group.predicate.as_ref(),
+                            wanted: wanted - matches.len(),
+                        };
+                        let expanded = self
+                            .match_edge_row_pattern(cell_id, &bound_edge, read_epoch, budget, Some(bound))
+                            .await?;
+                        matches.extend(expanded);
+                        if matches.len() >= wanted {
+                            break;
+                        }
+                    }
+                } else {
+                    // Without a bound the seeds expand together. With one, they
+                    // expand a bound's worth at a time and stop once enough rows
+                    // pass the predicate, so `LIMIT n` costs about n matches,
+                    // not every match of the pattern.
+                    let initial_rows = seeded.unwrap_or_else(|| vec![row.clone()]);
+                    let seed_chunk = wanted.map_or(initial_rows.len().max(1), |wanted| wanted.max(1));
+                    let mut initial_rows = initial_rows.into_iter().peekable();
+                    while initial_rows.peek().is_some() {
+                        let seeds = initial_rows.by_ref().take(seed_chunk).collect::<Vec<_>>();
+                        let expanded = self
+                            .match_row_patterns_from_rows(cell_id, &group.patterns, read_epoch, budget, seeds)
+                            .await?;
+                        extend_with_predicate_matches(group.predicate.as_ref(), expanded, &mut matches, budget)?;
+                        if wanted.is_some_and(|wanted| matches.len() >= wanted) {
+                            break;
+                        }
+                    }
                 }
 
                 if matches.is_empty() && group.optional {
                     let mut optional_row = row;
                     optional_row.mark_optional_group_nulls(group);
-                    self.push_binding_row(
-                        &mut group_rows,
-                        optional_row,
-                        "cypher_optional_match_rows",
-                    )?;
+                    self.push_binding_row(&mut group_rows, optional_row, "cypher_optional_match_rows")?;
                 } else {
                     for matched in matches {
                         self.push_binding_row(&mut group_rows, matched, "cypher_match_group_rows")?;
@@ -4563,37 +3380,256 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<(Option<RelationshipId>, EdgeMetadata)>> {
-        let mut relationships = self
+        let relationships = self
             .relationships_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
             .await?;
-        let structural_metadata = relationships.iter().find_map(|(relationship, metadata)| {
-            relationship
-                .relationship_id
-                .is_none()
-                .then(|| metadata.clone())
-        });
-        if let Some(structural_metadata) = structural_metadata {
-            if relationships
-                .iter()
-                .any(|(relationship, _)| relationship.relationship_id.is_some())
-            {
-                relationships = relationships
-                    .into_iter()
-                    .filter_map(|(relationship, metadata)| {
-                        relationship.relationship_id.map(|_| {
-                            let mut merged = structural_metadata.clone();
-                            merged.properties.extend(metadata.properties);
-                            (relationship, merged)
-                        })
-                    })
-                    .collect();
-            }
+        Ok(native_path_rows(relationships))
+    }
+
+    /// [`Self::native_path_relationships_at`] for a pair an expansion listed
+    /// from the adjacency of the snapshot being read, at `read_epoch`: the
+    /// listing already proved the structural edge, so it is not checked again.
+    #[cfg(feature = "opencypher")]
+    #[allow(dead_code)] // Used only when `experimental-cypher-engine` is also enabled.
+    pub(crate) async fn native_path_relationships_of_listed_edge_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(Option<RelationshipId>, EdgeMetadata)>> {
+        let relationships = self
+            .relationships_for_edge_with_presence_at(cell_id, edge_type, src, dst, read_epoch, budget, EdgePresence::Listed)
+            .await?;
+        Ok(native_path_rows(relationships))
+    }
+
+    /// Consecutive incoming neighbours have distinct sources. Seek their canonical
+    /// records in storage-key order using one iterator per namespace. The bounds,
+    /// seeks and single lookahead avoid walking unrelated sources between probes.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(super) async fn listed_incoming_relationship_rows(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        cell: &str,
+        edge_type: &str,
+        dst: VertexId,
+        sources: &[VertexId],
+        budget: &QueryBudget,
+    ) -> Result<Vec<NativePathRows>> {
+        debug_assert!(!sources.is_empty() && sources.windows(2).all(|ids| ids[0] < ids[1]));
+        validate_component("cell_id", cell)?;
+        validate_component("edge_type", edge_type)?;
+        let record_keys: Vec<_> = sources
+            .iter()
+            .map(|&src| keys::relationship_edge_prefix(cell, edge_type, src, dst))
+            .collect();
+        let metadata_keys: Vec<_> = sources.iter().map(|&src| keys::edge_metadata(cell, edge_type, src, dst)).collect();
+        let reads = async {
+            futures::try_join!(
+                self.seek_listed_keys(snapshot, &record_keys, true, budget, decode_relationship_record),
+                self.seek_listed_keys(snapshot, &metadata_keys, false, budget, decode_edge_metadata),
+            )
+        };
+        let (records, metadata) = budget.read_only_io("cypher_incoming_relationship_batch", Box::pin(reads)).await?;
+        let mut rows = Vec::with_capacity(sources.len());
+        for ((&src, records), mut meta) in sources.iter().zip(records).zip(metadata) {
+            budget.check("cypher_incoming_relationship_rows")?;
+            rows.push(native_path_rows(relationship_rows_for_edge(
+                edge_type,
+                src,
+                dst,
+                records,
+                meta.pop().unwrap_or_default(),
+            )));
         }
-        relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
-        Ok(relationships
-            .into_iter()
-            .map(|(relationship, metadata)| (relationship.relationship_id, metadata))
-            .collect())
+        Ok(rows)
+    }
+
+    #[cfg(feature = "experimental-cypher-engine")]
+    async fn seek_listed_keys<T>(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        keys: &[String],
+        prefixes: bool,
+        budget: &QueryBudget,
+        decode: impl Fn(&str, &[u8]) -> Result<T>,
+    ) -> Result<Vec<Vec<T>>> {
+        use std::ops::Bound;
+        let first = keys[0].as_bytes();
+        let last = keys.last().expect("batch is nonempty").as_bytes();
+        let shared = first.iter().zip(last).take_while(|(a, b)| a == b).count();
+        let mut end = last[shared..].to_vec();
+        end.push(0xff);
+        // A sparse seek needs at most one block in flight. SlateDB rounds the
+        // positive byte target up to a whole block.
+        let options = remote_scan_options_for_expected_items(1)
+            .with_read_ahead_bytes(1)
+            .with_max_fetch_tasks(1);
+        let mut iter = snapshot
+            .scan_prefix_with_options(
+                &first[..shared],
+                (Bound::Included(first[shared..].to_vec()), Bound::Excluded(end)),
+                &options,
+            )
+            .await?;
+        let mut next = iter.next().await?;
+        let mut output = Vec::with_capacity(keys.len());
+        let mut retained = 0;
+        for key in keys {
+            budget.check("cypher_incoming_relationship_seek")?;
+            if next.as_ref().is_some_and(|kv| kv.key.as_ref() < key.as_bytes()) {
+                iter.seek(key.as_bytes()).await?;
+                next = iter.next().await?;
+            }
+            let mut matches = Vec::new();
+            while let Some(kv) = next.as_ref().filter(|kv| {
+                if prefixes {
+                    kv.key.starts_with(key.as_bytes())
+                } else {
+                    kv.key.as_ref() == key.as_bytes()
+                }
+            }) {
+                budget.check("cypher_incoming_relationship_records")?;
+                matches.push(decode(&String::from_utf8_lossy(&kv.key), &kv.value)?);
+                retained += 1;
+                if prefixes {
+                    self.ensure_query_index_candidates("cypher_relationship_edge_records", matches.len())?;
+                }
+                self.ensure_query_intermediate_rows("cypher_incoming_relationship_records", retained)?;
+                next = iter.next().await?;
+            }
+            output.push(matches);
+        }
+        Ok(output)
+    }
+
+    /// [`Self::native_path_relationships_at`] for every listed out-neighbour
+    /// of one source at once: one prefix scan of the source's relationship
+    /// records and one of its edge metadata, instead of an existence check, a
+    /// record scan and a metadata read per edge. On a hub that is two scans
+    /// for thousands of edges rather than three round trips each.
+    ///
+    /// `dsts` must be the source's out-neighbours over `edge_type`, listed
+    /// from the snapshot this runs under at `read_epoch`. The listing applies
+    /// the rule `edge_exists_in_storage_snapshot` applies -- an `out` edge key,
+    /// or a visible segment destination -- so every listed pair already
+    /// passed the per-edge existence check. Records under the source for
+    /// destinations not in `dsts` (left by a removed edge) are skipped, as the
+    /// per-edge path skips them by not reading them.
+    ///
+    /// Answers each destination's rows in `dsts` order. `None` when
+    /// `read_epoch` is not the latest epoch: historical reads keep the
+    /// per-edge path, which reads record metadata as of that epoch.
+    #[cfg(feature = "opencypher")]
+    #[allow(dead_code)] // Used only when `experimental-cypher-engine` is also enabled.
+    pub(crate) async fn native_path_relationships_from_source_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dsts: &[VertexId],
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Option<Vec<NativePathRows>>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        if read_epoch != self.current_epoch(cell_id).await? {
+            return Ok(None);
+        }
+        let wanted = dsts.iter().copied().collect::<BTreeSet<_>>();
+        // Edge metadata holds one key per live edge (removing an edge removes
+        // it), so the listed destinations bound that scan and it is cached
+        // like the listing that produced them. Relationship records do not:
+        // a pair can carry any number of parallel relationships, so their
+        // count says nothing about how many blocks the scan would admit, and
+        // one multi-edge-heavy source could sweep the shared cache. Records
+        // are read ahead in large requests and not admitted.
+        let metadata_scan_options = || {
+            let options = remote_scan_options_for_expected_items(wanted.len() as u64);
+            if options.cache_blocks {
+                options
+            } else {
+                remote_bulk_scan_options()
+            }
+        };
+        let records = async {
+            let prefix = keys::relationship_source_prefix(cell_id, edge_type, src);
+            let mut iter = self
+                .storage
+                .scan_prefix_with_options(prefix.as_bytes(), None, &remote_bulk_scan_options())
+                .await?;
+            let mut by_dst: BTreeMap<VertexId, Vec<RelationshipRecord>> = BTreeMap::new();
+            let mut kept = 0_usize;
+            while let Some(kv) = iter.next().await? {
+                budget.check("cypher_relationship_source_records")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let record = decode_relationship_record(&key, &kv.value)?;
+                if !wanted.contains(&record.dst) {
+                    continue;
+                }
+                let records = by_dst.entry(record.dst).or_default();
+                records.push(record);
+                // The per-edge path bounds each pair's records the same way,
+                // and the source as a whole is bounded as the expansion's rows
+                // are, so a hub stops here rather than after it is all held.
+                self.ensure_query_index_candidates("cypher_relationship_edge_records", records.len())?;
+                kept += 1;
+                self.ensure_query_intermediate_rows("cypher_relationship_source_records", kept)?;
+            }
+            Ok::<_, GraphError>(by_dst)
+        };
+        let structural_metadata = async {
+            let prefix = keys::edge_metadata_source_prefix(cell_id, edge_type, src);
+            let mut iter = self
+                .storage
+                .scan_prefix_with_options(prefix.as_bytes(), None, &metadata_scan_options())
+                .await?;
+            let mut by_dst = BTreeMap::new();
+            while let Some(kv) = iter.next().await? {
+                budget.check("cypher_edge_metadata_source")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let dst = key
+                    .rsplit('/')
+                    .next()
+                    .and_then(|dst| dst.parse::<VertexId>().ok())
+                    .ok_or_else(|| GraphError::CorruptValue {
+                        key: key.clone(),
+                        reason: "edge metadata key does not end in a destination vertex id".to_string(),
+                    })?;
+                if wanted.contains(&dst) {
+                    by_dst.insert(dst, decode_edge_metadata(&key, &kv.value)?);
+                }
+            }
+            Ok::<_, GraphError>(by_dst)
+        };
+        let (records, structural_metadata) = budget
+            .read_only_io(
+                "cypher_relationship_source_records",
+                Box::pin(async { futures::try_join!(records, structural_metadata) }),
+            )
+            .await?;
+        // Each destination's rows are built once and handed to every listed
+        // occurrence of it: a repeated type (`[:KNOWS|KNOWS]`) lists a pair
+        // twice, and both must read the same relationships.
+        let mut rows_by_dst: BTreeMap<VertexId, NativePathRows> = BTreeMap::new();
+        let mut answered = Vec::with_capacity(dsts.len());
+        for &dst in dsts {
+            budget.check("cypher_relationship_source_rows")?;
+            let rows = rows_by_dst.entry(dst).or_insert_with(|| {
+                native_path_rows(relationship_rows_for_edge(
+                    edge_type,
+                    src,
+                    dst,
+                    records.get(&dst).cloned().unwrap_or_default(),
+                    structural_metadata.get(&dst).cloned().unwrap_or_default(),
+                ))
+            });
+            answered.push(rows.clone());
+        }
+        Ok(Some(answered))
     }
 
     #[cfg(feature = "opencypher")]
@@ -4620,8 +3656,7 @@ impl GraphShard {
             .as_ref()
             .map(row_predicate_property_equality_constraints)
             .unwrap_or_default();
-        let mut seeds =
-            Vec::<(&RowEdgePattern, RowPredicatePropertyEqualityConstraint, u64)>::new();
+        let mut seeds = Vec::<(&RowEdgePattern, RowPredicatePropertyEqualityConstraint, u64)>::new();
         for pattern in &group.patterns {
             let RowPattern::Edge(edge) = pattern else {
                 continue;
@@ -4631,10 +3666,7 @@ impl GraphShard {
             };
             // This seed binds the stored source/destination directly. An
             // undirected pattern must go through the two-orientation matcher.
-            if edge.direction == EdgeDirection::Bidirectional
-                || edge.hop_range.is_some()
-                || input.relationships.contains_key(binding)
-            {
+            if edge.direction == EdgeDirection::Bidirectional || edge.hop_range.is_some() || input.relationships.contains_key(binding) {
                 continue;
             }
 
@@ -4643,27 +3675,24 @@ impl GraphShard {
                 .filter(|constraint| constraint.binding == *binding)
                 .cloned()
                 .collect::<Vec<_>>();
-            constraints.extend(edge.properties.iter().map(|(property, value)| {
-                RowPredicatePropertyEqualityConstraint {
-                    binding: binding.clone(),
-                    property: property.clone(),
-                    values: vec![value.clone()],
-                }
-            }));
+            constraints.extend(
+                edge.properties
+                    .iter()
+                    .map(|(property, value)| RowPredicatePropertyEqualityConstraint {
+                        binding: binding.clone(),
+                        property: property.clone(),
+                        values: vec![value.clone()],
+                    }),
+            );
 
             // Inline properties live in a BTreeMap, but lexical property order
-            // is unrelated to selectivity. Rank every valid equality using the
-            // same persisted point/histogram statistics as the optimizer.
+            // is unrelated to selectivity: rank every valid equality the same
+            // way the optimizer does, by how many values it accepts.
             for constraint in constraints {
-                let estimate = self
-                    .edge_property_equality_estimate(
-                        cell_id,
-                        &edge.edge_type,
-                        &constraint.property,
-                        &constraint.values,
-                        16,
-                    )
-                    .await?;
+                if !constraint.values.iter().all(VertexPropertyValue::is_scalar_indexable) {
+                    continue;
+                }
+                let estimate = crate::shard::query_optimizer::edge_property_equality_estimate(&constraint.values);
                 seeds.push((edge, constraint, estimate));
             }
         }
@@ -4716,20 +3745,10 @@ impl GraphShard {
         let mut metadata_cache = BTreeMap::new();
         let mut edge_metadata_cache = BTreeMap::new();
         let candidates = {
-            let mut state = EdgeRowMatchState {
-                cell_id,
-                read_epoch,
-                edge,
-                rows: Vec::new(),
-                pending: Vec::new(),
-                metadata_cache: &mut metadata_cache,
-                edge_metadata_cache: &mut edge_metadata_cache,
-                budget,
-            };
+            let mut state = EdgeRowMatchState::new(cell_id, read_epoch, edge, &mut metadata_cache, &mut edge_metadata_cache, budget);
             for (src, dst) in pairs {
                 budget.check("cypher_edge_predicate_index_rows")?;
-                self.push_matching_edge_row(edge, src, dst, &mut state)
-                    .await?;
+                self.push_matching_edge_row(edge, src, dst, &mut state).await?;
             }
             self.finish_edge_rows(state).await?
         };
@@ -4778,9 +3797,7 @@ impl GraphShard {
         // The binding has to name a node this group matches, and one whose id
         // the pattern does not already pin: an inline `{id: ...}` is the
         // stricter anchor and `constrain_row_pattern` applies it anyway.
-        let seedable_node = |node: &RowNodePattern| {
-            node.binding.as_deref() == Some(binding.as_str()) && node.id.is_none()
-        };
+        let seedable_node = |node: &RowNodePattern| node.binding.as_deref() == Some(binding.as_str()) && node.id.is_none();
         let seedable = group.patterns.iter().any(|pattern| match pattern {
             RowPattern::Node(node) => seedable_node(node),
             RowPattern::Edge(edge) => seedable_node(&edge.src) || seedable_node(&edge.dst),
@@ -4800,6 +3817,37 @@ impl GraphShard {
         Ok(Some(rows))
     }
 
+    /// Candidate ids for a bounded, unanchored single-node group, from the
+    /// node's label or property index and without reading any vertex record.
+    /// [`Self::match_row_pattern_groups_limited`] reads their records a batch
+    /// at a time, applies the pattern and the group predicate, and stops once
+    /// enough rows pass. Without this, `MATCH (n:L) WITH n LIMIT 10` read every
+    /// `L` record before keeping ten. `None` when another seed or an all-vertex
+    /// scan has to match the group instead.
+    #[cfg(feature = "opencypher")]
+    async fn limited_node_scan_candidates<'group>(
+        &self,
+        cell_id: &str,
+        group: &'group RowMatchGroup,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+        input: &BindingRow,
+    ) -> Result<Option<(&'group RowNodePattern, Vec<VertexId>)>> {
+        let [RowPattern::Node(node)] = group.patterns.as_slice() else {
+            return Ok(None);
+        };
+        let Some(binding) = node.binding.as_deref() else {
+            return Ok(None);
+        };
+        if node.id.is_some() || input.values.contains_key(binding) || input.null_values.contains(binding) {
+            return Ok(None);
+        }
+        Ok(self
+            .candidate_vertex_ids(cell_id, node, read_epoch, budget)
+            .await?
+            .map(|candidates| (node, candidates)))
+    }
+
     #[cfg(feature = "opencypher")]
     async fn node_equality_predicate_seed_rows(
         &self,
@@ -4816,9 +3864,7 @@ impl GraphShard {
                 read_epoch,
                 budget,
                 input,
-                NodeEqualityProbe::PredicateEqualities(
-                    256.min(self.limits.max_query_intermediate_rows),
-                ),
+                NodeEqualityProbe::PredicateEqualities(256.min(self.limits.max_query_intermediate_rows)),
             )
             .await?
         else {
@@ -4856,17 +3902,14 @@ impl GraphShard {
             .unwrap_or_default();
         let eligible = |constraint: &RowPredicatePropertyEqualityConstraint| {
             !constraint.values.is_empty()
+                && constraint.values.iter().all(VertexPropertyValue::is_scalar_indexable)
                 && !input.values.contains_key(&constraint.binding)
                 && !input.null_values.contains(&constraint.binding)
                 && group.patterns.iter().any(|pattern| {
-                    let eligible_node = |node: &RowNodePattern| {
-                        node.binding.as_ref() == Some(&constraint.binding) && node.id.is_none()
-                    };
+                    let eligible_node = |node: &RowNodePattern| node.binding.as_ref() == Some(&constraint.binding) && node.id.is_none();
                     match pattern {
                         RowPattern::Node(node) => eligible_node(node),
-                        RowPattern::Edge(edge) => {
-                            eligible_node(&edge.src) || eligible_node(&edge.dst)
-                        }
+                        RowPattern::Edge(edge) => eligible_node(&edge.src) || eligible_node(&edge.dst),
                     }
                 })
         };
@@ -4982,11 +4025,7 @@ impl GraphShard {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let allowance = self
-            .limits
-            .max_query_index_candidates
-            .min(max_probe_entries)
-            / candidates.len();
+        let allowance = self.limits.max_query_index_candidates.min(max_probe_entries) / candidates.len();
         let alternative_allowance = QUERY_NODE_EQUALITY_PROBE_ALTERNATIVES / candidates.len();
         let concurrency = candidates.len();
         let mut probes = stream::iter(candidates.iter().enumerate())
@@ -5002,6 +4041,7 @@ impl GraphShard {
                 let mut vertices = BTreeSet::new();
                 let mut encodings = BTreeSet::new();
                 let mut complete = true;
+                let property_prefix = self.vertex_property_index_prefix_at(cell_id, property, budget).await?;
                 'keys: for encoded in encoded_keys {
                     if encodings.contains(encoded) {
                         continue;
@@ -5012,11 +4052,11 @@ impl GraphShard {
                     }
                     encodings.insert(encoded.clone());
                     budget.check("cypher_node_equality_seed_seek")?;
-                    let prefix = keys::vertex_property_index_prefix(cell_id, property, encoded);
+                    let prefix = keys::vertex_property_index_value_prefix(&property_prefix, encoded);
                     let mut iter = budget
                         .read_only_io(
                             "cypher_node_equality_seed_seek",
-                            self.db.scan_prefix_with_options(
+                            self.storage.scan_prefix_with_options(
                                 prefix.as_bytes(),
                                 None,
                                 &remote_scan_options_for_expected_items(allowance as u64),
@@ -5051,10 +4091,7 @@ impl GraphShard {
             .boxed();
         while let Some(probe) = probes.try_next().await? {
             if let Some((index, vertices)) = probe {
-                tracing::Span::current().record(
-                    "hydradb.query.runtime_property_index",
-                    candidates[index].0.as_str(),
-                );
+                tracing::Span::current().record("hydradb.query.runtime_property_index", candidates[index].0.as_str());
                 return Ok(Some((index, vertices)));
             }
         }
@@ -5083,19 +4120,17 @@ impl GraphShard {
         let binding_is_present = group.patterns.iter().any(|pattern| match pattern {
             RowPattern::Node(node) => node.binding.as_deref() == Some(binding.as_str()),
             RowPattern::Edge(edge) => {
-                edge.src.binding.as_deref() == Some(binding.as_str())
-                    || edge.dst.binding.as_deref() == Some(binding.as_str())
+                edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
             }
         });
         if !binding_is_present {
             return Ok(None);
         }
 
-        let encoded_prefix =
-            encode_vertex_property_value_key(&VertexPropertyValue::String(prefix.clone()));
+        let encoded_prefix = encode_vertex_property_value_key(&VertexPropertyValue::String(prefix.clone()));
         let index_prefix = format!(
             "{}{}",
-            keys::vertex_property_index_property_prefix(cell_id, property),
+            self.vertex_property_index_prefix_at(cell_id, property, budget).await?,
             encoded_prefix
         );
         let mut iter = self.scan_remote_prefix(&index_prefix).await?;
@@ -5103,16 +4138,12 @@ impl GraphShard {
         while let Some(kv) = iter.next().await? {
             budget.check("cypher_vertex_property_prefix_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, indexed_property, _encoded, vertex_id) =
-                parse_vertex_property_index_key(&key)?;
+            let (_cell_id, indexed_property, _encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
             if indexed_property != *property {
                 continue;
             }
             vertices.insert(vertex_id);
-            self.ensure_query_index_candidates(
-                "cypher_vertex_property_prefix_candidates",
-                vertices.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_vertex_property_prefix_candidates", vertices.len())?;
         }
 
         let mut rows = Vec::with_capacity(vertices.len());
@@ -5139,12 +4170,7 @@ impl GraphShard {
         let patterns = budget
             .read_only_io(
                 "cypher_plan_patterns",
-                self.optimize_row_patterns_with_stats(
-                    cell_id,
-                    patterns,
-                    read_epoch,
-                    &initial_bindings,
-                ),
+                self.optimize_row_patterns_with_stats(cell_id, patterns, read_epoch, &initial_bindings),
             )
             .await?;
         for pattern in &patterns {
@@ -5176,9 +4202,7 @@ impl GraphShard {
                 let Some(bound_pattern) = constrain_row_pattern(pattern, &row)? else {
                     continue;
                 };
-                let matches = self
-                    .match_row_pattern(cell_id, &bound_pattern, read_epoch, budget)
-                    .await?;
+                let matches = self.match_row_pattern(cell_id, &bound_pattern, read_epoch, budget).await?;
                 for matched in matches {
                     budget.check("cypher_match_join")?;
                     if let Some(joined) = row.join(&matched) {
@@ -5207,10 +4231,7 @@ impl GraphShard {
         let RowPattern::Edge(edge) = pattern else {
             return Ok(None);
         };
-        if edge.direction == EdgeDirection::Bidirectional
-            || edge.hop_range.is_some()
-            || rows.is_empty()
-        {
+        if edge.direction == EdgeDirection::Bidirectional || edge.hop_range.is_some() || rows.is_empty() {
             return Ok(None);
         }
 
@@ -5230,17 +4251,14 @@ impl GraphShard {
                 return Ok(None);
             };
             let exists = if latest_snapshot {
-                self.edge_exists(cell_id, &bound_edge.edge_type, src, dst)
-                    .await?
+                self.edge_exists(cell_id, &bound_edge.edge_type, src, dst).await?
             } else {
-                self.edge_exists_at(cell_id, &bound_edge.edge_type, src, dst, read_epoch)
-                    .await?
+                self.edge_exists_at(cell_id, &bound_edge.edge_type, src, dst, read_epoch).await?
             };
             if !exists {
                 continue;
             }
-            let relationships = if let Some((property, value)) = bound_edge.properties.iter().next()
-            {
+            let relationships = if let Some((property, value)) = first_indexable_property(&bound_edge.properties) {
                 self.relationships_for_edge_property_at(RelationshipPropertyLookup {
                     cell_id,
                     edge_type: &bound_edge.edge_type,
@@ -5253,21 +4271,12 @@ impl GraphShard {
                 })
                 .await?
             } else {
-                self.relationships_for_edge_at(
-                    cell_id,
-                    &bound_edge.edge_type,
-                    src,
-                    dst,
-                    read_epoch,
-                    budget,
-                )
-                .await?
+                self.relationships_for_edge_at(cell_id, &bound_edge.edge_type, src, dst, read_epoch, budget)
+                    .await?
             };
             let mut matches = Vec::new();
             for (relationship, relationship_metadata) in relationships {
-                let Some(matched) =
-                    BindingRow::from_relationship(&bound_edge, relationship, relationship_metadata)
-                else {
+                let Some(matched) = BindingRow::from_relationship(&bound_edge, relationship, relationship_metadata) else {
                     continue;
                 };
                 matches.push(matched);
@@ -5282,35 +4291,16 @@ impl GraphShard {
             .flat_map(|(_, _, matches)| matches.iter())
             .flat_map(|matched| matched.values.values().copied())
             .collect::<Vec<_>>();
-        self.hydrate_vertex_metadata_cache_at(
-            cell_id,
-            &wanted,
-            read_epoch,
-            &mut metadata_cache,
-            budget,
-        )
-        .await?;
+        self.hydrate_vertex_metadata_cache_at(cell_id, &wanted, read_epoch, &mut metadata_cache, budget)
+            .await?;
 
         for (input_index, bound_edge, matches) in groups {
             let row = &rows[input_index];
             for mut matched in matches {
-                self.hydrate_binding_metadata(
-                    cell_id,
-                    read_epoch,
-                    &mut matched,
-                    &mut metadata_cache,
-                    budget,
-                )
-                .await?;
-                self.hydrate_row_relationship_metadata(
-                    cell_id,
-                    read_epoch,
-                    &mut matched,
-                    &bound_edge,
-                    &mut edge_metadata_cache,
-                    budget,
-                )
-                .await?;
+                self.hydrate_binding_metadata(cell_id, read_epoch, &mut matched, &mut metadata_cache, budget)
+                    .await?;
+                self.hydrate_row_relationship_metadata(cell_id, read_epoch, &mut matched, &bound_edge, &mut edge_metadata_cache, budget)
+                    .await?;
                 if row_matches_edge_pattern(&matched, &bound_edge)? {
                     if let Some(joined) = row.join(&matched) {
                         self.push_binding_row(&mut next_rows, joined, "cypher_expand_into_rows")?;
@@ -5335,25 +4325,16 @@ impl GraphShard {
         }
         let row_bindings = binding_rows_bound_names_union(rows);
         let pattern_bindings = row_pattern_bound_names(pattern);
-        let join_bindings: Vec<_> = row_bindings
-            .intersection(&pattern_bindings)
-            .cloned()
-            .collect();
+        let join_bindings: Vec<_> = row_bindings.intersection(&pattern_bindings).cloned().collect();
 
         if join_bindings.is_empty() {
-            let matches = self
-                .match_row_pattern(cell_id, pattern, read_epoch, budget)
-                .await?;
+            let matches = self.match_row_pattern(cell_id, pattern, read_epoch, budget).await?;
             let mut next_rows = Vec::new();
             for row in rows {
                 for matched in &matches {
                     budget.check("cypher_precomputed_cross_join")?;
                     if let Some(joined) = row.join(matched) {
-                        self.push_binding_row(
-                            &mut next_rows,
-                            joined,
-                            "cypher_precomputed_cross_join_rows",
-                        )?;
+                        self.push_binding_row(&mut next_rows, joined, "cypher_precomputed_cross_join_rows")?;
                     }
                 }
             }
@@ -5375,15 +4356,12 @@ impl GraphShard {
                 .into_iter()
                 .collect();
             if vertices.len() <= self.limits.max_query_index_candidates.min(256) {
-                self.match_node_row_candidates(cell_id, node, read_epoch, budget, vertices)
-                    .await?
+                self.match_node_row_candidates(cell_id, node, read_epoch, budget, vertices).await?
             } else {
-                self.match_row_pattern(cell_id, pattern, read_epoch, budget)
-                    .await?
+                self.match_row_pattern(cell_id, pattern, read_epoch, budget).await?
             }
         } else {
-            self.match_row_pattern(cell_id, pattern, read_epoch, budget)
-                .await?
+            self.match_row_pattern(cell_id, pattern, read_epoch, budget).await?
         };
         let mut matches_by_key = BTreeMap::<Vec<VertexId>, Vec<BindingRow>>::new();
         for matched in matches {
@@ -5421,14 +4399,8 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         budget.check("cypher_match")?;
         match pattern {
-            RowPattern::Node(node) => {
-                self.match_node_row_pattern(cell_id, node, read_epoch, budget)
-                    .await
-            }
-            RowPattern::Edge(edge) => {
-                self.match_edge_row_pattern(cell_id, edge, read_epoch, budget)
-                    .await
-            }
+            RowPattern::Node(node) => self.match_node_row_pattern(cell_id, node, read_epoch, budget).await,
+            RowPattern::Edge(edge) => self.match_edge_row_pattern(cell_id, edge, read_epoch, budget, None).await,
         }
     }
 
@@ -5440,18 +4412,14 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
-        let Some(vertices) = self
-            .candidate_vertex_ids(cell_id, node, read_epoch, budget)
-            .await?
-        else {
+        let Some(vertices) = self.candidate_vertex_ids(cell_id, node, read_epoch, budget).await? else {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::Pattern,
                 dialect: "OpenCypher",
                 feature: "node-only MATCH requires an id, label, or property predicate".to_string(),
             });
         };
-        self.match_node_row_candidates(cell_id, node, read_epoch, budget, vertices)
-            .await
+        self.match_node_row_candidates(cell_id, node, read_epoch, budget, vertices).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -5487,10 +4455,7 @@ impl GraphShard {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for (vertex_id, metadata) in self
-            .existing_vertex_metadata_batch_at(cell_id, &wanted, read_epoch, budget)
-            .await?
-        {
+        for (vertex_id, metadata) in self.existing_vertex_metadata_batch_at(cell_id, &wanted, read_epoch, budget).await? {
             metadata_cache.insert(vertex_id, metadata);
         }
 
@@ -5498,14 +4463,8 @@ impl GraphShard {
             if !metadata_cache.contains_key(&vertex_id) {
                 continue;
             }
-            self.hydrate_binding_metadata(
-                cell_id,
-                read_epoch,
-                &mut row,
-                &mut metadata_cache,
-                budget,
-            )
-            .await?;
+            self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache, budget)
+                .await?;
             if row_matches_node(&row, node)? {
                 self.push_binding_row(&mut rows, row, "cypher_node_rows")?;
             }
@@ -5525,6 +4484,10 @@ impl GraphShard {
     ///
     /// `reversed()` returns an `Outbound` pattern, so the oriented matcher
     /// below cannot fan out a second time.
+    ///
+    /// With a `bound`, rows come back joined to its input and filtered by its
+    /// predicate, and the traversal stops once it has the rows wanted; the
+    /// reverse orientation runs only for what the forward one left short.
     #[cfg(feature = "opencypher")]
     async fn match_edge_row_pattern(
         &self,
@@ -5532,33 +4495,35 @@ impl GraphShard {
         edge: &RowEdgePattern,
         read_epoch: StorageSequence,
         budget: &QueryBudget,
+        bound: Option<EdgeRowBound<'_>>,
     ) -> Result<Vec<BindingRow>> {
         if edge.direction != EdgeDirection::Bidirectional {
             return self
-                .match_edge_row_pattern_oriented(cell_id, edge, read_epoch, budget)
+                .match_edge_row_pattern_oriented(cell_id, edge, read_epoch, budget, bound, false)
                 .await;
         }
         let mut rows = self
-            .match_edge_row_pattern_oriented(cell_id, edge, read_epoch, budget)
+            .match_edge_row_pattern_oriented(cell_id, edge, read_epoch, budget, bound, false)
             .await?;
+        let reverse_bound = match bound {
+            Some(bound) if rows.len() >= bound.wanted => return Ok(rows),
+            Some(bound) => Some(EdgeRowBound {
+                wanted: bound.wanted - rows.len(),
+                ..bound
+            }),
+            None => None,
+        };
         let reversed = edge.reversed();
-        let reverse_rows = self
-            .match_edge_row_pattern_oriented(cell_id, &reversed, read_epoch, budget)
-            .await?;
         // A single-hop row carries one physical relationship. Only self-loops
-        // duplicate the forward orientation. A non-loop has two matches even
-        // when neither endpoint has a binding, so row-value dedup is unsound.
+        // duplicate the forward orientation, so the reverse traversal drops
+        // them. A non-loop has two matches even when neither endpoint has a
+        // binding, so row-value dedup is unsound.
+        let reverse_rows = self
+            .match_edge_row_pattern_oriented(cell_id, &reversed, read_epoch, budget, reverse_bound, true)
+            .await?;
         for row in reverse_rows {
-            budget.check("cypher_undirected_edge_merge")?;
-            if row
-                .relationship_metadata
-                .keys()
-                .any(|relationship| relationship.src != relationship.dst)
-            {
-                self.push_binding_row(&mut rows, row, "cypher_undirected_edge_rows")?;
-            }
+            self.push_binding_row(&mut rows, row, "cypher_undirected_edge_rows")?;
         }
-        self.ensure_query_intermediate_rows("cypher_undirected_edge_rows", rows.len())?;
         Ok(rows)
     }
 
@@ -5569,6 +4534,8 @@ impl GraphShard {
         edge: &RowEdgePattern,
         read_epoch: StorageSequence,
         budget: &QueryBudget,
+        bound: Option<EdgeRowBound<'_>>,
+        skip_self_loops: bool,
     ) -> Result<Vec<BindingRow>> {
         validate_component("edge_type", &edge.edge_type)?;
         if let Some((min_hops, max_hops)) = edge.hop_range {
@@ -5583,53 +4550,30 @@ impl GraphShard {
                 self.best_row_edge_access_with_stats(cell_id, edge, read_epoch, &BTreeSet::new()),
             )
             .await?;
+        let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
+        let mut state = EdgeRowMatchState::new(cell_id, read_epoch, edge, &mut metadata_cache, &mut edge_metadata_cache, budget);
+        state.bound = bound;
+        state.skip_self_loops = skip_self_loops;
         match access {
-            RowQueryAccess::ExpandInto { .. } => {
-                self.match_edge_row_pattern_expand_into(cell_id, edge, read_epoch, budget)
-                    .await
-            }
+            RowQueryAccess::ExpandInto { .. } => self.match_edge_row_pattern_expand_into(state).await,
             RowQueryAccess::BoundOutExpand { .. } => {
-                let Some(sources) = self
-                    .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
-                    .await?
-                else {
-                    return self
-                        .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
-                        .await;
+                let Some(sources) = self.candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget).await? else {
+                    return self.match_edge_row_pattern_full_scan(state).await;
                 };
-                self.match_edge_row_pattern_from_sources(cell_id, edge, sources, read_epoch, budget)
-                    .await
+                self.match_edge_row_pattern_from_sources(state, sources).await
             }
             RowQueryAccess::BoundInExpand { .. } => {
-                let Some(destinations) = self
-                    .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
-                    .await?
-                else {
-                    return self
-                        .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
-                        .await;
+                let Some(destinations) = self.candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget).await? else {
+                    return self.match_edge_row_pattern_full_scan(state).await;
                 };
-                self.match_edge_row_pattern_from_destinations(
-                    cell_id,
-                    edge,
-                    destinations,
-                    read_epoch,
-                    budget,
-                )
-                .await
+                self.match_edge_row_pattern_from_destinations(state, destinations).await
             }
-            RowQueryAccess::EdgePropertyIndex { .. } => {
-                self.match_edge_row_pattern_from_property_index(cell_id, edge, read_epoch, budget)
-                    .await
-            }
-            RowQueryAccess::FullEdgeScan { .. } => {
-                self.match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
-                    .await
-            }
+            RowQueryAccess::EdgePropertyIndex { .. } => self.match_edge_row_pattern_from_property_index(state).await,
+            RowQueryAccess::FullEdgeScan { .. } => self.match_edge_row_pattern_full_scan(state).await,
             RowQueryAccess::VariableLengthExpand { .. } => Err(GraphError::CorruptValue {
                 key: format!("cell/{cell_id}/query/edge-access/{}", edge.edge_type),
-                reason: "optimizer sent variable-length edge pattern to single-edge matcher"
-                    .to_string(),
+                reason: "optimizer sent variable-length edge pattern to single-edge matcher".to_string(),
             }),
             RowQueryAccess::VertexIdSeek
             | RowQueryAccess::VertexPropertyIndex { .. }
@@ -5642,34 +4586,16 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn match_edge_row_pattern_expand_into(
-        &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<Vec<BindingRow>> {
-        let Some(sources) = self
-            .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
-            .await?
-        else {
-            return self
-                .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
-                .await;
+    async fn match_edge_row_pattern_expand_into(&self, mut state: EdgeRowMatchState<'_>) -> Result<Vec<BindingRow>> {
+        let (cell_id, edge, read_epoch, budget) = (state.cell_id, state.edge, state.read_epoch, state.budget);
+        let Some(sources) = self.candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget).await? else {
+            return self.match_edge_row_pattern_full_scan(state).await;
         };
-        let Some(destinations) = self
-            .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
-            .await?
-        else {
-            return self
-                .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
-                .await;
+        let Some(destinations) = self.candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget).await? else {
+            return self.match_edge_row_pattern_full_scan(state).await;
         };
         self.ensure_query_index_candidates("cypher_edge_expand_into_sources", sources.len())?;
-        self.ensure_query_index_candidates(
-            "cypher_edge_expand_into_destinations",
-            destinations.len(),
-        )?;
+        self.ensure_query_index_candidates("cypher_edge_expand_into_destinations", destinations.len())?;
         let candidate_pairs = sources
             .len()
             .checked_mul(destinations.len())
@@ -5681,31 +4607,19 @@ impl GraphShard {
 
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
-        let mut metadata_cache = BTreeMap::new();
-        let mut edge_metadata_cache = BTreeMap::new();
-        let mut state = EdgeRowMatchState {
-            cell_id,
-            read_epoch,
-            edge,
-            rows: Vec::new(),
-            pending: Vec::new(),
-            metadata_cache: &mut metadata_cache,
-            edge_metadata_cache: &mut edge_metadata_cache,
-            budget,
-        };
-        for src in sources {
+        'sources: for src in sources {
             for dst in &destinations {
                 budget.check("cypher_edge_expand_into")?;
                 let exists = if latest_snapshot {
-                    self.edge_exists(cell_id, &edge.edge_type, src, *dst)
-                        .await?
+                    self.edge_exists(cell_id, &edge.edge_type, src, *dst).await?
                 } else {
-                    self.edge_exists_at(cell_id, &edge.edge_type, src, *dst, read_epoch)
-                        .await?
+                    self.edge_exists_at(cell_id, &edge.edge_type, src, *dst, read_epoch).await?
                 };
                 if exists {
-                    self.push_matching_edge_row(edge, src, *dst, &mut state)
-                        .await?;
+                    self.push_matching_edge_row(edge, src, *dst, &mut state).await?;
+                    if state.is_full() {
+                        break 'sources;
+                    }
                 }
             }
         }
@@ -5713,43 +4627,24 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn match_edge_row_pattern_from_property_index(
-        &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<Vec<BindingRow>> {
-        let Some((property, value)) = edge.properties.iter().next() else {
-            return Ok(Vec::new());
+    async fn match_edge_row_pattern_from_property_index(&self, mut state: EdgeRowMatchState<'_>) -> Result<Vec<BindingRow>> {
+        let (cell_id, edge, read_epoch, budget) = (state.cell_id, state.edge, state.read_epoch, state.budget);
+        // The optimizer only picks this access for an indexable property, but
+        // never trust the map's first entry: a list or date is never an index
+        // key, so looking one up finds nothing.
+        let Some((property, value)) = first_indexable_property(&edge.properties) else {
+            return self.match_edge_row_pattern_full_scan(state).await;
         };
         let pairs = self
-            .scan_edge_property_index_at(
-                cell_id,
-                &edge.edge_type,
-                property,
-                value,
-                read_epoch,
-                budget,
-            )
+            .scan_edge_property_index_at(cell_id, &edge.edge_type, property, value, read_epoch, budget)
             .await?;
         self.ensure_query_index_candidates("cypher_edge_property_candidates", pairs.len())?;
-        let mut metadata_cache = BTreeMap::new();
-        let mut edge_metadata_cache = BTreeMap::new();
-        let mut state = EdgeRowMatchState {
-            cell_id,
-            read_epoch,
-            edge,
-            rows: Vec::new(),
-            pending: Vec::new(),
-            metadata_cache: &mut metadata_cache,
-            edge_metadata_cache: &mut edge_metadata_cache,
-            budget,
-        };
         for (src, dst) in pairs {
             budget.check("cypher_edge_property_rows")?;
-            self.push_matching_edge_row(edge, src, dst, &mut state)
-                .await?;
+            self.push_matching_edge_row(edge, src, dst, &mut state).await?;
+            if state.is_full() {
+                break;
+            }
         }
         self.finish_edge_rows(state).await
     }
@@ -5757,35 +4652,49 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     async fn match_edge_row_pattern_from_sources(
         &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
+        mut state: EdgeRowMatchState<'_>,
         sources: Vec<VertexId>,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
+        let (cell_id, edge, read_epoch, budget) = (state.cell_id, state.edge, state.read_epoch, state.budget);
         self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
-        let mut metadata_cache = BTreeMap::new();
-        let mut edge_metadata_cache = BTreeMap::new();
-        let mut state = EdgeRowMatchState {
-            cell_id,
-            read_epoch,
-            edge,
-            rows: Vec::new(),
-            pending: Vec::new(),
-            metadata_cache: &mut metadata_cache,
-            edge_metadata_cache: &mut edge_metadata_cache,
-            budget,
-        };
-        for src in sources {
+        // The pairs an edge property equality names, read once, for sources
+        // whose degree makes checking every neighbor the dearer way. A probe
+        // that overflowed only shows the index is broader than that source:
+        // a source with at least twice its cap probes again
+        // (anchored_property_probe_due).
+        let mut property_pairs: Option<BTreeSet<(VertexId, VertexId)>> = None;
+        let mut probe_overflowed_at = 0usize;
+        'sources: for src in sources {
             budget.check("cypher_edge_sources")?;
             let neighbors = self
                 .out_neighbors_at_for_query(cell_id, &edge.edge_type, src, read_epoch, budget)
                 .await?;
             let scanned_edges = budget.add_scanned_edges(neighbors.len() as u64);
             self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
+            if neighbors.len() > ANCHORED_EXPAND_PROPERTY_PROBE_MIN_DEGREE {
+                if property_pairs.is_none() && anchored_property_probe_due(neighbors.len(), probe_overflowed_at) {
+                    property_pairs = self
+                        .try_edge_property_pairs_bounded(cell_id, edge, read_epoch, budget, neighbors.len())
+                        .await?;
+                    if property_pairs.is_none() {
+                        probe_overflowed_at = neighbors.len();
+                    }
+                }
+                if let Some(pairs) = &property_pairs {
+                    for &(_, dst) in pairs.range((src, VertexId::MIN)..=(src, VertexId::MAX)) {
+                        self.push_matching_edge_row(edge, src, dst, &mut state).await?;
+                        if state.is_full() {
+                            break 'sources;
+                        }
+                    }
+                    continue;
+                }
+            }
             for dst in neighbors {
-                self.push_matching_edge_row(edge, src, dst, &mut state)
-                    .await?;
+                self.push_matching_edge_row(edge, src, dst, &mut state).await?;
+                if state.is_full() {
+                    break 'sources;
+                }
             }
         }
         self.finish_edge_rows(state).await
@@ -5794,29 +4703,12 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     async fn match_edge_row_pattern_from_destinations(
         &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
+        mut state: EdgeRowMatchState<'_>,
         destinations: Vec<VertexId>,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
-        self.ensure_query_index_candidates(
-            "cypher_edge_destination_candidates",
-            destinations.len(),
-        )?;
-        let mut metadata_cache = BTreeMap::new();
-        let mut edge_metadata_cache = BTreeMap::new();
-        let mut state = EdgeRowMatchState {
-            cell_id,
-            read_epoch,
-            edge,
-            rows: Vec::new(),
-            pending: Vec::new(),
-            metadata_cache: &mut metadata_cache,
-            edge_metadata_cache: &mut edge_metadata_cache,
-            budget,
-        };
-        for dst in destinations {
+        let (cell_id, edge, read_epoch, budget) = (state.cell_id, state.edge, state.read_epoch, state.budget);
+        self.ensure_query_index_candidates("cypher_edge_destination_candidates", destinations.len())?;
+        'destinations: for dst in destinations {
             budget.check("cypher_edge_destinations")?;
             let neighbors = self
                 .in_neighbors_at_for_query(cell_id, &edge.edge_type, dst, read_epoch, budget)
@@ -5824,42 +4716,29 @@ impl GraphShard {
             let scanned_edges = budget.add_scanned_edges(neighbors.len() as u64);
             self.ensure_query_scan_edges("cypher_edge_reverse_neighbor_scan", scanned_edges)?;
             for src in neighbors {
-                self.push_matching_edge_row(edge, src, dst, &mut state)
-                    .await?;
+                self.push_matching_edge_row(edge, src, dst, &mut state).await?;
+                if state.is_full() {
+                    break 'destinations;
+                }
             }
         }
         self.finish_edge_rows(state).await
     }
 
     #[cfg(feature = "opencypher")]
-    async fn match_edge_row_pattern_full_scan(
-        &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
-        read_epoch: StorageSequence,
-        budget: &QueryBudget,
-    ) -> Result<Vec<BindingRow>> {
-        let mut metadata_cache = BTreeMap::new();
-        let mut edge_metadata_cache = BTreeMap::new();
+    async fn match_edge_row_pattern_full_scan(&self, mut state: EdgeRowMatchState<'_>) -> Result<Vec<BindingRow>> {
+        let (cell_id, edge, read_epoch, budget) = (state.cell_id, state.edge, state.read_epoch, state.budget);
         let records = self
             .edges_at_with_budget(cell_id, &edge.edge_type, read_epoch, Some(budget))
             .await?;
         let scanned_edges = budget.add_scanned_edges(records.len() as u64);
         self.ensure_query_scan_edges("cypher_edge_full_scan", scanned_edges)?;
-        let mut state = EdgeRowMatchState {
-            cell_id,
-            read_epoch,
-            edge,
-            rows: Vec::new(),
-            pending: Vec::new(),
-            metadata_cache: &mut metadata_cache,
-            edge_metadata_cache: &mut edge_metadata_cache,
-            budget,
-        };
         for record in records {
             budget.check("cypher_edge_full_scan")?;
-            self.push_matching_edge_row(edge, record.src, record.dst, &mut state)
-                .await?;
+            self.push_matching_edge_row(edge, record.src, record.dst, &mut state).await?;
+            if state.is_full() {
+                break;
+            }
         }
         self.finish_edge_rows(state).await
     }
@@ -5873,12 +4752,10 @@ impl GraphShard {
         state: &mut EdgeRowMatchState<'_>,
     ) -> Result<()> {
         state.budget.check("cypher_edge_rows")?;
-        if matches!(edge.src.id, Some(fixed_src) if fixed_src != src)
-            || matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst)
-        {
+        if matches!(edge.src.id, Some(fixed_src) if fixed_src != src) || matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
             return Ok(());
         }
-        let relationships = if let Some((property, value)) = edge.properties.iter().next() {
+        let relationships = if let Some((property, value)) = first_indexable_property(&edge.properties) {
             self.relationships_for_edge_property_at(RelationshipPropertyLookup {
                 cell_id: state.cell_id,
                 edge_type: &edge.edge_type,
@@ -5891,15 +4768,8 @@ impl GraphShard {
             })
             .await?
         } else {
-            self.relationships_for_edge_at(
-                state.cell_id,
-                &edge.edge_type,
-                src,
-                dst,
-                state.read_epoch,
-                state.budget,
-            )
-            .await?
+            self.relationships_for_edge_at(state.cell_id, &edge.edge_type, src, dst, state.read_epoch, state.budget)
+                .await?
         };
         for (relationship, metadata) in relationships {
             let Some(row) = BindingRow::from_relationship(edge, relationship, metadata) else {
@@ -5914,6 +4784,9 @@ impl GraphShard {
             // decides how often that happens, never whether it does.
             if state.pending.len() >= EDGE_ROW_HYDRATION_BATCH {
                 self.flush_pending_edge_rows(state).await?;
+                if state.is_full() {
+                    break;
+                }
             }
         }
         Ok(())
@@ -5926,28 +4799,19 @@ impl GraphShard {
         }
         let pending = std::mem::take(&mut state.pending);
 
-        let wanted = pending
-            .iter()
-            .flat_map(|row| row.values.values().copied())
-            .collect::<Vec<_>>();
-        self.hydrate_vertex_metadata_cache_at(
-            state.cell_id,
-            &wanted,
-            state.read_epoch,
-            state.metadata_cache,
-            state.budget,
-        )
-        .await?;
+        let wanted = pending.iter().flat_map(|row| row.values.values().copied()).collect::<Vec<_>>();
+        self.hydrate_vertex_metadata_cache_at(state.cell_id, &wanted, state.read_epoch, state.metadata_cache, state.budget)
+            .await?;
 
         for mut row in pending {
-            self.hydrate_binding_metadata(
-                state.cell_id,
-                state.read_epoch,
-                &mut row,
-                state.metadata_cache,
-                state.budget,
-            )
-            .await?;
+            // A bounded traversal keeps no more than it wants. The rest of
+            // the batch was hydrated for nothing, which is the price of
+            // hydrating in batches at all; the traversal stops after this.
+            if state.is_full() {
+                break;
+            }
+            self.hydrate_binding_metadata(state.cell_id, state.read_epoch, &mut row, state.metadata_cache, state.budget)
+                .await?;
             self.hydrate_row_relationship_metadata(
                 state.cell_id,
                 state.read_epoch,
@@ -5957,9 +4821,33 @@ impl GraphShard {
                 state.budget,
             )
             .await?;
-            if row_matches_edge_pattern(&row, state.edge)? {
-                self.push_binding_row(&mut state.rows, row, "cypher_edge_rows")?;
+            if !row_matches_edge_pattern(&row, state.edge)? {
+                continue;
             }
+            if state.skip_self_loops
+                && row
+                    .relationship_metadata
+                    .keys()
+                    .all(|relationship| relationship.src == relationship.dst)
+            {
+                continue;
+            }
+            let row = match state.bound {
+                None => row,
+                Some(bound) => {
+                    let Some(joined) = bound.input.join(&row) else {
+                        continue;
+                    };
+                    if let Some(predicate) = bound.predicate {
+                        state.budget.check("cypher_group_where")?;
+                        if !row_predicate_matches(&joined, predicate)? {
+                            continue;
+                        }
+                    }
+                    joined
+                }
+            };
+            self.push_binding_row(&mut state.rows, row, "cypher_edge_rows")?;
         }
         Ok(())
     }
@@ -6002,22 +4890,11 @@ impl GraphShard {
         };
         // A source id without a canonical record names no vertex, so nothing
         // is reachable from it, not even itself at zero hops.
-        if self
-            .vertex_metadata_if_exists_at(cell_id, src, read_epoch, budget)
-            .await?
-            .is_none()
-        {
+        if self.vertex_metadata_if_exists_at(cell_id, src, read_epoch, budget).await?.is_none() {
             return Ok(Vec::new());
         }
         let (vertices, edge_visits) = self
-            .reachable_vertices_in_hop_range_at(
-                cell_id,
-                &edge.edge_type,
-                src,
-                (min_hops, max_hops),
-                read_epoch,
-                budget,
-            )
+            .reachable_vertices_in_hop_range_at(cell_id, &edge.edge_type, src, (min_hops, max_hops), read_epoch, budget)
             .await?;
         budget.check("cypher_reachable")?;
         self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
@@ -6037,37 +4914,15 @@ impl GraphShard {
             }
         }
 
-        let wanted = pending
-            .iter()
-            .flat_map(|row| row.values.values().copied())
-            .collect::<Vec<_>>();
-        self.hydrate_vertex_metadata_cache_at(
-            cell_id,
-            &wanted,
-            read_epoch,
-            &mut metadata_cache,
-            budget,
-        )
-        .await?;
+        let wanted = pending.iter().flat_map(|row| row.values.values().copied()).collect::<Vec<_>>();
+        self.hydrate_vertex_metadata_cache_at(cell_id, &wanted, read_epoch, &mut metadata_cache, budget)
+            .await?;
 
         for mut row in pending {
-            self.hydrate_binding_metadata(
-                cell_id,
-                read_epoch,
-                &mut row,
-                &mut metadata_cache,
-                budget,
-            )
-            .await?;
-            self.hydrate_row_relationship_metadata(
-                cell_id,
-                read_epoch,
-                &mut row,
-                edge,
-                &mut edge_metadata_cache,
-                budget,
-            )
-            .await?;
+            self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache, budget)
+                .await?;
+            self.hydrate_row_relationship_metadata(cell_id, read_epoch, &mut row, edge, &mut edge_metadata_cache, budget)
+                .await?;
             if row_matches_edge_pattern(&row, edge)? {
                 self.push_binding_row(&mut rows, row, "cypher_reachable_rows")?;
             }
@@ -6087,7 +4942,7 @@ impl GraphShard {
         let access = budget
             .read_only_io(
                 "cypher_plan_node_access",
-                self.best_row_node_access_with_stats(cell_id, pattern, &BTreeSet::new()),
+                self.best_row_node_access_with_stats(pattern, &BTreeSet::new()),
             )
             .await?;
         match access {
@@ -6125,21 +4980,13 @@ impl GraphShard {
                     // polled, making the result depend on cache timing.
                     let probe_budget = self.limits.max_query_index_candidates.min(256);
                     let allowance = probe_budget / properties.len();
-                    let alternative_allowance =
-                        QUERY_NODE_EQUALITY_PROBE_ALTERNATIVES / properties.len();
+                    let alternative_allowance = QUERY_NODE_EQUALITY_PROBE_ALTERNATIVES / properties.len();
                     if allowance > 0 && alternative_allowance > 0 {
                         let mut probes = stream::FuturesUnordered::new();
                         for (property, value) in properties {
                             probes.push(async move {
                                 let vertices = self
-                                    .try_scan_vertex_property_value_at(
-                                        cell_id,
-                                        property,
-                                        value,
-                                        budget,
-                                        allowance,
-                                        alternative_allowance,
-                                    )
+                                    .try_scan_vertex_property_value_at(cell_id, property, value, budget, allowance, alternative_allowance)
                                     .await?;
                                 Ok::<_, GraphError>((property, vertices))
                             });
@@ -6147,26 +4994,20 @@ impl GraphShard {
                         while let Some(probe) = probes.next().await {
                             let (winning_property, vertices) = probe?;
                             if let Some(vertices) = vertices {
-                                tracing::Span::current().record(
-                                    "hydradb.query.runtime_property_index",
-                                    winning_property,
-                                );
+                                tracing::Span::current().record("hydradb.query.runtime_property_index", winning_property);
                                 return Ok(Some(vertices));
                             }
                         }
                     }
                 }
                 Ok(Some(
-                    self.scan_vertex_property_index_at(
-                        cell_id, &property, value, read_epoch, budget,
-                    )
-                    .await?,
+                    self.scan_vertex_property_index_at(cell_id, &property, value, read_epoch, budget)
+                        .await?,
                 ))
             }
-            RowQueryAccess::VertexLabelScan { label } => Ok(Some(
-                self.scan_vertex_label_index_at(cell_id, &label, read_epoch, budget)
-                    .await?,
-            )),
+            RowQueryAccess::VertexLabelScan { label } => {
+                Ok(Some(self.scan_vertex_label_index_at(cell_id, &label, read_epoch, budget).await?))
+            }
             RowQueryAccess::AllVertexScan => Ok(None),
             RowQueryAccess::BoundOutExpand { .. }
             | RowQueryAccess::BoundInExpand { .. }
@@ -6190,12 +5031,164 @@ impl GraphShard {
     ) -> Result<VertexMetadata> {
         validate_component("cell_id", cell_id)?;
         let key = keys::vertex(cell_id, vertex_id);
+        match budget.read_only_io("cypher_vertex_metadata", self.read_remote(&key)).await? {
+            Some(value) => {
+                let mut metadata = decode_vertex_metadata(&key, &value)?;
+                self.refuse_pending_record_properties(cell_id, &metadata, budget).await?;
+                self.overlay_write_back_properties(cell_id, vertex_id, &mut metadata, budget)
+                    .await?;
+                Ok(metadata)
+            }
+            None => Ok(VertexMetadata::default()),
+        }
+    }
+
+    /// Lay the vertex's write-back values over its decoded record, the
+    /// value key winning. The write-back never touches the record, so a
+    /// property it wrote lives only here, and a copy the record still holds
+    /// from before the property moved is older by construction. Applied only
+    /// to a record that exists, which is what keeps a value written for a
+    /// vertex deleted in the meantime out of every read. One short prefix
+    /// scan per vertex read, on top of the record's point get, is the price
+    /// of a write-back that reads nothing.
+    #[cfg(feature = "opencypher")]
+    async fn overlay_write_back_properties(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: &mut VertexMetadata,
+        budget: &QueryBudget,
+    ) -> Result<()> {
+        metadata
+            .properties
+            .extend(self.write_back_properties(cell_id, vertex_id, budget).await?);
+        Ok(())
+    }
+
+    /// Check the actual value namespace so older stores and values with no
+    /// catalog entry are covered. The caller pins the snapshot for the probe
+    /// and all vertex reads that reuse its answer.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(super) async fn cell_has_write_back_values(&self, cell_id: &str, budget: &QueryBudget) -> Result<bool> {
+        validate_component("cell_id", cell_id)?;
+        budget
+            .read_only_io("cypher_write_back_presence", async {
+                let prefix = keys::vertex_write_back_cell_prefix(cell_id);
+                Ok(self.scan_remote_point_prefix(&prefix).await?.next().await?.is_some())
+            })
+            .await
+    }
+
+    /// The write-back values stored for `vertex_id`'s properties, which take
+    /// precedence over the vertex record's own.
+    #[cfg(feature = "opencypher")]
+    async fn write_back_properties(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        budget: &QueryBudget,
+    ) -> Result<BTreeMap<String, VertexPropertyValue>> {
+        let mut properties = BTreeMap::new();
+        let prefix = keys::vertex_write_back_property_prefix(cell_id, vertex_id);
+        let mut iter = budget
+            .read_only_io("cypher_vertex_write_back", self.scan_remote_point_prefix(&prefix))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let Some(property) = key.strip_prefix(&prefix) else {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "expected a write-back value key".to_string(),
+                });
+            };
+            let value = std::str::from_utf8(&kv.value).map_err(|err| GraphError::CorruptValue {
+                key: key.clone(),
+                reason: err.to_string(),
+            })?;
+            let value = decode_vertex_property_value_record(&key, value)?;
+            self.refuse_pending_write_back(cell_id, property, budget).await?;
+            properties.insert(property.to_string(), value);
+        }
+        Ok(properties)
+    }
+
+    /// Refuse a read of `property` while a write-back of it is pending
+    /// ([`keys::vertex_write_back_pending`]): its value keys and its index
+    /// disagree until a run completes. Per query, through `budget`'s
+    /// [`WriteBackPendingReads`]: one seek of the cell's markers, and one get
+    /// per property only when the cell has any.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn refuse_pending_write_back(&self, cell_id: &str, property: &str, budget: &QueryBudget) -> Result<()> {
+        let any_pending = *budget
+            .write_back_pending
+            .cell(cell_id)
+            .get_or_try_init(|| async {
+                let prefix = keys::vertex_write_back_pending_prefix(cell_id);
+                budget
+                    .read_only_io("cypher_vertex_write_back_pending", async {
+                        Ok(self.scan_remote_point_prefix(&prefix).await?.next().await?.is_some())
+                    })
+                    .await
+            })
+            .await?;
+        if !any_pending {
+            return Ok(());
+        }
+        let slot = budget.write_back_pending.slot(cell_id, property);
+        let pending = slot
+            .get_or_try_init(|| async {
+                let key = keys::vertex_write_back_pending(cell_id, property);
+                budget
+                    .read_only_io("cypher_vertex_write_back_pending", self.read_remote(&key))
+                    .await?
+                    .map(|value| decode_u64(&key, &value))
+                    .transpose()
+            })
+            .await?;
+        match pending {
+            Some(generation) => Err(hydradb_graph_slate::write::write_back_in_progress(property, *generation)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::refuse_pending_write_back`] for every property a vertex's
+    /// record holds. A run that has not reached the vertex yet left no value
+    /// key to lay over the record, so a copy the record holds from before
+    /// the property moved, or from before its first run, would be read as
+    /// the property's value. Checked whether or not the read lays write-back
+    /// values over the record, since a cell's first run has none to lay
+    /// until its first chunk commits.
+    #[cfg(feature = "opencypher")]
+    async fn refuse_pending_record_properties(&self, cell_id: &str, record: &VertexMetadata, budget: &QueryBudget) -> Result<()> {
+        for property in record.properties.keys() {
+            self.refuse_pending_write_back(cell_id, property, budget).await?;
+        }
+        Ok(())
+    }
+
+    /// Where `property`'s index entries live: the current generation of the
+    /// write-back index when the catalog names one, the classic index
+    /// otherwise. Every seek and walk over a vertex property index takes its
+    /// prefix from here, so a property that moved to the write-back layout
+    /// is found by the same seeds. One point get of the catalog per query
+    /// seed; the catalog is not cached on the shard, so a switch committed
+    /// by a write-back is seen by the next read with no invalidation step.
+    /// A property whose write-back is pending is refused first
+    /// ([`Self::refuse_pending_write_back`]), so no index read of it runs.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn vertex_property_index_prefix_at(&self, cell_id: &str, property: &str, budget: &QueryBudget) -> Result<String> {
+        self.refuse_pending_write_back(cell_id, property, budget).await?;
+        let key = keys::vertex_write_back_generation(cell_id, property);
         match budget
-            .read_only_io("cypher_vertex_metadata", self.read_remote(&key))
+            .read_only_io("cypher_vertex_property_index_generation", self.read_remote(&key))
             .await?
         {
-            Some(value) => decode_vertex_metadata(&key, &value),
-            None => Ok(VertexMetadata::default()),
+            Some(value) => Ok(keys::vertex_write_back_index_generation_prefix(
+                cell_id,
+                property,
+                decode_u64(&key, &value)?,
+            )),
+            None => Ok(keys::vertex_property_index_property_prefix(cell_id, property)),
         }
     }
 
@@ -6207,14 +5200,8 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<(VertexId, VertexMetadata)>> {
-        self.vertex_metadata_batch_at_concurrently(
-            cell_id,
-            vertex_ids,
-            read_epoch,
-            budget,
-            QUERY_METADATA_HYDRATION_CONCURRENCY,
-        )
-        .await
+        self.vertex_metadata_batch_at_concurrently(cell_id, vertex_ids, read_epoch, budget, QUERY_METADATA_HYDRATION_CONCURRENCY)
+            .await
     }
 
     /// [`Self::vertex_metadata_batch_at`] with `concurrency` point reads in
@@ -6240,8 +5227,7 @@ impl GraphShard {
                     hydradb.property_owner = "vertex",
                 ))
                 .await?;
-            self.operation_metrics
-                .record_property_fetch(started.elapsed().as_micros() as u64);
+            self.operation_metrics.record_property_fetch(started.elapsed().as_micros() as u64);
             Ok::<_, GraphError>((vertex_id, metadata))
         }))
         .buffered(concurrency)
@@ -6261,13 +5247,58 @@ impl GraphShard {
         _read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Option<VertexMetadata>> {
+        self.read_existing_vertex(cell_id, vertex_id, budget, true).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn read_existing_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        budget: &QueryBudget,
+        has_overlays: bool,
+    ) -> Result<Option<VertexMetadata>> {
         validate_component("cell_id", cell_id)?;
         let key = keys::vertex(cell_id, vertex_id);
-        budget
-            .read_only_io("cypher_vertex_metadata", self.read_remote(&key))
-            .await?
-            .map(|value| decode_vertex_metadata(&key, &value))
-            .transpose()
+        if !has_overlays {
+            let record = budget
+                .read_only_io("cypher_vertex_metadata", async {
+                    self.read_remote(&key)
+                        .await?
+                        .map(|bytes| decode_vertex_metadata(&key, &bytes))
+                        .transpose()
+                })
+                .await?;
+            if let Some(record) = &record {
+                self.refuse_pending_record_properties(cell_id, record, budget).await?;
+            }
+            return Ok(record);
+        }
+        // The overlay's prefix needs only the id, so it is read beside the
+        // vertex rather than after it: one round trip deep instead of two. The
+        // vertex decides: when it has no record the overlay is dropped
+        // unfinished and its result, errors included, never consulted, as when
+        // it was read only after the vertex. The deadline bounds the whole.
+        let vertex = Box::pin(self.read_remote(&key));
+        let overlay = Box::pin(self.write_back_properties(cell_id, vertex_id, budget));
+        let read = async {
+            let (value, overlay) = match futures::future::select(vertex, overlay).await {
+                futures::future::Either::Left((value, overlay)) => match value? {
+                    Some(value) => (value, overlay.await),
+                    None => return Ok(None),
+                },
+                futures::future::Either::Right((overlay, vertex)) => match vertex.await? {
+                    Some(value) => (value, overlay),
+                    None => return Ok(None),
+                },
+            };
+            let mut metadata = decode_vertex_metadata(&key, &value)?;
+            let overlay = overlay?;
+            self.refuse_pending_record_properties(cell_id, &metadata, budget).await?;
+            metadata.properties.extend(overlay);
+            Ok(Some(metadata))
+        };
+        budget.read_only_io("cypher_vertex_metadata", read).await
     }
 
     /// The records of the vertices among `vertex_ids` that exist, in input
@@ -6278,22 +5309,32 @@ impl GraphShard {
         &self,
         cell_id: &str,
         vertex_ids: &[VertexId],
-        read_epoch: StorageSequence,
+        _read_epoch: StorageSequence,
         budget: &QueryBudget,
+    ) -> Result<impl Iterator<Item = (VertexId, VertexMetadata)>> {
+        self.read_existing_vertices(cell_id, vertex_ids, budget, true).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(super) async fn read_existing_vertices(
+        &self,
+        cell_id: &str,
+        vertex_ids: &[VertexId],
+        budget: &QueryBudget,
+        has_overlays: bool,
     ) -> Result<impl Iterator<Item = (VertexId, VertexMetadata)>> {
         let records = stream::iter(vertex_ids.iter().copied().map(|vertex_id| async move {
             budget.check("cypher_metadata_hydration")?;
             let started = Instant::now();
             let metadata = self
-                .vertex_metadata_if_exists_at(cell_id, vertex_id, read_epoch, budget)
+                .read_existing_vertex(cell_id, vertex_id, budget, has_overlays)
                 .instrument(tracing::info_span!(
                     "query.property_fetch",
                     hydradb.cell_id = %cell_id,
                     hydradb.property_owner = "vertex",
                 ))
                 .await?;
-            self.operation_metrics
-                .record_property_fetch(started.elapsed().as_micros() as u64);
+            self.operation_metrics.record_property_fetch(started.elapsed().as_micros() as u64);
             Ok::<_, GraphError>(metadata.map(|metadata| (vertex_id, metadata)))
         }))
         .buffered(QUERY_METADATA_HYDRATION_CONCURRENCY)
@@ -6340,13 +5381,7 @@ impl GraphShard {
             .filter(|vertex_id| !cache.contains_key(vertex_id) && seen.insert(*vertex_id))
             .collect::<Vec<_>>();
         for (vertex_id, metadata) in self
-            .vertex_metadata_batch_at_concurrently(
-                cell_id,
-                &pending,
-                read_epoch,
-                budget,
-                concurrency,
-            )
+            .vertex_metadata_batch_at_concurrently(cell_id, &pending, read_epoch, budget, concurrency)
             .await?
         {
             cache.insert(vertex_id, metadata);
@@ -6367,10 +5402,7 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let key = keys::edge_metadata(cell_id, edge_type, src, dst);
-        match budget
-            .read_only_io("cypher_edge_metadata", self.read_remote(&key))
-            .await?
-        {
+        match budget.read_only_io("cypher_edge_metadata", self.read_remote(&key)).await? {
             Some(value) => decode_edge_metadata(&key, &value),
             None => Ok(EdgeMetadata::default()),
         }
@@ -6404,10 +5436,7 @@ impl GraphShard {
             relationship.dst,
             relationship_id,
         );
-        let Some(value) = budget
-            .read_only_io("cypher_relationship_record", self.read_remote(&key))
-            .await?
-        else {
+        let Some(value) = budget.read_only_io("cypher_relationship_record", self.read_remote(&key)).await? else {
             return Ok(EdgeMetadata::default());
         };
         let record = decode_relationship_record(&key, &value)?;
@@ -6439,20 +5468,16 @@ impl GraphShard {
                     .await?;
                 let own = records.iter().find(|(candidate, metadata)| {
                     candidate.relationship_id == Some(*id)
-                        && metadata.properties.get(property).is_some_and(|value| {
-                            encode_vertex_property_value_key(value) == *encoded
-                        })
+                        && metadata
+                            .properties
+                            .get(property)
+                            .is_some_and(|value| encode_vertex_property_value_key(value) == *encoded)
                 });
                 result.push(own.map(|(_, own)| {
                     let mut metadata = if inherit_structural {
                         records
                             .iter()
-                            .find_map(|(relationship, metadata)| {
-                                relationship
-                                    .relationship_id
-                                    .is_none()
-                                    .then_some(metadata.clone())
-                            })
+                            .find_map(|(relationship, metadata)| relationship.relationship_id.is_none().then_some(metadata.clone()))
                             .unwrap_or_default()
                     } else {
                         EdgeMetadata::default()
@@ -6464,20 +5489,12 @@ impl GraphShard {
             return Ok(result);
         }
         let snapshot = self.snapshot(cell_id).await?;
-        let scope = (
-            cell_id.to_string(),
-            edge_type.to_string(),
-            read_epoch,
-            inherit_structural,
-        );
+        let scope = (cell_id.to_string(), edge_type.to_string(), read_epoch, inherit_structural);
         if memo.scope.as_ref() != Some(&scope) {
             memo.pairs.clear();
             memo.scope = Some(scope);
         }
-        let pairs = candidates
-            .iter()
-            .map(|(src, dst, _, _)| (*src, *dst))
-            .collect::<BTreeSet<_>>();
+        let pairs = candidates.iter().map(|(src, dst, _, _)| (*src, *dst)).collect::<BTreeSet<_>>();
         let cached = pairs
             .iter()
             .filter_map(|pair| {
@@ -6491,18 +5508,12 @@ impl GraphShard {
             let snapshot = &snapshot;
             async move {
                 budget.check("cypher_indexed_relationship_pair")?;
-                let exists = budget.read_only_io(
-                    "cypher_indexed_relationship_exists",
-                    snapshot.edge_exists(edge_type, src, dst),
-                );
+                let exists = budget.read_only_io("cypher_indexed_relationship_exists", snapshot.edge_exists(edge_type, src, dst));
                 let metadata = async {
                     if inherit_structural {
                         let key = keys::edge_metadata(cell_id, edge_type, src, dst);
                         budget
-                            .read_only_io(
-                                "cypher_indexed_structural_metadata",
-                                self.read_remote(&key),
-                            )
+                            .read_only_io("cypher_indexed_structural_metadata", self.read_remote(&key))
                             .await
                     } else {
                         Ok(None)
@@ -6527,10 +5538,7 @@ impl GraphShard {
         .try_collect::<BTreeMap<_, _>>()
         .await?;
         for (pair, metadata) in &pairs {
-            if metadata
-                .as_ref()
-                .is_none_or(|value| value.properties.is_empty())
-            {
+            if metadata.as_ref().is_none_or(|value| value.properties.is_empty()) {
                 if memo.pairs.len() >= 4096 {
                     memo.pairs.clear();
                 }
@@ -6581,6 +5589,30 @@ impl GraphShard {
         .await
     }
 
+    /// [`relationship_rows_for_edge`] at a historical epoch: each record's
+    /// metadata is read as of `read_epoch` rather than taken from the record.
+    #[cfg(feature = "opencypher")]
+    #[allow(clippy::too_many_arguments)]
+    async fn historical_relationship_rows(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        records: Vec<RelationshipRecord>,
+        structural_metadata: EdgeMetadata,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
+        let mut rows = relationship_rows_for_edge(edge_type, src, dst, records, structural_metadata);
+        for (relationship, metadata) in &mut rows {
+            if relationship.relationship_id.is_some() {
+                *metadata = self.relationship_metadata_at(cell_id, relationship, read_epoch, budget).await?;
+            }
+        }
+        Ok(rows)
+    }
+
     #[cfg(feature = "opencypher")]
     async fn relationships_for_edge_at(
         &self,
@@ -6591,17 +5623,22 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
-        let cache_key = RelationshipRowsCacheKey::new(cell_id, edge_type, src, dst, read_epoch);
-        if let Some(cached) = self.relationship_rows_cache.lock().await.get(&cache_key) {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::RelationshipRows);
-            return Ok(relationship_rows_from_cache_value(
-                edge_type, src, dst, cached,
-            ));
-        }
-        self.cache_metrics
-            .record_miss(GraphCacheKind::RelationshipRows);
+        self.relationships_for_edge_with_presence_at(cell_id, edge_type, src, dst, read_epoch, budget, EdgePresence::Unverified)
+            .await
+    }
 
+    #[cfg(feature = "opencypher")]
+    #[allow(clippy::too_many_arguments)]
+    async fn relationships_for_edge_with_presence_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+        presence: EdgePresence,
+    ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
         // The structural edge, its relationship records and its own metadata
@@ -6611,11 +5648,10 @@ impl GraphShard {
         // hub's hydration three round trips deep per edge. Read them together;
         // the edge-existence check still decides what is returned.
         let structural_exists = async {
-            if latest_snapshot {
-                self.edge_exists(cell_id, edge_type, src, dst).await
-            } else {
-                self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
-                    .await
+            match presence {
+                EdgePresence::Listed => Ok(true),
+                EdgePresence::Unverified if latest_snapshot => self.edge_exists(cell_id, edge_type, src, dst).await,
+                EdgePresence::Unverified => self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch).await,
             }
         };
         let relationship_records = async {
@@ -6626,15 +5662,11 @@ impl GraphShard {
                 budget.check("cypher_relationship_edge_records")?;
                 let key = String::from_utf8_lossy(&kv.key).into_owned();
                 records.push(decode_relationship_record(&key, &kv.value)?);
-                self.ensure_query_index_candidates(
-                    "cypher_relationship_edge_records",
-                    records.len(),
-                )?;
+                self.ensure_query_index_candidates("cypher_relationship_edge_records", records.len())?;
             }
             Ok::<_, GraphError>(records)
         };
-        let structural_metadata =
-            self.edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget);
+        let structural_metadata = self.edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget);
         // The existence check decides first: for an absent edge the record and
         // metadata reads are irrelevant, so their ordinary errors (an
         // undecodable leftover record, the index-candidate limit) are held back
@@ -6657,65 +5689,27 @@ impl GraphShard {
             )
             .await?;
         if !structural_exists {
-            let cache_value = relationship_rows_cache_value(&[]);
-            let resident_bytes = cache_key
-                .estimated_resident_bytes()
-                .saturating_add(cache_value.estimated_resident_bytes());
-            self.relationship_rows_cache.lock().await.insert_sized(
-                cache_key,
-                cache_value,
-                cell_id.to_string(),
-                false,
-                resident_bytes,
-                &self.cache_metrics,
-            );
             return Ok(Vec::new());
         }
         let relationship_records = relationship_records?;
         let structural_metadata = structural_metadata?;
 
-        let mut rows = Vec::new();
-        let saw_live_relationship_record = !relationship_records.is_empty();
-        for record in relationship_records {
-            let relationship = BoundRelationship {
-                edge_type: record.edge_type,
-                src: record.src,
-                dst: record.dst,
-                relationship_id: Some(record.relationship_id),
-            };
-            let metadata = if latest_snapshot {
-                record.metadata
-            } else {
-                self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
-                    .await?
-            };
-            rows.push((relationship, metadata));
-        }
-        // A bare structural edge is its own relationship; alongside records it
-        // is one only when it carries properties of its own.
-        if !saw_live_relationship_record || !structural_metadata.properties.is_empty() {
-            rows.push((
-                BoundRelationship {
-                    edge_type: edge_type.to_string(),
-                    src,
-                    dst,
-                    relationship_id: None,
-                },
+        let rows = if latest_snapshot {
+            // Shared with the source-batched read so the two cannot disagree.
+            relationship_rows_for_edge(edge_type, src, dst, relationship_records, structural_metadata)
+        } else {
+            self.historical_relationship_rows(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                relationship_records,
                 structural_metadata,
-            ));
-        }
-        let cache_value = relationship_rows_cache_value(&rows);
-        let resident_bytes = cache_key
-            .estimated_resident_bytes()
-            .saturating_add(cache_value.estimated_resident_bytes());
-        self.relationship_rows_cache.lock().await.insert_sized(
-            cache_key,
-            cache_value,
-            cell_id.to_string(),
-            false,
-            resident_bytes,
-            &self.cache_metrics,
-        );
+                read_epoch,
+                budget,
+            )
+            .await?
+        };
         Ok(rows)
     }
 
@@ -6728,9 +5722,7 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
-        let cached = self
-            .source_relationship_dsts_at(cell_id, edge, src, read_epoch, budget)
-            .await?;
+        let cached = self.source_relationship_dsts_at(cell_id, edge, src, read_epoch, budget).await?;
         source_relationship_id_bindings_from_dsts(edge, src, cached.as_slice(), self, budget)
     }
 
@@ -6743,20 +5735,12 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Arc<Vec<VertexId>>> {
-        let cache_key =
-            SourceRelationshipRowsCacheKey::new(cell_id, &edge.edge_type, src, read_epoch);
-        if let Some(cached) = self
-            .source_relationship_rows_cache
-            .lock()
-            .await
-            .get(&cache_key)
-        {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::RelationshipRows);
+        let cache_key = SourceRelationshipRowsCacheKey::new(cell_id, &edge.edge_type, src, read_epoch);
+        if let Some(cached) = self.source_relationship_rows_cache.lock().await.get(&cache_key) {
+            self.cache_metrics.record_hit(GraphCacheKind::RelationshipRows);
             return Ok(cached);
         }
-        self.cache_metrics
-            .record_miss(GraphCacheKind::RelationshipRows);
+        self.cache_metrics.record_miss(GraphCacheKind::RelationshipRows);
 
         let prefix = keys::relationship_source_prefix(cell_id, &edge.edge_type, src);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
@@ -6780,24 +5764,18 @@ impl GraphShard {
                 continue;
             }
             dsts.push(dst);
-            self.ensure_query_intermediate_rows(
-                "cypher_source_relationship_structural_fallback",
-                dsts.len(),
-            )?;
+            self.ensure_query_intermediate_rows("cypher_source_relationship_structural_fallback", dsts.len())?;
         }
         let cached = Arc::new(dsts);
         let resident_bytes = source_relationship_rows_resident_bytes(&cache_key, &cached);
-        self.source_relationship_rows_cache
-            .lock()
-            .await
-            .insert_sized(
-                cache_key,
-                Arc::clone(&cached),
-                cell_id.to_string(),
-                false,
-                resident_bytes,
-                &self.cache_metrics,
-            );
+        self.source_relationship_rows_cache.lock().await.insert_sized(
+            cache_key,
+            Arc::clone(&cached),
+            cell_id.to_string(),
+            false,
+            resident_bytes,
+            &self.cache_metrics,
+        );
         Ok(cached)
     }
 
@@ -6863,16 +5841,11 @@ impl GraphShard {
                     continue;
                 }
                 rows.push((relationship, metadata));
-                self.ensure_query_index_candidates(
-                    "cypher_relationship_property_edge_candidates",
-                    rows.len(),
-                )?;
+                self.ensure_query_index_candidates("cypher_relationship_property_edge_candidates", rows.len())?;
             }
         }
 
-        let structural_metadata = self
-            .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
-            .await?;
+        let structural_metadata = self.edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget).await?;
         if structural_metadata
             .properties
             .get(property)
@@ -6907,36 +5880,23 @@ impl GraphShard {
             latest_snapshot,
             budget,
         } = lookup;
-        let cache_key = RelationshipPropertyRowsCacheKey::new(
-            cell_id, edge_type, src, dst, property, encoded, read_epoch,
-        );
-        if let Some(cached) = self
-            .relationship_property_rows_cache
-            .lock()
-            .await
-            .get(&cache_key)
-        {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::RelationshipPropertyRows);
-            return Ok(relationship_rows_from_cache_value(
-                edge_type, src, dst, cached,
-            ));
+        let cache_key = RelationshipPropertyRowsCacheKey::new(cell_id, edge_type, src, dst, property, encoded, read_epoch);
+        if let Some(cached) = self.relationship_property_rows_cache.lock().await.get(&cache_key) {
+            self.cache_metrics.record_hit(GraphCacheKind::RelationshipPropertyRows);
+            return Ok(relationship_rows_from_cache_value(edge_type, src, dst, cached));
         }
-        self.cache_metrics
-            .record_miss(GraphCacheKind::RelationshipPropertyRows);
+        self.cache_metrics.record_miss(GraphCacheKind::RelationshipPropertyRows);
 
         let relationship_ids = self
-            .scan_relationship_property_index_current_for_edge(
-                RelationshipPropertyEdgeIndexLookup {
-                    cell_id,
-                    edge_type,
-                    property,
-                    encoded,
-                    src,
-                    dst,
-                    budget,
-                },
-            )
+            .scan_relationship_property_index_current_for_edge(RelationshipPropertyEdgeIndexLookup {
+                cell_id,
+                edge_type,
+                property,
+                encoded,
+                src,
+                dst,
+                budget,
+            })
             .await?;
 
         let mut rows = Vec::with_capacity(relationship_ids.len());
@@ -6950,10 +5910,7 @@ impl GraphShard {
             };
             let key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
             let Some(value) = budget
-                .read_only_io(
-                    "cypher_relationship_property_record",
-                    self.read_remote(&key),
-                )
+                .read_only_io("cypher_relationship_property_record", self.read_remote(&key))
                 .await?
             else {
                 continue;
@@ -6962,30 +5919,23 @@ impl GraphShard {
             let metadata = if latest_snapshot {
                 record.metadata
             } else {
-                self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
-                    .await?
+                self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget).await?
             };
             rows.push((relationship, metadata));
-            self.ensure_query_index_candidates(
-                "cypher_relationship_property_edge_candidates",
-                rows.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_relationship_property_edge_candidates", rows.len())?;
         }
         let cache_value = relationship_rows_cache_value(&rows);
         let resident_bytes = cache_key
             .estimated_resident_bytes()
             .saturating_add(cache_value.estimated_resident_bytes());
-        self.relationship_property_rows_cache
-            .lock()
-            .await
-            .insert_sized(
-                cache_key,
-                cache_value,
-                cell_id.to_string(),
-                false,
-                resident_bytes,
-                &self.cache_metrics,
-            );
+        self.relationship_property_rows_cache.lock().await.insert_sized(
+            cache_key,
+            cache_value,
+            cell_id.to_string(),
+            false,
+            resident_bytes,
+            &self.cache_metrics,
+        );
         Ok(rows)
     }
 
@@ -7003,9 +5953,7 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         let current_epoch = self.current_epoch(cell_id).await?;
         if read_epoch == current_epoch {
-            let count = self
-                .read_counter(&keys::relationship_count(cell_id, edge_type, src, dst))
-                .await?;
+            let count = self.read_counter(&keys::relationship_count(cell_id, edge_type, src, dst)).await?;
             if count > 0 {
                 return Ok(count);
             }
@@ -7021,8 +5969,7 @@ impl GraphShard {
         let structural_exists = if read_epoch == current_epoch {
             self.edge_exists(cell_id, edge_type, src, dst).await?
         } else {
-            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
-                .await?
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch).await?
         };
         Ok(u64::from(structural_exists))
     }
@@ -7069,25 +6016,57 @@ impl GraphShard {
                 .await?
             {
                 edges.insert(edge);
-                self.ensure_query_index_candidates(
-                    "cypher_edge_property_index_candidates",
-                    edges.len(),
-                )?;
+                self.ensure_query_index_candidates("cypher_edge_property_index_candidates", edges.len())?;
             }
             for (src, dst, _relationship_id) in self
-                .scan_relationship_property_index_current(
-                    cell_id, edge_type, property, &encoded, budget,
-                )
+                .scan_relationship_property_index_current(cell_id, edge_type, property, &encoded, budget)
                 .await?
             {
                 edges.insert((src, dst));
-                self.ensure_query_index_candidates(
-                    "cypher_edge_property_index_candidates",
-                    edges.len(),
-                )?;
+                self.ensure_query_index_candidates("cypher_edge_property_index_candidates", edges.len())?;
             }
         }
         Ok(edges.into_iter().collect())
+    }
+
+    /// The entries an equality on `edge_type`.`property` names, split by kind:
+    /// the endpoint pairs of the structural (unidentified) index, and each
+    /// relationship-index entry with the id and encoded value it carries. The
+    /// candidate bound counts distinct endpoint pairs, as
+    /// [`Self::scan_edge_property_index_at`] does.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(super) async fn scan_relationship_property_entries_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+        budget: &QueryBudget,
+    ) -> Result<RelationshipPropertyEntries> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        let mut entries = RelationshipPropertyEntries::default();
+        let mut pairs = BTreeSet::<(VertexId, VertexId)>::new();
+        for encoded in equivalent_property_index_keys(value) {
+            for edge in self
+                .scan_edge_property_index_current(cell_id, edge_type, property, &encoded, budget)
+                .await?
+            {
+                entries.structural_pairs.insert(edge);
+                pairs.insert(edge);
+                self.ensure_query_index_candidates("cypher_edge_property_index_candidates", pairs.len())?;
+            }
+            for (src, dst, relationship_id) in self
+                .scan_relationship_property_index_current(cell_id, edge_type, property, &encoded, budget)
+                .await?
+            {
+                entries.identified.push((src, dst, relationship_id, encoded.clone()));
+                pairs.insert((src, dst));
+                self.ensure_query_index_candidates("cypher_edge_property_index_candidates", pairs.len())?;
+            }
+        }
+        Ok(entries)
     }
 
     /// A bounded speculative range probe. An overfull index is not an error:
@@ -7121,10 +6100,7 @@ impl GraphShard {
         let mut candidates = EdgeCandidateBitmap::default();
         let mut scanned = 0_usize;
         for (base, identified) in [
-            (
-                keys::edge_property_index_property_prefix(cell_id, edge_type, property),
-                false,
-            ),
+            (keys::edge_property_index_property_prefix(cell_id, edge_type, property), false),
             (
                 keys::relationship_property_index_property_prefix(cell_id, edge_type, property),
                 true,
@@ -7139,20 +6115,15 @@ impl GraphShard {
                     'i' if lower > u64::MAX as i128 => continue,
                     'i' if lower >= 0 => Some(format!("{:020}", lower as u64).into_bytes()),
                     'j' if lower > i64::MAX as i128 => continue,
-                    'j' if lower >= i64::MIN as i128 => {
-                        Some(format!("{:016x}", (lower as i64 as u64) ^ (1_u64 << 63)).into_bytes())
-                    }
+                    'j' if lower >= i64::MIN as i128 => Some(format!("{:016x}", (lower as i64 as u64) ^ (1_u64 << 63)).into_bytes()),
                     _ => None,
                 };
                 let prefix = format!("{base}{marker}");
                 let mut iter = budget
                     .read_only_io(
                         "cypher_relationship_range_probe_open",
-                        self.db.scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            start_suffix,
-                            &remote_scan_options(),
-                        ),
+                        self.storage
+                            .scan_prefix_with_options(prefix.as_bytes(), start_suffix, &remote_scan_options()),
                     )
                     .await?;
                 while let Some(kv) = budget
@@ -7167,8 +6138,7 @@ impl GraphShard {
                     }
                     let key = String::from_utf8_lossy(&kv.key).into_owned();
                     let (source, target) = if identified {
-                        let (_, _, _, _, source, target, _) =
-                            parse_relationship_property_index_key(&key)?;
+                        let (_, _, _, _, source, target, _) = parse_relationship_property_index_key(&key)?;
                         (source, target)
                     } else {
                         let (_, _, _, _, source, target) = parse_edge_property_index_key(&key)?;
@@ -7194,10 +6164,7 @@ impl GraphShard {
     /// point out-edges, batched segments, segment tombstones — with an entry
     /// budget threaded through so a dense type is abandoned instead of read.
     #[cfg(feature = "experimental-cypher-engine")]
-    pub(crate) async fn try_scan_edge_type_at(
-        &self,
-        probe: RelationshipTypeProbe<'_>,
-    ) -> Result<Option<Vec<(VertexId, VertexId)>>> {
+    pub(crate) async fn try_scan_edge_type_at(&self, probe: RelationshipTypeProbe<'_>) -> Result<Option<Vec<(VertexId, VertexId)>>> {
         let RelationshipTypeProbe {
             cell_id,
             edge_type,
@@ -7224,10 +6191,7 @@ impl GraphShard {
 
         let prefix = keys::out_edge_type_prefix(cell_id, edge_type);
         let mut iter = budget
-            .read_only_io(
-                "cypher_relationship_type_probe_open",
-                self.scan_remote_prefix(&prefix),
-            )
+            .read_only_io("cypher_relationship_type_probe_open", self.scan_remote_prefix(&prefix))
             .await?;
         while let Some(kv) = budget
             .read_only_io("cypher_relationship_type_probe_read", async {
@@ -7250,10 +6214,7 @@ impl GraphShard {
         // edges rather than merely cost time.
         let prefix = keys::out_segment_tombstone_edge_type_prefix(cell_id, edge_type);
         let mut iter = budget
-            .read_only_io(
-                "cypher_relationship_type_probe_tombstone_open",
-                self.scan_remote_prefix(&prefix),
-            )
+            .read_only_io("cypher_relationship_type_probe_tombstone_open", self.scan_remote_prefix(&prefix))
             .await?;
         let mut tombstones = BTreeMap::<(VertexId, VertexId), StorageSequence>::new();
         while let Some(kv) = budget
@@ -7267,8 +6228,7 @@ impl GraphShard {
                 return Ok(None);
             }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
+            let (key_cell_id, key_edge_type, src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
             if key_cell_id != cell_id || key_edge_type != edge_type {
                 return Err(GraphError::CorruptValue {
                     key,
@@ -7283,10 +6243,7 @@ impl GraphShard {
 
         let prefix = keys::out_segment_edge_type_prefix(cell_id, edge_type);
         let mut iter = budget
-            .read_only_io(
-                "cypher_relationship_type_probe_segment_open",
-                self.scan_remote_prefix(&prefix),
-            )
+            .read_only_io("cypher_relationship_type_probe_segment_open", self.scan_remote_prefix(&prefix))
             .await?;
         while let Some(kv) = budget
             .read_only_io("cypher_relationship_type_probe_segment_read", async {
@@ -7316,10 +6273,7 @@ impl GraphShard {
             scanned = scanned.saturating_add(declared);
             let segment = decode_out_edge_segment(&key, &kv.value)?;
             for dst in segment.destinations.iter().copied() {
-                if segment_edge_visible(
-                    storage_sequence,
-                    tombstones.get(&(segment_src, dst)).copied(),
-                ) {
+                if segment_edge_visible(storage_sequence, tombstones.get(&(segment_src, dst)).copied()) {
                     pairs.insert((segment_src, dst));
                 }
             }
@@ -7347,9 +6301,7 @@ impl GraphShard {
         for value in values {
             for encoded in equivalent_property_index_keys(value) {
                 let mut edge_iter = self
-                    .scan_remote_prefix(&keys::edge_property_index_prefix(
-                        cell_id, edge_type, property, &encoded,
-                    ))
+                    .scan_remote_prefix(&keys::edge_property_index_prefix(cell_id, edge_type, property, &encoded))
                     .await?;
                 while let Some(kv) = edge_iter.next().await? {
                     budget.check("cypher_edge_property_seed_probe")?;
@@ -7358,8 +6310,7 @@ impl GraphShard {
                         return Ok(None);
                     }
                     let key = String::from_utf8_lossy(&kv.key).into_owned();
-                    let (_cell_id, _edge_type, _property, _encoded, src, dst) =
-                        parse_edge_property_index_key(&key)?;
+                    let (_cell_id, _edge_type, _property, _encoded, src, dst) = parse_edge_property_index_key(&key)?;
                     edges.insert((src, dst));
                     if edges.len() > candidate_limit {
                         return Ok(None);
@@ -7367,9 +6318,7 @@ impl GraphShard {
                 }
 
                 let mut relationship_iter = self
-                    .scan_remote_prefix(&keys::relationship_property_index_prefix(
-                        cell_id, edge_type, property, &encoded,
-                    ))
+                    .scan_remote_prefix(&keys::relationship_property_index_prefix(cell_id, edge_type, property, &encoded))
                     .await?;
                 while let Some(kv) = relationship_iter.next().await? {
                     budget.check("cypher_relationship_property_seed_probe")?;
@@ -7402,27 +6351,19 @@ impl GraphShard {
         let mut iter = budget
             .read_only_io(
                 "cypher_edge_property_index_open",
-                self.scan_remote_prefix(&keys::edge_property_index_prefix(
-                    cell_id, edge_type, property, encoded,
-                )),
+                self.scan_remote_prefix(&keys::edge_property_index_prefix(cell_id, edge_type, property, encoded)),
             )
             .await?;
         let mut edges = Vec::new();
         while let Some(kv) = budget
-            .read_only_io("cypher_edge_property_index_read", async {
-                Ok(iter.next().await?)
-            })
+            .read_only_io("cypher_edge_property_index_read", async { Ok(iter.next().await?) })
             .await?
         {
             budget.check("cypher_edge_property_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, _encoded, src, dst) =
-                parse_edge_property_index_key(&key)?;
+            let (_cell_id, _edge_type, _property, _encoded, src, dst) = parse_edge_property_index_key(&key)?;
             edges.push((src, dst));
-            self.ensure_query_index_candidates(
-                "cypher_edge_property_index_candidates",
-                edges.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_edge_property_index_candidates", edges.len())?;
         }
         Ok(edges)
     }
@@ -7439,29 +6380,97 @@ impl GraphShard {
         let mut iter = budget
             .read_only_io(
                 "cypher_relationship_property_index_open",
-                self.scan_remote_prefix(&keys::relationship_property_index_prefix(
-                    cell_id, edge_type, property, encoded,
-                )),
+                self.scan_remote_prefix(&keys::relationship_property_index_prefix(cell_id, edge_type, property, encoded)),
             )
             .await?;
         let mut relationships = Vec::new();
         while let Some(kv) = budget
-            .read_only_io("cypher_relationship_property_index_read", async {
-                Ok(iter.next().await?)
-            })
+            .read_only_io("cypher_relationship_property_index_read", async { Ok(iter.next().await?) })
             .await?
         {
             budget.check("cypher_relationship_property_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, _encoded, src, dst, relationship_id) =
-                parse_relationship_property_index_key(&key)?;
+            let (_cell_id, _edge_type, _property, _encoded, src, dst, relationship_id) = parse_relationship_property_index_key(&key)?;
             relationships.push((src, dst, relationship_id));
-            self.ensure_query_index_candidates(
-                "cypher_relationship_property_index_candidates",
-                relationships.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_relationship_property_index_candidates", relationships.len())?;
         }
         Ok(relationships)
+    }
+
+    /// The (src, dst) pairs an edge property equality of `edge` names, read
+    /// from the edge and relationship property indexes, or `None` when the
+    /// pattern has no indexable equality, the read is not at the current
+    /// epoch (the current-property indexes are), or more than
+    /// `max_entries` index entries are read (entries, not pairs: parallel
+    /// relationships each have one, and the probe must stay cheaper than the
+    /// expansion it replaces). A source expansion uses it in place of checking each of
+    /// a high-degree source's neighbors, which reads the relationship index
+    /// once per neighbor: on a hub entity with thousands of edges, a
+    /// single-edge write timed out at the query runtime limit.
+    #[cfg(feature = "opencypher")]
+    async fn try_edge_property_pairs_bounded(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+        max_entries: usize,
+    ) -> Result<Option<BTreeSet<(VertexId, VertexId)>>> {
+        let Some((property, value)) = edge.properties.iter().next() else {
+            return Ok(None);
+        };
+        if !value.is_scalar_indexable() || read_epoch != self.current_epoch(cell_id).await? {
+            return Ok(None);
+        }
+        let max_entries = max_entries.min(self.limits.max_query_index_candidates);
+        let mut pairs = BTreeSet::new();
+        let mut entries_read = 0usize;
+        for encoded in equivalent_property_index_keys(value) {
+            let mut iter = budget
+                .read_only_io(
+                    "cypher_edge_property_index_open",
+                    self.scan_remote_prefix(&keys::edge_property_index_prefix(cell_id, &edge.edge_type, property, &encoded)),
+                )
+                .await?;
+            while let Some(kv) = budget
+                .read_only_io("cypher_edge_property_index_read", async { Ok(iter.next().await?) })
+                .await?
+            {
+                budget.check("cypher_edge_property_index")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (_cell_id, _edge_type, _property, _encoded, src, dst) = parse_edge_property_index_key(&key)?;
+                entries_read += 1;
+                if entries_read > max_entries {
+                    return Ok(None);
+                }
+                pairs.insert((src, dst));
+            }
+            let mut iter = budget
+                .read_only_io(
+                    "cypher_relationship_property_index_open",
+                    self.scan_remote_prefix(&keys::relationship_property_index_prefix(
+                        cell_id,
+                        &edge.edge_type,
+                        property,
+                        &encoded,
+                    )),
+                )
+                .await?;
+            while let Some(kv) = budget
+                .read_only_io("cypher_relationship_property_index_read", async { Ok(iter.next().await?) })
+                .await?
+            {
+                budget.check("cypher_relationship_property_index")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (_cell_id, _edge_type, _property, _encoded, src, dst, _relationship_id) = parse_relationship_property_index_key(&key)?;
+                entries_read += 1;
+                if entries_read > max_entries {
+                    return Ok(None);
+                }
+                pairs.insert((src, dst));
+            }
+        }
+        Ok(Some(pairs))
     }
 
     #[cfg(feature = "opencypher")]
@@ -7488,34 +6497,21 @@ impl GraphShard {
             .await?;
         let mut relationships = Vec::new();
         while let Some(kv) = budget
-            .read_only_io("cypher_relationship_property_index_edge_read", async {
-                Ok(iter.next().await?)
-            })
+            .read_only_io("cypher_relationship_property_index_edge_read", async { Ok(iter.next().await?) })
             .await?
         {
             budget.check("cypher_relationship_property_index_edge")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (
-                _cell_id,
-                _edge_type,
-                _property,
-                _encoded,
-                parsed_src,
-                parsed_dst,
-                relationship_id,
-            ) = parse_relationship_property_index_key(&key)?;
+            let (_cell_id, _edge_type, _property, _encoded, parsed_src, parsed_dst, relationship_id) =
+                parse_relationship_property_index_key(&key)?;
             if parsed_src != src || parsed_dst != dst {
                 return Err(GraphError::CorruptValue {
                     key,
-                    reason: "relationship property index edge prefix returned a different endpoint"
-                        .to_string(),
+                    reason: "relationship property index edge prefix returned a different endpoint".to_string(),
                 });
             }
             relationships.push(relationship_id);
-            self.ensure_query_index_candidates(
-                "cypher_relationship_property_index_edge_candidates",
-                relationships.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_relationship_property_index_edge_candidates", relationships.len())?;
         }
         Ok(relationships)
     }
@@ -7573,8 +6569,7 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("label", label)?;
-        self.scan_vertex_label_index_current(cell_id, label, budget, max_results)
-            .await
+        self.scan_vertex_label_index_current(cell_id, label, budget, max_results).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -7593,18 +6588,13 @@ impl GraphShard {
             .await?;
         let mut vertices = Vec::new();
         while let Some(kv) = budget
-            .read_only_io("cypher_vertex_label_index_read", async {
-                Ok(iter.next().await?)
-            })
+            .read_only_io("cypher_vertex_label_index_read", async { Ok(iter.next().await?) })
             .await?
         {
             budget.check("cypher_vertex_label_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
-            self.ensure_query_index_candidates(
-                "cypher_vertex_label_index_candidates",
-                vertices.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_vertex_label_index_candidates", vertices.len())?;
             if max_results.is_some_and(|limit| vertices.len() >= limit) {
                 break;
             }
@@ -7625,15 +6615,9 @@ impl GraphShard {
         validate_component("property", property)?;
         let mut vertices = BTreeSet::<VertexId>::new();
         for encoded in equivalent_property_index_keys(value) {
-            for vertex_id in self
-                .scan_vertex_property_index_current(cell_id, property, &encoded, budget)
-                .await?
-            {
+            for vertex_id in self.scan_vertex_property_index_current(cell_id, property, &encoded, budget).await? {
                 vertices.insert(vertex_id);
-                self.ensure_query_index_candidates(
-                    "cypher_vertex_property_index_candidates",
-                    vertices.len(),
-                )?;
+                self.ensure_query_index_candidates("cypher_vertex_property_index_candidates", vertices.len())?;
             }
         }
         Ok(vertices.into_iter().collect())
@@ -7651,16 +6635,8 @@ impl GraphShard {
     ) -> Result<Option<Vec<VertexId>>> {
         let probe_allowance = std::sync::atomic::AtomicUsize::new(probe_allowance);
         let refused = std::sync::atomic::AtomicUsize::new(0);
-        self.try_scan_vertex_property_value_within(
-            cell_id,
-            property,
-            value,
-            budget,
-            &probe_allowance,
-            &refused,
-            alternative_allowance,
-        )
-        .await
+        self.try_scan_vertex_property_value_within(cell_id, property, value, budget, &probe_allowance, &refused, alternative_allowance)
+            .await
     }
 
     /// [`Self::try_scan_vertex_property_value_at`] drawing on an allowance
@@ -7686,6 +6662,7 @@ impl GraphShard {
 
         let mut vertices = BTreeSet::new();
         let mut encodings = BTreeSet::new();
+        let property_prefix = self.vertex_property_index_prefix_at(cell_id, property, budget).await?;
         for encoded in equivalent_property_index_keys(value) {
             if !encodings.insert(encoded.clone()) {
                 continue;
@@ -7696,16 +6673,12 @@ impl GraphShard {
             let mut iter = budget
                 .read_only_io(
                     "cypher_vertex_property_seed_probe_open",
-                    self.scan_remote_prefix(&keys::vertex_property_index_prefix(
-                        cell_id, property, &encoded,
-                    )),
+                    self.scan_remote_prefix(&keys::vertex_property_index_value_prefix(&property_prefix, &encoded)),
                 )
                 .await?;
             loop {
                 let Some(kv) = budget
-                    .read_only_io("cypher_vertex_property_seed_probe_read", async {
-                        Ok(iter.next().await?)
-                    })
+                    .read_only_io("cypher_vertex_property_seed_probe_read", async { Ok(iter.next().await?) })
                     .await?
                 else {
                     break;
@@ -7732,25 +6705,18 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("property", property)?;
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_property_prefix(
-                cell_id, property,
-            ))
-            .await?;
+        let property_prefix = self.vertex_property_index_prefix_at(cell_id, property, budget).await?;
+        let mut iter = self.scan_remote_prefix(&property_prefix).await?;
         let mut vertices = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
             budget.check("cypher_vertex_property_values")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, indexed_property, _encoded, vertex_id) =
-                parse_vertex_property_index_key(&key)?;
+            let (_cell_id, indexed_property, _encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
             if indexed_property != property {
                 continue;
             }
             vertices.insert(vertex_id);
-            self.ensure_query_index_candidates(
-                "cypher_vertex_property_value_candidates",
-                vertices.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_vertex_property_value_candidates", vertices.len())?;
         }
         Ok(vertices.into_iter().collect())
     }
@@ -7763,28 +6729,22 @@ impl GraphShard {
         encoded: &str,
         budget: &QueryBudget,
     ) -> Result<Vec<VertexId>> {
+        let property_prefix = self.vertex_property_index_prefix_at(cell_id, property, budget).await?;
         let mut iter = budget
             .read_only_io(
                 "cypher_vertex_property_index_open",
-                self.scan_remote_prefix(&keys::vertex_property_index_prefix(
-                    cell_id, property, encoded,
-                )),
+                self.scan_remote_prefix(&keys::vertex_property_index_value_prefix(&property_prefix, encoded)),
             )
             .await?;
         let mut vertices = Vec::new();
         while let Some(kv) = budget
-            .read_only_io("cypher_vertex_property_index_read", async {
-                Ok(iter.next().await?)
-            })
+            .read_only_io("cypher_vertex_property_index_read", async { Ok(iter.next().await?) })
             .await?
         {
             budget.check("cypher_vertex_property_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
-            self.ensure_query_index_candidates(
-                "cypher_vertex_property_index_candidates",
-                vertices.len(),
-            )?;
+            self.ensure_query_index_candidates("cypher_vertex_property_index_candidates", vertices.len())?;
         }
         Ok(vertices)
     }
@@ -7798,11 +6758,7 @@ impl GraphShard {
         cache: &mut BTreeMap<VertexId, VertexMetadata>,
         budget: &QueryBudget,
     ) -> Result<()> {
-        let bindings: Vec<_> = row
-            .values
-            .iter()
-            .map(|(name, id)| (name.clone(), *id))
-            .collect();
+        let bindings: Vec<_> = row.values.iter().map(|(name, id)| (name.clone(), *id)).collect();
         for (binding, vertex_id) in bindings {
             budget.check("cypher_metadata_hydration")?;
             let metadata = match cache.get(&vertex_id) {
@@ -7822,8 +6778,7 @@ impl GraphShard {
                             hydradb.property_owner = "vertex",
                         ))
                         .await?;
-                    self.operation_metrics
-                        .record_property_fetch(started.elapsed().as_micros() as u64);
+                    self.operation_metrics.record_property_fetch(started.elapsed().as_micros() as u64);
                     cache.insert(vertex_id, metadata.clone());
                     metadata
                 }
@@ -7863,8 +6818,7 @@ impl GraphShard {
                                 hydradb.property_owner = "relationship",
                             ))
                             .await?;
-                        self.operation_metrics
-                            .record_property_fetch(started.elapsed().as_micros() as u64);
+                        self.operation_metrics.record_property_fetch(started.elapsed().as_micros() as u64);
                         metadata
                     }
                 };
@@ -7892,7 +6846,7 @@ impl GraphShard {
             let mut seen = BTreeSet::new();
             for row in projected {
                 budget.check("cypher_distinct_rows")?;
-                if seen.insert(row.row.values.clone()) {
+                if seen.insert(row.row.values.iter().cloned().map(SemanticQueryValue).collect::<Vec<_>>()) {
                     deduped.push(row);
                 }
             }
@@ -7910,11 +6864,7 @@ impl GraphShard {
             limit: usize::MAX as u64,
         })?;
         let max = self.limits.max_query_result_vertices;
-        let mut rows: Vec<_> = projected
-            .into_iter()
-            .skip(skip)
-            .map(|projected| projected.row)
-            .collect();
+        let mut rows: Vec<_> = projected.into_iter().skip(skip).map(|projected| projected.row).collect();
         if let Some(limit) = window.limit {
             ensure_limit("query_result_limit", limit as u64, max as u64)?;
             rows.truncate(limit);
@@ -7935,23 +6885,13 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         check_optional_query_budget(budget, "query_out_neighbors_window")?;
         let vertices = match budget {
-            Some(budget) => {
-                self.out_neighbors_at_for_query(cell_id, edge_type, src, read_epoch, budget)
-                    .await?
-            }
-            None => {
-                self.out_neighbors_at(cell_id, edge_type, src, read_epoch)
-                    .await?
-            }
+            Some(budget) => self.out_neighbors_at_for_query(cell_id, edge_type, src, read_epoch, budget).await?,
+            None => self.out_neighbors_at(cell_id, edge_type, src, read_epoch).await?,
         };
         self.apply_query_window(vertices, window)
     }
 
-    fn apply_query_window(
-        &self,
-        vertices: Vec<VertexId>,
-        window: QueryWindow,
-    ) -> Result<Vec<VertexId>> {
+    fn apply_query_window(&self, vertices: Vec<VertexId>, window: QueryWindow) -> Result<Vec<VertexId>> {
         let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
             operation: "query_result_skip",
             actual: window.skip,
@@ -7961,11 +6901,7 @@ impl GraphShard {
         self.apply_query_window_fetch_result(windowed, window)
     }
 
-    fn apply_query_window_fetch_result(
-        &self,
-        mut vertices: Vec<VertexId>,
-        window: QueryWindow,
-    ) -> Result<Vec<VertexId>> {
+    fn apply_query_window_fetch_result(&self, mut vertices: Vec<VertexId>, window: QueryWindow) -> Result<Vec<VertexId>> {
         let max = self.limits.max_query_result_vertices;
         if let Some(limit) = window.limit {
             ensure_limit("query_result_limit", limit as u64, max as u64)?;
@@ -7977,11 +6913,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    fn apply_query_row_window(
-        &self,
-        rows: Vec<QueryRow>,
-        window: QueryWindow,
-    ) -> Result<Vec<QueryRow>> {
+    fn apply_query_row_window(&self, rows: Vec<QueryRow>, window: QueryWindow) -> Result<Vec<QueryRow>> {
         let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
             operation: "query_result_skip",
             actual: window.skip,
@@ -8012,11 +6944,7 @@ impl GraphShard {
         let page_context = self.query_page_context(context.clone(), cursor_offset, page_size)?;
         let page_window = page_context.result_window;
         if page_window.limit == Some(0) {
-            return Ok(Some(QueryResultPage::new(
-                query.columns.clone(),
-                Vec::new(),
-                None,
-            )));
+            return Ok(Some(QueryResultPage::new(query.columns.clone(), Vec::new(), None)));
         }
 
         let read_epoch = self.query_read_epoch(context).await?;
@@ -8028,23 +6956,18 @@ impl GraphShard {
         if request.edge.dst.id.is_none() {
             match request.projection {
                 GraphKernelProjection::NodeId => {
-                    let (mut vertices, edge_visits) = Box::pin(
-                        self.reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
-                            cell_id: &context.cell_id,
-                            edge_type: &request.edge.edge_type,
-                            src: request.src,
-                            hop_range: request.hop_range,
-                            read_epoch,
-                            window: page_window,
-                            ascending: request.ascending,
-                            budget: &budget,
-                        }),
-                    )
+                    let (mut vertices, edge_visits) = Box::pin(self.reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
+                        cell_id: &context.cell_id,
+                        edge_type: &request.edge.edge_type,
+                        src: request.src,
+                        hop_range: request.hop_range,
+                        read_epoch,
+                        window: page_window,
+                        ascending: request.ascending,
+                        budget: &budget,
+                    }))
                     .await?;
-                    self.ensure_query_scan_edges(
-                        "cypher_graph_kernel_page_window_edge_visits",
-                        edge_visits,
-                    )?;
+                    self.ensure_query_scan_edges("cypher_graph_kernel_page_window_edge_visits", edge_visits)?;
                     let has_next = vertices.len() > page_size;
                     vertices.truncate(page_size);
                     let rows = graph_kernel_node_id_rows(vertices, &budget)?;
@@ -8065,10 +6988,7 @@ impl GraphShard {
                             &budget,
                         )
                         .await?;
-                    self.ensure_query_scan_edges(
-                        "cypher_graph_kernel_page_count_edge_visits",
-                        edge_visits,
-                    )?;
+                    self.ensure_query_scan_edges("cypher_graph_kernel_page_count_edge_visits", edge_visits)?;
                     let rows = vec![QueryRow::new(vec![QueryValue::Count(count)])];
                     let mut rows = self.apply_query_row_window(rows, page_window)?;
                     let has_next = rows.len() > page_size;
@@ -8115,9 +7035,7 @@ impl GraphShard {
                 )));
             }
             GraphKernelProjection::CountAll => {
-                let rows = vec![QueryRow::new(vec![
-                    QueryValue::Count(vertices.len() as u64),
-                ])];
+                let rows = vec![QueryRow::new(vec![QueryValue::Count(vertices.len() as u64)])];
                 self.apply_query_row_window(rows, page_window)?
             }
         };
@@ -8142,23 +7060,14 @@ impl GraphShard {
         let Some(edge) = streaming_neighbor_page_edge(query) else {
             return Ok(None);
         };
-        if !streaming_neighbor_order_supported(
-            edge,
-            &query.projections,
-            &query.columns,
-            &query.order_by,
-        ) {
+        if !streaming_neighbor_order_supported(edge, &query.projections, &query.columns, &query.order_by) {
             return Ok(None);
         }
 
         let page_context = self.query_page_context(context.clone(), cursor_offset, page_size)?;
         let page_window = page_context.result_window;
         if page_window.limit == Some(0) {
-            return Ok(Some(QueryResultPage::new(
-                query.columns.clone(),
-                Vec::new(),
-                None,
-            )));
+            return Ok(Some(QueryResultPage::new(query.columns.clone(), Vec::new(), None)));
         }
 
         let read_epoch = self.query_read_epoch(context).await?;
@@ -8171,14 +7080,7 @@ impl GraphShard {
             return Ok(None);
         };
         let mut vertices = self
-            .out_neighbors_window_at(
-                &context.cell_id,
-                &edge.edge_type,
-                src,
-                read_epoch,
-                page_window,
-                Some(&budget),
-            )
+            .out_neighbors_window_at(&context.cell_id, &edge.edge_type, src, read_epoch, page_window, Some(&budget))
             .await?;
         let has_next = vertices.len() > page_size;
         vertices.truncate(page_size);
@@ -8198,47 +7100,28 @@ impl GraphShard {
         } else {
             None
         };
-        Ok(Some(QueryResultPage::new(
-            query.columns.clone(),
-            rows,
-            next_cursor,
-        )))
+        Ok(Some(QueryResultPage::new(query.columns.clone(), rows, next_cursor)))
     }
 
     #[cfg(feature = "opencypher")]
     fn record_streaming_query_rows_success(&self, row_count: usize, started: std::time::Instant) {
-        self.operation_metrics
-            .query_rows_started
-            .fetch_add(1, Ordering::Relaxed);
-        self.operation_metrics
-            .query_rows_completed
-            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics.query_rows_started.fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics.query_rows_completed.fetch_add(1, Ordering::Relaxed);
         self.operation_metrics
             .query_rows_returned
             .fetch_add(row_count as u64, Ordering::Relaxed);
-        self.operation_metrics
-            .query_rows_latency
-            .record(started.elapsed());
+        self.operation_metrics.query_rows_latency.record(started.elapsed());
     }
 
     #[cfg(feature = "opencypher")]
     fn record_streaming_query_rows_failure(&self, started: std::time::Instant, error: &GraphError) {
-        self.operation_metrics
-            .query_rows_started
-            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics.query_rows_started.fetch_add(1, Ordering::Relaxed);
         self.operation_metrics.record_query_rows_failure(error);
-        self.operation_metrics
-            .query_rows_latency
-            .record(started.elapsed());
+        self.operation_metrics.query_rows_latency.record(started.elapsed());
     }
 
     #[cfg(feature = "opencypher")]
-    fn query_page_context(
-        &self,
-        context: QueryContext,
-        cursor_offset: u64,
-        page_size: usize,
-    ) -> Result<QueryContext> {
+    fn query_page_context(&self, context: QueryContext, cursor_offset: u64, page_size: usize) -> Result<QueryContext> {
         let max = self.limits.max_query_result_vertices;
         if page_size == 0 {
             return Err(GraphError::AdmissionRejected {
@@ -8251,15 +7134,11 @@ impl GraphShard {
         ensure_limit("query_page_size", page_size as u64, max_page_size as u64)?;
 
         let base_window = context.result_window;
-        let skip =
-            base_window
-                .skip
-                .checked_add(cursor_offset)
-                .ok_or(GraphError::AdmissionRejected {
-                    operation: "query_cursor_offset",
-                    actual: u64::MAX,
-                    limit: u64::MAX - 1,
-                })?;
+        let skip = base_window.skip.checked_add(cursor_offset).ok_or(GraphError::AdmissionRejected {
+            operation: "query_cursor_offset",
+            actual: u64::MAX,
+            limit: u64::MAX - 1,
+        })?;
         let probe_limit = match base_window.limit {
             Some(limit) => {
                 let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
@@ -8267,9 +7146,7 @@ impl GraphShard {
                     0
                 } else {
                     let remaining = limit_u64 - cursor_offset;
-                    usize::try_from(remaining)
-                        .unwrap_or(usize::MAX)
-                        .min(page_size.saturating_add(1))
+                    usize::try_from(remaining).unwrap_or(usize::MAX).min(page_size.saturating_add(1))
                 }
             }
             None => page_size.saturating_add(1),
@@ -8278,29 +7155,13 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(super) fn ensure_query_intermediate_rows(
-        &self,
-        operation: &'static str,
-        rows: usize,
-    ) -> Result<()> {
-        ensure_limit(
-            operation,
-            rows as u64,
-            self.limits.max_query_intermediate_rows as u64,
-        )
+    pub(super) fn ensure_query_intermediate_rows(&self, operation: &'static str, rows: usize) -> Result<()> {
+        ensure_limit(operation, rows as u64, self.limits.max_query_intermediate_rows as u64)
     }
 
     #[cfg(feature = "opencypher")]
-    pub(super) fn ensure_query_index_candidates(
-        &self,
-        operation: &'static str,
-        candidates: usize,
-    ) -> Result<()> {
-        ensure_limit(
-            operation,
-            candidates as u64,
-            self.limits.max_query_index_candidates as u64,
-        )
+    pub(super) fn ensure_query_index_candidates(&self, operation: &'static str, candidates: usize) -> Result<()> {
+        ensure_limit(operation, candidates as u64, self.limits.max_query_index_candidates as u64)
     }
 
     /// Charge index entries to the query's shared tally and fail once the whole
@@ -8311,12 +7172,7 @@ impl GraphShard {
     /// answers one query. A paged walk asks once per page, so its accounting
     /// has to live on the budget its pages share or it bounds nothing.
     #[cfg(feature = "experimental-cypher-engine")]
-    pub(super) fn charge_query_index_candidates(
-        &self,
-        operation: &'static str,
-        budget: &QueryBudget,
-        entries: u64,
-    ) -> Result<()> {
+    pub(super) fn charge_query_index_candidates(&self, operation: &'static str, budget: &QueryBudget, entries: u64) -> Result<()> {
         ensure_limit(
             operation,
             budget.add_scanned_index_candidates(entries),
@@ -8325,25 +7181,17 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    fn ensure_query_scan_edges(&self, operation: &'static str, edges: u64) -> Result<()> {
+    pub(super) fn ensure_query_scan_edges(&self, operation: &'static str, edges: u64) -> Result<()> {
         ensure_limit(operation, edges, self.limits.max_query_scan_edges)
     }
 
     #[cfg(feature = "opencypher")]
-    fn push_binding_row(
-        &self,
-        rows: &mut Vec<BindingRow>,
-        row: BindingRow,
-        operation: &'static str,
-    ) -> Result<()> {
-        let next_len = rows
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| GraphError::AdmissionRejected {
-                operation,
-                actual: u64::MAX,
-                limit: self.limits.max_query_intermediate_rows as u64,
-            })?;
+    fn push_binding_row(&self, rows: &mut Vec<BindingRow>, row: BindingRow, operation: &'static str) -> Result<()> {
+        let next_len = rows.len().checked_add(1).ok_or_else(|| GraphError::AdmissionRejected {
+            operation,
+            actual: u64::MAX,
+            limit: self.limits.max_query_intermediate_rows as u64,
+        })?;
         self.ensure_query_intermediate_rows(operation, next_len)?;
         rows.push(row);
         Ok(())
@@ -8358,8 +7206,7 @@ impl GraphShard {
         read_epoch: Option<StorageSequence>,
     ) -> Result<bool> {
         if let Some(read_epoch) = read_epoch {
-            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
-                .await
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch).await
         } else {
             self.edge_exists(cell_id, edge_type, src, dst).await
         }
@@ -8382,11 +7229,7 @@ impl GraphShard {
                 feature: "invalid variable-length hop range".to_string(),
             });
         }
-        ensure_limit(
-            operation,
-            u64::from(max_hops),
-            u64::from(self.limits.max_traversal_hops),
-        )?;
+        ensure_limit(operation, u64::from(max_hops), u64::from(self.limits.max_traversal_hops))?;
         Ok((min_hops, max_hops))
     }
 
@@ -8400,30 +7243,16 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<(Vec<VertexId>, u64)> {
         budget.check("cypher_match_reachable")?;
-        let (min_hops, max_hops) = self.validate_reachable_hop_request(
-            "cypher_match_reachable",
-            cell_id,
-            edge_type,
-            hop_range,
-        )?;
+        let (min_hops, max_hops) = self.validate_reachable_hop_request("cypher_match_reachable", cell_id, edge_type, hop_range)?;
         if let Some(result) = self
-            .reachable_vertices_with_compiled_graph_kernel(
-                cell_id, edge_type, src, hop_range, read_epoch, budget,
-            )
+            .reachable_vertices_with_compiled_graph_kernel(cell_id, edge_type, src, hop_range, read_epoch, budget)
             .await?
         {
             return Ok(result);
         }
 
         let traversal = self
-            .reachable_from_storage_frontier(
-                cell_id,
-                edge_type,
-                src,
-                (min_hops, max_hops),
-                read_epoch,
-                budget,
-            )
+            .reachable_from_storage_frontier(cell_id, edge_type, src, (min_hops, max_hops), read_epoch, budget)
             .await?;
         self.operation_metrics
             .query_rust_sparse_fallbacks
@@ -8441,7 +7270,7 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<crate::sparse_kernel::SparseTraversal> {
         let (min_hops, max_hops) = hop_range;
-        let snapshot = self.db.snapshot().await?;
+        let snapshot = self.storage.snapshot().await?;
         let mut frontier = BTreeSet::from([src]);
         let mut reachable = BTreeSet::new();
         let mut edge_visits = 0_u64;
@@ -8453,16 +7282,10 @@ impl GraphShard {
             for source in frontier {
                 budget.check("graph_storage_frontier_source")?;
                 let neighbors = self
-                    .out_neighbors_in_storage_snapshot(
-                        &snapshot, cell_id, edge_type, source, read_epoch,
-                    )
+                    .out_neighbors_in_storage_snapshot(&snapshot, cell_id, edge_type, source, read_epoch)
                     .await?;
                 edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
-                ensure_limit(
-                    "graph_storage_frontier_edges",
-                    edge_visits,
-                    self.limits.max_query_scan_edges,
-                )?;
+                ensure_limit("graph_storage_frontier_edges", edge_visits, self.limits.max_query_scan_edges)?;
                 next.extend(neighbors);
             }
             ensure_limit(
@@ -8498,33 +7321,21 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<(u64, u64)> {
         budget.check("cypher_match_reachable_count")?;
-        let hop_range = self.validate_reachable_hop_request(
-            "cypher_match_reachable_count",
-            cell_id,
-            edge_type,
-            hop_range,
-        )?;
+        let hop_range = self.validate_reachable_hop_request("cypher_match_reachable_count", cell_id, edge_type, hop_range)?;
         if let Some(result) = self
-            .reachable_count_with_compiled_graph_kernel(
-                cell_id, edge_type, src, hop_range, read_epoch, budget,
-            )
+            .reachable_count_with_compiled_graph_kernel(cell_id, edge_type, src, hop_range, read_epoch, budget)
             .await?
         {
             return Ok(result);
         }
         let (vertices, edge_visits) = self
-            .reachable_vertices_in_hop_range_at(
-                cell_id, edge_type, src, hop_range, read_epoch, budget,
-            )
+            .reachable_vertices_in_hop_range_at(cell_id, edge_type, src, hop_range, read_epoch, budget)
             .await?;
         Ok((vertices.len() as u64, edge_visits))
     }
 
     #[cfg(feature = "opencypher")]
-    async fn reachable_vertices_window_in_hop_range_at(
-        &self,
-        request: ReachableWindowRequest<'_>,
-    ) -> Result<(Vec<VertexId>, u64)> {
+    async fn reachable_vertices_window_in_hop_range_at(&self, request: ReachableWindowRequest<'_>) -> Result<(Vec<VertexId>, u64)> {
         validate_query_result_window(request.window, self.limits.max_query_result_vertices)?;
         self.validate_reachable_hop_request(
             "cypher_match_reachable_window",
@@ -8539,25 +7350,14 @@ impl GraphShard {
             request.hop_range,
             request.read_epoch,
         );
-        if let Some(cached) = self
-            .source_relationship_rows_cache
-            .lock()
-            .await
-            .get(&cache_key)
-        {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::RelationshipRows);
+        if let Some(cached) = self.source_relationship_rows_cache.lock().await.get(&cache_key) {
+            self.cache_metrics.record_hit(GraphCacheKind::RelationshipRows);
             return Ok((
-                graph_kernel_window_sorted_vertices(
-                    cached.as_slice(),
-                    request.window,
-                    request.ascending,
-                )?,
+                graph_kernel_window_sorted_vertices(cached.as_slice(), request.window, request.ascending)?,
                 0,
             ));
         }
-        self.cache_metrics
-            .record_miss(GraphCacheKind::RelationshipRows);
+        self.cache_metrics.record_miss(GraphCacheKind::RelationshipRows);
 
         let (mut vertices, edge_visits) = Box::pin(self.reachable_vertices_in_hop_range_at(
             request.cell_id,
@@ -8572,23 +7372,16 @@ impl GraphShard {
         graph_kernel_order_vertices(&mut vertices, true);
         let cached = Arc::new(vertices);
         let resident_bytes = source_relationship_rows_resident_bytes(&cache_key, &cached);
-        self.source_relationship_rows_cache
-            .lock()
-            .await
-            .insert_sized(
-                cache_key,
-                Arc::clone(&cached),
-                request.cell_id,
-                false,
-                resident_bytes,
-                &self.cache_metrics,
-            );
+        self.source_relationship_rows_cache.lock().await.insert_sized(
+            cache_key,
+            Arc::clone(&cached),
+            request.cell_id,
+            false,
+            resident_bytes,
+            &self.cache_metrics,
+        );
         Ok((
-            graph_kernel_window_sorted_vertices(
-                cached.as_slice(),
-                request.window,
-                request.ascending,
-            )?,
+            graph_kernel_window_sorted_vertices(cached.as_slice(), request.window, request.ascending)?,
             edge_visits,
         ))
     }
@@ -8603,52 +7396,31 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(Vec<VertexId>, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
-        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
-            == SparseKernelBackend::Adjacency
-        {
+        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy) == SparseKernelBackend::Adjacency {
             return Ok(None);
         }
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_artifact_lookup")?;
-            let Some(artifact) = self
-                .traced_latest_matrix_artifact(cell_id, edge_type, read_epoch)
-                .await?
-            else {
+            let Some(artifact) = self.traced_latest_matrix_artifact(cell_id, edge_type, read_epoch).await? else {
                 return Ok(None);
             };
             budget.check("cypher_graphblas_compiled_matrix")?;
             let Some((compiled, overlay, rebuilt)) = self
-                .compiled_graphblas_query_snapshot(
-                    cell_id,
-                    edge_type,
-                    artifact.base_epoch,
-                    read_epoch,
-                    budget,
-                )
+                .compiled_graphblas_query_snapshot(cell_id, edge_type, artifact.base_epoch, read_epoch, budget)
                 .await?
             else {
                 return Ok(None);
             };
             self.record_graphblas_snapshot(rebuilt);
-            let traversal = run_graph_compute(
-                Arc::clone(&self.operation_metrics),
-                "graphblas_expand_range",
-                move || {
-                    if let Some(overlay) = overlay {
-                        expand_range_with_overlay(&compiled, &overlay, &[src], min_hops, max_hops)
-                    } else {
-                        let empty_adjacency = BTreeMap::new();
-                        crate::sparse_kernel::expand_range_compiled_graphblas(
-                            &compiled,
-                            &empty_adjacency,
-                            &[src],
-                            min_hops,
-                            max_hops,
-                        )
-                    }
-                },
-            )
+            let traversal = run_graph_compute(Arc::clone(&self.operation_metrics), "graphblas_expand_range", move || {
+                if let Some(overlay) = overlay {
+                    expand_range_with_overlay(&compiled, &overlay, &[src], min_hops, max_hops)
+                } else {
+                    let empty_adjacency = BTreeMap::new();
+                    crate::sparse_kernel::expand_range_compiled_graphblas(&compiled, &empty_adjacency, &[src], min_hops, max_hops)
+                }
+            })
             .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
@@ -8665,57 +7437,37 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(u64, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
-        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
-            == SparseKernelBackend::Adjacency
-        {
+        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy) == SparseKernelBackend::Adjacency {
             return Ok(None);
         }
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_count_artifact_lookup")?;
             let artifact_started = std::time::Instant::now();
-            let Some(artifact) = self
-                .traced_latest_matrix_artifact(cell_id, edge_type, read_epoch)
-                .await?
-            else {
+            let Some(artifact) = self.traced_latest_matrix_artifact(cell_id, edge_type, read_epoch).await? else {
                 return Ok(None);
             };
             self.operation_metrics.query_artifact_lookup_us.fetch_add(
-                artifact_started
-                    .elapsed()
-                    .as_micros()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
+                artifact_started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                 std::sync::atomic::Ordering::Relaxed,
             );
             budget.check("cypher_graphblas_count_compiled_matrix")?;
             let cache_started = std::time::Instant::now();
             let Some((compiled, overlay, rebuilt)) = self
-                .compiled_graphblas_query_snapshot(
-                    cell_id,
-                    edge_type,
-                    artifact.base_epoch,
-                    read_epoch,
-                    budget,
-                )
+                .compiled_graphblas_query_snapshot(cell_id, edge_type, artifact.base_epoch, read_epoch, budget)
                 .await?
             else {
                 return Ok(None);
             };
             self.record_graphblas_snapshot(rebuilt);
             self.operation_metrics.query_graphblas_cache_us.fetch_add(
-                cache_started
-                    .elapsed()
-                    .as_micros()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
+                cache_started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                 std::sync::atomic::Ordering::Relaxed,
             );
             let run_inline = overlay.is_some() || compiled.prefer_inline_count(max_hops);
             let compute = move || {
                 if let Some(overlay) = overlay {
-                    let traversal =
-                        expand_range_with_overlay(&compiled, &overlay, &[src], min_hops, max_hops)?;
+                    let traversal = expand_range_with_overlay(&compiled, &overlay, &[src], min_hops, max_hops)?;
                     Ok(crate::sparse_kernel::SparseTraversalCount {
                         vertices: traversal.vertices.len() as u64,
                         edge_visits: traversal.edge_visits,
@@ -8723,24 +7475,13 @@ impl GraphShard {
                     })
                 } else {
                     let empty_adjacency = BTreeMap::new();
-                    crate::sparse_kernel::expand_range_count_compiled_graphblas(
-                        &compiled,
-                        &empty_adjacency,
-                        &[src],
-                        min_hops,
-                        max_hops,
-                    )
+                    crate::sparse_kernel::expand_range_count_compiled_graphblas(&compiled, &empty_adjacency, &[src], min_hops, max_hops)
                 }
             };
             let traversal = if run_inline {
                 run_graph_compute_inline(Arc::clone(&self.operation_metrics), compute)?
             } else {
-                run_graph_compute(
-                    Arc::clone(&self.operation_metrics),
-                    "graphblas_expand_range_count",
-                    compute,
-                )
-                .await?
+                run_graph_compute(Arc::clone(&self.operation_metrics), "graphblas_expand_range_count", compute).await?
             };
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
@@ -8806,25 +7547,17 @@ impl GraphShard {
             bool,
         )>,
     > {
-        if let Some(generation) = self
-            .graph_index_generation_at(cell_id, edge_type, base_epoch)
-            .await?
-        {
-            let storage_snapshot = self.db.snapshot().await?;
+        if let Some(generation) = self.graph_index_generation_at(cell_id, edge_type, base_epoch).await? {
+            let storage_snapshot = self.storage.snapshot().await?;
             if storage_snapshot.seq() != read_epoch {
                 return Ok(None);
             }
             let mut generation = generation;
             for refresh_attempt in 0..=1 {
-                let Some(compiled) = self
-                    .cached_graphblas_matrix(cell_id, edge_type, generation.base_sequence)
-                    .await?
-                else {
+                let Some(compiled) = self.cached_graphblas_matrix(cell_id, edge_type, generation.base_sequence).await? else {
                     if refresh_attempt == 0 {
                         if let Some(latest) = self.discover_graph_index(cell_id, edge_type).await? {
-                            if latest.base_sequence > generation.base_sequence
-                                && latest.base_sequence <= read_epoch
-                            {
+                            if latest.base_sequence > generation.base_sequence && latest.base_sequence <= read_epoch {
                                 generation = latest;
                                 continue;
                             }
@@ -8880,13 +7613,10 @@ impl GraphShard {
                                 }
                             ) =>
                     {
-                        let Some(latest) = self.discover_graph_index(cell_id, edge_type).await?
-                        else {
+                        let Some(latest) = self.discover_graph_index(cell_id, edge_type).await? else {
                             return Err(err);
                         };
-                        if latest.base_sequence <= generation.base_sequence
-                            || latest.base_sequence > read_epoch
-                        {
+                        if latest.base_sequence <= generation.base_sequence || latest.base_sequence > read_epoch {
                             return Err(err);
                         }
                         generation = latest;
@@ -8898,9 +7628,7 @@ impl GraphShard {
         }
         if base_epoch < read_epoch {
             budget.check("cypher_graphblas_adjacency_generation")?;
-            let adjacency_generation = self
-                .read_counter(&keys::adjacency_generation(cell_id, edge_type))
-                .await?;
+            let adjacency_generation = self.read_counter(&keys::adjacency_generation(cell_id, edge_type)).await?;
             if adjacency_generation == 0 || adjacency_generation > base_epoch {
                 return Ok(None);
             }
@@ -8909,6 +7637,50 @@ impl GraphShard {
             .cached_graphblas_matrix(cell_id, edge_type, base_epoch)
             .await?
             .map(|compiled| (compiled, None, false)))
+    }
+
+    /// The compiled matrix of the newest index generation published at or
+    /// before `read_epoch`, with that generation, and none of the WAL tail
+    /// since. `None` until the indexer has published one, or when the
+    /// configured kernel has no compiled form.
+    #[cfg(feature = "opencypher")]
+    pub(super) async fn published_generation_matrix(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Option<(GraphIndexGeneration, Arc<crate::sparse_kernel::CompiledGraphBlasMatrix>)>> {
+        // The published pointer is read on every call, not the cached
+        // artifact: a cached older generation would
+        // keep answering after the indexer moved on. An older generation is
+        // still used when the newest one is past the read epoch.
+        let published = budget
+            .read_only_io("gds_generation_lookup", self.discover_graph_index(cell_id, edge_type))
+            .await?
+            .filter(|generation| generation.base_sequence <= read_epoch);
+        let generation = match published {
+            Some(generation) => generation,
+            None => {
+                let Some(artifact) = budget
+                    .read_only_io(
+                        "gds_artifact_lookup",
+                        self.traced_latest_matrix_artifact(cell_id, edge_type, read_epoch),
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let Some(generation) = self.graph_index_generation_at(cell_id, edge_type, artifact.base_epoch).await? else {
+                    return Ok(None);
+                };
+                generation
+            }
+        };
+        Ok(self
+            .cached_graphblas_matrix(cell_id, edge_type, generation.base_sequence)
+            .await?
+            .map(|matrix| (generation, matrix)))
     }
 
     pub(crate) fn record_graphblas_snapshot(&self, rebuilt: bool) {
@@ -8920,35 +7692,18 @@ impl GraphShard {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub async fn edge_exists(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        dst: VertexId,
-    ) -> Result<bool> {
+    pub async fn edge_exists(&self, cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> Result<bool> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "edge_exists").await?;
-        self.snapshot(cell_id)
-            .await?
-            .edge_exists(edge_type, src, dst)
-            .await
+        self.snapshot(cell_id).await?.edge_exists(edge_type, src, dst).await
     }
 
-    pub async fn out_neighbors(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-    ) -> Result<Vec<VertexId>> {
+    pub async fn out_neighbors(&self, cell_id: &str, edge_type: &str, src: VertexId) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "out_neighbors").await?;
-        self.snapshot(cell_id)
-            .await?
-            .out_neighbors(edge_type, src)
-            .await
+        self.snapshot(cell_id).await?.out_neighbors(edge_type, src).await
     }
 
     pub async fn out_neighbors_batch(
@@ -8958,8 +7713,7 @@ impl GraphShard {
         sources: impl IntoIterator<Item = VertexId>,
     ) -> Result<Vec<NeighborBatchEntry>> {
         let read_epoch = self.current_epoch(cell_id).await?;
-        self.out_neighbors_batch_at(cell_id, edge_type, sources, read_epoch)
-            .await
+        self.out_neighbors_batch_at(cell_id, edge_type, sources, read_epoch).await
     }
 
     pub async fn out_neighbors_batch_at(
@@ -8983,8 +7737,7 @@ impl GraphShard {
     ) -> Result<Vec<NeighborBatchEntry>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_cell_readable(cell_id, "out_neighbors_batch")
-            .await?;
+        self.ensure_cell_readable(cell_id, "out_neighbors_batch").await?;
         let sources: Vec<_> = sources.into_iter().collect();
         ensure_limit(
             "out_neighbors_batch_sources",
@@ -9009,11 +7762,7 @@ impl GraphShard {
             budget.check("out_neighbors_batch_snapshot_source")?;
             let neighbors = snapshot.out_neighbors(edge_type, source).await?;
             scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
-            ensure_limit(
-                "out_neighbors_batch_scanned_edges",
-                scanned_edges,
-                self.limits.max_query_scan_edges,
-            )?;
+            ensure_limit("out_neighbors_batch_scanned_edges", scanned_edges, self.limits.max_query_scan_edges)?;
             by_source.entry(source).or_default().extend(neighbors);
         }
         Ok(sources
@@ -9035,8 +7784,7 @@ impl GraphShard {
         destinations: impl IntoIterator<Item = VertexId>,
     ) -> Result<Vec<NeighborBatchEntry>> {
         let read_epoch = self.current_epoch(cell_id).await?;
-        self.in_neighbors_batch_at(cell_id, edge_type, destinations, read_epoch)
-            .await
+        self.in_neighbors_batch_at(cell_id, edge_type, destinations, read_epoch).await
     }
 
     pub async fn in_neighbors_batch_at(
@@ -9046,14 +7794,8 @@ impl GraphShard {
         destinations: impl IntoIterator<Item = VertexId>,
         read_epoch: StorageSequence,
     ) -> Result<Vec<NeighborBatchEntry>> {
-        self.in_neighbors_batch_at_with_cancellation(
-            cell_id,
-            edge_type,
-            destinations,
-            read_epoch,
-            None,
-        )
-        .await
+        self.in_neighbors_batch_at_with_cancellation(cell_id, edge_type, destinations, read_epoch, None)
+            .await
     }
 
     pub(crate) async fn in_neighbors_batch_at_with_cancellation(
@@ -9066,8 +7808,7 @@ impl GraphShard {
     ) -> Result<Vec<NeighborBatchEntry>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_cell_readable(cell_id, "in_neighbors_batch")
-            .await?;
+        self.ensure_cell_readable(cell_id, "in_neighbors_batch").await?;
         let destinations: Vec<_> = destinations.into_iter().collect();
         ensure_limit(
             "in_neighbors_batch_destinations",
@@ -9093,30 +7834,17 @@ impl GraphShard {
                 budget.check("in_neighbors_batch_snapshot_destination")?;
                 let neighbors = snapshot.in_neighbors(edge_type, destination).await?;
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
-                ensure_limit(
-                    "in_neighbors_batch_scanned_edges",
-                    scanned_edges,
-                    self.limits.max_query_scan_edges,
-                )?;
-                by_destination
-                    .entry(destination)
-                    .or_default()
-                    .extend(neighbors);
+                ensure_limit("in_neighbors_batch_scanned_edges", scanned_edges, self.limits.max_query_scan_edges)?;
+                by_destination.entry(destination).or_default().extend(neighbors);
             }
         } else {
-            let adjacency = self
-                .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-                .await?;
+            let adjacency = self.canonical_adjacency_at(cell_id, edge_type, read_epoch).await?;
             for (src, destinations) in adjacency {
                 budget.check("in_neighbors_batch_snapshot_adjacency")?;
                 for destination in destinations {
                     if let Some(neighbors) = by_destination.get_mut(&destination) {
                         scanned_edges = scanned_edges.saturating_add(1);
-                        ensure_limit(
-                            "in_neighbors_batch_scanned_edges",
-                            scanned_edges,
-                            self.limits.max_query_scan_edges,
-                        )?;
+                        ensure_limit("in_neighbors_batch_scanned_edges", scanned_edges, self.limits.max_query_scan_edges)?;
                         neighbors.insert(src);
                     }
                 }
@@ -9141,8 +7869,7 @@ impl GraphShard {
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
     ) -> Result<Vec<EdgeExistenceBatchEntry>> {
         let read_epoch = self.current_epoch(cell_id).await?;
-        self.edge_exists_batch_at(cell_id, edge_type, edges, read_epoch)
-            .await
+        self.edge_exists_batch_at(cell_id, edge_type, edges, read_epoch).await
     }
 
     pub async fn edge_exists_batch_at(
@@ -9154,8 +7881,7 @@ impl GraphShard {
     ) -> Result<Vec<EdgeExistenceBatchEntry>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_cell_readable(cell_id, "edge_exists_batch")
-            .await?;
+        self.ensure_cell_readable(cell_id, "edge_exists_batch").await?;
         let edges: Vec<_> = edges.into_iter().collect();
         ensure_limit(
             "edge_exists_batch_edges",
@@ -9215,10 +7941,7 @@ impl GraphShard {
             .out_segment_tombstone_epoch_at(cell_id, edge_type, src, dst, read_epoch)
             .await?;
         let mut latest = None;
-        for (sequence, edge) in self
-            .scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch, None)
-            .await?
-        {
+        for (sequence, edge) in self.scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch, None).await? {
             if edge.dst == dst && segment_edge_visible(sequence, tombstone_epoch) {
                 latest = Some((sequence, edge));
             }
@@ -9256,11 +7979,7 @@ impl GraphShard {
                     },
                 ));
                 if budget.is_some() {
-                    ensure_limit(
-                        "query_out_segment_records",
-                        edges.len() as u64,
-                        self.limits.max_query_scan_edges,
-                    )?;
+                    ensure_limit("query_out_segment_records", edges.len() as u64, self.limits.max_query_scan_edges)?;
                 }
             }
         }
@@ -9296,8 +8015,7 @@ impl GraphShard {
         while let Some(kv) = iter.next().await? {
             check_optional_query_budget(budget, "query_out_segment_tombstone_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
+            let (key_cell_id, key_edge_type, src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
             if key_cell_id != cell_id || key_edge_type != edge_type {
                 return Err(GraphError::CorruptValue {
                     key,
@@ -9322,9 +8040,7 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         let prefix = keys::out_segment_edge_type_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let tombstones = self
-            .out_segment_tombstones_at(cell_id, edge_type, read_epoch, None)
-            .await?;
+        let tombstones = self.out_segment_tombstones_at(cell_id, edge_type, read_epoch, None).await?;
         let mut pairs = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -9342,18 +8058,13 @@ impl GraphShard {
         Ok(pairs)
     }
 
-    pub async fn in_neighbors(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        dst: VertexId,
-    ) -> Result<Vec<VertexId>> {
+    pub async fn in_neighbors(&self, cell_id: &str, edge_type: &str, dst: VertexId) -> Result<Vec<VertexId>> {
         let snapshot = self.snapshot(cell_id).await?;
         if self.writes_reverse_index() {
             return snapshot.in_neighbors(edge_type, dst).await;
         }
         let read_epoch = snapshot.read_epoch();
-        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
+        SlateGraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
             let mut neighbors: Vec<_> = self
                 .edges_at(cell_id, edge_type, read_epoch)
                 .await?
@@ -9380,7 +8091,7 @@ impl GraphShard {
         if self.writes_reverse_index() {
             return snapshot.in_neighbors(edge_type, dst).await;
         }
-        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
+        SlateGraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
             let mut neighbors: Vec<_> = self
                 .edges_at(cell_id, edge_type, read_epoch)
                 .await?
@@ -9407,10 +8118,7 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         if !self.writes_reverse_index() {
             let mut neighbors = Vec::new();
-            for edge in self
-                .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
-                .await?
-            {
+            for edge in self.edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget)).await? {
                 budget.check("query_in_neighbors_full_scan")?;
                 if edge.dst == dst {
                     neighbors.push(edge.src);
@@ -9423,11 +8131,8 @@ impl GraphShard {
 
         let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
         let scan_options = remote_scan_options_for_expected_items(
-            self.degree_for_cache_admission(
-                &snapshot.storage_snapshot,
-                &keys::degree_in(cell_id, edge_type, dst),
-            )
-            .await?,
+            self.degree_for_cache_admission(&snapshot.storage_snapshot, &keys::degree_in(cell_id, edge_type, dst))
+                .await?,
         );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = snapshot
@@ -9450,55 +8155,36 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "out_degree").await?;
-        self.snapshot(cell_id)
-            .await?
-            .out_degree(edge_type, src)
-            .await
+        self.snapshot(cell_id).await?.out_degree(edge_type, src).await
     }
 
     pub async fn current_epoch(&self, cell_id: &str) -> Result<StorageSequence> {
         validate_component("cell_id", cell_id)?;
         self.ensure_cell_readable(cell_id, "current_epoch").await?;
-        Ok(self.db.snapshot().await?.seq())
+        Ok(self.storage.snapshot().await?.seq())
     }
 
-    pub(crate) async fn ensure_cell_readable(
-        &self,
-        cell_id: &str,
-        operation: &'static str,
-    ) -> Result<()> {
+    pub(crate) async fn ensure_cell_readable(&self, cell_id: &str, operation: &'static str) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         // Both marker reads use the pinned query snapshot. Rechecking that
         // same immutable view adds I/O but cannot discover a later drop.
-        if GraphStore::snapshot_cell_is_readable(cell_id) {
+        if SlateGraphStore::snapshot_cell_is_readable(cell_id) {
             return Ok(());
         }
-        if self
-            .read_remote(&keys::cell_drop_marker(cell_id))
-            .await?
-            .is_some()
-            || self
-                .read_remote(&keys::cell_drop_pending_marker(cell_id))
-                .await?
-                .is_some()
+        if self.read_remote(&keys::cell_drop_marker(cell_id)).await?.is_some()
+            || self.read_remote(&keys::cell_drop_pending_marker(cell_id)).await?.is_some()
         {
             return Err(GraphError::CellDropped {
                 operation,
                 cell_id: cell_id.to_string(),
             });
         }
-        GraphStore::remember_snapshot_readable_cell(cell_id);
+        SlateGraphStore::remember_snapshot_readable_cell(cell_id);
         Ok(())
     }
 
-    pub async fn edges_at(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        read_epoch: StorageSequence,
-    ) -> Result<Vec<EdgeRecord>> {
-        self.edges_at_with_budget(cell_id, edge_type, read_epoch, None)
-            .await
+    pub async fn edges_at(&self, cell_id: &str, edge_type: &str, read_epoch: StorageSequence) -> Result<Vec<EdgeRecord>> {
+        self.edges_at_with_budget(cell_id, edge_type, read_epoch, None).await
     }
 
     async fn edges_at_with_budget(
@@ -9513,8 +8199,7 @@ impl GraphShard {
         self.ensure_cell_readable(cell_id, "edges_at").await?;
         check_optional_query_budget(budget, "query_edges_at")?;
         let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
-        self.edges_in_snapshot_at_topology(&snapshot, edge_type, read_epoch, budget)
-            .await
+        self.edges_in_snapshot_at_topology(&snapshot, edge_type, read_epoch, budget).await
     }
 
     pub(crate) async fn edges_in_current_snapshot_at_topology(
@@ -9536,10 +8221,8 @@ impl GraphShard {
         budget: Option<&QueryBudget>,
     ) -> Result<Vec<EdgeRecord>> {
         let cell_id = snapshot.cell_id();
-        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
-            let adjacency = self
-                .canonical_adjacency_at(cell_id, edge_type, topology_sequence)
-                .await?;
+        SlateGraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
+            let adjacency = self.canonical_adjacency_at(cell_id, edge_type, topology_sequence).await?;
             let mut edges = Vec::new();
             for (src, destinations) in adjacency {
                 check_optional_query_budget(budget, "query_edges_at_adjacency")?;
@@ -9552,11 +8235,7 @@ impl GraphShard {
                         dst,
                     });
                     if budget.is_some() {
-                        ensure_limit(
-                            "query_edges_at_canonical",
-                            edges.len() as u64,
-                            self.limits.max_query_scan_edges,
-                        )?;
+                        ensure_limit("query_edges_at_canonical", edges.len() as u64, self.limits.max_query_scan_edges)?;
                     }
                 }
             }
@@ -9565,11 +8244,7 @@ impl GraphShard {
         .await
     }
 
-    pub async fn validate_cell_edge_type(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<GraphRepairReport> {
+    pub async fn validate_cell_edge_type(&self, cell_id: &str, edge_type: &str) -> Result<GraphRepairReport> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let read_epoch = self.current_epoch(cell_id).await?;
@@ -9589,17 +8264,13 @@ impl GraphShard {
         }
         if self.writes_reverse_index() {
             for (dst, expected) in in_counts {
-                let actual = self
-                    .read_counter(&keys::degree_in(cell_id, edge_type, dst))
-                    .await?;
+                let actual = self.read_counter(&keys::degree_in(cell_id, edge_type, dst)).await?;
                 if actual != expected {
                     degree_mismatches.push(format!("in:{dst}:expected={expected}:actual={actual}"));
                 }
             }
         } else {
-            let mut iter = self
-                .scan_remote_prefix(&keys::degree_in_prefix(cell_id, edge_type))
-                .await?;
+            let mut iter = self.scan_remote_prefix(&keys::degree_in_prefix(cell_id, edge_type)).await?;
             while let Some(kv) = iter.next().await? {
                 let key = String::from_utf8_lossy(&kv.key);
                 degree_mismatches.push(format!("in:{key}:unexpected-under-outbound-only"));
@@ -9640,9 +8311,7 @@ fn take_one(allowance: &std::sync::atomic::AtomicUsize) -> bool {
 /// Hold back a read's error unless it is a timeout or cancellation, which fails
 /// the query whatever the other reads it is joined with return.
 #[cfg(feature = "opencypher")]
-async fn defer_unless_query_timeout<T>(
-    read: impl std::future::Future<Output = Result<T>>,
-) -> Result<Result<T>> {
+async fn defer_unless_query_timeout<T>(read: impl std::future::Future<Output = Result<T>>) -> Result<Result<T>> {
     match read.await {
         Err(error @ GraphError::QueryTimeout { .. }) => Err(error),
         result => Ok(result),
@@ -9672,6 +8341,44 @@ pub(crate) struct QueryBudget {
     /// read the whole index and never reach the limit.
     #[cfg(feature = "experimental-cypher-engine")]
     scanned_index_candidates: Arc<AtomicU64>,
+    /// The write-back pending markers this query has read, shared across
+    /// clones, so the query reads each property's once however many
+    /// vertices or seeds touch it.
+    #[cfg(feature = "opencypher")]
+    write_back_pending: Arc<WriteBackPendingReads>,
+}
+
+/// The pending markers ([`keys::vertex_write_back_pending`]) one query has
+/// read, by cell and property. Held per query rather than on the shard, as
+/// [`WriteBackGenerations`] holds the catalog per transaction, so a marker
+/// put or cleared between two queries is seen by the second without an
+/// invalidation step. Each slot is initialised once: concurrent reads of one
+/// property in a query wait for the first one's get rather than each make
+/// their own. A cell's slot holds whether it has any marker at all, one seek
+/// of the marker prefix, which a property's get waits behind: a query on a
+/// cell with no write-back in flight reads that one seek and nothing per
+/// property.
+#[cfg(feature = "opencypher")]
+#[derive(Debug, Default)]
+pub(crate) struct WriteBackPendingReads {
+    cells: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<bool>>>>,
+    slots: std::sync::Mutex<std::collections::HashMap<(String, String), PendingMarkerSlot>>,
+}
+
+#[cfg(feature = "opencypher")]
+type PendingMarkerSlot = Arc<tokio::sync::OnceCell<Option<StorageSequence>>>;
+
+#[cfg(feature = "opencypher")]
+impl WriteBackPendingReads {
+    fn cell(&self, cell_id: &str) -> Arc<tokio::sync::OnceCell<bool>> {
+        let mut cells = self.cells.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(cells.entry(cell_id.to_string()).or_default())
+    }
+
+    fn slot(&self, cell_id: &str, property: &str) -> PendingMarkerSlot {
+        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(slots.entry((cell_id.to_string(), property.to_string())).or_default())
+    }
 }
 
 impl QueryBudget {
@@ -9680,9 +8387,7 @@ impl QueryBudget {
     /// allowance.
     #[cfg(feature = "opencypher")]
     pub(crate) fn add_scanned_edges(&self, edges: u64) -> u64 {
-        self.scanned_edges
-            .fetch_add(edges, Ordering::Relaxed)
-            .saturating_add(edges)
+        self.scanned_edges.fetch_add(edges, Ordering::Relaxed).saturating_add(edges)
     }
 
     /// Add to the query's index-entry tally and return the new total. Shared
@@ -9697,15 +8402,21 @@ impl QueryBudget {
     /// Only for cancellation-safe read I/O, never commits or native compute
     /// whose resource ownership must outlive cancellation of the caller.
     #[cfg(feature = "opencypher")]
-    pub(crate) async fn read_only_io<T>(
-        &self,
-        operation: &'static str,
-        read: impl std::future::Future<Output = Result<T>>,
-    ) -> Result<T> {
+    pub(crate) async fn read_only_io<T>(&self, operation: &'static str, read: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         self.check(operation)?;
         // A cache hit can be immediately ready for every iteration of a large
         // scan. `await` alone then never yields the worker to other requests.
         tokio::task::consume_budget().await;
+        self.until_deadline(operation, read).await?
+    }
+
+    /// Wait for `wait`, or fail at the query's deadline or on its
+    /// cancellation, whichever comes first. Only for waits that are safe to
+    /// abandon: a read, or an acquisition (a permit, a lock) that holds
+    /// nothing until it completes. A commit or native compute must never be
+    /// raced against the deadline, since dropping it does not undo it.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn until_deadline<T>(&self, operation: &'static str, wait: impl std::future::Future<Output = T>) -> Result<T> {
         self.check(operation)?;
         let cancelled = async {
             match &self.cancellation_token {
@@ -9715,13 +8426,7 @@ impl QueryBudget {
         };
         let deadline = async {
             match self.max_runtime_ms {
-                Some(limit) => {
-                    tokio::time::sleep(
-                        std::time::Duration::from_millis(limit)
-                            .saturating_sub(self.started_at.elapsed()),
-                    )
-                    .await
-                }
+                Some(limit) => tokio::time::sleep(std::time::Duration::from_millis(limit).saturating_sub(self.started_at.elapsed())).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -9737,14 +8442,11 @@ impl QueryBudget {
                 elapsed_ms: self.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 limit_ms: self.max_runtime_ms.unwrap_or(0),
             }),
-            result = read => result,
+            result = wait => Ok(result),
         }
     }
 
-    pub(crate) fn new(
-        max_runtime_ms: Option<u64>,
-        cancellation_token: Option<QueryCancellationToken>,
-    ) -> Self {
+    pub(crate) fn new(max_runtime_ms: Option<u64>, cancellation_token: Option<QueryCancellationToken>) -> Self {
         Self {
             started_at: std::time::Instant::now(),
             max_runtime_ms,
@@ -9757,6 +8459,8 @@ impl QueryBudget {
             scanned_edges: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "experimental-cypher-engine")]
             scanned_index_candidates: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "opencypher")]
+            write_back_pending: Arc::default(),
         }
     }
 
@@ -9776,9 +8480,7 @@ impl QueryBudget {
         // both arms carry the value before this row was added.
         let previous = self
             .result_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(bytes))
-            })
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(bytes)))
             .unwrap_or_else(|previous| previous);
         let actual = previous.saturating_add(bytes);
         if actual > limit {
@@ -9806,11 +8508,7 @@ impl QueryBudget {
             }
             return Err(GraphError::QueryTimeout {
                 operation: "query_cancelled",
-                elapsed_ms: self
-                    .started_at
-                    .elapsed()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64,
+                elapsed_ms: self.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 limit_ms: 0,
             });
         }
@@ -9833,153 +8531,11 @@ impl QueryBudget {
     }
 }
 
-fn check_optional_query_budget(
-    budget: Option<&QueryBudget>,
-    operation: &'static str,
-) -> Result<()> {
+fn check_optional_query_budget(budget: Option<&QueryBudget>, operation: &'static str) -> Result<()> {
     if let Some(budget) = budget {
         budget.check(operation)?;
     }
     Ok(())
-}
-
-#[cfg(feature = "opencypher")]
-struct QueryStatsHistogramPublish<'a> {
-    cell_id: &'a str,
-    operation: &'static str,
-    read_epoch: StorageSequence,
-    histogram_key: String,
-    bucket_prefix: String,
-    stats: &'a QueryStatsRecord,
-    buckets: &'a BTreeMap<String, u64>,
-}
-
-#[cfg(feature = "opencypher")]
-struct EdgeExpansionStatsRequest<'a> {
-    cell_id: &'a str,
-    edge_type: &'a str,
-    direction: QueryStatsDirection,
-    anchor: &'a str,
-    source_labels: &'a [String],
-    snapshot: &'a GraphStorageSnapshot,
-    read_epoch: StorageSequence,
-    budget: &'a QueryBudget,
-}
-
-#[cfg(feature = "opencypher")]
-fn stats_record_from_bucket_count(
-    count: u64,
-    read_epoch: StorageSequence,
-    buckets: &BTreeMap<String, u64>,
-) -> QueryStatsRecord {
-    let mut stats = stats_record_from_histogram(read_epoch, buckets);
-    stats.count = count;
-    stats
-}
-
-#[cfg(feature = "opencypher")]
-fn stats_record_from_histogram(
-    read_epoch: StorageSequence,
-    buckets: &BTreeMap<String, u64>,
-) -> QueryStatsRecord {
-    let total = buckets.values().copied().sum::<u64>();
-    let most_common = buckets.values().copied().max().unwrap_or(0);
-    let mut stats = QueryStatsRecord::histogram(
-        total,
-        read_epoch,
-        graph_now_millis(),
-        buckets.len() as u64,
-        most_common,
-    );
-    stats.bloom = Some(QueryStatsBloom::from_encoded_values(
-        buckets.keys().map(String::as_str),
-    ));
-    stats
-}
-
-#[cfg(feature = "opencypher")]
-fn validate_query_stats_refresh_kind(kind: &QueryStatsRefreshKind) -> Result<()> {
-    match kind {
-        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeExpansion {
-            edge_type,
-            source_labels,
-            ..
-        }) => {
-            validate_component("edge_type", edge_type)?;
-            canonical_query_stats_source_labels(source_labels).map(|_| ())
-        }
-        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeType { edge_type }) => {
-            validate_component("edge_type", edge_type)
-        }
-        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexLabel { label }) => {
-            validate_component("label", label)
-        }
-        QueryStatsRefreshKind::Cardinality(
-            QueryCardinalityStatsKind::VertexLabelIntersection { labels },
-        ) => canonical_query_stats_labels(labels).map(|_| ()),
-        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexProperty {
-            property,
-            ..
-        }) => validate_component("property", property),
-        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeProperty {
-            edge_type,
-            property,
-            ..
-        }) => {
-            validate_component("edge_type", edge_type)?;
-            validate_component("property", property)
-        }
-        QueryStatsRefreshKind::VertexPropertyHistogram { property } => {
-            validate_component("property", property)
-        }
-        QueryStatsRefreshKind::EdgePropertyHistogram {
-            edge_type,
-            property,
-        } => {
-            validate_component("edge_type", edge_type)?;
-            validate_component("property", property)
-        }
-    }
-}
-
-#[cfg(feature = "opencypher")]
-fn canonical_query_stats_labels(labels: &[String]) -> Result<Vec<String>> {
-    if labels.len() < 2 {
-        return Err(GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Other,
-            dialect: "QueryStats",
-            feature: "a label intersection requires at least two labels".to_string(),
-        });
-    }
-    let labels = canonical_query_stats_source_labels(labels)?;
-    if labels.len() < 2 {
-        return Err(GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Other,
-            dialect: "QueryStats",
-            feature: "a label intersection requires at least two distinct labels".to_string(),
-        });
-    }
-    Ok(labels)
-}
-
-#[cfg(feature = "opencypher")]
-fn canonical_query_stats_source_labels(labels: &[String]) -> Result<Vec<String>> {
-    if labels.is_empty() {
-        return Err(GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Other,
-            dialect: "QueryStats",
-            feature: "edge-expansion statistics require at least one source label".to_string(),
-        });
-    }
-    for label in labels {
-        validate_component("label", label)?;
-    }
-    Ok(labels
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
 }
 
 #[cfg(feature = "opencypher")]
@@ -10010,6 +8566,58 @@ struct EdgeRowMatchState<'a> {
     metadata_cache: &'a mut BTreeMap<VertexId, VertexMetadata>,
     edge_metadata_cache: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
+    /// Set when only some rows are wanted: [`Self::rows`] then holds rows
+    /// joined to the bound's input and filtered by its predicate, and the
+    /// traversal stops once [`Self::is_full`].
+    bound: Option<EdgeRowBound<'a>>,
+    /// Drop self-loops, for the reverse orientation of an undirected hop,
+    /// whose forward orientation already matched them.
+    skip_self_loops: bool,
+}
+
+#[cfg(feature = "opencypher")]
+impl<'a> EdgeRowMatchState<'a> {
+    fn new(
+        cell_id: &'a str,
+        read_epoch: StorageSequence,
+        edge: &'a RowEdgePattern,
+        metadata_cache: &'a mut BTreeMap<VertexId, VertexMetadata>,
+        edge_metadata_cache: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
+        budget: &'a QueryBudget,
+    ) -> Self {
+        Self {
+            cell_id,
+            read_epoch,
+            edge,
+            rows: Vec::new(),
+            pending: Vec::new(),
+            metadata_cache,
+            edge_metadata_cache,
+            budget,
+            bound: None,
+            skip_self_loops: false,
+        }
+    }
+
+    /// Whether a bounded traversal has the rows it wants. Counted on flushed
+    /// rows, so the traversal may read up to one [`EDGE_ROW_HYDRATION_BATCH`]
+    /// past its bound, but never keeps more than [`EdgeRowBound::wanted`].
+    fn is_full(&self) -> bool {
+        self.bound.is_some_and(|bound| self.rows.len() >= bound.wanted)
+    }
+}
+
+/// The rows a bounded group still needs from one hop: the row being extended,
+/// the group's predicate, and how many joined rows that pass it are wanted.
+/// Applying both inside the traversal is what lets it stop early: a hop whose
+/// vertex has more relationships than the intermediate-row limit still yields
+/// its first `wanted` rows instead of being refused.
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Copy)]
+struct EdgeRowBound<'a> {
+    input: &'a BindingRow,
+    predicate: Option<&'a RowPredicate>,
+    wanted: usize,
 }
 
 /// How many rows accumulate before a traversal hydrates them.
@@ -10022,6 +8630,21 @@ struct EdgeRowMatchState<'a> {
 /// that `push_binding_row` enforces on the rows actually returned.
 #[cfg(feature = "opencypher")]
 const EDGE_ROW_HYDRATION_BATCH: usize = 1_024;
+
+/// A source expansion with an edge property equality reads that property's
+/// index once, instead of checking each neighbor, past this many neighbors.
+#[cfg(feature = "opencypher")]
+const ANCHORED_EXPAND_PROPERTY_PROBE_MIN_DEGREE: usize = 64;
+
+/// Whether a source with `degree` neighbors probes the property index, after
+/// a probe overflowed at `overflowed_at` entries (0: none has). Only a source
+/// with at least twice that degree retries, so on sources of slowly rising
+/// degree the failed probes read at most about twice the largest degree in
+/// all, while a much larger hub still gets its probe.
+#[cfg(feature = "opencypher")]
+fn anchored_property_probe_due(degree: usize, overflowed_at: usize) -> bool {
+    overflowed_at == 0 || degree >= overflowed_at.saturating_mul(2)
+}
 
 #[cfg(feature = "opencypher")]
 struct VertexMutationApplyState<'a> {
@@ -10106,10 +8729,7 @@ enum GraphKernelProjection {
 }
 
 #[cfg(feature = "opencypher")]
-fn graph_kernel_node_id_rows(
-    vertices: Vec<VertexId>,
-    budget: &QueryBudget,
-) -> Result<Vec<QueryRow>> {
+fn graph_kernel_node_id_rows(vertices: Vec<VertexId>, budget: &QueryBudget) -> Result<Vec<QueryRow>> {
     let mut rows = Vec::with_capacity(vertices.len());
     for vertex in vertices {
         budget.check("cypher_graph_kernel_project")?;
@@ -10129,11 +8749,7 @@ fn graph_kernel_order_vertices(vertices: &mut Vec<VertexId>, ascending: bool) {
 }
 
 #[cfg(feature = "opencypher")]
-fn graph_kernel_window_sorted_vertices(
-    vertices: &[VertexId],
-    window: QueryWindow,
-    ascending: bool,
-) -> Result<Vec<VertexId>> {
+fn graph_kernel_window_sorted_vertices(vertices: &[VertexId], window: QueryWindow, ascending: bool) -> Result<Vec<VertexId>> {
     let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
         operation: "query_result_skip",
         actual: window.skip,
@@ -10143,13 +8759,7 @@ fn graph_kernel_window_sorted_vertices(
     if ascending {
         Ok(vertices.iter().copied().skip(skip).take(limit).collect())
     } else {
-        Ok(vertices
-            .iter()
-            .rev()
-            .copied()
-            .skip(skip)
-            .take(limit)
-            .collect())
+        Ok(vertices.iter().rev().copied().skip(skip).take(limit).collect())
     }
 }
 
@@ -10167,9 +8777,7 @@ fn validate_query_result_window(window: QueryWindow, max_rows: usize) -> Result<
 }
 
 #[cfg(feature = "opencypher")]
-fn graph_kernel_row_query_request(
-    query: &ParsedRowQuery,
-) -> Option<GraphKernelRowQueryRequest<'_>> {
+fn graph_kernel_row_query_request(query: &ParsedRowQuery) -> Option<GraphKernelRowQueryRequest<'_>> {
     if !query.union_arms.is_empty() || query.predicate.is_some() {
         return None;
     }
@@ -10191,13 +8799,7 @@ fn graph_kernel_row_query_request(
         return None;
     }
     let projection = graph_kernel_projection(edge, &query.projections)?;
-    let ascending = graph_kernel_order_supported(
-        edge,
-        projection,
-        &query.projections,
-        &query.columns,
-        &query.order_by,
-    )?;
+    let ascending = graph_kernel_order_supported(edge, projection, &query.projections, &query.columns, &query.order_by)?;
     Some(GraphKernelRowQueryRequest {
         edge,
         src,
@@ -10237,10 +8839,7 @@ fn relationship_count_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePatte
 
 #[cfg(feature = "opencypher")]
 fn source_relationship_id_rows_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
-    if !query.union_arms.is_empty()
-        || query.predicate.is_some()
-        || row_projections_have_aggregates(&query.projections)
-    {
+    if !query.union_arms.is_empty() || query.predicate.is_some() || row_projections_have_aggregates(&query.projections) {
         return None;
     }
     let patterns = graph_kernel_query_patterns(query)?;
@@ -10259,12 +8858,7 @@ fn source_relationship_id_rows_query_edge(query: &ParsedRowQuery) -> Option<&Row
         || !graph_kernel_node_pattern(&edge.src)
         || !graph_kernel_node_pattern(&edge.dst)
         || !source_relationship_id_projection_supported(edge, &query.projections)
-        || !source_relationship_id_order_supported(
-            edge,
-            &query.projections,
-            &query.columns,
-            &query.order_by,
-        )
+        || !source_relationship_id_order_supported(edge, &query.projections, &query.columns, &query.order_by)
     {
         return None;
     }
@@ -10272,20 +8866,13 @@ fn source_relationship_id_rows_query_edge(query: &ParsedRowQuery) -> Option<&Row
 }
 
 #[cfg(feature = "opencypher")]
-fn source_relationship_id_projection_supported(
-    edge: &RowEdgePattern,
-    projections: &[RowProjection],
-) -> bool {
+fn source_relationship_id_projection_supported(edge: &RowEdgePattern, projections: &[RowProjection]) -> bool {
     !projections.is_empty()
         && projections.iter().all(|projection| match projection {
             RowProjection::NodeId { binding } => {
-                edge.src.binding.as_deref() == Some(binding.as_str())
-                    || edge.dst.binding.as_deref() == Some(binding.as_str())
+                edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
             }
-            RowProjection::Property { .. }
-            | RowProjection::CountAll
-            | RowProjection::Literal(_)
-            | RowProjection::Aggregate { .. } => false,
+            RowProjection::Property { .. } | RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => false,
         })
 }
 
@@ -10298,8 +8885,7 @@ fn source_relationship_id_order_supported(
 ) -> bool {
     order_by.iter().all(|sort| match &sort.expression {
         RowSortExpression::NodeId { binding } => {
-            edge.src.binding.as_deref() == Some(binding.as_str())
-                || edge.dst.binding.as_deref() == Some(binding.as_str())
+            edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
         }
         RowSortExpression::Column { name } => columns
             .iter()
@@ -10307,30 +8893,23 @@ fn source_relationship_id_order_supported(
             .and_then(|idx| projections.get(idx))
             .is_some_and(|projection| match projection {
                 RowProjection::NodeId { binding } => {
-                    edge.src.binding.as_deref() == Some(binding.as_str())
-                        || edge.dst.binding.as_deref() == Some(binding.as_str())
+                    edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
                 }
-                RowProjection::Property { .. }
-                | RowProjection::CountAll
-                | RowProjection::Literal(_)
-                | RowProjection::Aggregate { .. } => false,
+                RowProjection::Property { .. } | RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => {
+                    false
+                }
             }),
         RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
     })
 }
 
 #[cfg(feature = "opencypher")]
-fn source_relationship_id_page_order(
-    edge: &RowEdgePattern,
-    query: &ParsedRowQuery,
-) -> Option<bool> {
+fn source_relationship_id_page_order(edge: &RowEdgePattern, query: &ParsedRowQuery) -> Option<bool> {
     let [sort] = query.order_by.as_slice() else {
         return None;
     };
     let orders_destination = match &sort.expression {
-        RowSortExpression::NodeId { binding } => {
-            edge.dst.binding.as_deref() == Some(binding.as_str())
-        }
+        RowSortExpression::NodeId { binding } => edge.dst.binding.as_deref() == Some(binding.as_str()),
         RowSortExpression::Column { name } => query
             .columns
             .iter()
@@ -10361,10 +8940,7 @@ fn source_relationship_id_bindings_from_dsts(
         budget.check("cypher_source_relationship_id_cached_rows")?;
         if let Some(row) = BindingRow::from_edge(edge, src, *dst) {
             rows.push(row);
-            shard.ensure_query_intermediate_rows(
-                "cypher_source_relationship_id_cached_rows",
-                rows.len(),
-            )?;
+            shard.ensure_query_intermediate_rows("cypher_source_relationship_id_cached_rows", rows.len())?;
         }
     }
     Ok(rows)
@@ -10372,10 +8948,7 @@ fn source_relationship_id_bindings_from_dsts(
 
 #[cfg(feature = "opencypher")]
 fn relationship_rows_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
-    if !query.union_arms.is_empty()
-        || query.predicate.is_some()
-        || row_projections_have_aggregates(&query.projections)
-    {
+    if !query.union_arms.is_empty() || query.predicate.is_some() || row_projections_have_aggregates(&query.projections) {
         return None;
     }
     let patterns = graph_kernel_query_patterns(query)?;
@@ -10403,10 +8976,7 @@ fn ordered_relationship_property_index_spec(
     query: &ParsedRowQuery,
     window: QueryWindow,
 ) -> Option<OrderedRelationshipPropertyIndexSpec<'_>> {
-    if !query.union_arms.is_empty()
-        || query.distinct
-        || row_projections_have_aggregates(&query.projections)
-    {
+    if !query.union_arms.is_empty() || query.distinct || row_projections_have_aggregates(&query.projections) {
         return None;
     }
     let (patterns, predicate) = if query.pattern_groups.is_empty() {
@@ -10419,11 +8989,7 @@ fn ordered_relationship_property_index_spec(
             return None;
         }
         let predicate = match (query.predicate.as_ref(), group.predicate.as_ref()) {
-            (Some(query_predicate), Some(group_predicate))
-                if query_predicate == group_predicate =>
-            {
-                query_predicate
-            }
+            (Some(query_predicate), Some(group_predicate)) if query_predicate == group_predicate => query_predicate,
             (Some(predicate), None) | (None, Some(predicate)) => predicate,
             (Some(_), Some(_)) | (None, None) => return None,
         };
@@ -10435,29 +9001,18 @@ fn ordered_relationship_property_index_spec(
     let RowPattern::Edge(edge) = pattern else {
         return None;
     };
-    if edge.direction == EdgeDirection::Bidirectional
-        || edge.hop_range.is_some()
-        || !edge.properties.is_empty()
-        || edge.binding.is_none()
-    {
+    if edge.direction == EdgeDirection::Bidirectional || edge.hop_range.is_some() || !edge.properties.is_empty() || edge.binding.is_none() {
         return None;
     }
     let sort = query.order_by.first()?;
     let property = match &sort.expression {
-        RowSortExpression::Property { binding, property }
-            if edge.binding.as_deref() == Some(binding.as_str()) && property != "id" =>
-        {
+        RowSortExpression::Property { binding, property } if edge.binding.as_deref() == Some(binding.as_str()) && property != "id" => {
             property.as_str()
         }
         RowSortExpression::Column { name } => {
-            let index = query
-                .columns
-                .iter()
-                .position(|column| column.name == *name)?;
+            let index = query.columns.iter().position(|column| column.name == *name)?;
             match query.projections.get(index)? {
-                RowProjection::Property { binding, property }
-                    if edge.binding.as_deref() == Some(binding.as_str()) && property != "id" =>
-                {
+                RowProjection::Property { binding, property } if edge.binding.as_deref() == Some(binding.as_str()) && property != "id" => {
                     property.as_str()
                 }
                 RowProjection::NodeId { .. }
@@ -10467,11 +9022,9 @@ fn ordered_relationship_property_index_spec(
                 | RowProjection::Aggregate { .. } => return None,
             }
         }
-        RowSortExpression::NodeId { .. }
-        | RowSortExpression::Property { .. }
-        | RowSortExpression::CountAll => return None,
+        RowSortExpression::NodeId { .. } | RowSortExpression::Property { .. } | RowSortExpression::CountAll => return None,
     };
-    if !row_predicate_requires_property(predicate, edge.binding.as_deref()?, property) {
+    if !row_predicate_requires_scalar_indexed_property(predicate, edge.binding.as_deref()?, property) {
         return None;
     }
     Some(OrderedRelationshipPropertyIndexSpec {
@@ -10484,21 +9037,13 @@ fn ordered_relationship_property_index_spec(
 }
 
 #[cfg(feature = "opencypher")]
-fn relationship_rows_projection_supported(
-    edge: &RowEdgePattern,
-    projections: &[RowProjection],
-) -> bool {
+fn relationship_rows_projection_supported(edge: &RowEdgePattern, projections: &[RowProjection]) -> bool {
     projections.iter().all(|projection| match projection {
         RowProjection::NodeId { binding } => {
-            edge.src.binding.as_deref() == Some(binding.as_str())
-                || edge.dst.binding.as_deref() == Some(binding.as_str())
+            edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
         }
-        RowProjection::Property { binding, property } => {
-            edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
-        }
-        RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => {
-            false
-        }
+        RowProjection::Property { binding, property } => edge.binding.as_deref() == Some(binding.as_str()) && property != "id",
+        RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => false,
     })
 }
 
@@ -10511,27 +9056,19 @@ fn relationship_rows_order_supported(
 ) -> bool {
     order_by.iter().all(|sort| match &sort.expression {
         RowSortExpression::NodeId { binding } => {
-            edge.src.binding.as_deref() == Some(binding.as_str())
-                || edge.dst.binding.as_deref() == Some(binding.as_str())
+            edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
         }
-        RowSortExpression::Property { binding, property } => {
-            edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
-        }
+        RowSortExpression::Property { binding, property } => edge.binding.as_deref() == Some(binding.as_str()) && property != "id",
         RowSortExpression::Column { name } => columns
             .iter()
             .position(|column| column.name == *name)
             .and_then(|idx| projections.get(idx))
             .is_some_and(|projection| match projection {
                 RowProjection::NodeId { binding } => {
-                    edge.src.binding.as_deref() == Some(binding.as_str())
-                        || edge.dst.binding.as_deref() == Some(binding.as_str())
+                    edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
                 }
-                RowProjection::Property { binding, property } => {
-                    edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
-                }
-                RowProjection::CountAll
-                | RowProjection::Literal(_)
-                | RowProjection::Aggregate { .. } => false,
+                RowProjection::Property { binding, property } => edge.binding.as_deref() == Some(binding.as_str()) && property != "id",
+                RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => false,
             }),
         RowSortExpression::CountAll => false,
     })
@@ -10558,10 +9095,7 @@ fn graph_kernel_node_pattern(node: &RowNodePattern) -> bool {
 }
 
 #[cfg(feature = "opencypher")]
-fn graph_kernel_projection(
-    edge: &RowEdgePattern,
-    projections: &[RowProjection],
-) -> Option<GraphKernelProjection> {
+fn graph_kernel_projection(edge: &RowEdgePattern, projections: &[RowProjection]) -> Option<GraphKernelProjection> {
     let [projection] = projections else {
         return None;
     };
@@ -10574,9 +9108,7 @@ fn graph_kernel_projection(
             }
         }
         RowProjection::CountAll => Some(GraphKernelProjection::CountAll),
-        RowProjection::Property { .. }
-        | RowProjection::Literal(_)
-        | RowProjection::Aggregate { .. } => None,
+        RowProjection::Property { .. } | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => None,
     }
 }
 
@@ -10606,9 +9138,7 @@ fn graph_kernel_order_supported(
             RowSortExpression::Column { name } => {
                 let projection_idx = columns.iter().position(|column| column.name == *name)?;
                 match projections.get(projection_idx) {
-                    Some(RowProjection::NodeId { binding })
-                        if edge.dst.binding.as_deref() == Some(binding.as_str()) =>
-                    {
+                    Some(RowProjection::NodeId { binding }) if edge.dst.binding.as_deref() == Some(binding.as_str()) => {
                         Some(sort.ascending)
                     }
                     _ => None,
@@ -10631,15 +9161,11 @@ fn graph_kernel_order_supported(
 }
 
 #[cfg(feature = "opencypher")]
-fn streaming_neighbor_projection_supported(
-    edge: &RowEdgePattern,
-    projection: &RowProjection,
-) -> bool {
+fn streaming_neighbor_projection_supported(edge: &RowEdgePattern, projection: &RowProjection) -> bool {
     let RowProjection::NodeId { binding } = projection else {
         return false;
     };
-    edge.src.binding.as_deref() == Some(binding.as_str())
-        || edge.dst.binding.as_deref() == Some(binding.as_str())
+    edge.src.binding.as_deref() == Some(binding.as_str()) || edge.dst.binding.as_deref() == Some(binding.as_str())
 }
 
 #[cfg(feature = "opencypher")]
@@ -10659,9 +9185,7 @@ fn streaming_neighbor_order_supported(
         return false;
     }
     match &sort.expression {
-        RowSortExpression::NodeId { binding } => {
-            edge.dst.binding.as_deref() == Some(binding.as_str())
-        }
+        RowSortExpression::NodeId { binding } => edge.dst.binding.as_deref() == Some(binding.as_str()),
         RowSortExpression::Column { name } => match columns
             .iter()
             .position(|column| column.name == *name)
@@ -10765,11 +9289,7 @@ fn opencypher_outer_window(query: &ParsedRowQuery) -> QueryWindow {
 }
 
 #[cfg(feature = "opencypher")]
-fn query_next_cursor(
-    cursor_offset: u64,
-    page_size: usize,
-    has_next: bool,
-) -> Result<Option<QueryCursorToken>> {
+fn query_next_cursor(cursor_offset: u64, page_size: usize, has_next: bool) -> Result<Option<QueryCursorToken>> {
     if !has_next {
         return Ok(None);
     }
@@ -10784,18 +9304,21 @@ fn query_next_cursor(
     )))
 }
 
+/// The `(cell, property, encoded value, vertex id)` of a vertex property
+/// index entry, from either layout: the classic index or one generation of
+/// the write-back index, whose generation segment the readers never need.
 #[cfg(feature = "opencypher")]
-pub(super) fn parse_vertex_property_index_key(
-    key: &str,
-) -> Result<(String, String, String, VertexId)> {
+pub(super) fn parse_vertex_property_index_key(key: &str) -> Result<(String, String, String, VertexId)> {
     let parts: Vec<_> = key.split('/').collect();
     match parts.as_slice() {
-        ["cell", cell_id, "vprop_idx", property, encoded, vertex_id] => Ok((
-            (*cell_id).to_string(),
-            (*property).to_string(),
-            (*encoded).to_string(),
-            parse_u64(key, vertex_id, "vertex_id")?,
-        )),
+        ["cell", cell_id, "vprop_idx", property, encoded, vertex_id] | ["cell", cell_id, "vprop_gidx", property, _, encoded, vertex_id] => {
+            Ok((
+                (*cell_id).to_string(),
+                (*property).to_string(),
+                (*encoded).to_string(),
+                parse_u64(key, vertex_id, "vertex_id")?,
+            ))
+        }
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected vertex property index key".to_string(),
@@ -10804,9 +9327,7 @@ pub(super) fn parse_vertex_property_index_key(
 }
 
 #[cfg(feature = "opencypher")]
-pub(super) fn parse_edge_property_index_key(
-    key: &str,
-) -> Result<(String, String, String, String, VertexId, VertexId)> {
+pub(super) fn parse_edge_property_index_key(key: &str) -> Result<(String, String, String, String, VertexId, VertexId)> {
     let parts: Vec<_> = key.split('/').collect();
     match parts.as_slice() {
         ["cell", cell_id, "eprop_idx", edge_type, property, encoded, src, dst] => Ok((
@@ -10835,6 +9356,98 @@ struct BindingRow {
     metadata: BTreeMap<String, VertexMetadata>,
 }
 
+/// How a statement's effects went: applied, or refused before anything was
+/// written because a record it updates changed after its snapshot.
+#[cfg(feature = "opencypher")]
+#[must_use]
+enum StatementApply {
+    Applied,
+    LostRace,
+}
+
+/// How many times a statement that lost a race to a concurrent write re-runs
+/// on a fresh snapshot before it gives up: as many as a write transaction
+/// retries a storage conflict, so a hot vertex is no likelier to fail.
+#[cfg(feature = "opencypher")]
+const STATEMENT_RACE_ATTEMPTS: usize = crate::GRAPH_TXN_MAX_RETRIES;
+
+/// A statement's property updates, with the records each was computed from.
+#[cfg(feature = "opencypher")]
+struct StatementUpdates {
+    vertex_metadata: BTreeMap<VertexId, VertexMetadata>,
+    relationship_metadata: BTreeMap<BoundRelationship, EdgeMetadata>,
+    original_metadata: BTreeMap<VertexId, VertexMetadata>,
+    original_edge_metadata: BTreeMap<BoundRelationship, EdgeMetadata>,
+}
+
+/// What one mutation statement writes, collected from every matched row
+/// before anything is applied.
+#[cfg(feature = "opencypher")]
+#[derive(Debug, Default)]
+struct StatementEffects {
+    deleted_relationships: BTreeSet<BoundRelationship>,
+    /// Each deleted vertex, and whether any `DELETE` of it was `DETACH`.
+    deleted_vertices: BTreeMap<VertexId, bool>,
+    vertex_metadata: BTreeMap<VertexId, VertexMetadata>,
+    relationship_metadata: BTreeMap<BoundRelationship, EdgeMetadata>,
+    /// The record each update started from, to tell a change from a no-op.
+    original_metadata: BTreeMap<VertexId, VertexMetadata>,
+    original_edge_metadata: BTreeMap<BoundRelationship, EdgeMetadata>,
+}
+
+#[cfg(feature = "opencypher")]
+impl StatementEffects {
+    /// How many batch transactions applying these effects takes: identified
+    /// and structural relationship deletes, `DETACH` and plain vertex deletes,
+    /// vertex updates and relationship updates each commit separately.
+    fn batch_transactions(&self) -> usize {
+        let relationship_deletes = |identified: bool| {
+            self.deleted_relationships
+                .iter()
+                .any(|relationship| relationship.relationship_id.is_some() == identified)
+        };
+        let vertex_deletes = |detach: bool| self.deleted_vertices.values().any(|vertex_detach| *vertex_detach == detach);
+        [
+            relationship_deletes(true),
+            relationship_deletes(false),
+            vertex_deletes(true),
+            vertex_deletes(false),
+            !self.vertex_metadata.is_empty(),
+            !self.relationship_metadata.is_empty(),
+        ]
+        .into_iter()
+        .filter(|applies| *applies)
+        .count()
+    }
+
+    /// Drop, and count as no-ops, the updates that change nothing and the
+    /// property updates on something the same statement deletes: applying one
+    /// after the delete would recreate the record.
+    fn drop_noops(&mut self, result: &mut QueryMutationResult) {
+        let deleted_vertices = &self.deleted_vertices;
+        let original_metadata = &self.original_metadata;
+        self.vertex_metadata.retain(|vertex_id, metadata| {
+            let keep = original_metadata.get(vertex_id) != Some(metadata) && !deleted_vertices.contains_key(vertex_id);
+            if !keep {
+                result.noops = result.noops.saturating_add(1);
+            }
+            keep
+        });
+        let deleted_relationships = &self.deleted_relationships;
+        let original_edge_metadata = &self.original_edge_metadata;
+        self.relationship_metadata.retain(|relationship, metadata| {
+            let keep = original_edge_metadata.get(relationship) != Some(metadata)
+                && !deleted_relationships.contains(relationship)
+                && !deleted_vertices.contains_key(&relationship.src)
+                && !deleted_vertices.contains_key(&relationship.dst);
+            if !keep {
+                result.noops = result.noops.saturating_add(1);
+            }
+            keep
+        });
+    }
+}
+
 #[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BoundRelationship {
@@ -10842,6 +9455,38 @@ struct BoundRelationship {
     src: VertexId,
     dst: VertexId,
     relationship_id: Option<RelationshipId>,
+}
+
+/// Append the rows that pass the group's `WHERE`, or all of them without one.
+/// The one pattern of a group a bound can be pushed into an edge traversal
+/// for: a single fixed-length hop. Longer paths and variable-length hops
+/// expand through [`GraphShard::match_row_patterns_from_rows`] instead.
+#[cfg(feature = "opencypher")]
+fn bounded_edge_group_pattern(group: &RowMatchGroup) -> Option<&RowPattern> {
+    match group.patterns.as_slice() {
+        [pattern @ RowPattern::Edge(edge)] if edge.hop_range.is_none() => Some(pattern),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn extend_with_predicate_matches(
+    predicate: Option<&RowPredicate>,
+    rows: Vec<BindingRow>,
+    matches: &mut Vec<BindingRow>,
+    budget: &QueryBudget,
+) -> Result<()> {
+    let Some(predicate) = predicate else {
+        matches.extend(rows);
+        return Ok(());
+    };
+    for row in rows {
+        budget.check("cypher_group_where")?;
+        if row_predicate_matches(&row, predicate)? {
+            matches.push(row);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "opencypher")]
@@ -10852,10 +9497,7 @@ fn mutation_return_rows(returning: &MutationReturn, bindings: &[BindingRow]) -> 
     // a concurrent writer already removed still counts. Deriving it from the
     // row set rather than from the delete result keeps that true, because the
     // delete result dedupes by relationship identity.
-    let counted = bindings
-        .iter()
-        .filter(|row| row.is_bound(&returning.binding))
-        .count() as u64;
+    let counted = bindings.iter().filter(|row| row.is_bound(&returning.binding)).count() as u64;
     QueryResultSet::new(
         vec![returning.column.clone()],
         vec![QueryRow::new(vec![QueryValue::Count(counted)])],
@@ -10863,10 +9505,7 @@ fn mutation_return_rows(returning: &MutationReturn, bindings: &[BindingRow]) -> 
 }
 
 #[cfg(feature = "opencypher")]
-fn bound_relationship_delete_mutation(
-    context: &QueryContext,
-    relationship: &BoundRelationship,
-) -> EdgeMutation {
+fn bound_relationship_delete_mutation(context: &QueryContext, relationship: &BoundRelationship) -> EdgeMutation {
     EdgeMutation {
         cell_id: context.cell_id.clone(),
         edge_type: relationship.edge_type.clone(),
@@ -10878,9 +9517,7 @@ fn bound_relationship_delete_mutation(
             relationship.edge_type,
             relationship.src,
             relationship.dst,
-            relationship
-                .relationship_id
-                .map_or_else(|| "edge".to_string(), |id| id.to_string())
+            relationship.relationship_id.map_or_else(|| "edge".to_string(), |id| id.to_string())
         ),
     }
 }
@@ -10949,12 +9586,9 @@ fn ordered_edge_property_candidate(key: &[u8]) -> Result<OrderedRelationshipProp
 }
 
 #[cfg(feature = "opencypher")]
-fn ordered_relationship_property_candidate(
-    key: &[u8],
-) -> Result<OrderedRelationshipPropertyCandidate> {
+fn ordered_relationship_property_candidate(key: &[u8]) -> Result<OrderedRelationshipPropertyCandidate> {
     let key = String::from_utf8_lossy(key).into_owned();
-    let (_, _, _, encoded, src, dst, relationship_id) =
-        parse_relationship_property_index_key(&key)?;
+    let (_, _, _, encoded, src, dst, relationship_id) = parse_relationship_property_index_key(&key)?;
     Ok(OrderedRelationshipPropertyCandidate {
         encoded,
         src,
@@ -10970,12 +9604,10 @@ fn ordered_relationship_property_source_candidate<'a>(
     relationships: &'a [Option<OrderedRelationshipPropertyCandidate>],
 ) -> &'a OrderedRelationshipPropertyCandidate {
     match source {
-        OrderedRelationshipPropertyCandidateSource::Edge(index) => edges[index]
-            .as_ref()
-            .expect("edge candidate source is populated"),
-        OrderedRelationshipPropertyCandidateSource::Relationship(index) => relationships[index]
-            .as_ref()
-            .expect("relationship candidate source is populated"),
+        OrderedRelationshipPropertyCandidateSource::Edge(index) => edges[index].as_ref().expect("edge candidate source is populated"),
+        OrderedRelationshipPropertyCandidateSource::Relationship(index) => {
+            relationships[index].as_ref().expect("relationship candidate source is populated")
+        }
     }
 }
 
@@ -10988,15 +9620,11 @@ fn ordered_relationship_property_candidate_source(
     let mut selected = None;
     for source in (0..edges.len())
         .map(OrderedRelationshipPropertyCandidateSource::Edge)
-        .chain(
-            (0..relationships.len()).map(OrderedRelationshipPropertyCandidateSource::Relationship),
-        )
+        .chain((0..relationships.len()).map(OrderedRelationshipPropertyCandidateSource::Relationship))
     {
         let candidate = match source {
             OrderedRelationshipPropertyCandidateSource::Edge(index) => edges[index].as_ref(),
-            OrderedRelationshipPropertyCandidateSource::Relationship(index) => {
-                relationships[index].as_ref()
-            }
+            OrderedRelationshipPropertyCandidateSource::Relationship(index) => relationships[index].as_ref(),
         };
         let Some(candidate) = candidate else {
             continue;
@@ -11005,12 +9633,9 @@ fn ordered_relationship_property_candidate_source(
             selected = Some(source);
             continue;
         };
-        let current =
-            ordered_relationship_property_source_candidate(current_source, edges, relationships);
+        let current = ordered_relationship_property_source_candidate(current_source, edges, relationships);
         let ordering = compare_encoded_property_order(&candidate.encoded, &current.encoded)?;
-        if (ascending && ordering == std::cmp::Ordering::Less)
-            || (!ascending && ordering == std::cmp::Ordering::Greater)
-        {
+        if (ascending && ordering == std::cmp::Ordering::Less) || (!ascending && ordering == std::cmp::Ordering::Greater) {
             selected = Some(source);
         }
     }
@@ -11122,11 +9747,7 @@ impl BindingRow {
         Self::from_relationship(pattern, relationship, EdgeMetadata::default())
     }
 
-    fn from_relationship(
-        pattern: &RowEdgePattern,
-        relationship: BoundRelationship,
-        metadata: EdgeMetadata,
-    ) -> Option<Self> {
+    fn from_relationship(pattern: &RowEdgePattern, relationship: BoundRelationship, metadata: EdgeMetadata) -> Option<Self> {
         let mut row = Self::default();
         if !row.bind(pattern.src.binding.as_deref(), relationship.src) {
             return None;
@@ -11181,14 +9802,11 @@ impl BindingRow {
                 feature: format!("variable {binding} is null"),
             });
         }
-        self.values
-            .get(binding)
-            .copied()
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Other,
-                dialect: "OpenCypher",
-                feature: format!("unbound variable {binding}"),
-            })
+        self.values.get(binding).copied().ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Other,
+            dialect: "OpenCypher",
+            feature: format!("unbound variable {binding}"),
+        })
     }
 
     fn get_optional(&self, binding: &str) -> Result<Option<VertexId>> {
@@ -11262,9 +9880,7 @@ impl BindingRow {
                 Some(existing) if existing != relationship => return None,
                 Some(_) => {}
                 None => {
-                    joined
-                        .relationships
-                        .insert(binding.clone(), relationship.clone());
+                    joined.relationships.insert(binding.clone(), relationship.clone());
                 }
             }
         }
@@ -11277,16 +9893,12 @@ impl BindingRow {
         for (relationship, metadata) in &other.relationship_metadata {
             match joined.relationship_metadata.get(relationship) {
                 Some(existing) if existing.properties.is_empty() => {
-                    joined
-                        .relationship_metadata
-                        .insert(relationship.clone(), metadata.clone());
+                    joined.relationship_metadata.insert(relationship.clone(), metadata.clone());
                 }
                 Some(existing) if metadata.properties.is_empty() || existing == metadata => {}
                 Some(_) => return None,
                 None => {
-                    joined
-                        .relationship_metadata
-                        .insert(relationship.clone(), metadata.clone());
+                    joined.relationship_metadata.insert(relationship.clone(), metadata.clone());
                 }
             }
         }
@@ -11314,11 +9926,7 @@ fn binding_rows_bound_names_union(rows: &[BindingRow]) -> BTreeSet<String> {
 
 #[cfg(feature = "opencypher")]
 fn binding_row_bound_names(row: &BindingRow) -> BTreeSet<String> {
-    row.values
-        .keys()
-        .chain(row.relationships.keys())
-        .cloned()
-        .collect()
+    row.values.keys().chain(row.relationships.keys()).cloned().collect()
 }
 
 #[cfg(feature = "opencypher")]
@@ -11347,12 +9955,22 @@ fn binding_row_join_key(row: &BindingRow, bindings: &[String]) -> Option<Vec<Ver
     Some(key)
 }
 
+/// The first pattern property that a property index can look up.
+///
+/// Lists and dates are never index keys (`is_scalar_indexable`), so an index
+/// lookup on one finds nothing. Relationship matching uses this to choose its
+/// lookup property; with none, it loads the pair's relationships and compares
+/// every pattern property directly, as it does for a pattern without
+/// properties.
+#[cfg(feature = "opencypher")]
+fn first_indexable_property(properties: &BTreeMap<String, VertexPropertyValue>) -> Option<(&String, &VertexPropertyValue)> {
+    properties.iter().find(|(_, value)| value.is_scalar_indexable())
+}
+
 #[cfg(feature = "opencypher")]
 fn hash_joinable_pattern(pattern: &RowPattern) -> bool {
     match pattern {
-        RowPattern::Node(node) => {
-            node.id.is_none() && (!node.labels.is_empty() || node_has_metadata_constraints(node))
-        }
+        RowPattern::Node(node) => node.id.is_none() && (!node.labels.is_empty() || node_has_metadata_constraints(node)),
         RowPattern::Edge(edge) => edge.hop_range.is_none() && !edge.properties.is_empty(),
     }
 }
@@ -11374,8 +9992,7 @@ struct OrderedWindowRow<'a> {
 #[cfg(feature = "opencypher")]
 impl Ord for OrderedWindowRow<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        compare_projected_rows(&self.projected, &other.projected, self.order_by)
-            .then_with(|| self.ordinal.cmp(&other.ordinal))
+        compare_projected_rows(&self.projected, &other.projected, self.order_by).then_with(|| self.ordinal.cmp(&other.ordinal))
     }
 }
 
@@ -11439,20 +10056,12 @@ impl<'a> OrderedRowWindow<'a> {
     }
 
     fn into_rows(self) -> Vec<ProjectedQueryRow> {
-        self.rows
-            .into_sorted_vec()
-            .into_iter()
-            .map(|entry| entry.projected)
-            .collect()
+        self.rows.into_sorted_vec().into_iter().map(|entry| entry.projected).collect()
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn push_projected_query_row(
-    projected: &mut Vec<ProjectedQueryRow>,
-    row: QueryRow,
-    sort_keys: Vec<QueryValue>,
-) {
+fn push_projected_query_row(projected: &mut Vec<ProjectedQueryRow>, row: QueryRow, sort_keys: Vec<QueryValue>) {
     projected.push(ProjectedQueryRow { row, sort_keys });
 }
 
@@ -11508,10 +10117,7 @@ fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Optio
 }
 
 #[cfg(feature = "opencypher")]
-fn constrain_row_node_pattern(
-    node: &RowNodePattern,
-    row: &BindingRow,
-) -> Result<Option<RowNodePattern>> {
+fn constrain_row_node_pattern(node: &RowNodePattern, row: &BindingRow) -> Result<Option<RowNodePattern>> {
     let Some(binding) = &node.binding else {
         return Ok(Some(node.clone()));
     };
@@ -11569,23 +10175,15 @@ fn relationship_metadata_matches(metadata: &EdgeMetadata, pattern: &RowEdgePatte
 }
 
 #[cfg(feature = "opencypher")]
-fn relationship_identity_for_pattern(
-    row: &BindingRow,
-    pattern: &RowEdgePattern,
-) -> Result<BoundRelationship> {
+fn relationship_identity_for_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Result<BoundRelationship> {
     if let Some(binding) = &pattern.binding {
-        return row.relationships.get(binding).cloned().ok_or_else(|| {
-            GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Other,
-                dialect: "OpenCypher",
-                feature: format!("unbound relationship {binding}"),
-            }
+        return row.relationships.get(binding).cloned().ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Other,
+            dialect: "OpenCypher",
+            feature: format!("unbound relationship {binding}"),
         });
     }
-    if let (Some(src_binding), Some(dst_binding)) = (
-        pattern.src.binding.as_deref(),
-        pattern.dst.binding.as_deref(),
-    ) {
+    if let (Some(src_binding), Some(dst_binding)) = (pattern.src.binding.as_deref(), pattern.dst.binding.as_deref()) {
         return Ok(BoundRelationship {
             edge_type: pattern.edge_type.clone(),
             src: row.get(src_binding)?,
@@ -11645,9 +10243,7 @@ fn node_has_metadata_constraints(node: &RowNodePattern) -> bool {
 
 #[cfg(feature = "opencypher")]
 fn vertex_metadata_matches(metadata: &VertexMetadata, node: &RowNodePattern) -> bool {
-    node.labels
-        .iter()
-        .all(|label| metadata.labels.contains(label))
+    node.labels.iter().all(|label| metadata.labels.contains(label))
         && node
             .properties
             .iter()
@@ -11670,29 +10266,42 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
 #[cfg(feature = "opencypher")]
 fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<Option<bool>> {
     Ok(match predicate {
-        RowPredicate::Compare { left, op, right } => compare_row_values(
-            eval_row_expression(row, left)?,
-            *op,
-            eval_row_expression(row, right)?,
-        )?,
-        RowPredicate::StartsWith { expression, prefix } => {
-            match eval_row_expression(row, expression)? {
-                RowScalarValue::Value(VertexPropertyValue::String(value)) => {
-                    Some(value.starts_with(prefix))
-                }
-                RowScalarValue::Value(_) => Some(false),
-                RowScalarValue::Missing => None,
-            }
+        RowPredicate::Compare { left, op, right } => {
+            compare_row_values(eval_row_expression(row, left)?, *op, eval_row_expression(row, right)?)?
         }
-        // Even null IN [] is false: there are no elements that could match.
-        RowPredicate::In { values, .. } if values.is_empty() => Some(false),
-        RowPredicate::In { expression, values } => match eval_row_expression(row, expression)? {
-            RowScalarValue::Value(value) => Some(
-                values
-                    .iter()
-                    .any(|candidate| vertex_property_values_equal(candidate, &value)),
-            ),
+        RowPredicate::StartsWith { expression, prefix } => match eval_row_expression(row, expression)? {
+            RowScalarValue::Value(VertexPropertyValue::String(value)) => Some(value.starts_with(prefix)),
+            RowScalarValue::Value(_) => Some(false),
             RowScalarValue::Missing => None,
+        },
+        RowPredicate::In {
+            list: RowInList::Values(values),
+            ..
+        } if values.is_empty() => Some(false),
+        RowPredicate::In {
+            expression,
+            list: RowInList::Values(values),
+        } => match eval_row_expression(row, expression)? {
+            RowScalarValue::Value(value) => Some(values.iter().any(|candidate| vertex_property_values_equal(candidate, &value))),
+            RowScalarValue::Missing => None,
+        },
+        RowPredicate::In {
+            expression,
+            list: RowInList::Expression(list),
+        } => match eval_row_expression(row, list)? {
+            RowScalarValue::Value(VertexPropertyValue::List(values)) if values.is_empty() => Some(false),
+            RowScalarValue::Value(VertexPropertyValue::List(values)) => match eval_row_expression(row, expression)? {
+                RowScalarValue::Value(value) => Some(property_list_contains(&values, &value)),
+                RowScalarValue::Missing => None,
+            },
+            RowScalarValue::Missing => None,
+            RowScalarValue::Value(_) => {
+                return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Evaluation,
+                    dialect: "OpenCypher",
+                    feature: "the right side of IN must evaluate to a list".to_string(),
+                });
+            }
         },
         RowPredicate::And(left, right) => match eval_row_predicate(row, left)? {
             Some(false) => Some(false),
@@ -11713,15 +10322,9 @@ fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<Opti
         RowPredicate::Not(inner) => eval_row_predicate(row, inner)?.map(|value| !value),
         // The test for unknown is itself never unknown: a missing property is
         // the only null a row holds.
-        RowPredicate::IsNull {
-            expression,
-            negated,
-        } => Some(
-            matches!(
-                eval_row_expression(row, expression)?,
-                RowScalarValue::Missing
-            ) != *negated,
-        ),
+        RowPredicate::IsNull { expression, negated } => {
+            Some(matches!(eval_row_expression(row, expression)?, RowScalarValue::Missing) != *negated)
+        }
         // The binding itself: null exactly when nothing is bound to it, which
         // an OPTIONAL MATCH that did not match records explicitly. A name the
         // row never bound is null too -- there is nothing there either.
@@ -11735,11 +10338,7 @@ fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<Opti
 }
 
 #[cfg(feature = "opencypher")]
-fn predicate_guarantees_string_property(
-    predicate: &RowPredicate,
-    binding: &str,
-    property: &str,
-) -> bool {
+fn predicate_guarantees_string_property(predicate: &RowPredicate, binding: &str, property: &str) -> bool {
     match predicate {
         RowPredicate::StartsWith {
             expression:
@@ -11751,12 +10350,10 @@ fn predicate_guarantees_string_property(
         } => candidate_binding == binding && candidate_property == property,
         RowPredicate::StartsWith { .. } => false,
         RowPredicate::And(left, right) => {
-            predicate_guarantees_string_property(left, binding, property)
-                || predicate_guarantees_string_property(right, binding, property)
+            predicate_guarantees_string_property(left, binding, property) || predicate_guarantees_string_property(right, binding, property)
         }
         RowPredicate::Or(left, right) => {
-            predicate_guarantees_string_property(left, binding, property)
-                && predicate_guarantees_string_property(right, binding, property)
+            predicate_guarantees_string_property(left, binding, property) && predicate_guarantees_string_property(right, binding, property)
         }
         RowPredicate::Compare { .. }
         | RowPredicate::In { .. }
@@ -11767,18 +10364,8 @@ fn predicate_guarantees_string_property(
 }
 
 #[cfg(feature = "opencypher")]
-fn string_property_lower_bound(
-    predicate: &RowPredicate,
-    binding: &str,
-    property: &str,
-) -> Option<String> {
-    fn direct_bound(
-        left: &RowExpression,
-        op: RowComparisonOp,
-        right: &RowExpression,
-        binding: &str,
-        property: &str,
-    ) -> Option<String> {
+fn string_property_lower_bound(predicate: &RowPredicate, binding: &str, property: &str) -> Option<String> {
+    fn direct_bound(left: &RowExpression, op: RowComparisonOp, right: &RowExpression, binding: &str, property: &str) -> Option<String> {
         let is_property = |expression: &RowExpression| {
             matches!(
                 expression,
@@ -11793,29 +10380,17 @@ fn string_property_lower_bound(
             _ => None,
         };
 
-        if is_property(left)
-            && matches!(
-                op,
-                RowComparisonOp::Eq | RowComparisonOp::Gt | RowComparisonOp::Gte
-            )
-        {
+        if is_property(left) && matches!(op, RowComparisonOp::Eq | RowComparisonOp::Gt | RowComparisonOp::Gte) {
             return string_literal(right);
         }
-        if is_property(right)
-            && matches!(
-                op,
-                RowComparisonOp::Eq | RowComparisonOp::Lt | RowComparisonOp::Lte
-            )
-        {
+        if is_property(right) && matches!(op, RowComparisonOp::Eq | RowComparisonOp::Lt | RowComparisonOp::Lte) {
             return string_literal(left);
         }
         None
     }
 
     match predicate {
-        RowPredicate::Compare { left, op, right } => {
-            direct_bound(left, *op, right, binding, property)
-        }
+        RowPredicate::Compare { left, op, right } => direct_bound(left, *op, right, binding, property),
         RowPredicate::StartsWith { expression, prefix } => matches!(
             expression,
             RowExpression::Property {
@@ -11849,9 +10424,7 @@ fn string_property_lower_bound(
         // values. Offering a bound here would let the planner pick the weaker
         // access path.
         RowPredicate::In { .. } => None,
-        RowPredicate::Not(_) | RowPredicate::IsNull { .. } | RowPredicate::BindingIsNull { .. } => {
-            None
-        }
+        RowPredicate::Not(_) | RowPredicate::IsNull { .. } | RowPredicate::BindingIsNull { .. } => None,
     }
 }
 
@@ -11951,18 +10524,14 @@ enum NodeEqualityProbe {
 /// separately, which is exactly the row-dropping mistake the singular
 /// extractor refuses to make.
 #[cfg(feature = "opencypher")]
-pub(super) fn row_predicate_property_equality_constraints(
-    predicate: &RowPredicate,
-) -> Vec<RowPredicatePropertyEqualityConstraint> {
+pub(super) fn row_predicate_property_equality_constraints(predicate: &RowPredicate) -> Vec<RowPredicatePropertyEqualityConstraint> {
     match predicate {
         RowPredicate::And(left, right) => {
             let mut constraints = row_predicate_property_equality_constraints(left);
             constraints.extend(row_predicate_property_equality_constraints(right));
             constraints
         }
-        other => row_predicate_property_equality_constraint(other)
-            .into_iter()
-            .collect(),
+        other => row_predicate_property_equality_constraint(other).into_iter().collect(),
     }
 }
 
@@ -11975,18 +10544,16 @@ pub(super) fn row_predicate_property_equality_constraints(
 /// returns `None`, because the index seek it would authorise could drop rows
 /// the predicate keeps.
 #[cfg(feature = "opencypher")]
-pub(super) fn row_predicate_property_equality_constraint(
-    predicate: &RowPredicate,
-) -> Option<RowPredicatePropertyEqualityConstraint> {
+pub(super) fn row_predicate_property_equality_constraint(predicate: &RowPredicate) -> Option<RowPredicatePropertyEqualityConstraint> {
     match predicate {
         RowPredicate::Compare {
             left,
             op: RowComparisonOp::Eq,
             right,
-        } => row_property_literal_equality(left, right)
-            .or_else(|| row_property_literal_equality(right, left)),
-        RowPredicate::And(left, right) => row_predicate_property_equality_constraint(left)
-            .or_else(|| row_predicate_property_equality_constraint(right)),
+        } => row_property_literal_equality(left, right).or_else(|| row_property_literal_equality(right, left)),
+        RowPredicate::And(left, right) => {
+            row_predicate_property_equality_constraint(left).or_else(|| row_predicate_property_equality_constraint(right))
+        }
         RowPredicate::Or(left, right) => {
             let mut left = row_predicate_property_equality_constraint(left)?;
             let right = row_predicate_property_equality_constraint(right)?;
@@ -12006,7 +10573,7 @@ pub(super) fn row_predicate_property_equality_constraint(
         // returns nothing while the predicate still has to reject every row.
         RowPredicate::In {
             expression: RowExpression::Property { binding, property },
-            values,
+            list: RowInList::Values(values),
         } if !values.is_empty() => Some(RowPredicatePropertyEqualityConstraint {
             binding: binding.clone(),
             property: property.clone(),
@@ -12055,12 +10622,10 @@ fn row_predicate_node_id_values(predicate: &RowPredicate) -> Option<(String, Vec
             left,
             op: RowComparisonOp::Eq,
             right,
-        } => {
-            node_id_literal_equality(left, right).or_else(|| node_id_literal_equality(right, left))
-        }
+        } => node_id_literal_equality(left, right).or_else(|| node_id_literal_equality(right, left)),
         RowPredicate::In {
             expression: RowExpression::NodeId { binding },
-            values,
+            list: RowInList::Values(values),
         } => {
             let ids = vertex_id_literals(values)?;
             Some((binding.clone(), ids))
@@ -12068,9 +10633,7 @@ fn row_predicate_node_id_values(predicate: &RowPredicate) -> Option<(String, Vec
         // Both sides of an `And` hold, so either side's ids already contain
         // every row the whole predicate keeps. Seeking one side and filtering
         // with the rest is the same bargain the property extractor makes.
-        RowPredicate::And(left, right) => {
-            row_predicate_node_id_values(left).or_else(|| row_predicate_node_id_values(right))
-        }
+        RowPredicate::And(left, right) => row_predicate_node_id_values(left).or_else(|| row_predicate_node_id_values(right)),
         // Only one side of an `Or` need hold, so one side's ids are not a
         // superset and seeding from them would drop the other side's rows. A
         // union over the same binding is a superset; anything else falls back
@@ -12098,10 +10661,7 @@ fn row_predicate_node_id_values(predicate: &RowPredicate) -> Option<(String, Vec
 }
 
 #[cfg(feature = "opencypher")]
-fn node_id_literal_equality(
-    id_expression: &RowExpression,
-    literal_expression: &RowExpression,
-) -> Option<(String, Vec<VertexId>)> {
+fn node_id_literal_equality(id_expression: &RowExpression, literal_expression: &RowExpression) -> Option<(String, Vec<VertexId>)> {
     let RowExpression::NodeId { binding } = id_expression else {
         return None;
     };
@@ -12137,16 +10697,14 @@ fn vertex_id_literal(value: &VertexPropertyValue) -> Option<VertexId> {
         VertexPropertyValue::SignedInteger(value) => VertexId::try_from(*value).ok(),
         VertexPropertyValue::Float(_)
         | VertexPropertyValue::Bool(_)
-        | VertexPropertyValue::String(_) => None,
+        | VertexPropertyValue::String(_)
+        | VertexPropertyValue::Date(_)
+        | VertexPropertyValue::List(_) => None,
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn row_predicate_requires_property(
-    predicate: &RowPredicate,
-    binding: &str,
-    property: &str,
-) -> bool {
+fn row_predicate_requires_scalar_indexed_property(predicate: &RowPredicate, binding: &str, property: &str) -> bool {
     let expression_matches = |expression: &RowExpression| {
         matches!(
             expression,
@@ -12156,39 +10714,39 @@ fn row_predicate_requires_property(
             } if candidate_binding == binding && candidate_property == property
         )
     };
+    let scalar_literal = |expression: &RowExpression| matches!(expression, RowExpression::Literal(value) if value.is_scalar_indexable());
     match predicate {
-        RowPredicate::Compare { left, right, .. } => {
-            expression_matches(left) || expression_matches(right)
-        }
+        RowPredicate::Compare {
+            left,
+            op: RowComparisonOp::Eq | RowComparisonOp::Lt | RowComparisonOp::Gt | RowComparisonOp::Lte | RowComparisonOp::Gte,
+            right,
+        } => (expression_matches(left) && scalar_literal(right)) || (expression_matches(right) && scalar_literal(left)),
+        RowPredicate::Compare { .. } => false,
         RowPredicate::StartsWith { expression, .. } => expression_matches(expression),
-        // `x IN [...]` constrains `x` exactly as an equality does, so it must
-        // answer the same way a `Compare` on that property would.
-        RowPredicate::In { expression, .. } => expression_matches(expression),
+        RowPredicate::In {
+            expression,
+            list: RowInList::Values(values),
+        } => expression_matches(expression) && values.iter().all(VertexPropertyValue::is_scalar_indexable),
+        RowPredicate::In {
+            list: RowInList::Expression(_),
+            ..
+        } => false,
         RowPredicate::And(left, right) => {
-            row_predicate_requires_property(left, binding, property)
-                || row_predicate_requires_property(right, binding, property)
+            row_predicate_requires_scalar_indexed_property(left, binding, property)
+                || row_predicate_requires_scalar_indexed_property(right, binding, property)
         }
         RowPredicate::Or(left, right) => {
-            row_predicate_requires_property(left, binding, property)
-                && row_predicate_requires_property(right, binding, property)
+            row_predicate_requires_scalar_indexed_property(left, binding, property)
+                && row_predicate_requires_scalar_indexed_property(right, binding, property)
         }
         RowPredicate::Not(_) => false,
-        // Only the negated form rejects a row without the property.
-        RowPredicate::IsNull {
-            expression,
-            negated,
-        } => *negated && expression_matches(expression),
-        // A predicate on the binding says nothing about any property of it.
+        RowPredicate::IsNull { .. } => false,
         RowPredicate::BindingIsNull { .. } => false,
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn retain_binding_rows_matching_predicate(
-    rows: &mut Vec<BindingRow>,
-    predicate: &RowPredicate,
-    budget: &QueryBudget,
-) -> Result<()> {
+fn retain_binding_rows_matching_predicate(rows: &mut Vec<BindingRow>, predicate: &RowPredicate, budget: &QueryBudget) -> Result<()> {
     let mut matching = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
         budget.check("cypher_ordered_relationship_property_predicate")?;
@@ -12207,23 +10765,17 @@ fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<R
             Some(value) => Ok(RowScalarValue::Value(VertexPropertyValue::Integer(value))),
             None => Ok(RowScalarValue::Missing),
         },
-        RowExpression::Property { binding, property } => {
-            Ok(match binding_property(row, binding, property)? {
-                Some(value) => RowScalarValue::Value(value),
-                None => RowScalarValue::Missing,
-            })
-        }
+        RowExpression::Property { binding, property } => Ok(match binding_property(row, binding, property)? {
+            Some(value) => RowScalarValue::Value(value),
+            None => RowScalarValue::Missing,
+        }),
         RowExpression::Literal(value) => Ok(RowScalarValue::Value(value.clone())),
         RowExpression::Null => Ok(RowScalarValue::Missing),
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn compare_row_values(
-    left: RowScalarValue,
-    op: RowComparisonOp,
-    right: RowScalarValue,
-) -> Result<Option<bool>> {
+fn compare_row_values(left: RowScalarValue, op: RowComparisonOp, right: RowScalarValue) -> Result<Option<bool>> {
     let (RowScalarValue::Value(left), RowScalarValue::Value(right)) = (left, right) else {
         return Ok(None);
     };
@@ -12231,46 +10783,62 @@ fn compare_row_values(
 }
 
 #[cfg(feature = "opencypher")]
-fn compare_vertex_property_values(
-    left: &VertexPropertyValue,
-    op: RowComparisonOp,
-    right: &VertexPropertyValue,
-) -> Result<bool> {
+fn compare_vertex_property_values(left: &VertexPropertyValue, op: RowComparisonOp, right: &VertexPropertyValue) -> Result<bool> {
     Ok(match op {
-        RowComparisonOp::Eq => numeric_property_order(left, right)
+        RowComparisonOp::Eq => semantic_property_order(left, right)
             .map(|ordering| compare_ordering(ordering, op))
             .unwrap_or(left == right),
-        RowComparisonOp::Ne => numeric_property_order(left, right)
+        RowComparisonOp::Ne => semantic_property_order(left, right)
             .map(|ordering| compare_ordering(ordering, op))
             .unwrap_or(left != right),
         RowComparisonOp::Lt | RowComparisonOp::Gt | RowComparisonOp::Lte | RowComparisonOp::Gte => {
-            match numeric_property_order(left, right) {
+            match semantic_property_order(left, right) {
                 Some(ordering) => compare_ordering(ordering, op),
-                None => match (left, right) {
-                    (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => {
-                        compare_ordering(left.cmp(right), op)
-                    }
-                    _ => {
-                        return Err(GraphError::UnsupportedQuery {
-                            reason: QueryFailureReason::Evaluation,
-                            dialect: "OpenCypher",
-                            feature:
-                                "ordered comparisons require numeric or matching string values"
-                                    .to_string(),
-                        });
-                    }
-                },
+                None => {
+                    return Err(GraphError::UnsupportedQuery {
+                        reason: QueryFailureReason::Evaluation,
+                        dialect: "OpenCypher",
+                        feature: "ordered comparisons require numeric or matching string, date, or list values".to_string(),
+                    });
+                }
             }
         }
     })
 }
 
 #[cfg(feature = "opencypher")]
-pub(super) fn vertex_property_values_equal(
-    left: &VertexPropertyValue,
-    right: &VertexPropertyValue,
-) -> bool {
+fn semantic_property_order(left: &VertexPropertyValue, right: &VertexPropertyValue) -> Option<std::cmp::Ordering> {
+    numeric_property_order(left, right).or_else(|| match (left, right) {
+        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => Some(left.cmp(right)),
+        (VertexPropertyValue::Date(left), VertexPropertyValue::Date(right)) => Some(left.cmp(right)),
+        (VertexPropertyValue::List(left), VertexPropertyValue::List(right)) => Some(compare_property_lists(left, right)),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+pub(super) fn vertex_property_values_equal(left: &VertexPropertyValue, right: &VertexPropertyValue) -> bool {
     compare_vertex_property_values(left, RowComparisonOp::Eq, right).unwrap_or(false)
+}
+
+#[cfg(feature = "opencypher")]
+fn property_list_contains(list: &VertexPropertyList, value: &VertexPropertyValue) -> bool {
+    match list {
+        VertexPropertyList::Empty => false,
+        VertexPropertyList::Integer(values) => values.iter().any(|candidate| {
+            let candidate = match candidate {
+                VertexPropertyInteger::Unsigned(value) => VertexPropertyValue::Integer(*value),
+                VertexPropertyInteger::Signed(value) => VertexPropertyValue::SignedInteger(*value),
+            };
+            vertex_property_values_equal(&candidate, value)
+        }),
+        VertexPropertyList::Bool(values) => matches!(value, VertexPropertyValue::Bool(value) if values.contains(value)),
+        VertexPropertyList::Float(values) => values
+            .iter()
+            .any(|candidate| vertex_property_values_equal(&VertexPropertyValue::Float(*candidate), value)),
+        VertexPropertyList::String(values) => matches!(value, VertexPropertyValue::String(value) if values.contains(value)),
+        VertexPropertyList::Date(values) => matches!(value, VertexPropertyValue::Date(value) if values.contains(value)),
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -12286,11 +10854,7 @@ fn compare_ordering(ordering: std::cmp::Ordering, op: RowComparisonOp) -> bool {
 }
 
 #[cfg(feature = "opencypher")]
-fn binding_property(
-    row: &BindingRow,
-    binding: &str,
-    property: &str,
-) -> Result<Option<VertexPropertyValue>> {
+fn binding_property(row: &BindingRow, binding: &str, property: &str) -> Result<Option<VertexPropertyValue>> {
     if row.null_values.contains(binding) || row.null_relationships.contains(binding) {
         return Ok(None);
     }
@@ -12302,8 +10866,7 @@ fn binding_property(
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::Other,
                 dialect: "OpenCypher",
-                feature: "relationship id properties are not executable in Query engine"
-                    .to_string(),
+                feature: "relationship id properties are not executable in Query engine".to_string(),
             });
         }
         let Some(metadata) = row.relationship_metadata.get(relationship) else {
@@ -12343,11 +10906,7 @@ fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Resul
                 });
             }
             RowProjection::Literal(literal) => {
-                values.push(
-                    literal
-                        .clone()
-                        .map_or(QueryValue::Null, QueryValue::Property),
-                );
+                values.push(literal.clone().map_or(QueryValue::Null, QueryValue::Property));
             }
             RowProjection::CountAll | RowProjection::Aggregate { .. } => {
                 return Err(GraphError::UnsupportedQuery {
@@ -12371,25 +10930,20 @@ fn project_relationship_row(
     let mut values = Vec::with_capacity(projections.len());
     for projection in projections {
         values.push(match projection {
-            RowProjection::NodeId { binding } => {
-                QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
-            }
+            RowProjection::NodeId { binding } => QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?),
             RowProjection::Property { binding, property } => {
                 if edge.binding.as_deref() != Some(binding.as_str()) {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::Return,
                         dialect: "OpenCypher",
-                        feature: format!(
-                            "relationship fast path cannot project property {binding}.{property}"
-                        ),
+                        feature: format!("relationship fast path cannot project property {binding}.{property}"),
                     });
                 }
                 if property == "id" {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::Return,
                         dialect: "OpenCypher",
-                        feature: "relationship id properties are not executable in Query engine"
-                            .to_string(),
+                        feature: "relationship id properties are not executable in Query engine".to_string(),
                     });
                 }
                 metadata
@@ -12401,9 +10955,7 @@ fn project_relationship_row(
             }
             // Unreachable while the guards above reject literals on this
             // path, but the fast path can project a constant perfectly well.
-            RowProjection::Literal(literal) => literal
-                .clone()
-                .map_or(QueryValue::Null, QueryValue::Property),
+            RowProjection::Literal(literal) => literal.clone().map_or(QueryValue::Null, QueryValue::Property),
             RowProjection::CountAll | RowProjection::Aggregate { .. } => {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::Other,
@@ -12417,9 +10969,7 @@ fn project_relationship_row(
 }
 
 #[cfg(feature = "opencypher")]
-fn relationship_rows_cache_value(
-    rows: &[(BoundRelationship, EdgeMetadata)],
-) -> RelationshipRowsCacheValue {
+fn relationship_rows_cache_value(rows: &[(BoundRelationship, EdgeMetadata)]) -> RelationshipRowsCacheValue {
     RelationshipRowsCacheValue::new(
         rows.iter()
             .map(|(relationship, metadata)| RelationshipRowsCacheEntry {
@@ -12465,17 +11015,13 @@ fn sort_keys_for_relationship_row(
     let mut keys = Vec::with_capacity(query.order_by.len());
     for sort in &query.order_by {
         keys.push(match &sort.expression {
-            RowSortExpression::NodeId { binding } => {
-                QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
-            }
+            RowSortExpression::NodeId { binding } => QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?),
             RowSortExpression::Property { binding, property } => {
                 if edge.binding.as_deref() != Some(binding.as_str()) {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::OrderWindow,
                         dialect: "OpenCypher",
-                        feature: format!(
-                            "relationship fast path cannot sort by property {binding}.{property}"
-                        ),
+                        feature: format!("relationship fast path cannot sort by property {binding}.{property}"),
                     });
                 }
                 metadata
@@ -12485,9 +11031,7 @@ fn sort_keys_for_relationship_row(
                     .map(QueryValue::Property)
                     .unwrap_or(QueryValue::Null)
             }
-            RowSortExpression::Column { name } => {
-                projected_column_value(row, &query.columns, name)?
-            }
+            RowSortExpression::Column { name } => projected_column_value(row, &query.columns, name)?,
             RowSortExpression::CountAll => {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::OrderWindow,
@@ -12501,11 +11045,7 @@ fn sort_keys_for_relationship_row(
 }
 
 #[cfg(feature = "opencypher")]
-fn relationship_endpoint_id(
-    edge: &RowEdgePattern,
-    relationship: &BoundRelationship,
-    binding: &str,
-) -> Result<VertexId> {
+fn relationship_endpoint_id(edge: &RowEdgePattern, relationship: &BoundRelationship, binding: &str) -> Result<VertexId> {
     if edge.src.binding.as_deref() == Some(binding) {
         return Ok(relationship.src);
     }
@@ -12526,10 +11066,7 @@ fn row_projections_have_aggregates(projections: &[RowProjection]) -> bool {
 
 #[cfg(feature = "opencypher")]
 fn is_aggregate_projection(projection: &RowProjection) -> bool {
-    matches!(
-        projection,
-        RowProjection::CountAll | RowProjection::Aggregate { .. }
-    )
+    matches!(projection, RowProjection::CountAll | RowProjection::Aggregate { .. })
 }
 
 #[cfg(feature = "opencypher")]
@@ -12551,14 +11088,17 @@ fn aggregate_projected_rows(
         .filter_map(|(idx, projection)| is_aggregate_projection(projection).then_some(idx))
         .collect();
 
-    let mut groups = BTreeMap::<Vec<QueryValue>, Vec<AggregateAccumulator>>::new();
+    let mut groups = BTreeMap::<Vec<SemanticQueryValue>, (Vec<QueryValue>, Vec<AggregateAccumulator>)>::new();
     if bindings.is_empty() && group_projection_indexes.is_empty() {
         groups.insert(
             Vec::new(),
-            aggregate_projection_indexes
-                .iter()
-                .map(|idx| new_aggregate_accumulator(&projections[*idx]))
-                .collect::<Result<_>>()?,
+            (
+                Vec::new(),
+                aggregate_projection_indexes
+                    .iter()
+                    .map(|idx| new_aggregate_accumulator(&projections[*idx]))
+                    .collect::<Result<_>>()?,
+            ),
         );
     }
 
@@ -12568,26 +11108,28 @@ fn aggregate_projected_rows(
         for idx in &group_projection_indexes {
             group_key.push(project_single_binding_value(&binding, &projections[*idx])?);
         }
-        let states = match groups.entry(group_key) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                aggregate_projection_indexes
-                    .iter()
-                    .map(|idx| new_aggregate_accumulator(&projections[*idx]))
-                    .collect::<Result<_>>()?,
-            ),
+        let semantic_group_key = group_key.iter().cloned().map(SemanticQueryValue).collect();
+        let states = match groups.entry(semantic_group_key) {
+            std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                &mut entry
+                    .insert((
+                        group_key,
+                        aggregate_projection_indexes
+                            .iter()
+                            .map(|idx| new_aggregate_accumulator(&projections[*idx]))
+                            .collect::<Result<_>>()?,
+                    ))
+                    .1
+            }
         };
         for (state_idx, projection_idx) in aggregate_projection_indexes.iter().enumerate() {
-            apply_aggregate_projection(
-                &mut states[state_idx],
-                &projections[*projection_idx],
-                &binding,
-            )?;
+            apply_aggregate_projection(&mut states[state_idx], &projections[*projection_idx], &binding)?;
         }
     }
 
     let mut projected = Vec::with_capacity(groups.len());
-    for (group_key, states) in groups {
+    for (_, (group_key, states)) in groups {
         budget.check("cypher_aggregate_project")?;
         let mut group_idx = 0;
         let mut aggregate_idx = 0;
@@ -12629,11 +11171,7 @@ fn new_aggregate_accumulator(projection: &RowProjection) -> Result<AggregateAccu
 }
 
 #[cfg(feature = "opencypher")]
-fn apply_aggregate_projection(
-    state: &mut AggregateAccumulator,
-    projection: &RowProjection,
-    row: &BindingRow,
-) -> Result<()> {
+fn apply_aggregate_projection(state: &mut AggregateAccumulator, projection: &RowProjection, row: &BindingRow) -> Result<()> {
     match (state, projection) {
         (AggregateAccumulator::CountAll(count), RowProjection::CountAll) => {
             *count = count.saturating_add(1);
@@ -12657,12 +11195,10 @@ fn apply_aggregate_projection(
             },
         ) => {
             if let Some(value) = aggregate_integer_value(row, expression, "sum")? {
-                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
-                    GraphError::UnsupportedQuery {
-                        reason: QueryFailureReason::Evaluation,
-                        dialect: "OpenCypher",
-                        feature: "sum aggregate overflowed".to_string(),
-                    }
+                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Evaluation,
+                    dialect: "OpenCypher",
+                    feature: "sum aggregate overflowed".to_string(),
                 })?;
             }
         }
@@ -12674,12 +11210,10 @@ fn apply_aggregate_projection(
             },
         ) => {
             if let Some(value) = aggregate_integer_value(row, expression, "avg")? {
-                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
-                    GraphError::UnsupportedQuery {
-                        reason: QueryFailureReason::Evaluation,
-                        dialect: "OpenCypher",
-                        feature: "avg aggregate overflowed".to_string(),
-                    }
+                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Evaluation,
+                    dialect: "OpenCypher",
+                    feature: "avg aggregate overflowed".to_string(),
                 })?;
                 *count = count.saturating_add(1);
             }
@@ -12707,11 +11241,7 @@ fn apply_aggregate_projection(
 }
 
 #[cfg(feature = "opencypher")]
-fn aggregate_integer_value(
-    row: &BindingRow,
-    expression: &RowExpression,
-    function: &str,
-) -> Result<Option<u64>> {
+fn aggregate_integer_value(row: &BindingRow, expression: &RowExpression, function: &str) -> Result<Option<u64>> {
     match eval_row_expression(row, expression)? {
         RowScalarValue::Missing => Ok(None),
         RowScalarValue::Value(VertexPropertyValue::Integer(value)) => Ok(Some(value)),
@@ -12726,79 +11256,54 @@ fn aggregate_integer_value(
 #[cfg(feature = "opencypher")]
 fn finalize_aggregate(state: &AggregateAccumulator) -> Result<QueryValue> {
     Ok(match state {
-        AggregateAccumulator::CountAll(count) | AggregateAccumulator::CountExpression(count) => {
-            QueryValue::Count(*count)
-        }
-        AggregateAccumulator::Sum(sum) => {
-            QueryValue::Property(VertexPropertyValue::Integer((*sum).try_into().map_err(
-                |_| GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::Evaluation,
-                    dialect: "OpenCypher",
-                    feature: "sum aggregate exceeds u64 result range".to_string(),
-                },
-            )?))
-        }
+        AggregateAccumulator::CountAll(count) | AggregateAccumulator::CountExpression(count) => QueryValue::Count(*count),
+        AggregateAccumulator::Sum(sum) => QueryValue::Property(VertexPropertyValue::Integer((*sum).try_into().map_err(|_| {
+            GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Evaluation,
+                dialect: "OpenCypher",
+                feature: "sum aggregate exceeds u64 result range".to_string(),
+            }
+        })?)),
         AggregateAccumulator::Avg { sum: _, count: 0 } => QueryValue::Null,
-        AggregateAccumulator::Avg { sum, count } => {
-            QueryValue::Float(QueryFloat(*sum as f64 / *count as f64))
-        }
+        AggregateAccumulator::Avg { sum, count } => QueryValue::Float(QueryFloat(*sum as f64 / *count as f64)),
         AggregateAccumulator::Collect(values) => QueryValue::List(values.clone()),
     })
 }
 
 #[cfg(feature = "opencypher")]
-fn project_single_binding_value(
-    row: &BindingRow,
-    projection: &RowProjection,
-) -> Result<QueryValue> {
+fn project_single_binding_value(row: &BindingRow, projection: &RowProjection) -> Result<QueryValue> {
     match projection {
         RowProjection::NodeId { binding } => Ok(match row.get_optional(binding)? {
             Some(value) => QueryValue::VertexId(value),
             None => QueryValue::Null,
         }),
-        RowProjection::Property { binding, property } => {
-            Ok(match binding_property(row, binding, property)? {
-                Some(value) => QueryValue::Property(value),
-                None => QueryValue::Null,
-            })
-        }
+        RowProjection::Property { binding, property } => Ok(match binding_property(row, binding, property)? {
+            Some(value) => QueryValue::Property(value),
+            None => QueryValue::Null,
+        }),
         // A constant is a legitimate group key: every row carries the same
         // value, so it partitions nothing and drops out of the grouping.
-        RowProjection::Literal(literal) => Ok(literal
-            .clone()
-            .map_or(QueryValue::Null, QueryValue::Property)),
-        RowProjection::CountAll | RowProjection::Aggregate { .. } => {
-            Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Other,
-                dialect: "OpenCypher",
-                feature: "aggregate projection cannot be used as a group key".to_string(),
-            })
-        }
+        RowProjection::Literal(literal) => Ok(literal.clone().map_or(QueryValue::Null, QueryValue::Property)),
+        RowProjection::CountAll | RowProjection::Aggregate { .. } => Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Other,
+            dialect: "OpenCypher",
+            feature: "aggregate projection cannot be used as a group key".to_string(),
+        }),
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn expression_query_value(
-    row: &BindingRow,
-    expression: &RowExpression,
-) -> Result<Option<QueryValue>> {
+fn expression_query_value(row: &BindingRow, expression: &RowExpression) -> Result<Option<QueryValue>> {
     Ok(match expression {
         RowExpression::NodeId { binding } => row.get_optional(binding)?.map(QueryValue::VertexId),
-        RowExpression::Property { binding, property } => {
-            binding_property(row, binding, property)?.map(QueryValue::Property)
-        }
+        RowExpression::Property { binding, property } => binding_property(row, binding, property)?.map(QueryValue::Property),
         RowExpression::Literal(value) => Some(QueryValue::Property(value.clone())),
         RowExpression::Null => None,
     })
 }
 
 #[cfg(feature = "opencypher")]
-fn sort_keys_for_row(
-    binding_row: &BindingRow,
-    row: &QueryRow,
-    columns: &[QueryColumn],
-    order_by: &[RowSort],
-) -> Result<Vec<QueryValue>> {
+fn sort_keys_for_row(binding_row: &BindingRow, row: &QueryRow, columns: &[QueryColumn], order_by: &[RowSort]) -> Result<Vec<QueryValue>> {
     let mut keys = Vec::with_capacity(order_by.len());
     for sort in order_by {
         keys.push(match &sort.expression {
@@ -12806,12 +11311,10 @@ fn sort_keys_for_row(
                 Some(value) => QueryValue::VertexId(value),
                 None => QueryValue::Null,
             },
-            RowSortExpression::Property { binding, property } => {
-                match binding_property(binding_row, binding, property)? {
-                    Some(value) => QueryValue::Property(value),
-                    None => QueryValue::Null,
-                }
-            }
+            RowSortExpression::Property { binding, property } => match binding_property(binding_row, binding, property)? {
+                Some(value) => QueryValue::Property(value),
+                None => QueryValue::Null,
+            },
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {
                 return Err(GraphError::UnsupportedQuery {
@@ -12826,21 +11329,13 @@ fn sort_keys_for_row(
 }
 
 #[cfg(feature = "opencypher")]
-fn sort_keys_for_projected_only(
-    row: &QueryRow,
-    columns: &[QueryColumn],
-    order_by: &[RowSort],
-) -> Result<Vec<QueryValue>> {
+fn sort_keys_for_projected_only(row: &QueryRow, columns: &[QueryColumn], order_by: &[RowSort]) -> Result<Vec<QueryValue>> {
     let mut keys = Vec::with_capacity(order_by.len());
     for sort in order_by {
         keys.push(match &sort.expression {
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {
-                let Some(value) = row
-                    .values
-                    .iter()
-                    .find(|value| matches!(value, QueryValue::Count(_)))
-                else {
+                let Some(value) = row.values.iter().find(|value| matches!(value, QueryValue::Count(_))) else {
                     return Err(GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::OrderWindow,
                         dialect: "OpenCypher",
@@ -12869,11 +11364,7 @@ fn sort_keys_for_projected_only(
 }
 
 #[cfg(feature = "opencypher")]
-fn projected_column_value(
-    row: &QueryRow,
-    columns: &[QueryColumn],
-    name: &str,
-) -> Result<QueryValue> {
+fn projected_column_value(row: &QueryRow, columns: &[QueryColumn], name: &str) -> Result<QueryValue> {
     let Some(index) = columns.iter().position(|column| column.name == name) else {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::OrderWindow,
@@ -12881,29 +11372,18 @@ fn projected_column_value(
             feature: format!("ORDER BY references unknown projection {name}"),
         });
     };
-    row.values
-        .get(index)
-        .cloned()
-        .ok_or_else(|| GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::OrderWindow,
-            dialect: "OpenCypher",
-            feature: format!("ORDER BY projection {name} has no row value"),
-        })
+    row.values.get(index).cloned().ok_or_else(|| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::OrderWindow,
+        dialect: "OpenCypher",
+        feature: format!("ORDER BY projection {name} has no row value"),
+    })
 }
 
 #[cfg(feature = "opencypher")]
-fn compare_projected_rows(
-    left: &ProjectedQueryRow,
-    right: &ProjectedQueryRow,
-    order_by: &[RowSort],
-) -> std::cmp::Ordering {
+fn compare_projected_rows(left: &ProjectedQueryRow, right: &ProjectedQueryRow, order_by: &[RowSort]) -> std::cmp::Ordering {
     for (idx, sort) in order_by.iter().enumerate() {
         let ordering = compare_query_values(&left.sort_keys[idx], &right.sort_keys[idx]);
-        let ordering = if sort.ascending {
-            ordering
-        } else {
-            ordering.reverse()
-        };
+        let ordering = if sort.ascending { ordering } else { ordering.reverse() };
         if ordering != std::cmp::Ordering::Equal {
             return ordering;
         }
@@ -12912,13 +11392,31 @@ fn compare_projected_rows(
 }
 
 #[cfg(feature = "opencypher")]
-#[derive(Clone, Copy)]
-struct EncodedPropertyIndexScan<'a> {
-    cell_id: &'a str,
-    edge_type: &'a str,
-    property: &'a str,
-    encoded: &'a str,
-    budget: &'a QueryBudget,
+#[derive(Clone, Debug)]
+struct SemanticQueryValue(QueryValue);
+
+#[cfg(feature = "opencypher")]
+impl PartialEq for SemanticQueryValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Eq for SemanticQueryValue {}
+
+#[cfg(feature = "opencypher")]
+impl PartialOrd for SemanticQueryValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Ord for SemanticQueryValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_query_values(&self.0, &other.0)
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -12930,9 +11428,7 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
         | (QueryValue::Count(left), QueryValue::VertexId(right))
         | (QueryValue::Count(left), QueryValue::Count(right)) => left.cmp(right),
         (QueryValue::Float(left), QueryValue::Float(right)) => left.cmp(right),
-        (QueryValue::Property(left), QueryValue::Property(right)) => {
-            compare_vertex_property_order(left, right)
-        }
+        (QueryValue::Property(left), QueryValue::Property(right)) => compare_vertex_property_order(left, right),
         (QueryValue::List(left), QueryValue::List(right)) => {
             for (left, right) in left.iter().zip(right.iter()) {
                 let ordering = compare_query_values(left, right);
@@ -12944,22 +11440,92 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
         }
         (QueryValue::Path(left), QueryValue::Path(right)) => left.cmp(right),
         (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
+        (QueryValue::GraphValue(left), QueryValue::GraphValue(right)) => left.cmp(right),
         _ => query_value_rank(left).cmp(&query_value_rank(right)),
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn compare_vertex_property_order(
-    left: &VertexPropertyValue,
-    right: &VertexPropertyValue,
-) -> std::cmp::Ordering {
-    if let Some(ordering) = numeric_property_order(left, right) {
+fn compare_vertex_property_order(left: &VertexPropertyValue, right: &VertexPropertyValue) -> std::cmp::Ordering {
+    if let Some(ordering) = semantic_property_order(left, right) {
         return ordering;
     }
     match (left, right) {
         (VertexPropertyValue::Bool(left), VertexPropertyValue::Bool(right)) => left.cmp(right),
-        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => left.cmp(right),
         _ => vertex_property_rank(left).cmp(&vertex_property_rank(right)),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_property_lists(left: &crate::VertexPropertyList, right: &crate::VertexPropertyList) -> std::cmp::Ordering {
+    use crate::VertexPropertyList as List;
+
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => return std::cmp::Ordering::Equal,
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        (false, false) => {}
+    }
+
+    match (left, right) {
+        (List::Empty, List::Empty) => std::cmp::Ordering::Equal,
+        (List::Empty, _) => std::cmp::Ordering::Less,
+        (_, List::Empty) => std::cmp::Ordering::Greater,
+        (List::Integer(left), List::Integer(right)) => compare_slices(left, right, compare_property_integers),
+        (List::Bool(left), List::Bool(right)) => compare_slices(left, right, bool::cmp),
+        (List::Float(left), List::Float(right)) => compare_slices(left, right, |left, right| compare_f64_numeric(left.0, right.0)),
+        (List::String(left), List::String(right)) => compare_slices(left, right, String::cmp),
+        (List::Date(left), List::Date(right)) => compare_slices(left, right, i32::cmp),
+        (List::Integer(left), List::Float(right)) => compare_numeric_list_slices(left, right),
+        (List::Float(left), List::Integer(right)) => compare_numeric_list_slices(right, left).reverse(),
+        _ => property_list_rank(left).cmp(&property_list_rank(right)),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_slices<T, U>(left: &[T], right: &[U], compare: impl Fn(&T, &U) -> std::cmp::Ordering) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = compare(left, right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_property_integers(left: &crate::VertexPropertyInteger, right: &crate::VertexPropertyInteger) -> std::cmp::Ordering {
+    use crate::VertexPropertyInteger as Integer;
+
+    match (left, right) {
+        (Integer::Unsigned(left), Integer::Unsigned(right)) => left.cmp(right),
+        (Integer::Signed(left), Integer::Signed(right)) => left.cmp(right),
+        (Integer::Unsigned(_), Integer::Signed(right)) if *right < 0 => std::cmp::Ordering::Greater,
+        (Integer::Unsigned(left), Integer::Signed(right)) => left.cmp(&(*right as u64)),
+        (Integer::Signed(left), Integer::Unsigned(_)) if *left < 0 => std::cmp::Ordering::Less,
+        (Integer::Signed(left), Integer::Unsigned(right)) => (*left as u64).cmp(right),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_numeric_list_slices(left: &[crate::VertexPropertyInteger], right: &[QueryFloat]) -> std::cmp::Ordering {
+    compare_slices(left, right, |left, right| {
+        let left = match left {
+            crate::VertexPropertyInteger::Unsigned(value) => VertexPropertyValue::Integer(*value),
+            crate::VertexPropertyInteger::Signed(value) => VertexPropertyValue::SignedInteger(*value),
+        };
+        numeric_property_order(&left, &VertexPropertyValue::Float(*right)).expect("integer and float are numeric")
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn property_list_rank(value: &crate::VertexPropertyList) -> u8 {
+    match value {
+        crate::VertexPropertyList::Empty => 0,
+        crate::VertexPropertyList::Bool(_) => 1,
+        crate::VertexPropertyList::Integer(_) | crate::VertexPropertyList::Float(_) => 2,
+        crate::VertexPropertyList::String(_) => 3,
+        crate::VertexPropertyList::Date(_) => 4,
     }
 }
 
@@ -12972,6 +11538,11 @@ fn query_value_rank(value: &QueryValue) -> u8 {
         QueryValue::Property(value) => 4 + vertex_property_rank(value),
         QueryValue::List(_) => 8,
         QueryValue::Path(_) => 9,
+        QueryValue::Record(_) => 10,
+        QueryValue::Temporal(_) => 11,
+        QueryValue::Decimal(_) => 12,
+        QueryValue::Bytes(_) => 13,
+        QueryValue::GraphValue(_) => 14,
         QueryValue::Null => u8::MAX,
     }
 }
@@ -12980,23 +11551,24 @@ fn query_value_rank(value: &QueryValue) -> u8 {
 fn vertex_property_rank(value: &VertexPropertyValue) -> u8 {
     match value {
         VertexPropertyValue::Bool(_) => 0,
-        VertexPropertyValue::Integer(_)
-        | VertexPropertyValue::SignedInteger(_)
-        | VertexPropertyValue::Float(_) => 1,
+        VertexPropertyValue::Integer(_) | VertexPropertyValue::SignedInteger(_) | VertexPropertyValue::Float(_) => 1,
         VertexPropertyValue::String(_) => 2,
+        VertexPropertyValue::Date(_) => 3,
+        VertexPropertyValue::List(_) => 4,
     }
 }
 
 #[cfg(feature = "opencypher")]
 pub(crate) fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
+    if !value.is_scalar_indexable() {
+        return Vec::new();
+    }
     let mut keys = BTreeSet::new();
     keys.insert(encode_vertex_property_value_key(value));
     match value {
         VertexPropertyValue::Integer(value) => {
             if let Ok(signed) = i64::try_from(*value) {
-                keys.insert(encode_vertex_property_value_key(
-                    &VertexPropertyValue::SignedInteger(signed),
-                ));
+                keys.insert(encode_vertex_property_value_key(&VertexPropertyValue::SignedInteger(signed)));
             }
             if let Some(float) = VertexPropertyValue::exact_f64_from_u64(*value) {
                 insert_float_property_index_key(&mut keys, float);
@@ -13007,9 +11579,7 @@ pub(crate) fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec
         }
         VertexPropertyValue::SignedInteger(value) => {
             if let Ok(unsigned) = u64::try_from(*value) {
-                keys.insert(encode_vertex_property_value_key(
-                    &VertexPropertyValue::Integer(unsigned),
-                ));
+                keys.insert(encode_vertex_property_value_key(&VertexPropertyValue::Integer(unsigned)));
             }
             if let Some(float) = VertexPropertyValue::exact_f64_from_i64(*value) {
                 insert_float_property_index_key(&mut keys, float);
@@ -13024,61 +11594,34 @@ pub(crate) fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec
                 insert_float_property_index_key(&mut keys, -0.0);
             }
             if let Some(integer) = VertexPropertyValue::exact_u64_from_f64(value.0) {
-                keys.insert(encode_vertex_property_value_key(
-                    &VertexPropertyValue::Integer(integer),
-                ));
+                keys.insert(encode_vertex_property_value_key(&VertexPropertyValue::Integer(integer)));
             }
             if let Some(integer) = VertexPropertyValue::exact_i64_from_f64(value.0) {
-                keys.insert(encode_vertex_property_value_key(
-                    &VertexPropertyValue::SignedInteger(integer),
-                ));
+                keys.insert(encode_vertex_property_value_key(&VertexPropertyValue::SignedInteger(integer)));
             }
         }
-        VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {}
+        VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) | VertexPropertyValue::Date(_) | VertexPropertyValue::List(_) => {}
     }
     keys.into_iter().collect()
 }
 
 #[cfg(feature = "opencypher")]
 fn insert_float_property_index_key(keys: &mut BTreeSet<String>, value: f64) {
-    keys.insert(encode_vertex_property_value_key(
-        &VertexPropertyValue::Float(QueryFloat(value)),
-    ));
+    keys.insert(encode_vertex_property_value_key(&VertexPropertyValue::Float(QueryFloat(value))));
 }
 
 #[cfg(feature = "opencypher")]
-fn numeric_property_order(
-    left: &VertexPropertyValue,
-    right: &VertexPropertyValue,
-) -> Option<std::cmp::Ordering> {
+fn numeric_property_order(left: &VertexPropertyValue, right: &VertexPropertyValue) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
-            Some(left.cmp(right))
-        }
-        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => {
-            Some(left.cmp(right))
-        }
-        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Integer(right)) => {
-            Some(compare_i64_u64(*left, *right))
-        }
-        (VertexPropertyValue::Integer(left), VertexPropertyValue::SignedInteger(right)) => {
-            Some(compare_i64_u64(*right, *left).reverse())
-        }
-        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => {
-            Some(compare_f64_numeric(left.0, right.0))
-        }
-        (VertexPropertyValue::Integer(left), VertexPropertyValue::Float(right)) => {
-            Some(compare_u64_f64(*left, right.0))
-        }
-        (VertexPropertyValue::Float(left), VertexPropertyValue::Integer(right)) => {
-            Some(compare_u64_f64(*right, left.0).reverse())
-        }
-        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Float(right)) => {
-            Some(compare_i64_f64(*left, right.0))
-        }
-        (VertexPropertyValue::Float(left), VertexPropertyValue::SignedInteger(right)) => {
-            Some(compare_i64_f64(*right, left.0).reverse())
-        }
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => Some(left.cmp(right)),
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => Some(left.cmp(right)),
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Integer(right)) => Some(compare_i64_u64(*left, *right)),
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::SignedInteger(right)) => Some(compare_i64_u64(*right, *left).reverse()),
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => Some(compare_f64_numeric(left.0, right.0)),
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Float(right)) => Some(compare_u64_f64(*left, right.0)),
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Integer(right)) => Some(compare_u64_f64(*right, left.0).reverse()),
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Float(right)) => Some(compare_i64_f64(*left, right.0)),
+        (VertexPropertyValue::Float(left), VertexPropertyValue::SignedInteger(right)) => Some(compare_i64_f64(*right, left.0).reverse()),
         _ => None,
     }
 }
@@ -13141,4 +11684,89 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
     }
+}
+
+/// One pair's relationship rows as native paths read them.
+#[cfg(feature = "opencypher")]
+pub(crate) type NativePathRows = Vec<(Option<RelationshipId>, EdgeMetadata)>;
+
+/// What a relationship read knows about its endpoint pair's structural edge.
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgePresence {
+    /// Nothing: the read checks that the edge exists before answering.
+    Unverified,
+    /// Listed from the adjacency of the snapshot being read, at the epoch
+    /// read, so it exists there.
+    Listed,
+}
+
+/// A pair's relationships as native paths see them: a structural edge that
+/// carries properties lends them to every record of the pair, and the pair's
+/// rows are ordered by relationship id.
+#[cfg(feature = "opencypher")]
+fn native_path_rows(mut relationships: Vec<(BoundRelationship, EdgeMetadata)>) -> NativePathRows {
+    let structural_metadata = relationships
+        .iter()
+        .find_map(|(relationship, metadata)| relationship.relationship_id.is_none().then(|| metadata.clone()));
+    if let Some(structural_metadata) = structural_metadata {
+        if relationships.iter().any(|(relationship, _)| relationship.relationship_id.is_some()) {
+            relationships = relationships
+                .into_iter()
+                .filter_map(|(relationship, metadata)| {
+                    relationship.relationship_id.map(|_| {
+                        let mut merged = structural_metadata.clone();
+                        merged.properties.extend(metadata.properties);
+                        (relationship, merged)
+                    })
+                })
+                .collect();
+        }
+    }
+    relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
+    relationships
+        .into_iter()
+        .map(|(relationship, metadata)| (relationship.relationship_id, metadata))
+        .collect()
+}
+
+/// The rows `relationships_for_edge_at` builds for an existing pair at the
+/// latest epoch, from its live records and its structural metadata: one row
+/// per record, plus the structural edge itself when it has no records or
+/// carries properties of its own.
+#[cfg(feature = "opencypher")]
+fn relationship_rows_for_edge(
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    records: Vec<RelationshipRecord>,
+    structural_metadata: EdgeMetadata,
+) -> Vec<(BoundRelationship, EdgeMetadata)> {
+    let saw_live_relationship_record = !records.is_empty();
+    let mut rows = records
+        .into_iter()
+        .map(|record| {
+            (
+                BoundRelationship {
+                    edge_type: record.edge_type,
+                    src: record.src,
+                    dst: record.dst,
+                    relationship_id: Some(record.relationship_id),
+                },
+                record.metadata,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !saw_live_relationship_record || !structural_metadata.properties.is_empty() {
+        rows.push((
+            BoundRelationship {
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                relationship_id: None,
+            },
+            structural_metadata,
+        ));
+    }
+    rows
 }

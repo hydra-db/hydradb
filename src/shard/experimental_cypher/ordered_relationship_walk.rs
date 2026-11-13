@@ -23,9 +23,7 @@
 //! entry never surfaces a value the relationship no longer holds.
 use std::cmp::Ordering;
 
-use hydradb_cypher_engine::{
-    compare_property_values, OrderedPropertyScanRequest, OrderedRelationshipPropertyScanRequest,
-};
+use hydradb_cypher_engine::{compare_property_values, OrderedPropertyScanRequest, OrderedRelationshipPropertyScanRequest};
 
 use super::ordered_walk::{stream_range, tighter_lower, tighter_upper, Stream, STREAMS};
 use std::ops::Bound;
@@ -33,9 +31,7 @@ use std::ops::Bound;
 use super::*;
 use crate::codec::parse_relationship_property_index_key;
 use crate::shard::query::parse_edge_property_index_key;
-use crate::shard::query::{
-    IndexedRelationshipBatch, IndexedRelationshipPairMemo, ORDERED_RELATIONSHIP_FETCH_BATCH,
-};
+use crate::shard::query::{IndexedRelationshipBatch, IndexedRelationshipPairMemo, ORDERED_RELATIONSHIP_FETCH_BATCH};
 
 /// One relationship of an ordered page: its identity (`None` for a
 /// structural edge, which the adapter names), endpoints, and the properties
@@ -54,9 +50,9 @@ pub(in crate::shard) struct OrderedRelationshipPropertyPage {
     /// that restarts at the value reads the whole run again, so this is what a
     /// test can hold a paged tie to.
     ///
-    /// Only the tests assert it, and an unread field under
-    /// `server-runtime,experimental-cypher-engine` fails `-D dead-code`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Retained for observability; carried through the walk even when no
+    /// reader asserts it, so the field can stay `-D dead-code` clean.
+    #[allow(dead_code)]
     pub(in crate::shard) index_entries: u64,
     /// The cursor to resume after, opaque to the engine.
     pub(in crate::shard) last: Option<Vec<u8>>,
@@ -105,12 +101,7 @@ impl Position {
     /// Ascending merge order; a descending walk reverses it.
     fn cmp(&self, other: &Self) -> Ordering {
         compare_property_values(&self.value, &other.value).then_with(|| {
-            (self.src, self.dst, self.index, self.relationship_id).cmp(&(
-                other.src,
-                other.dst,
-                other.index,
-                other.relationship_id,
-            ))
+            (self.src, self.dst, self.index, self.relationship_id).cmp(&(other.src, other.dst, other.index, other.relationship_id))
         })
     }
 }
@@ -200,13 +191,7 @@ struct OpenStream {
 }
 
 impl OpenStream {
-    async fn advance(
-        &mut self,
-        edge_type: &str,
-        property: &str,
-        budget: &QueryBudget,
-        index_entries: &mut u64,
-    ) -> Result<()> {
+    async fn advance(&mut self, edge_type: &str, property: &str, budget: &QueryBudget, index_entries: &mut u64) -> Result<()> {
         loop {
             *index_entries = index_entries.saturating_add(1);
             let Some(kv) = budget
@@ -219,19 +204,16 @@ impl OpenStream {
                 return Ok(());
             };
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (indexed_type, indexed_property, encoded, src, dst, relationship_id) =
-                match self.index {
-                    Index::Edge => {
-                        let (_cell, edge_type, property, encoded, src, dst) =
-                            parse_edge_property_index_key(&key)?;
-                        (edge_type, property, encoded, src, dst, 0)
-                    }
-                    Index::Relationship => {
-                        let (_cell, edge_type, property, encoded, src, dst, relationship_id) =
-                            parse_relationship_property_index_key(&key)?;
-                        (edge_type, property, encoded, src, dst, relationship_id)
-                    }
-                };
+            let (indexed_type, indexed_property, encoded, src, dst, relationship_id) = match self.index {
+                Index::Edge => {
+                    let (_cell, edge_type, property, encoded, src, dst) = parse_edge_property_index_key(&key)?;
+                    (edge_type, property, encoded, src, dst, 0)
+                }
+                Index::Relationship => {
+                    let (_cell, edge_type, property, encoded, src, dst, relationship_id) = parse_relationship_property_index_key(&key)?;
+                    (edge_type, property, encoded, src, dst, relationship_id)
+                }
+            };
             // A property whose name extends this one shares the byte prefix.
             if indexed_type != edge_type || indexed_property != property {
                 continue;
@@ -303,10 +285,7 @@ impl GraphShard {
                     metadata,
                 });
                 *kept += 1;
-                self.ensure_query_intermediate_rows(
-                    "experimental_ordered_relationship_property_rows",
-                    rows.len(),
-                )?;
+                self.ensure_query_intermediate_rows("experimental_ordered_relationship_property_rows", rows.len())?;
             }
         }
         Ok(())
@@ -334,11 +313,7 @@ impl GraphShard {
                 index_entries: 0,
             });
         }
-        let cursor = request
-            .after
-            .as_ref()
-            .map(|cursor| Cursor::decode(&cursor.0))
-            .transpose()?;
+        let cursor = request.after.as_ref().map(|cursor| Cursor::decode(&cursor.0)).transpose()?;
         let resume = cursor.as_ref().map(Cursor::position).transpose()?;
         let edge_type = request.relationship_type.as_str();
         let property = request.property.as_str();
@@ -360,14 +335,9 @@ impl GraphShard {
             allowed: None,
             max_index_entries: None,
         };
-        let resume_value = resume
-            .as_ref()
-            .map(|position| (position.value.clone(), position.src));
+        let resume_value = resume.as_ref().map(|position| (position.value.clone(), position.src));
         let prefixes = [
-            (
-                Index::Edge,
-                keys::edge_property_index_property_prefix(cell_id, edge_type, property),
-            ),
+            (Index::Edge, keys::edge_property_index_property_prefix(cell_id, edge_type, property)),
             (
                 Index::Relationship,
                 keys::relationship_property_index_property_prefix(cell_id, edge_type, property),
@@ -405,12 +375,9 @@ impl GraphShard {
         // that key. The saved suffix is relative to the property prefix and so
         // carries the tag; a scan prefix carries the tag too, so dropping it
         // puts the key in the frame `stream_range` works in.
-        let resume_key = cursor.as_ref().and_then(|cursor| {
-            cursor
-                .suffix
-                .split_first()
-                .map(|(tag, key)| (cursor.index, *tag, key.to_vec()))
-        });
+        let resume_key = cursor
+            .as_ref()
+            .and_then(|cursor| cursor.suffix.split_first().map(|(tag, key)| (cursor.index, *tag, key.to_vec())));
         let mut last = cursor.map(|cursor| (cursor.index, cursor.suffix));
         let mut exhausted = false;
         while entries < request.required {
@@ -425,9 +392,7 @@ impl GraphShard {
                     // resume entry only for a caller whose key layout it
                     // knows, and the relationship indexes key by endpoints, so
                     // it gets `None` and the cursor is applied below instead.
-                    let Some(range) =
-                        stream_range(stream, &restrictions, resume_value.as_ref(), &|_, _| None)?
-                    else {
+                    let Some(range) = stream_range(stream, &restrictions, resume_value.as_ref(), &|_, _| None)? else {
                         continue;
                     };
                     for (index, property_prefix) in &prefixes {
@@ -465,10 +430,7 @@ impl GraphShard {
                                 };
                                 above && below
                             };
-                            if resume_index == index
-                                && u32::from(*tag) == stream.tag as u32
-                                && within(&range.0, &range.1)
-                            {
+                            if resume_index == index && u32::from(*tag) == stream.tag as u32 && within(&range.0, &range.1) {
                                 if request.ascending {
                                     start = tighter_lower(start, Bound::Excluded(key.clone()));
                                 } else {
@@ -479,7 +441,7 @@ impl GraphShard {
                         let iter = budget
                             .read_only_io(
                                 "experimental_ordered_relationship_index_seek",
-                                self.db.scan_prefix_range_with_options(
+                                self.storage.scan_prefix_range_with_options(
                                     prefix.as_bytes(),
                                     // This API seeks from an inclusive start,
                                     // so an excluded bound becomes the
@@ -510,9 +472,7 @@ impl GraphShard {
                             prefix_len: property_prefix.len(),
                             head: None,
                         };
-                        stream
-                            .advance(edge_type, property, budget, &mut index_entries)
-                            .await?;
+                        stream.advance(edge_type, property, budget, &mut index_entries).await?;
                         open.push(stream);
                     }
                 }
@@ -538,18 +498,12 @@ impl GraphShard {
             }
             let stream = &mut open[best.expect("a stream has a head")];
             let mut entry = stream.head.take().expect("selected head");
-            stream
-                .advance(edge_type, property, budget, &mut index_entries)
-                .await?;
+            stream.advance(edge_type, property, budget, &mut index_entries).await?;
             budget.check("experimental_ordered_relationship_property_index")?;
 
             if let Some(resume) = &resume {
                 let ordering = entry.position.cmp(resume);
-                let after = if request.ascending {
-                    ordering.is_gt()
-                } else {
-                    ordering.is_lt()
-                };
+                let after = if request.ascending { ordering.is_gt() } else { ordering.is_lt() };
                 if !after {
                     continue;
                 }
@@ -567,19 +521,13 @@ impl GraphShard {
             // -- gave each one a fresh allowance and could read a multiple of
             // the cap without an admission error. The budget is the whole
             // request's, which is the scope the cap is written in.
-            self.charge_query_index_candidates(
-                "experimental_ordered_relationship_property_candidates",
-                budget,
-                1,
-            )?;
+            self.charge_query_index_candidates("experimental_ordered_relationship_property_candidates", budget, 1)?;
             if !request.accepts(&entry.position.value) {
                 continue;
             }
             if entry.position.index == Index::Relationship {
                 pending_identified.push(entry);
-                if pending_identified.len()
-                    >= ORDERED_RELATIONSHIP_FETCH_BATCH.min(request.required - entries)
-                {
+                if pending_identified.len() >= ORDERED_RELATIONSHIP_FETCH_BATCH.min(request.required - entries) {
                     let metadata = self
                         .fetch_identified_ordered_entries(
                             cell_id,
@@ -590,12 +538,7 @@ impl GraphShard {
                             budget,
                         )
                         .await?;
-                    self.append_identified_ordered_entries(
-                        &mut rows,
-                        &mut entries,
-                        &mut pending_identified,
-                        metadata,
-                    )?;
+                    self.append_identified_ordered_entries(&mut rows, &mut entries, &mut pending_identified, metadata)?;
                 }
                 continue;
             }
@@ -610,23 +553,14 @@ impl GraphShard {
                         budget,
                     )
                     .await?;
-                self.append_identified_ordered_entries(
-                    &mut rows,
-                    &mut entries,
-                    &mut pending_identified,
-                    metadata,
-                )?;
+                self.append_identified_ordered_entries(&mut rows, &mut entries, &mut pending_identified, metadata)?;
             }
             let Position { src, dst, .. } = entry.position;
             let records = self
                 .unmerged_relationships_at(cell_id, edge_type, src, dst, read_epoch, budget)
                 .await?;
-            let structural = records
-                .iter()
-                .find_map(|(id, metadata)| id.is_none().then_some(metadata));
-            let identified = records
-                .iter()
-                .filter_map(|(id, metadata)| id.map(|id| (id, metadata)));
+            let structural = records.iter().find_map(|(id, metadata)| id.is_none().then_some(metadata));
+            let identified = records.iter().filter_map(|(id, metadata)| id.map(|id| (id, metadata)));
             let holds_entry = |metadata: &EdgeMetadata| {
                 metadata
                     .properties
@@ -644,9 +578,7 @@ impl GraphShard {
                 // Expansion reports the identified relationships in place
                 // of the edge; those without their own value inherit it.
                 Some(_) if records.iter().any(|(id, _)| id.is_some()) => {
-                    for (id, own) in
-                        identified.filter(|(_, own)| !own.properties.contains_key(property))
-                    {
+                    for (id, own) in identified.filter(|(_, own)| !own.properties.contains_key(property)) {
                         rows.push(OrderedRelationshipRow {
                             relationship_id: Some(id),
                             src,
@@ -664,10 +596,7 @@ impl GraphShard {
             }
             if rows.len() > before {
                 entries += 1;
-                self.ensure_query_intermediate_rows(
-                    "experimental_ordered_relationship_property_rows",
-                    rows.len(),
-                )?;
+                self.ensure_query_intermediate_rows("experimental_ordered_relationship_property_rows", rows.len())?;
             }
         }
         if !pending_identified.is_empty() {
@@ -681,12 +610,7 @@ impl GraphShard {
                     budget,
                 )
                 .await?;
-            self.append_identified_ordered_entries(
-                &mut rows,
-                &mut entries,
-                &mut pending_identified,
-                metadata,
-            )?;
+            self.append_identified_ordered_entries(&mut rows, &mut entries, &mut pending_identified, metadata)?;
         }
         let last = last.map(|(index, suffix)| Cursor { index, suffix }.encode());
         // The caller's operator span declares this; outside one it is silently

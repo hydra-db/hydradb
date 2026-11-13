@@ -1,0 +1,313 @@
+// Decimal digits include Unicode Nd (§21.4 SR2). Preserve the Cypher
+// identifier tail so malformed numeric tokens still receive one diagnostic.
+//@ replace UNSIGNED_DECIMAL_INTEGER
+UNSIGNED_DECIMAL_INTEGER
+   : GQL_DIGIT (GQL_DIGIT | '_')* (PART_LETTER)*
+   ;
+
+//@ insert-after UNSIGNED_DECIMAL_INTEGER
+fragment GQL_DIGIT
+   : [\p{Nd}]
+   ;
+
+// Leading-zero decimals now tie with radix tokens. Keep radix recognition
+// first instead of decoding the same spelling under two token kinds.
+//@ move-after UNSIGNED_OCTAL_INTEGER
+UNSIGNED_DECIMAL_INTEGER
+
+//@ replace DECIMAL_EXPONENT
+fragment DECIMAL_EXPONENT
+   : ('e' | 'E') ('+' | '-')? GQL_DIGIT (GQL_DIGIT | '_')*
+   ;
+
+//@ replace DECIMAL_DOUBLE
+DECIMAL_DOUBLE
+   : (GQL_DIGIT (GQL_DIGIT | '_')* '.' {_input.LA(1) != '.'}? (GQL_DIGIT | '_')* (DECIMAL_EXPONENT)? (IDENTIFIER)?
+     | '.' GQL_DIGIT (GQL_DIGIT | '_')* (DECIMAL_EXPONENT)? (IDENTIFIER)?
+     | GQL_DIGIT (GQL_DIGIT | '_')* DECIMAL_EXPONENT (IDENTIFIER)?)
+   ;
+
+// GQL additions to the staged Cypher 25 lexer (ISO/IEC 39075:2024, as
+// Technical Corrigendum 1:2026 amends it). build.rs applies these to its copy
+// of query-language/cypher/grammar/Cypher25Lexer.g4; the vendored file is untouched.
+//
+// Directives, one per item:
+//   //@ replace RULE       the item is RULE's new definition
+//   //@ insert-after RULE  the item is new rules, placed after RULE
+// A directive naming a rule the grammar lacks fails the build, so a Neo4j
+// grammar upgrade that moves a rule cannot silently drop an overlay item.
+
+// §21.2: a doubled quote inside a single-quoted string stands for one quote
+// (<double single quote>).
+//@ replace STRING_LITERAL1
+STRING_LITERAL1
+   : '\'' (~['\\] | EscapeSequence | '\'\'')* '\''
+   ;
+
+// §21.2, §21.3: a doubled double quote inside a double-quoted string or
+// identifier stands for one (<double double quote>).
+//@ replace STRING_LITERAL2
+STRING_LITERAL2
+   : '"' (~["\\] | EscapeSequence | '""')* '"'
+   ;
+
+// §21.2 GL11: `@'...'` and `@"..."` turn character escaping off; a doubled
+// quote still stands for one.
+//@ insert-after STRING_LITERAL2
+NO_ESCAPE_STRING_LITERAL1
+   : '@\'' (~['] | '\'\'')* '\''
+   ;
+
+NO_ESCAPE_STRING_LITERAL2
+   : '@"' (~["] | '""')* '"'
+   ;
+
+// §21.2 GL03: binary integer literals, `0b101`. Like the hex and octal
+// tokens, letters are let through and the lowering rejects a bad digit.
+//@ insert-after UNSIGNED_OCTAL_INTEGER
+UNSIGNED_BINARY_INTEGER
+   : '0b' (PART_LETTER)*
+   ;
+
+// §16.4 G002: `DIFFERENT EDGES`, GQL's spelling of `DIFFERENT RELATIONSHIPS`.
+//@ insert-after EDGE
+EDGES
+   : E D G E S
+   ;
+
+// §19.10 G112: `IS SOURCE OF` and `IS DESTINATION OF`.
+//@ insert-after OF
+SOURCE
+   : S O U R C E
+   ;
+
+DESTINATION
+   : D E S T I N A T I O N
+   ;
+
+// §16.17 GA03: `NULLS FIRST` and `NULLS LAST`.
+//@ insert-after NULL
+NULLS
+   : N U L L S
+   ;
+
+FIRST
+   : F I R S T
+   ;
+
+LAST
+   : L A S T
+   ;
+// §14.2 GQ02, GQ04 to GQ07: `OTHERWISE`, `EXCEPT` and `INTERSECT`.
+//@ insert-after OF
+OTHERWISE
+   : O T H E R W I S E
+   ;
+
+EXCEPT
+   : E X C E P T
+   ;
+
+INTERSECT
+   : I N T E R S E C T
+   ;
+
+// §14.8 GQ11: `WITH ORDINALITY`.
+ORDINALITY
+   : O R D I N A L I T Y
+   ;
+
+// §16.6 G012: the SIMPLE path mode.
+//@ insert-after OF
+SIMPLE
+   : S I M P L E
+   ;
+
+// §16.4 G006, G007: `KEEP`.
+//@ insert-after OF
+KEEP
+   : K E E P
+   ;
+
+// §16.7 G030: the <multiset alternation operator> `|+|`.
+//@ insert-after DOUBLEBAR
+MULTISET_ALTERNATION
+   : '|+|'
+   ;
+
+// §16.7 G043, G045, §16.12 G039, G081: the `~` of edges that may be
+// undirected.
+//@ insert-after DOUBLEBAR
+TILDE
+   : '~'
+   ;
+
+// §18.9 GV01 to GV26, GV30 to GV38, §20.8 GA05: type name words and `CAST`.
+//@ insert-after OF
+CAST
+   : C A S T
+   ;
+
+UINT
+   : U I N T
+   ;
+
+UINT8
+   : U I N T EIGHT
+   ;
+
+UINT16
+   : U I N T ONE SIX
+   ;
+
+UINT32
+   : U I N T THREE TWO
+   ;
+
+UINT64
+   : U I N T SIX FOUR
+   ;
+
+UINT128
+   : U I N T ONE TWO EIGHT
+   ;
+
+UINT256
+   : U I N T TWO FIVE SIX
+   ;
+
+INT128
+   : I N T ONE TWO EIGHT
+   ;
+
+INT256
+   : I N T TWO FIVE SIX
+   ;
+
+INTEGER128
+   : I N T E G E R ONE TWO EIGHT
+   ;
+
+INTEGER256
+   : I N T E G E R TWO FIVE SIX
+   ;
+
+SMALLINT
+   : S M A L L I N T
+   ;
+
+BIGINT
+   : B I G I N T
+   ;
+
+USMALLINT
+   : U S M A L L I N T
+   ;
+
+UBIGINT
+   : U B I G I N T
+   ;
+
+UNSIGNED
+   : U N S I G N E D
+   ;
+
+SMALL
+   : S M A L L
+   ;
+
+BIG
+   : B I G
+   ;
+
+DECIMAL
+   : D E C I M A L
+   ;
+
+DEC
+   : D E C
+   ;
+
+FLOAT16
+   : F L O A T ONE SIX
+   ;
+
+FLOAT128
+   : F L O A T ONE TWO EIGHT
+   ;
+
+FLOAT256
+   : F L O A T TWO FIVE SIX
+   ;
+
+REAL
+   : R E A L
+   ;
+
+DOUBLE
+   : D O U B L E
+   ;
+
+PRECISION
+   : P R E C I S I O N
+   ;
+
+CHAR
+   : C H A R
+   ;
+
+BYTES
+   : B Y T E S
+   ;
+
+BINARY
+   : B I N A R Y
+   ;
+
+VARBINARY
+   : V A R B I N A R Y
+   ;
+
+// §18.9, §20.18 GV45 to GV48: `RECORD`.
+//@ insert-after OF
+RECORD
+   : R E C O R D
+   ;
+
+// §18.9, §20.28 GV41: the duration qualifiers' words and `DURATION_BETWEEN`.
+//@ insert-after OF
+YEAR
+   : Y E A R
+   ;
+
+MONTH
+   : M O N T H
+   ;
+
+DAY
+   : D A Y
+   ;
+
+DURATION_BETWEEN
+   : D U R A T I O N '_' B E T W E E N
+   ;
+
+// §21.2 GL12: SQL's interval literal and the fields of its qualifier.
+INTERVAL
+   : I N T E R V A L
+   ;
+
+HOUR
+   : H O U R
+   ;
+
+MINUTE
+   : M I N U T E
+   ;
+
+// §21.2 GV35: the first piece of a byte string. Continuations are parser
+// children so the normal hidden-channel separator rules own their comments.
+//@ insert-after OF
+BYTE_STRING_LITERAL
+   : [xX] '\'' [ 0-9a-fA-F]* '\''
+   ;

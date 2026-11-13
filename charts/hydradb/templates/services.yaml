@@ -76,7 +76,7 @@ metadata:
   labels:
     {{- include "hydradb.labels" . | nindent 4 }}
     app.kubernetes.io/component: node
-    graph.usecortex.io/metrics: "true"
+    graph.hydradb.io/metrics: "true"
 spec:
   selector:
     {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
@@ -93,7 +93,7 @@ metadata:
   labels:
     {{- include "hydradb.labels" . | nindent 4 }}
     app.kubernetes.io/component: indexer
-    graph.usecortex.io/metrics: "true"
+    graph.hydradb.io/metrics: "true"
 spec:
   selector:
     {{- include "hydradb.componentLabels" (dict "root" . "component" "indexer") | nindent 4 }}
