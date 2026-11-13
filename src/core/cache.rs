@@ -255,6 +255,10 @@ where
         Self::new_with_byte_limit(max_entries, max_entries_per_tenant, usize::MAX)
     }
 
+    /// `max_entries` and `max_resident_bytes` are both caps, and both spell
+    /// "off" as zero: zero is the off value for every cap in the kernel
+    /// (`max_entries` here, and the `GraphCachePolicy` and `GraphMemoryConfig`
+    /// entries that reach this constructor).
     pub(crate) fn new_with_byte_limit(
         max_entries: usize,
         max_entries_per_tenant: Option<usize>,
@@ -311,6 +315,17 @@ where
         self.insert_sized(key, value, tenant, pinned, 0, metrics)
     }
 
+    /// Zero on either limit means the cache is off: the insert is refused and
+    /// the caller is left to use the value it just built.
+    ///
+    /// That refusal has to happen here, before the entry goes in, and not
+    /// through [`Self::enforce_total_limit`]. The entry is inserted and counted
+    /// *first* and the limits are enforced afterwards, so a byte budget read as
+    /// a literal zero could only ever be satisfied by an empty cache: it would
+    /// evict every entry held -- pinned ones included, then the entry it was
+    /// asked to store -- on every insert, and still report that insert as a
+    /// miss. A zero budget asks for no bytes to be cached, not for the cache to
+    /// be emptied one insert at a time.
     pub(crate) fn insert_sized(
         &mut self,
         key: K,
@@ -320,7 +335,7 @@ where
         resident_bytes: usize,
         metrics: &GraphCacheMetrics,
     ) -> Option<V> {
-        if self.max_entries == 0 {
+        if self.max_entries == 0 || self.max_resident_bytes == 0 {
             metrics.record_quota_rejection();
             return None;
         }
@@ -422,5 +437,118 @@ where
                 self.tenant_entries.remove(tenant);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A zero byte budget has to read as "this cache is off", the way a zero
+    /// `max_entries` already does, rather than as a real budget of zero bytes
+    /// that every insert is then trimmed back down to.
+    #[test]
+    fn zero_byte_cap_disables_the_cache() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::<u64, String>::new_with_byte_limit(4, None, 0);
+
+        for id in 1..=3 {
+            assert_eq!(
+                cache.insert_sized(id, format!("v{id}"), "cell", false, 60, &metrics),
+                None,
+                "a disabled cache refuses the insert"
+            );
+            assert_eq!(cache.get(&id), None, "and nothing answers a lookup");
+        }
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
+
+        // The insert is refused *before* anything is stored, so no eviction
+        // work runs on the way. Reporting the refusal is what makes a cache
+        // that caches nothing distinguishable from one that is simply cold.
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.insertions, 0, "nothing was ever stored");
+        assert_eq!(snapshot.evictions, 0, "and so nothing had to be evicted");
+        assert_eq!(snapshot.tenant_quota_rejections, 3);
+    }
+
+    /// `insert` reports a zero size, but a zero *cap* is still off: an entry
+    /// that claims to be free does not buy its way into a disabled cache.
+    #[test]
+    fn zero_byte_cap_refuses_a_zero_sized_insert() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::<u64, String>::new_with_byte_limit(4, None, 0);
+
+        assert_eq!(cache.insert(1, "v1".to_string(), "cell", false, &metrics), None);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(metrics.snapshot().tenant_quota_rejections, 1);
+    }
+
+    /// A zero entry cap has always meant "off". It still does, so both limits
+    /// answer the same way.
+    #[test]
+    fn zero_entry_cap_still_disables_the_cache() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::<u64, String>::new_with_byte_limit(0, None, usize::MAX);
+
+        assert_eq!(cache.insert_sized(1, "v1".to_string(), "cell", false, 60, &metrics), None);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
+        assert_eq!(metrics.snapshot().tenant_quota_rejections, 1);
+    }
+
+    /// A real byte budget behaves exactly as it did before the zero cap was
+    /// given its own meaning: it holds what fits and evicts the
+    /// least-recently-used unpinned entry to make room.
+    #[test]
+    fn non_zero_byte_cap_still_caches_and_evicts_by_lru() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::<u64, String>::new_with_byte_limit(4, None, 100);
+
+        assert_eq!(
+            cache.insert_sized(1, "a".to_string(), "cell", false, 60, &metrics),
+            Some("a".to_string()),
+            "an entry inside the budget is stored and handed back"
+        );
+        assert_eq!(
+            cache.insert_sized(2, "b".to_string(), "cell", false, 60, &metrics),
+            Some("b".to_string())
+        );
+
+        assert_eq!(cache.len(), 1, "60 + 60 does not fit in 100");
+        assert_eq!(cache.resident_bytes(), 60);
+        assert_eq!(cache.get(&1), None, "the older entry made room");
+        assert_eq!(cache.get(&2), Some("b".to_string()));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.insertions, 2);
+        assert_eq!(snapshot.evictions, 1);
+        assert_eq!(snapshot.tenant_quota_rejections, 0);
+    }
+
+    /// An entry larger than the whole budget is not cached even though it fits
+    /// `max_entries`, and making room for it empties the cache. That is what
+    /// the cache did before the zero cap was special-cased and is deliberately
+    /// unchanged here: only a budget of exactly zero is "off", not a budget
+    /// that some entry happens to exceed.
+    #[test]
+    fn an_entry_larger_than_the_whole_budget_is_not_cached() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::<u64, String>::new_with_byte_limit(4, None, 100);
+
+        assert_eq!(
+            cache.insert_sized(1, "a".to_string(), "cell", false, 60, &metrics),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            cache.insert_sized(2, "big".to_string(), "cell", true, 101, &metrics),
+            None,
+            "the oversized insert reports a miss, so the caller keeps its own copy"
+        );
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
     }
 }
