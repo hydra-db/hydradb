@@ -1,0 +1,15 @@
+[package]
+name = "hydradb-cypher-tck-harness"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+gherkin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -42,10 +42,7 @@ pub enum GraphIndexBuildPath {
 }
 
 impl GraphShard {
-    pub async fn dirty_graph_index_edge_types(
-        &self,
-        cell_id: &str,
-    ) -> Result<Vec<(String, StorageSequence)>> {
+    pub async fn dirty_graph_index_edge_types(&self, cell_id: &str) -> Result<Vec<(String, StorageSequence)>> {
         validate_component("cell_id", cell_id)?;
         let mut result = Vec::new();
         let prefix = crate::keys::matrix_dirty_prefix(cell_id);
@@ -67,15 +64,11 @@ impl GraphShard {
         Ok(result)
     }
 
-    pub async fn current_graph_index(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<Option<GraphIndexGeneration>> {
+    pub async fn current_graph_index(&self, cell_id: &str, edge_type: &str) -> Result<Option<GraphIndexGeneration>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let path = graph_index_manifest_path(self.db.store_path(), cell_id, edge_type);
-        let result = match self.db.object_store().get(&path).await {
+        let path = graph_index_manifest_path(self.storage.store_path(), cell_id, edge_type);
+        let result = match self.storage.object_store().get(&path).await {
             Ok(result) => result,
             Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -88,19 +81,12 @@ impl GraphShard {
         Ok(Some(manifest))
     }
 
-    pub async fn discover_graph_index(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<Option<GraphIndexGeneration>> {
+    pub async fn discover_graph_index(&self, cell_id: &str, edge_type: &str) -> Result<Option<GraphIndexGeneration>> {
         let Some(generation) = self.current_graph_index(cell_id, edge_type).await? else {
             return Ok(None);
         };
         let key = MatrixCacheKey::new(cell_id, edge_type, generation.base_sequence);
-        self.graph_index_generations
-            .lock()
-            .await
-            .insert(key, generation.clone());
+        self.graph_index_generations.lock().await.insert(key, generation.clone());
         let artifact = MatrixArtifact {
             cell_id: generation.cell_id.clone(),
             edge_type: generation.edge_type.clone(),
@@ -114,23 +100,17 @@ impl GraphShard {
             MatrixCacheKey::new(cell_id, edge_type, generation.base_sequence),
             artifact.clone(),
             cell_id.to_string(),
-            self.cache_policy.pin_matrix_artifact(&artifact),
+            artifact.edge_count >= self.cache_policy.pin_matrix_min_edges,
             &self.cache_metrics,
         );
         Ok(Some(generation))
     }
 
-    pub async fn build_graph_index(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<GraphIndexGeneration> {
+    pub async fn build_graph_index(&self, cell_id: &str, edge_type: &str) -> Result<GraphIndexGeneration> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let _permit = self
-            .acquire_artifact_build_permit("build_graph_index")
-            .await?;
-        self.db.refresh_durable_reader().await?;
+        let _permit = self.acquire_artifact_build_permit("build_graph_index").await?;
+        self.storage.refresh_durable_reader().await?;
         // A writer snapshot carries no WAL position (`state.rs`), and a
         // generation published with `last_wal_id = 0` forces every later tail
         // to walk the entire WAL history — which GC may have partially
@@ -140,22 +120,17 @@ impl GraphShard {
         // entry with seq > base_sequence in files <= last_wal_id) holds; at
         // worst the tail re-reads a few recent files whose entries the
         // sequence guard skips.
-        let durable_wal_id = self.db.last_durable_wal_id().await?;
-        let snapshot = self.db.snapshot().await?;
+        let durable_wal_id = self.storage.last_durable_wal_id().await?;
+        let snapshot = self.storage.snapshot().await?;
         let base_sequence = snapshot.seq();
         let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
-        let adjacency = GraphStore::scope_snapshot(snapshot, async {
-            self.canonical_adjacency_at(cell_id, edge_type, base_sequence)
-                .await
+        let adjacency = SlateGraphStore::scope_snapshot(snapshot, async {
+            self.canonical_adjacency_at(cell_id, edge_type, base_sequence).await
         })
         .await?;
         let csc = graphblas_csc_from_adjacency(&adjacency)?;
         let edge_count = csc.indices.len() as u64;
-        ensure_limit(
-            "build_graph_index_edges",
-            edge_count,
-            self.limits.max_artifact_build_edges,
-        )?;
+        ensure_limit("build_graph_index_edges", edge_count, self.limits.max_artifact_build_edges)?;
         let checksum = graphblas_csc_checksum(&csc);
         let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
         let generation = sha256_hex(&payload);
@@ -169,10 +144,10 @@ impl GraphShard {
             generation,
         };
         let published = self.publish_graph_index(&manifest, payload).await?;
-        self.graph_index_generations.lock().await.insert(
-            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
-            published.clone(),
-        );
+        self.graph_index_generations
+            .lock()
+            .await
+            .insert(MatrixCacheKey::new(cell_id, edge_type, published.base_sequence), published.clone());
         Ok(published)
     }
 
@@ -193,25 +168,25 @@ impl GraphShard {
     ) -> Result<GraphIndexGeneration> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let _permit = self
-            .acquire_artifact_build_permit("build_graph_index_from_edges")
-            .await?;
-        self.db.refresh_durable_reader().await?;
-        let durable_wal_id = self.db.last_durable_wal_id().await?;
-        let snapshot = self.db.snapshot().await?;
+        let _permit = self.acquire_artifact_build_permit("build_graph_index_from_edges").await?;
+        self.storage.refresh_durable_reader().await?;
+        let durable_wal_id = self.storage.last_durable_wal_id().await?;
+        let snapshot = self.storage.snapshot().await?;
         let base_sequence = snapshot.seq();
         let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
         let mut adjacency = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
+        let mut distinct_edges = 0_u64;
         for (source, destination) in edges {
-            adjacency.entry(source).or_default().insert(destination);
+            // Counted as the adjacency grows, so a stream above the cap is
+            // refused at the first edge past it rather than once it is held.
+            if adjacency.entry(source).or_default().insert(destination) {
+                distinct_edges += 1;
+                ensure_limit("build_graph_index_edges", distinct_edges, self.limits.max_artifact_build_edges)?;
+            }
         }
         let csc = graphblas_csc_from_adjacency(&adjacency)?;
         let edge_count = csc.indices.len() as u64;
-        ensure_limit(
-            "build_graph_index_edges",
-            edge_count,
-            self.limits.max_artifact_build_edges,
-        )?;
+        ensure_limit("build_graph_index_edges", edge_count, self.limits.max_artifact_build_edges)?;
         let checksum = graphblas_csc_checksum(&csc);
         let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
         let generation = sha256_hex(&payload);
@@ -225,10 +200,10 @@ impl GraphShard {
             generation,
         };
         let published = self.publish_graph_index(&manifest, payload).await?;
-        self.graph_index_generations.lock().await.insert(
-            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
-            published.clone(),
-        );
+        self.graph_index_generations
+            .lock()
+            .await
+            .insert(MatrixCacheKey::new(cell_id, edge_type, published.base_sequence), published.clone());
         Ok(published)
     }
 
@@ -267,14 +242,12 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
 
-        let _permit = self
-            .acquire_artifact_build_permit("build_graph_index_incremental")
-            .await?;
-        self.db.refresh_durable_reader().await?;
+        let _permit = self.acquire_artifact_build_permit("build_graph_index_incremental").await?;
+        self.storage.refresh_durable_reader().await?;
         // Same pre-pin capture as the full build above, and for the same
         // reason: a writer snapshot has no WAL position of its own.
-        let durable_wal_id = self.db.last_durable_wal_id().await?;
-        let snapshot = self.db.snapshot().await?;
+        let durable_wal_id = self.storage.last_durable_wal_id().await?;
+        let snapshot = self.storage.snapshot().await?;
         let base_sequence = snapshot.seq();
         let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
 
@@ -292,15 +265,9 @@ impl GraphShard {
         // reads, independent of WAL file count and write cadence, so there
         // is no cost gate and no cost-based decline: the two non-`Complete`
         // arms are one-time coverage bootstraps, not fallbacks
-        // (the incremental build-cost analysis §11).
+        // (the incremental build cost analysis §11).
         let overlay = match self
-            .xlog_delta_since(
-                snapshot.as_ref(),
-                &previous,
-                base_sequence,
-                cell_id,
-                edge_type,
-            )
+            .xlog_delta_since(snapshot.as_ref(), &previous, base_sequence, cell_id, edge_type)
             .await?
         {
             crate::shard::xlog::XlogDelta::Complete(overlay) => overlay,
@@ -332,23 +299,34 @@ impl GraphShard {
             }
         };
 
+        // The cap, before anything is decoded or allocated. Each removal can
+        // take at most one edge from the previous generation, so this many
+        // edges survive the overlay at least, and a build above the cap by
+        // that count alone is refused here rather than after rebuilding the
+        // whole adjacency. One that the additions push over is refused below.
+        let removals = overlay.entries().filter(|(_, _, exists)| !exists).count() as u64;
+        ensure_limit(
+            "build_graph_index_edges",
+            previous.edge_count.saturating_sub(removals),
+            self.limits.max_artifact_build_edges,
+        )?;
+
         // Reconstruct the adjacency the previous generation encodes. `None`
         // means the CSC payload behind the manifest was already collected by
         // GC — there is nothing to patch, so decline to the full rebuild.
-        let mut adjacency: crate::sparse_kernel::Adjacency =
-            match self.graph_index_csc(&previous).await? {
-                Some(csc) => csc.to_adjacency()?,
-                None => {
-                    tracing::info!(
-                        cell_id,
-                        edge_type,
-                        generation = %previous.generation,
-                        reason = "previous_payload_missing",
-                        "incremental index build declined; falling back to full rebuild"
-                    );
-                    return Ok(None);
-                }
-            };
+        let mut adjacency: crate::sparse_kernel::Adjacency = match self.graph_index_csc(&previous).await? {
+            Some(csc) => csc.to_adjacency()?,
+            None => {
+                tracing::info!(
+                    cell_id,
+                    edge_type,
+                    generation = %previous.generation,
+                    reason = "previous_payload_missing",
+                    "incremental index build declined; falling back to full rebuild"
+                );
+                return Ok(None);
+            }
+        };
         // Apply the overlay. Entries are resolved final states, not
         // operations, so order does not matter and re-application is
         // idempotent. A removal that empties a source must drop the source
@@ -379,11 +357,7 @@ impl GraphShard {
         // therefore an identical content-addressed generation id.
         let csc = graphblas_csc_from_adjacency(&adjacency)?;
         let edge_count = csc.indices.len() as u64;
-        ensure_limit(
-            "build_graph_index_edges",
-            edge_count,
-            self.limits.max_artifact_build_edges,
-        )?;
+        ensure_limit("build_graph_index_edges", edge_count, self.limits.max_artifact_build_edges)?;
         let checksum = graphblas_csc_checksum(&csc);
         let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
         let generation = sha256_hex(&payload);
@@ -399,29 +373,19 @@ impl GraphShard {
 
         let delta_edges = overlay.entries().count() as u64;
         let published = self.publish_graph_index(&manifest, payload).await?;
-        self.graph_index_generations.lock().await.insert(
-            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
-            published.clone(),
-        );
-        Ok(Some((
-            published,
-            GraphIndexBuildPath::Incremental { delta_edges },
-        )))
+        self.graph_index_generations
+            .lock()
+            .await
+            .insert(MatrixCacheKey::new(cell_id, edge_type, published.base_sequence), published.clone());
+        Ok(Some((published, GraphIndexBuildPath::Incremental { delta_edges })))
     }
 
     /// Incremental-first entry point for the indexer loop
     /// (`src/bin/graph-indexer.rs:904` calls `build_graph_index` today):
     /// try the delta path, fall back to the full rebuild whenever it
     /// declines.
-    pub async fn build_graph_index_auto(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<(GraphIndexGeneration, GraphIndexBuildPath)> {
-        if let Some(result) = self
-            .build_graph_index_incremental(cell_id, edge_type)
-            .await?
-        {
+    pub async fn build_graph_index_auto(&self, cell_id: &str, edge_type: &str) -> Result<(GraphIndexGeneration, GraphIndexBuildPath)> {
+        if let Some(result) = self.build_graph_index_incremental(cell_id, edge_type).await? {
             return Ok(result);
         }
         let generation = self.build_graph_index(cell_id, edge_type).await?;
@@ -429,18 +393,15 @@ impl GraphShard {
         Ok((generation, GraphIndexBuildPath::Full { edges }))
     }
 
-    pub(crate) async fn graph_index_csc(
-        &self,
-        generation: &GraphIndexGeneration,
-    ) -> Result<Option<GraphBlasCsc>> {
+    pub(crate) async fn graph_index_csc(&self, generation: &GraphIndexGeneration) -> Result<Option<GraphBlasCsc>> {
         let path = graph_index_generation_path(
-            self.db.store_path(),
+            self.storage.store_path(),
             &generation.cell_id,
             &generation.edge_type,
             generation.base_sequence,
             &generation.generation,
         );
-        let result = match self.db.object_store().get(&path).await {
+        let result = match self.storage.object_store().get(&path).await {
             Ok(result) => result,
             Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -464,11 +425,7 @@ impl GraphShard {
     }
 
     pub(crate) async fn forget_graph_index_generation(&self, generation: &GraphIndexGeneration) {
-        let key = MatrixCacheKey::new(
-            &generation.cell_id,
-            &generation.edge_type,
-            generation.base_sequence,
-        );
+        let key = MatrixCacheKey::new(&generation.cell_id, &generation.edge_type, generation.base_sequence);
         self.graph_index_generations.lock().await.remove(&key);
         self.graphblas_cache.lock().await.remove(&key);
     }
@@ -489,19 +446,14 @@ impl GraphShard {
             .filter(|generation| generation.base_sequence == base_sequence))
     }
 
-    pub async fn gc_graph_index_generations(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        retain_previous: usize,
-    ) -> Result<u64> {
+    pub async fn gc_graph_index_generations(&self, cell_id: &str, edge_type: &str, retain_previous: usize) -> Result<u64> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let Some(current) = self.current_graph_index(cell_id, edge_type).await? else {
             return Ok(0);
         };
-        let prefix = graph_index_generations_prefix(self.db.store_path(), cell_id, edge_type);
-        let mut stream = self.db.object_store().list(Some(&prefix));
+        let prefix = graph_index_generations_prefix(self.storage.store_path(), cell_id, edge_type);
+        let mut stream = self.storage.object_store().list(Some(&prefix));
         let mut older = Vec::new();
         while let Some(meta) = stream.next().await.transpose()? {
             let base_sequence = graph_index_sequence_from_path(meta.location.as_ref())?;
@@ -512,43 +464,34 @@ impl GraphShard {
         older.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
         let mut deleted = 0_u64;
         for (_, location) in older.into_iter().skip(retain_previous) {
-            self.db.object_store().delete(&location).await?;
+            self.storage.object_store().delete(&location).await?;
             deleted = deleted.saturating_add(1);
         }
         Ok(deleted)
     }
 
-    async fn publish_graph_index(
-        &self,
-        proposed: &GraphIndexGeneration,
-        payload: Vec<u8>,
-    ) -> Result<GraphIndexGeneration> {
+    async fn publish_graph_index(&self, proposed: &GraphIndexGeneration, payload: Vec<u8>) -> Result<GraphIndexGeneration> {
         let generation_path = graph_index_generation_path(
-            self.db.store_path(),
+            self.storage.store_path(),
             &proposed.cell_id,
             &proposed.edge_type,
             proposed.base_sequence,
             &proposed.generation,
         );
         match self
-            .db
+            .storage
             .object_store()
-            .put_opts(
-                &generation_path,
-                Bytes::from(payload).into(),
-                PutMode::Create.into(),
-            )
+            .put_opts(&generation_path, Bytes::from(payload).into(), PutMode::Create.into())
             .await
         {
             Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => {}
             Err(err) => return Err(err.into()),
         }
 
-        let manifest_path =
-            graph_index_manifest_path(self.db.store_path(), &proposed.cell_id, &proposed.edge_type);
+        let manifest_path = graph_index_manifest_path(self.storage.store_path(), &proposed.cell_id, &proposed.edge_type);
         let manifest_payload = Bytes::from(encode_graph_index_manifest(proposed));
         for _ in 0..INDEX_PUBLISH_ATTEMPTS {
-            let current = match self.db.object_store().get(&manifest_path).await {
+            let current = match self.storage.object_store().get(&manifest_path).await {
                 Ok(result) => Some(result),
                 Err(slatedb::object_store::Error::NotFound { .. }) => None,
                 Err(err) => return Err(err.into()),
@@ -561,8 +504,7 @@ impl GraphShard {
                 let value = current.bytes().await?;
                 let published = decode_graph_index_manifest(manifest_path.as_ref(), &value)?;
                 if published.base_sequence > proposed.base_sequence
-                    || (published.base_sequence == proposed.base_sequence
-                        && published.last_wal_id >= proposed.last_wal_id)
+                    || (published.base_sequence == proposed.base_sequence && published.last_wal_id >= proposed.last_wal_id)
                 {
                     return Ok(published);
                 }
@@ -571,7 +513,7 @@ impl GraphShard {
                 PutMode::Create
             };
             match self
-                .db
+                .storage
                 .object_store()
                 .put_opts(&manifest_path, manifest_payload.clone().into(), mode.into())
                 .await
@@ -599,11 +541,7 @@ fn graph_index_manifest_path(
     cell_id: &str,
     edge_type: &str,
 ) -> slatedb::object_store::path::Path {
-    format!(
-        "{}/{cell_id}/{edge_type}/current",
-        graph_index_root(store_path)
-    )
-    .into()
+    format!("{}/{cell_id}/{edge_type}/current", graph_index_root(store_path)).into()
 }
 
 fn graph_index_generation_path(
@@ -625,11 +563,7 @@ fn graph_index_generations_prefix(
     cell_id: &str,
     edge_type: &str,
 ) -> slatedb::object_store::path::Path {
-    format!(
-        "{}/{cell_id}/{edge_type}/generations",
-        graph_index_root(store_path)
-    )
-    .into()
+    format!("{}/{cell_id}/{edge_type}/generations", graph_index_root(store_path)).into()
 }
 
 fn encode_graph_index_manifest(manifest: &GraphIndexGeneration) -> Vec<u8> {
@@ -668,17 +602,11 @@ fn decode_graph_index_manifest(key: &str, value: &[u8]) -> Result<GraphIndexGene
     })
 }
 
-fn encode_graph_index_csc(
-    base_sequence: u64,
-    last_wal_id: u64,
-    checksum: u64,
-    csc: &GraphBlasCsc,
-) -> Vec<u8> {
+fn encode_graph_index_csc(base_sequence: u64, last_wal_id: u64, checksum: u64, csc: &GraphBlasCsc) -> Vec<u8> {
     let mut value = Vec::with_capacity(
         INDEX_CSC_MAGIC.len()
             + 6 * std::mem::size_of::<u64>()
-            + (csc.vertices.len() + csc.pointers.len() + csc.indices.len())
-                * std::mem::size_of::<u64>(),
+            + (csc.vertices.len() + csc.pointers.len() + csc.indices.len()) * std::mem::size_of::<u64>(),
     );
     value.extend_from_slice(INDEX_CSC_MAGIC);
     value.extend_from_slice(&base_sequence.to_le_bytes());
@@ -704,9 +632,7 @@ fn decode_graph_index_csc(
     let base_sequence = decode_index_u64(key, value, &mut cursor, "base_sequence")?;
     let last_wal_id = decode_index_u64(key, value, &mut cursor, "last_wal_id")?;
     let checksum = decode_index_u64(key, value, &mut cursor, "checksum")?;
-    if (base_sequence, last_wal_id, checksum)
-        != (expected_sequence, expected_wal_id, expected_checksum)
-    {
+    if (base_sequence, last_wal_id, checksum) != (expected_sequence, expected_wal_id, expected_checksum) {
         return corrupt(key, "index CSC identity does not match manifest");
     }
     let csc = GraphBlasCsc {
@@ -734,10 +660,7 @@ fn graph_index_sequence_from_path(key: &str) -> Result<StorageSequence> {
             reason: "index generation key is missing its sequence prefix".to_string(),
         })?;
     if sequence.len() != 20 || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
-        return corrupt(
-            key,
-            "index generation sequence must be a 20-digit decimal prefix",
-        );
+        return corrupt(key, "index generation sequence must be a 20-digit decimal prefix");
     }
     parse_u64(key, sequence, "base_sequence")
 }
@@ -751,43 +674,33 @@ fn encode_index_u64s(out: &mut Vec<u8>, values: &[u64]) {
 
 fn decode_index_u64(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
     let end = cursor.saturating_add(std::mem::size_of::<u64>());
-    let bytes = value
-        .get(*cursor..end)
-        .ok_or_else(|| GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("truncated {field}"),
-        })?;
+    let bytes = value.get(*cursor..end).ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("truncated {field}"),
+    })?;
     *cursor = end;
-    Ok(u64::from_le_bytes(
-        bytes.try_into().expect("u64 byte width"),
-    ))
+    Ok(u64::from_le_bytes(bytes.try_into().expect("u64 byte width")))
 }
 
 fn decode_index_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<Vec<u64>> {
-    let len = usize::try_from(decode_index_u64(key, value, cursor, field)?).map_err(|err| {
-        GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("{field} length does not fit memory: {err}"),
-        }
+    let len = usize::try_from(decode_index_u64(key, value, cursor, field)?).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("{field} length does not fit memory: {err}"),
     })?;
-    let byte_len =
-        len.checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: format!("{field} byte length overflow"),
-            })?;
-    let end = cursor
-        .checked_add(byte_len)
+    let byte_len = len
+        .checked_mul(std::mem::size_of::<u64>())
         .ok_or_else(|| GraphError::CorruptValue {
             key: key.to_string(),
-            reason: format!("{field} cursor overflow"),
+            reason: format!("{field} byte length overflow"),
         })?;
-    let bytes = value
-        .get(*cursor..end)
-        .ok_or_else(|| GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("truncated {field}"),
-        })?;
+    let end = cursor.checked_add(byte_len).ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("{field} cursor overflow"),
+    })?;
+    let bytes = value.get(*cursor..end).ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("truncated {field}"),
+    })?;
     *cursor = end;
     Ok(bytes
         .as_chunks::<{ std::mem::size_of::<u64>() }>()
@@ -798,8 +711,5 @@ fn decode_index_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -
 }
 
 fn sha256_hex(value: &[u8]) -> String {
-    Sha256::digest(value)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    Sha256::digest(value).iter().map(|byte| format!("{byte:02x}")).collect()
 }

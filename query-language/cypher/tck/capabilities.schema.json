@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hydra-db.github.io/hydradb/tck/capabilities-v1.schema.json",
+  "title": "openCypher TCK unsupported capability policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unsupported"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "unsupported": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["corpus_revision", "case_id", "engines", "capability", "observed_reason", "reason", "owner", "reference", "review_by"],
+        "properties": {
+          "corpus_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "case_id": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$"},
+          "engines": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"enum": ["legacy", "experimental"]}
+          },
+          "capability": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]+$"},
+          "observed_reason": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$"},
+          "reason": {"type": "string", "minLength": 1},
+          "owner": {"type": "string", "minLength": 1},
+          "reference": {"type": "string", "minLength": 1},
+          "review_by": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}

@@ -2,28 +2,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hydradb::{
-    BoltRoutingServer, BoltServerConfig, ClientBoltServer, ClientQueryService,
-    ClientQueryServiceConfig, ClientQueryTarget, GraphScope, QueryCellClient, QueryColumn,
-    QueryContext, QueryCursorToken, QueryResultPage, QueryResultSet, QueryRow,
-    QueryTransportScopeGrant, QueryValue, Result, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer,
+    BoltRoutingServer, BoltServerConfig, ClientBoltServer, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget, GraphScope,
+    QueryCellClient, QueryColumn, QueryContext, QueryCursorToken, QueryResultPage, QueryResultSet, QueryRow, QueryTransportScopeGrant,
+    QueryValue, Result, StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
 };
 
 struct CompatibilityQueryClient;
 
 #[async_trait]
 impl QueryCellClient for CompatibilityQueryClient {
-    async fn execute_cypher_rows(
-        &self,
-        _context: QueryContext,
-        _query: &str,
-    ) -> Result<QueryResultSet> {
-        Ok(QueryResultSet::new(
-            vec![QueryColumn::new("answer")],
-            vec![QueryRow::new(vec![QueryValue::Count(42)])],
+    async fn execute_cypher_rows(&self, _context: QueryContext, _query: &str) -> Result<QueryResultSet> {
+        Ok(
+            QueryResultSet::new(vec![QueryColumn::new("answer")], vec![QueryRow::new(vec![QueryValue::Count(42)])])
+                .with_read_epoch(42)
+                .with_storage_sequence(42),
         )
-        .with_read_epoch(42)
-        .with_storage_sequence(42))
     }
 
     async fn execute_cypher_rows_page(
@@ -37,11 +30,7 @@ impl QueryCellClient for CompatibilityQueryClient {
         Ok(QueryResultPage::new(rows.columns, rows.rows, None))
     }
 
-    async fn current_storage_sequence(
-        &self,
-        _scope: &GraphScope,
-        _cell_id: &str,
-    ) -> Result<Option<u64>> {
+    async fn current_storage_sequence(&self, _scope: &GraphScope, _cell_id: &str) -> Result<Option<u64>> {
         Ok(Some(42))
     }
 }
@@ -56,20 +45,15 @@ async fn main() -> Result<()> {
             reason: err.to_string(),
         })?;
     let scope = GraphScope::default();
-    let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
-        "bolt-secret",
-        QueryTransportScopeGrant::read_graph(scope.clone()),
-    )?;
+    let authorizer =
+        StaticQueryTransportScopeAuthorizer::new().with_bearer_grant("bolt-secret", QueryTransportScopeGrant::read_graph(scope.clone()))?;
     let service = ClientQueryService::new(
         Arc::new(CompatibilityQueryClient),
         ClientQueryServiceConfig::default()
             .with_required_bearer_token("bolt-secret")
             .with_scope_authorizer(Arc::new(authorizer)),
     )?;
-    let resolver = StaticClientDatabaseResolver::single(
-        "default",
-        ClientQueryTarget::new(scope, "compat-cell")?,
-    )?;
+    let resolver = StaticClientDatabaseResolver::single("default", ClientQueryTarget::new(scope, "compat-cell")?)?;
     let advertised = addr.to_string();
     let mut config = BoltServerConfig::new(Arc::new(resolver)).insecure_allow_plaintext();
     for role in ["ROUTE", "READ", "WRITE"] {

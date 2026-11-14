@@ -129,10 +129,7 @@ pub fn prometheus_gauge() -> String {
 /// nothing validates, and an unescaped quote there would not corrupt one label
 /// but break the parse of the whole scrape.
 fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// Whether the process was invoked to report its build rather than to run.
@@ -147,9 +144,7 @@ fn escape_label(value: &str) -> String {
 /// identify, and the answer has to be one plain block on stdout rather than a
 /// JSON log line wrapped around it.
 pub fn version_flag_requested() -> bool {
-    std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--version" || arg == "-V")
+    std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V")
 }
 
 /// Log the provenance of the running binary. The first line a process emits.

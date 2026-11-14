@@ -1,13 +1,7 @@
 use super::*;
 
 #[cfg(feature = "opencypher")]
-use futures::{stream, StreamExt as _, TryStreamExt as _};
-
-#[cfg(feature = "opencypher")]
-use super::query::{
-    ordered_string_vertex_index_spec, row_predicate_property_equality_constraints,
-    RowPredicatePropertyEqualityConstraint,
-};
+use super::query::{ordered_string_vertex_index_spec, row_predicate_property_equality_constraints, RowPredicatePropertyEqualityConstraint};
 
 #[cfg(feature = "opencypher")]
 use crate::core::metrics::QueryPlanShapes;
@@ -41,12 +35,7 @@ impl GraphShard {
         let started = std::time::Instant::now();
         let plan = async {
             let mut groups = self
-                .optimized_row_query_groups(
-                    cell_id,
-                    &query.patterns,
-                    &query.pattern_groups,
-                    read_epoch,
-                )
+                .optimized_row_query_groups(cell_id, &query.patterns, &query.pattern_groups, read_epoch)
                 .await?;
             if let Some(spec) = ordered_string_vertex_index_spec(query, query.window) {
                 let estimated = query
@@ -60,30 +49,20 @@ impl GraphShard {
                             property: spec.property.to_string(),
                         };
                         pattern.estimated_cardinality = estimated;
-                        pattern.optimizer_passes.retain(|pass| {
-                            !matches!(pass, RowQueryOptimizerPass::FullScanFallback)
-                        });
-                        if !pattern
-                            .optimizer_passes
-                            .contains(&RowQueryOptimizerPass::UtilizeVertexIndex)
-                        {
-                            pattern
-                                .optimizer_passes
-                                .push(RowQueryOptimizerPass::UtilizeVertexIndex);
-                        }
                         pattern
                             .optimizer_passes
-                            .push(RowQueryOptimizerPass::OrderedLimitPushdown);
+                            .retain(|pass| !matches!(pass, RowQueryOptimizerPass::FullScanFallback));
+                        if !pattern.optimizer_passes.contains(&RowQueryOptimizerPass::UtilizeVertexIndex) {
+                            pattern.optimizer_passes.push(RowQueryOptimizerPass::UtilizeVertexIndex);
+                        }
+                        pattern.optimizer_passes.push(RowQueryOptimizerPass::OrderedLimitPushdown);
                         group.plan.estimated_cardinality = estimated;
                     }
                 }
             }
             let mut union_arms = Vec::with_capacity(query.union_arms.len());
             for arm in &query.union_arms {
-                union_arms.push(
-                    Box::pin(self.explain_row_query_plan_with_stats(cell_id, read_epoch, arm))
-                        .await?,
-                );
+                union_arms.push(Box::pin(self.explain_row_query_plan_with_stats(cell_id, read_epoch, arm)).await?);
             }
             Ok(RowQueryPlan {
                 cell_id: cell_id.to_string(),
@@ -97,9 +76,7 @@ impl GraphShard {
         .instrument(span.clone())
         .await;
         match &plan {
-            Ok(plan) => {
-                RowQueryPlanSummary::from_plan(plan).record(&span, cell_id, started.elapsed())
-            }
+            Ok(plan) => RowQueryPlanSummary::from_plan(plan).record(&span, cell_id, started.elapsed()),
             Err(err) => record_plan_error(&span, err),
         }
         plan
@@ -131,8 +108,7 @@ impl GraphShard {
         // `explain_row_query_plan_with_stats` plans without executing; counting
         // either would make the denominator scale with result size or with
         // EXPLAIN traffic instead of with queries.
-        self.operation_metrics
-            .record_query_plan(summary.plan_shapes());
+        self.operation_metrics.record_query_plan(summary.plan_shapes());
         Ok(planned.into_iter().map(|group| group.group).collect())
     }
 
@@ -156,11 +132,7 @@ impl GraphShard {
                 return Err(err);
             }
         };
-        RowQueryPlanSummary::from_patterns(planned.iter().map(|pattern| &pattern.plan)).record(
-            &span,
-            cell_id,
-            started.elapsed(),
-        );
+        RowQueryPlanSummary::from_patterns(planned.iter().map(|pattern| &pattern.plan)).record(&span, cell_id, started.elapsed());
         Ok(planned.into_iter().map(|pattern| pattern.pattern).collect())
     }
 
@@ -177,12 +149,9 @@ impl GraphShard {
                 predicate: None,
                 optional: false,
             };
-            return self
-                .optimize_row_match_group_plans_with_stats(cell_id, &[group], read_epoch)
-                .await;
+            return self.optimize_row_match_group_plans_with_stats(cell_id, &[group], read_epoch).await;
         }
-        self.optimize_row_match_group_plans_with_stats(cell_id, groups, read_epoch)
-            .await
+        self.optimize_row_match_group_plans_with_stats(cell_id, groups, read_epoch).await
     }
 
     async fn optimize_row_match_group_plans_with_stats(
@@ -200,14 +169,8 @@ impl GraphShard {
                 required_segment.push((idx, group));
                 continue;
             }
-            self.flush_required_row_groups(
-                cell_id,
-                read_epoch,
-                &mut required_segment,
-                &mut available_bindings,
-                &mut output,
-            )
-            .await?;
+            self.flush_required_row_groups(cell_id, read_epoch, &mut required_segment, &mut available_bindings, &mut output)
+                .await?;
 
             // Fold the WHERE equality into the node pattern *before* planning
             // it. `best_row_node_access` reads only labels and properties, and
@@ -215,38 +178,22 @@ impl GraphShard {
             // pattern again at execution time, so rewriting the plan alone
             // would change EXPLAIN and nothing else. Doing it first also means
             // the cardinality estimate below is the index's, not the scan's.
-            let pushed_equality =
-                push_down_vertex_equality_predicate(&mut group, &available_bindings);
+            let pushed_equality = push_down_vertex_equality_predicate(&mut group, &available_bindings);
 
             let mut optimized_patterns = self
-                .optimize_row_pattern_plans_with_stats(
-                    cell_id,
-                    &group.patterns,
-                    read_epoch,
-                    &available_bindings,
-                )
+                .optimize_row_pattern_plans_with_stats(cell_id, &group.patterns, read_epoch, &available_bindings)
                 .await?;
-            self.apply_relationship_predicate_index_plan(
-                cell_id,
-                read_epoch,
-                group.predicate.as_ref(),
-                &mut optimized_patterns,
-            )
-            .await?;
+            self.apply_relationship_predicate_index_plan(cell_id, read_epoch, group.predicate.as_ref(), &mut optimized_patterns)
+                .await?;
             let mut plan = row_query_plan_group(&group, &optimized_patterns);
-            plan.optimizer_passes
-                .push(RowQueryOptimizerPass::PreserveOptionalBoundary);
+            plan.optimizer_passes.push(RowQueryOptimizerPass::PreserveOptionalBoundary);
             if pushed_equality {
-                plan.optimizer_passes
-                    .push(RowQueryOptimizerPass::EqualityPredicatePushdown);
+                plan.optimizer_passes.push(RowQueryOptimizerPass::EqualityPredicatePushdown);
             }
             available_bindings.extend(row_match_group_bindings(&group));
             output.push(OptimizedRowMatchGroup {
                 group: RowMatchGroup {
-                    patterns: optimized_patterns
-                        .into_iter()
-                        .map(|pattern| pattern.pattern)
-                        .collect(),
+                    patterns: optimized_patterns.into_iter().map(|pattern| pattern.pattern).collect(),
                     predicate: group.predicate,
                     optional: group.optional,
                 },
@@ -254,14 +201,8 @@ impl GraphShard {
             });
         }
 
-        self.flush_required_row_groups(
-            cell_id,
-            read_epoch,
-            &mut required_segment,
-            &mut available_bindings,
-            &mut output,
-        )
-        .await?;
+        self.flush_required_row_groups(cell_id, read_epoch, &mut required_segment, &mut available_bindings, &mut output)
+            .await?;
         Ok(output)
     }
 
@@ -277,18 +218,12 @@ impl GraphShard {
             let mut best = None::<(RowGroupChoice, OptimizedRowMatchGroup)>;
             for (position, (original_idx, group)) in required_segment.iter().enumerate() {
                 let optimized_patterns = self
-                    .optimize_row_pattern_plans_with_stats(
-                        cell_id,
-                        &group.patterns,
-                        read_epoch,
-                        available_bindings,
-                    )
+                    .optimize_row_pattern_plans_with_stats(cell_id, &group.patterns, read_epoch, available_bindings)
                     .await?;
                 let mut plan = row_query_plan_group(group, &optimized_patterns);
                 plan.optimizer_passes.push(RowQueryOptimizerPass::JoinOrder);
                 let group_bindings = row_match_group_bindings(group);
-                let disconnected = !available_bindings.is_empty()
-                    && group_bindings.is_disjoint(available_bindings);
+                let disconnected = !available_bindings.is_empty() && group_bindings.is_disjoint(available_bindings);
                 let choice = RowGroupChoice {
                     disconnected,
                     estimated_cardinality: plan.estimated_cardinality,
@@ -297,10 +232,7 @@ impl GraphShard {
                 };
                 let candidate = OptimizedRowMatchGroup {
                     group: RowMatchGroup {
-                        patterns: optimized_patterns
-                            .into_iter()
-                            .map(|pattern| pattern.pattern)
-                            .collect(),
+                        patterns: optimized_patterns.into_iter().map(|pattern| pattern.pattern).collect(),
                         predicate: group.predicate.clone(),
                         optional: group.optional,
                     },
@@ -355,21 +287,11 @@ impl GraphShard {
             }) else {
                 continue;
             };
-            let RowPattern::Edge(edge) = &patterns[index].pattern else {
+            if !matches!(&patterns[index].pattern, RowPattern::Edge(_)) {
                 continue;
-            };
-            let estimate = self
-                .edge_property_equality_estimate(
-                    cell_id,
-                    &edge.edge_type,
-                    &constraint.property,
-                    &constraint.values,
-                    16,
-                )
-                .await?;
-            let replace = best
-                .as_ref()
-                .is_none_or(|(_, _, current_estimate)| estimate < *current_estimate);
+            }
+            let estimate = edge_property_equality_estimate(&constraint.values);
+            let replace = best.as_ref().is_none_or(|(_, _, current_estimate)| estimate < *current_estimate);
             if replace {
                 best = Some((constraint, index, estimate));
             }
@@ -391,10 +313,7 @@ impl GraphShard {
             .plan
             .optimizer_passes
             .retain(|pass| !matches!(pass, RowQueryOptimizerPass::FullScanFallback));
-        pattern
-            .plan
-            .optimizer_passes
-            .push(RowQueryOptimizerPass::UtilizeEdgeIndex);
+        pattern.plan.optimizer_passes.push(RowQueryOptimizerPass::UtilizeEdgeIndex);
         Ok(())
     }
 
@@ -415,10 +334,7 @@ impl GraphShard {
             .iter()
             .cloned()
             .enumerate()
-            .map(|(original_index, pattern)| RemainingRowPattern {
-                original_index,
-                pattern,
-            })
+            .map(|(original_index, pattern)| RemainingRowPattern { original_index, pattern })
             .collect();
         let mut bound = initial_bindings.clone();
         let mut output = Vec::with_capacity(patterns.len());
@@ -428,7 +344,6 @@ impl GraphShard {
             for (position, remaining_pattern) in remaining.iter().enumerate() {
                 let mut optimized = self
                     .plan_row_pattern_with_stats(
-                        cell_id,
                         reverse_index_available,
                         latest_snapshot,
                         &remaining_pattern.pattern,
@@ -439,10 +354,7 @@ impl GraphShard {
                 let pattern_bindings = row_pattern_bindings(&remaining_pattern.pattern);
                 let connected = !bound.is_empty() && !pattern_bindings.is_disjoint(&bound);
                 if connected || !output.is_empty() {
-                    optimized
-                        .plan
-                        .optimizer_passes
-                        .push(RowQueryOptimizerPass::ConnectivityOrder);
+                    optimized.plan.optimizer_passes.push(RowQueryOptimizerPass::ConnectivityOrder);
                 }
                 let choice = RowPatternChoice {
                     disconnected: !output.is_empty() && !connected,
@@ -471,7 +383,6 @@ impl GraphShard {
 
     async fn plan_row_pattern_with_stats(
         &self,
-        cell_id: &str,
         reverse_index_available: bool,
         latest_snapshot: bool,
         pattern: &RowPattern,
@@ -479,20 +390,10 @@ impl GraphShard {
         bound: &BTreeSet<String>,
     ) -> Result<OptimizedRowPattern> {
         let node_or_edge = match pattern {
-            RowPattern::Node(node) => {
-                self.plan_row_node_with_stats(cell_id, node, original_index, bound)
-                    .await?
-            }
+            RowPattern::Node(node) => self.plan_row_node_with_stats(node, original_index, bound).await?,
             RowPattern::Edge(edge) => {
-                self.plan_row_edge_with_stats(
-                    cell_id,
-                    reverse_index_available,
-                    latest_snapshot,
-                    edge,
-                    original_index,
-                    bound,
-                )
-                .await?
+                self.plan_row_edge_with_stats(reverse_index_available, latest_snapshot, edge, original_index, bound)
+                    .await?
             }
         };
         Ok(OptimizedRowPattern {
@@ -503,12 +404,11 @@ impl GraphShard {
 
     async fn plan_row_node_with_stats(
         &self,
-        cell_id: &str,
         node: &RowNodePattern,
         original_index: usize,
         bound: &BTreeSet<String>,
     ) -> Result<RowQueryPlanPattern> {
-        let access = self.best_row_node_access(cell_id, node, bound).await?;
+        let access = self.best_row_node_access(node, bound).await?;
         Ok(RowQueryPlanPattern {
             original_index,
             estimated_cardinality: access.estimated_cardinality,
@@ -520,7 +420,6 @@ impl GraphShard {
 
     async fn plan_row_edge_with_stats(
         &self,
-        cell_id: &str,
         reverse_index_available: bool,
         latest_snapshot: bool,
         edge: &RowEdgePattern,
@@ -528,13 +427,7 @@ impl GraphShard {
         bound: &BTreeSet<String>,
     ) -> Result<RowQueryPlanPattern> {
         let access = self
-            .best_row_edge_access(
-                cell_id,
-                edge,
-                reverse_index_available,
-                latest_snapshot,
-                bound,
-            )
+            .best_row_edge_access(edge, reverse_index_available, latest_snapshot, bound)
             .await?;
         Ok(RowQueryPlanPattern {
             original_index,
@@ -545,16 +438,8 @@ impl GraphShard {
         })
     }
 
-    pub(crate) async fn best_row_node_access_with_stats(
-        &self,
-        cell_id: &str,
-        node: &RowNodePattern,
-        bound: &BTreeSet<String>,
-    ) -> Result<RowQueryAccess> {
-        Ok(self
-            .best_row_node_access(cell_id, node, bound)
-            .await?
-            .access)
+    pub(crate) async fn best_row_node_access_with_stats(&self, node: &RowNodePattern, bound: &BTreeSet<String>) -> Result<RowQueryAccess> {
+        Ok(self.best_row_node_access(node, bound).await?.access)
     }
 
     pub(crate) async fn best_row_edge_access_with_stats(
@@ -568,96 +453,46 @@ impl GraphShard {
         let latest_snapshot = read_epoch == current_epoch;
         let reverse_index_available = self.writes_reverse_index();
         Ok(self
-            .best_row_edge_access(
-                cell_id,
-                edge,
-                reverse_index_available,
-                latest_snapshot,
-                bound,
-            )
+            .best_row_edge_access(edge, reverse_index_available, latest_snapshot, bound)
             .await?
             .access)
     }
 
-    async fn best_row_node_access(
-        &self,
-        cell_id: &str,
-        node: &RowNodePattern,
-        bound: &BTreeSet<String>,
-    ) -> Result<AccessEstimate> {
-        if matches!(node.binding.as_ref(), Some(binding) if bound.contains(binding))
-            || node.id.is_some()
-        {
+    async fn best_row_node_access(&self, node: &RowNodePattern, bound: &BTreeSet<String>) -> Result<AccessEstimate> {
+        if matches!(node.binding.as_ref(), Some(binding) if bound.contains(binding)) || node.id.is_some() {
             return Ok(AccessEstimate::new(RowQueryAccess::VertexIdSeek, 1));
         }
 
+        // Fixed estimates: an indexed equality beats a label scan, and the
+        // first candidate wins a tie.
         let properties = node
             .properties
             .iter()
-            .filter(|(property, _)| property.as_str() != "id")
-            .map(|(property, value)| {
-                (
-                    keys::query_stats_vertex_property(
-                        cell_id,
-                        property,
-                        &encode_vertex_property_value_key(value),
-                    ),
-                    Some(keys::query_stats_vertex_property_histogram(
-                        cell_id, property,
-                    )),
-                    AccessEstimate::new(
-                        RowQueryAccess::VertexPropertyIndex {
-                            property: property.clone(),
-                        },
-                        8,
-                    )
-                    .with_pass(RowQueryOptimizerPass::UtilizeVertexIndex),
+            .filter(|(property, value)| property.as_str() != "id" && value.is_scalar_indexable())
+            .map(|(property, _)| {
+                AccessEstimate::new(
+                    RowQueryAccess::VertexPropertyIndex {
+                        property: property.clone(),
+                    },
+                    8,
                 )
+                .with_pass(RowQueryOptimizerPass::UtilizeVertexIndex)
             });
         let labels = node.labels.iter().map(|label| {
-            (
-                keys::query_stats_vertex_label(cell_id, label),
-                None,
-                AccessEstimate::new(
-                    RowQueryAccess::VertexLabelScan {
-                        label: label.clone(),
-                    },
-                    64,
-                )
-                .with_pass(RowQueryOptimizerPass::CostBasedLabelScan),
-            )
+            AccessEstimate::new(RowQueryAccess::VertexLabelScan { label: label.clone() }, 64)
+                .with_pass(RowQueryOptimizerPass::CostBasedLabelScan)
         });
-        // Preserve candidate/tie order while overlapping only bounded, read-only
-        // statistics I/O. No task is spawned and no extra candidates are fetched.
-        let candidates = properties.chain(labels).collect::<Vec<_>>();
-        let mut estimates = stream::iter(candidates)
-            .map(|(key, histogram, mut access)| async move {
-                access.estimated_cardinality = self
-                    .query_stats_estimate(
-                        cell_id,
-                        &key,
-                        histogram.as_deref(),
-                        access.estimated_cardinality,
-                    )
-                    .await?
-                    .unwrap_or(access.estimated_cardinality);
-                Ok::<_, GraphError>(access)
-            })
-            .buffered(8)
-            .boxed();
         let mut best = None::<AccessEstimate>;
-        while let Some(access) = estimates.try_next().await? {
+        for access in properties.chain(labels) {
             choose_best_access(&mut best, access);
         }
         Ok(best.unwrap_or_else(|| {
-            AccessEstimate::new(RowQueryAccess::AllVertexScan, 1_000_000)
-                .with_pass(RowQueryOptimizerPass::FullScanFallback)
+            AccessEstimate::new(RowQueryAccess::AllVertexScan, 1_000_000).with_pass(RowQueryOptimizerPass::FullScanFallback)
         }))
     }
 
     async fn best_row_edge_access(
         &self,
-        cell_id: &str,
         edge: &RowEdgePattern,
         reverse_index_available: bool,
         latest_snapshot: bool,
@@ -676,16 +511,12 @@ impl GraphShard {
             .with_pass(RowQueryOptimizerPass::GraphKernel));
         }
 
-        let source = self.best_row_node_access(cell_id, &edge.src, bound).await?;
-        let destination = self.best_row_node_access(cell_id, &edge.dst, bound).await?;
-        let source_seekable = row_node_is_bound_or_seekable(&edge.src, bound)
-            || endpoint_access_is_indexed(&source.access);
-        let destination_seekable = row_node_is_bound_or_seekable(&edge.dst, bound)
-            || endpoint_access_is_indexed(&destination.access);
+        let source = self.best_row_node_access(&edge.src, bound).await?;
+        let destination = self.best_row_node_access(&edge.dst, bound).await?;
+        let source_seekable = row_node_is_bound_or_seekable(&edge.src, bound) || endpoint_access_is_indexed(&source.access);
+        let destination_seekable = row_node_is_bound_or_seekable(&edge.dst, bound) || endpoint_access_is_indexed(&destination.access);
 
-        if row_node_is_bound_or_seekable(&edge.src, bound)
-            && row_node_is_bound_or_seekable(&edge.dst, bound)
-        {
+        if row_node_is_bound_or_seekable(&edge.src, bound) && row_node_is_bound_or_seekable(&edge.dst, bound) {
             return Ok(AccessEstimate::new(
                 RowQueryAccess::ExpandInto {
                     edge_type: edge.edge_type.clone(),
@@ -720,26 +551,7 @@ impl GraphShard {
             );
         }
         if latest_snapshot {
-            for (property, value) in &edge.properties {
-                let encoded = encode_vertex_property_value_key(value);
-                let estimate = self
-                    .query_stats_estimate(
-                        cell_id,
-                        &keys::query_stats_edge_property(
-                            cell_id,
-                            &edge.edge_type,
-                            property,
-                            &encoded,
-                        ),
-                        Some(&keys::query_stats_edge_property_histogram(
-                            cell_id,
-                            &edge.edge_type,
-                            property,
-                        )),
-                        16,
-                    )
-                    .await?
-                    .unwrap_or(16);
+            for (property, _) in edge.properties.iter().filter(|(_, value)| value.is_scalar_indexable()) {
                 choose_best_access(
                     &mut best,
                     AccessEstimate::new(
@@ -747,7 +559,7 @@ impl GraphShard {
                             edge_type: edge.edge_type.clone(),
                             property: property.clone(),
                         },
-                        estimate,
+                        16,
                     )
                     .with_pass(RowQueryOptimizerPass::UtilizeEdgeIndex),
                 );
@@ -757,113 +569,21 @@ impl GraphShard {
             return Ok(best);
         }
 
-        let estimate = self
-            .query_stats_estimate(
-                cell_id,
-                &keys::query_stats_edge_type(cell_id, &edge.edge_type),
-                None,
-                1_000_000,
-            )
-            .await?
-            .unwrap_or(1_000_000);
         Ok(AccessEstimate::new(
             RowQueryAccess::FullEdgeScan {
                 edge_type: edge.edge_type.clone(),
             },
-            estimate,
+            1_000_000,
         )
         .with_pass(RowQueryOptimizerPass::FullScanFallback))
     }
-
-    pub(crate) async fn query_stats_estimate(
-        &self,
-        cell_id: &str,
-        key: &str,
-        histogram_key: Option<&str>,
-        fallback: u64,
-    ) -> Result<Option<u64>> {
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if let Some(record) = self.query_stats_record(key).await? {
-            return Ok(Some(stats_record_cost_estimate(
-                &record,
-                current_epoch,
-                fallback,
-            )));
-        }
-        if let Some(histogram_key) = histogram_key {
-            if let Some(record) = self.query_stats_record(histogram_key).await? {
-                let estimate = record.equality_estimate();
-                return Ok(Some(stats_record_cost_estimate(
-                    &QueryStatsRecord {
-                        count: estimate,
-                        ..record
-                    },
-                    current_epoch,
-                    fallback,
-                )));
-            }
-        }
-        Ok(None)
-    }
-
-    pub(crate) async fn edge_property_equality_estimate(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        values: &[VertexPropertyValue],
-        fallback: u64,
-    ) -> Result<u64> {
-        let mut estimate = 0_u64;
-        for value in values {
-            let encoded = encode_vertex_property_value_key(value);
-            estimate = estimate.saturating_add(
-                self.query_stats_estimate(
-                    cell_id,
-                    &keys::query_stats_edge_property(cell_id, edge_type, property, &encoded),
-                    Some(&keys::query_stats_edge_property_histogram(
-                        cell_id, edge_type, property,
-                    )),
-                    fallback,
-                )
-                .await?
-                .unwrap_or(fallback),
-            );
-        }
-        Ok(estimate.max(1))
-    }
-
-    pub(crate) async fn query_stats_record(&self, key: &str) -> Result<Option<QueryStatsRecord>> {
-        if let Some(record) = GraphStore::snapshot_query_stats(key) {
-            return Ok(record);
-        }
-        let record_key = keys::query_stats_record_key(key);
-        let record = if let Some(value) = self.read_remote(&record_key).await? {
-            Some(decode_query_stats_record(&record_key, &value)?)
-        } else {
-            self.read_remote(key)
-                .await?
-                .map(|value| decode_query_stats_record(key, &value))
-                .transpose()?
-        };
-        // Replanning within one immutable snapshot must not repeat remote point
-        // reads, including missing statistics. This memo dies with the snapshot scope.
-        GraphStore::remember_snapshot_query_stats(key, record.clone());
-        Ok(record)
-    }
 }
 
+/// An edge property equality's cost without statistics: one index seek per
+/// accepted value.
 #[cfg(feature = "opencypher")]
-fn stats_record_cost_estimate(
-    record: &QueryStatsRecord,
-    current_epoch: StorageSequence,
-    fallback: u64,
-) -> u64 {
-    let base = record.count.max(1);
-    if record.is_unusable_at(current_epoch, graph_now_millis()) {
-        return base.saturating_mul(4).max(fallback);
-    }
-    base
+pub(crate) fn edge_property_equality_estimate(values: &[VertexPropertyValue]) -> u64 {
+    16_u64.saturating_mul(values.len() as u64).max(1)
 }
 
 #[cfg(feature = "opencypher")]
@@ -917,20 +637,12 @@ impl AccessEstimate {
 }
 
 #[cfg(feature = "opencypher")]
-fn row_query_plan_group(
-    group: &RowMatchGroup,
-    patterns: &[OptimizedRowPattern],
-) -> RowQueryPlanGroup {
+fn row_query_plan_group(group: &RowMatchGroup, patterns: &[OptimizedRowPattern]) -> RowQueryPlanGroup {
     RowQueryPlanGroup {
         optional: group.optional,
         has_predicate: group.predicate.is_some(),
-        estimated_cardinality: patterns
-            .first()
-            .map_or(0, |pattern| pattern.plan.estimated_cardinality),
-        patterns: patterns
-            .iter()
-            .map(|pattern| pattern.plan.clone())
-            .collect(),
+        estimated_cardinality: patterns.first().map_or(0, |pattern| pattern.plan.estimated_cardinality),
+        patterns: patterns.iter().map(|pattern| pattern.plan.clone()).collect(),
         optimizer_passes: Vec::new(),
     }
 }
@@ -939,10 +651,8 @@ fn row_query_plan_group(
 fn choose_best_access(best: &mut Option<AccessEstimate>, candidate: AccessEstimate) {
     if match best.as_ref() {
         Some(best) => {
-            (
-                candidate.estimated_cardinality,
-                access_priority(&candidate.access),
-            ) < (best.estimated_cardinality, access_priority(&best.access))
+            (candidate.estimated_cardinality, access_priority(&candidate.access))
+                < (best.estimated_cardinality, access_priority(&best.access))
         }
         None => true,
     } {
@@ -967,9 +677,7 @@ fn access_priority(access: &RowQueryAccess) -> u8 {
 fn endpoint_access_is_indexed(access: &RowQueryAccess) -> bool {
     matches!(
         access,
-        RowQueryAccess::VertexIdSeek
-            | RowQueryAccess::VertexPropertyIndex { .. }
-            | RowQueryAccess::VertexLabelScan { .. }
+        RowQueryAccess::VertexIdSeek | RowQueryAccess::VertexPropertyIndex { .. } | RowQueryAccess::VertexLabelScan { .. }
     )
 }
 
@@ -980,11 +688,7 @@ fn row_node_is_bound_or_seekable(node: &RowNodePattern, bound: &BTreeSet<String>
 
 #[cfg(feature = "opencypher")]
 fn row_match_group_bindings(group: &RowMatchGroup) -> BTreeSet<String> {
-    group
-        .patterns
-        .iter()
-        .flat_map(row_pattern_bindings)
-        .collect()
+    group.patterns.iter().flat_map(row_pattern_bindings).collect()
 }
 
 #[cfg(feature = "opencypher")]
@@ -1124,16 +828,14 @@ impl RowQueryPlanSummary {
             label_scan: self.has_access_kind("VertexLabelScan"),
             property_index: self.has_access_kind("VertexPropertyIndex"),
             full_scan: self.full_scan,
-            equality_pushdown: self.optimizer_passes.contains(&optimizer_pass_label(
-                &RowQueryOptimizerPass::EqualityPredicatePushdown,
-            )),
+            equality_pushdown: self
+                .optimizer_passes
+                .contains(&optimizer_pass_label(&RowQueryOptimizerPass::EqualityPredicatePushdown)),
         }
     }
 
     fn has_access_kind(&self, kind: &str) -> bool {
-        self.access_paths
-            .iter()
-            .any(|path| path.split(':').next() == Some(kind))
+        self.access_paths.iter().any(|path| path.split(':').next() == Some(kind))
     }
 
     fn absorb_pass(&mut self, pass: &RowQueryOptimizerPass) {
@@ -1170,11 +872,7 @@ impl RowQueryPlanSummary {
     }
 
     fn optimizer_passes(&self) -> String {
-        self.optimizer_passes
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(",")
+        self.optimizer_passes.iter().copied().collect::<Vec<_>>().join(",")
     }
 
     /// Stamp the summary onto `span` and, if the plan or the elapsed time asks
@@ -1258,10 +956,7 @@ impl RowQueryPlanSummary {
 ///
 /// Returns whether any pattern was rewritten.
 #[cfg(feature = "opencypher")]
-fn push_down_vertex_equality_predicate(
-    group: &mut RowMatchGroup,
-    bound: &BTreeSet<String>,
-) -> bool {
+fn push_down_vertex_equality_predicate(group: &mut RowMatchGroup, bound: &BTreeSet<String>) -> bool {
     let Some(predicate) = group.predicate.as_ref() else {
         return false;
     };
@@ -1295,6 +990,19 @@ fn push_down_vertex_equality_predicate(
             continue;
         }
 
+        // A node pattern that declares the binding anchors it, and an edge
+        // endpoint naming the same binding then joins through that node. A
+        // constraint copied onto the endpoint makes it a second, weaker
+        // anchor: the endpoint carries only the pushed property, so it seeks
+        // that index by itself. A mutation's MATCH clauses share one group, so
+        // `MATCH (s:Source {source_id: $id}) WHERE s.tenant_id = $t
+        // MATCH (s)-[e]->()` sought every vertex of the tenant through its
+        // `(s)` endpoint and failed admission on a large scope.
+        let declared_by_node = group
+            .patterns
+            .iter()
+            .any(|pattern| matches!(pattern, RowPattern::Node(node) if node.binding.as_deref() == Some(constraint.binding.as_str())));
+
         for pattern in &mut group.patterns {
             match pattern {
                 RowPattern::Node(node) => {
@@ -1307,6 +1015,7 @@ fn push_down_vertex_equality_predicate(
                 // bound value regardless of the pattern
                 // (`hydrate_binding_metadata`), so the added constraint has
                 // something to match against.
+                RowPattern::Edge(_) if declared_by_node => {}
                 RowPattern::Edge(edge) => {
                     pushed |= constrain_row_node_property(&mut edge.src, &constraint, value);
                     pushed |= constrain_row_node_property(&mut edge.dst, &constraint, value);
@@ -1333,8 +1042,7 @@ fn constrain_row_node_property(
     if node.id.is_some() || node.properties.contains_key(&constraint.property) {
         return false;
     }
-    node.properties
-        .insert(constraint.property.clone(), value.clone());
+    node.properties.insert(constraint.property.clone(), value.clone());
     true
 }
 
@@ -1356,10 +1064,7 @@ fn access_path_label(access: &RowQueryAccess) -> String {
         RowQueryAccess::BoundOutExpand { edge_type } => format!("BoundOutExpand:{edge_type}"),
         RowQueryAccess::BoundInExpand { edge_type } => format!("BoundInExpand:{edge_type}"),
         RowQueryAccess::ExpandInto { edge_type } => format!("ExpandInto:{edge_type}"),
-        RowQueryAccess::EdgePropertyIndex {
-            edge_type,
-            property,
-        } => format!("EdgePropertyIndex:{edge_type}.{property}"),
+        RowQueryAccess::EdgePropertyIndex { edge_type, property } => format!("EdgePropertyIndex:{edge_type}.{property}"),
         RowQueryAccess::FullEdgeScan { edge_type } => format!("FullEdgeScan:{edge_type}"),
         RowQueryAccess::VariableLengthExpand {
             edge_type,
@@ -1371,10 +1076,7 @@ fn access_path_label(access: &RowQueryAccess) -> String {
 
 #[cfg(feature = "opencypher")]
 fn access_is_full_scan(access: &RowQueryAccess) -> bool {
-    matches!(
-        access,
-        RowQueryAccess::AllVertexScan | RowQueryAccess::FullEdgeScan { .. }
-    )
+    matches!(access, RowQueryAccess::AllVertexScan | RowQueryAccess::FullEdgeScan { .. })
 }
 
 #[cfg(feature = "opencypher")]

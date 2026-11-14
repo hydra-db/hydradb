@@ -18,10 +18,7 @@ impl GraphTopologyOverlay {
     }
 
     pub(crate) fn state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
-        self.states
-            .get(&src)
-            .and_then(|destinations| destinations.get(&dst))
-            .copied()
+        self.states.get(&src).and_then(|destinations| destinations.get(&dst)).copied()
     }
 
     /// Flat iteration over every `(src, dst, exists)` delta in the overlay.
@@ -31,11 +28,9 @@ impl GraphTopologyOverlay {
     /// `src/engine/index_store.rs` instead needs to walk every delta once to
     /// patch a decoded CSC adjacency, which is what this exposes.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (VertexId, VertexId, bool)> + '_ {
-        self.states.iter().flat_map(|(src, destinations)| {
-            destinations
-                .iter()
-                .map(move |(dst, exists)| (*src, *dst, *exists))
-        })
+        self.states
+            .iter()
+            .flat_map(|(src, destinations)| destinations.iter().map(move |(dst, exists)| (*src, *dst, *exists)))
     }
 
     #[cfg(feature = "opencypher")]
@@ -45,17 +40,13 @@ impl GraphTopologyOverlay {
 
     #[cfg(feature = "opencypher")]
     pub(crate) fn out_neighbor_scan_work(&self, src: VertexId) -> u64 {
-        self.states.get(&src).map_or(0, |destinations| {
-            u64::try_from(destinations.len()).unwrap_or(u64::MAX)
-        })
+        self.states
+            .get(&src)
+            .map_or(0, |destinations| u64::try_from(destinations.len()).unwrap_or(u64::MAX))
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn apply_in_neighbors(
-        &self,
-        dst: VertexId,
-        neighbors: &mut BTreeSet<VertexId>,
-    ) -> u64 {
+    pub(crate) fn apply_in_neighbors(&self, dst: VertexId, neighbors: &mut BTreeSet<VertexId>) -> u64 {
         for (src, destinations) in &self.states {
             let Some(exists) = destinations.get(&dst) else {
                 continue;
@@ -70,11 +61,7 @@ impl GraphTopologyOverlay {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn apply_out_neighbors(
-        &self,
-        src: VertexId,
-        neighbors: &mut BTreeSet<VertexId>,
-    ) -> u64 {
+    pub(crate) fn apply_out_neighbors(&self, src: VertexId, neighbors: &mut BTreeSet<VertexId>) -> u64 {
         let Some(destinations) = self.states.get(&src) else {
             return 0;
         };
@@ -216,9 +203,30 @@ impl GraphShard {
         if generation.base_sequence >= read_sequence {
             return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
         }
-        let last_wal_id = self.db.last_durable_wal_id().await?;
+        let last_wal_id = self.storage.last_durable_wal_id().await?;
         if generation.last_wal_id >= last_wal_id {
             return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
+        }
+
+        // The type's change stamp, read at the reader's own snapshot.
+        // `mark_topology_change_txn` writes it at the commit epoch in the same
+        // transaction as every add, delete and detach of an edge of the type
+        // and every segment or segment tombstone of it, which are all the
+        // records the walk below collects. A stamp at or below the generation
+        // therefore proves the snapshot holds no change of the type the
+        // generation lacks, however many WAL files other writes (vertex
+        // properties, other types) added since, and the walk is skipped. The
+        // indexer applies the same test to skip a build, so a type whose
+        // edges are quiet keeps one generation and its readers keep reading it.
+        budget.check("graph_index_change_stamp")?;
+        let stamp_key = keys::matrix_dirty(&generation.cell_id, &generation.edge_type);
+        match snapshot.get_with_options(stamp_key.as_bytes(), &remote_read_options()).await? {
+            Some(value) => {
+                if decode_u64(&stamp_key, &value)? <= generation.base_sequence {
+                    return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
+                }
+            }
+            None => warn_generation_without_change_stamp(generation),
         }
 
         // The cost gate. The span counts object-store round trips, and it
@@ -238,8 +246,7 @@ impl GraphShard {
             return Ok(GraphTopologyTail::Unavailable);
         }
 
-        let wal_ids =
-            (generation.last_wal_id.saturating_add(1)..=last_wal_id).collect::<Vec<u64>>();
+        let wal_ids = (generation.last_wal_id.saturating_add(1)..=last_wal_id).collect::<Vec<u64>>();
         let mut files = BTreeMap::new();
         let mut missing = Vec::new();
         {
@@ -257,7 +264,7 @@ impl GraphShard {
         {
             let fetches = futures::stream::iter(missing.iter().copied())
                 .map(|wal_id| {
-                    let wal_reader = self.db.wal_reader();
+                    let wal_reader = self.storage.wal_reader();
                     async move {
                         budget.check("graph_index_wal_file")?;
                         let mut entries = match wal_reader.get(wal_id).iterator().await {
@@ -273,12 +280,7 @@ impl GraphShard {
                         };
                         let mut parsed = Vec::new();
                         while let Some(entry) = entries.next().await? {
-                            collect_wal_topology_entry(
-                                &entry.key,
-                                &entry.value,
-                                entry.seq,
-                                &mut parsed,
-                            );
+                            collect_wal_topology_entry(&entry.key, &entry.value, entry.seq, &mut parsed);
                         }
                         Ok::<_, crate::GraphError>((wal_id, WalFileFetch::Parsed(parsed)))
                     }
@@ -332,14 +334,7 @@ impl GraphShard {
                 .map(|(src, dst)| async move {
                     budget.check("graph_index_wal_resolve_edge")?;
                     let exists = self
-                        .edge_exists_in_storage_snapshot(
-                            snapshot,
-                            &generation.cell_id,
-                            &generation.edge_type,
-                            src,
-                            dst,
-                            read_sequence,
-                        )
+                        .edge_exists_in_storage_snapshot(snapshot, &generation.cell_id, &generation.edge_type, src, dst, read_sequence)
                         .await?;
                     Ok::<_, crate::GraphError>((src, dst, exists))
                 })
@@ -354,12 +349,31 @@ impl GraphShard {
     }
 }
 
-fn collect_wal_topology_entry(
-    key: &[u8],
-    value: &ValueDeletable,
-    seq: u64,
-    parsed: &mut Vec<WalTopologyEntry>,
-) {
+/// A published generation whose type has no change stamp predates the stamp
+/// or outlived its cell's keys. Readers then walk the WAL as they would with
+/// no stamp to consult; the warning says why their tail cost no longer stays
+/// flat, once per cell and type for the life of the process. The fallback is
+/// the reader's alone: the indexer finds edge types only through their
+/// stamps, so a type without one is never rebuilt and there is nothing for
+/// it to do.
+fn warn_generation_without_change_stamp(generation: &crate::GraphIndexGeneration) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<(String, String)>>> = std::sync::OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((generation.cell_id.clone(), generation.edge_type.clone()));
+    if first {
+        tracing::warn!(
+            hydradb.cell_id = %generation.cell_id,
+            hydradb.edge_type = %generation.edge_type,
+            hydradb.base_sequence = generation.base_sequence,
+            "graph index generation has no edge-type change stamp; reading its WAL tail"
+        );
+    }
+}
+
+fn collect_wal_topology_entry(key: &[u8], value: &ValueDeletable, seq: u64, parsed: &mut Vec<WalTopologyEntry>) {
     let Ok(key) = std::str::from_utf8(key) else {
         return;
     };
@@ -374,20 +388,13 @@ fn collect_wal_topology_entry(
         ["cell", cell, "seg", "out", edge_type, _, _, _] => {
             if let Some(value) = value.as_bytes() {
                 match decode_out_edge_segment(key, &value) {
-                    Ok(segment) => parsed.extend(segment.destinations.into_iter().map(|dst| {
-                        WalTopologyEntry {
-                            cell_id: (*cell).to_string(),
-                            edge_type: (*edge_type).to_string(),
-                            seq,
-                            decoded: WalTopologyEntryDecoded::Edge {
-                                src: segment.src,
-                                dst,
-                            },
-                        }
+                    Ok(segment) => parsed.extend(segment.destinations.into_iter().map(|dst| WalTopologyEntry {
+                        cell_id: (*cell).to_string(),
+                        edge_type: (*edge_type).to_string(),
+                        seq,
+                        decoded: WalTopologyEntryDecoded::Edge { src: segment.src, dst },
                     })),
-                    Err(error) => {
-                        parsed.push(corrupt_wal_topology_entry(cell, edge_type, key, seq, error))
-                    }
+                    Err(error) => parsed.push(corrupt_wal_topology_entry(cell, edge_type, key, seq, error)),
                 }
             }
         }
@@ -395,17 +402,8 @@ fn collect_wal_topology_entry(
     }
 }
 
-fn push_wal_topology_edge(
-    parsed: &mut Vec<WalTopologyEntry>,
-    cell_id: &str,
-    edge_type: &str,
-    key: &str,
-    src: &str,
-    dst: &str,
-    seq: u64,
-) {
-    let decoded =
-        parse_u64(key, src, "src").and_then(|src| parse_u64(key, dst, "dst").map(|dst| (src, dst)));
+fn push_wal_topology_edge(parsed: &mut Vec<WalTopologyEntry>, cell_id: &str, edge_type: &str, key: &str, src: &str, dst: &str, seq: u64) {
+    let decoded = parse_u64(key, src, "src").and_then(|src| parse_u64(key, dst, "dst").map(|dst| (src, dst)));
     parsed.push(match decoded {
         Ok((src, dst)) => WalTopologyEntry {
             cell_id: cell_id.to_string(),
@@ -417,13 +415,7 @@ fn push_wal_topology_edge(
     });
 }
 
-fn corrupt_wal_topology_entry(
-    cell_id: &str,
-    edge_type: &str,
-    fallback_key: &str,
-    seq: u64,
-    error: GraphError,
-) -> WalTopologyEntry {
+fn corrupt_wal_topology_entry(cell_id: &str, edge_type: &str, fallback_key: &str, seq: u64, error: GraphError) -> WalTopologyEntry {
     let (key, reason) = match error {
         GraphError::CorruptValue { key, reason } => (key, reason),
         error => (fallback_key.to_string(), error.to_string()),
@@ -453,8 +445,7 @@ pub(crate) fn expand_range_with_overlay(
             break;
         }
         let frontier_values = frontier.iter().copied().collect::<Vec<_>>();
-        let base =
-            crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
+        let base = crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
         edge_visits = edge_visits.saturating_add(base.edge_visits);
         let mut next = base.vertices.into_iter().collect::<BTreeSet<_>>();
 
@@ -470,11 +461,9 @@ pub(crate) fn expand_range_with_overlay(
                 }
                 if next.contains(dst)
                     && !frontier.iter().any(|candidate| {
-                        overlay.state(*candidate, *dst).unwrap_or_else(|| {
-                            crate::sparse_kernel::compiled_graphblas_contains_edge(
-                                compiled, *candidate, *dst,
-                            )
-                        })
+                        overlay
+                            .state(*candidate, *dst)
+                            .unwrap_or_else(|| crate::sparse_kernel::compiled_graphblas_contains_edge(compiled, *candidate, *dst))
                     })
                 {
                     next.remove(dst);

@@ -5,9 +5,19 @@ edition = "2021"
 rust-version = "1.99"
 publish = false
 
+# The offline graph-store builder shares this crate's sorter and finalize
+# steps with the FalkorDB importer; the crate's name is narrower than what it
+# holds.
+[[bin]]
+name = "graph-image"
+path = "src/bin/graph_image.rs"
+
 [dependencies]
+async-trait = { workspace = true }
 blake2 = { workspace = true }
 falkordb-rdb = { path = "../falkordb-rdb" }
+md5 = { package = "md-5", version = "0.11", default-features = false }
+mimalloc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

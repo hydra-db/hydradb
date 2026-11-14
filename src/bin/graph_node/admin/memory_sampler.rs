@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hydradb::cgroup_directory;
 use tokio::task::JoinHandle;
 
 use super::{append_process_memory_metrics, process_memory_metrics, ProcessMemoryMetrics};
@@ -48,9 +49,72 @@ struct Sample {
     cgroup: Option<CgroupMemory>,
     process_status: SourceStatus,
     cgroup_status: SourceStatus,
+    runtime: RuntimeGauges,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Thread, scheduler and CPU-throttling gauges, sampled with the memory
+/// snapshot and exported by `crate::otel_metrics::node_runtime`.
+///
+/// Every field is optional and an absent one is not exported: there is no
+/// `/proc` on macOS, cgroup v1 has no `cpu.stat` in the unified layout, and a
+/// cgroup v2 without the cpu controller enabled reports usage but no
+/// throttling. A zero would claim a measurement nobody took.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeGauges {
+    /// The `Threads:` row of `/proc/self/status`.
+    pub(crate) threads: Option<u64>,
+    pub(crate) cgroup_cpu: Option<CgroupCpu>,
+    pub(crate) tokio: Option<TokioRuntime>,
+}
+
+/// Cumulative CPU accounting from cgroup v2 `cpu.stat`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct CgroupCpu {
+    pub(crate) usage_usec: Option<u64>,
+    /// Enforcement periods in which the cgroup was throttled.
+    pub(crate) nr_throttled: Option<u64>,
+    pub(crate) throttled_usec: Option<u64>,
+}
+
+/// The tokio runtime's stable metrics, read from the handle the sampler runs on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TokioRuntime {
+    pub(crate) workers: u64,
+    pub(crate) alive_tasks: u64,
+    pub(crate) global_queue_depth: u64,
+}
+
+impl TokioRuntime {
+    /// `None` outside a runtime. Three loads from the scheduler's own counters,
+    /// cheap enough to read on a worker.
+    fn current() -> Option<Self> {
+        let metrics = tokio::runtime::Handle::try_current().ok()?.metrics();
+        Some(Self {
+            workers: metrics.num_workers() as u64,
+            alive_tasks: metrics.num_alive_tasks() as u64,
+            global_queue_depth: metrics.global_queue_depth() as u64,
+        })
+    }
+}
+
+impl RuntimeGauges {
+    /// A fresh reading, for an exporter that does not hold the sampler. The
+    /// file reads run on the blocking pool, like the sampler's own.
+    #[cfg_attr(not(feature = "otlp"), allow(dead_code))]
+    pub(crate) async fn read() -> Self {
+        let tokio = TokioRuntime::current();
+        let (threads, cgroup_cpu) = run_blocking(|| (read_threads(), cgroup_directory().as_deref().and_then(read_cgroup_cpu)))
+            .await
+            .unwrap_or_default();
+        Self {
+            threads,
+            cgroup_cpu,
+            tokio,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 struct CgroupMemory {
     current: u64,
     limit: Option<u64>,
@@ -74,10 +138,8 @@ impl Sample {
         process_attempted: bool,
         cgroup_attempted: bool,
     ) {
-        self.process_status
-            .observe(process_attempted, process.is_some(), now);
-        self.cgroup_status
-            .observe(cgroup_attempted, cgroup.is_some(), now);
+        self.process_status.observe(process_attempted, process.is_some(), now);
+        self.cgroup_status.observe(cgroup_attempted, cgroup.is_some(), now);
         if (process_attempted || cgroup_attempted) && process.is_none() && cgroup.is_none() {
             self.failures += 1;
             // Failed reads must not publish stale current values.
@@ -104,15 +166,18 @@ impl Sample {
         self.cgroup = cgroup;
     }
 
+    /// Replaces rather than merges, so a source that stops answering stops
+    /// being exported instead of repeating its last value.
+    fn observe_runtime(&mut self, runtime: RuntimeGauges) {
+        self.runtime = runtime;
+    }
+
     fn render(&self, output: &mut String) {
+        crate::otel_metrics::node_runtime::append(output, &self.runtime);
         fn gauge(output: &mut String, name: &str, value: impl std::fmt::Display) {
             output.push_str(&format!("# TYPE {name} gauge\n{name} {value}\n"));
         }
-        gauge(
-            output,
-            "graph_memory_sampler_last_success_timestamp_seconds",
-            self.timestamp,
-        );
+        gauge(output, "graph_memory_sampler_last_success_timestamp_seconds", self.timestamp);
         for (name, value) in [
             ("graph_memory_sampler_samples_total", self.samples),
             ("graph_memory_sampler_failures_total", self.failures),
@@ -125,10 +190,7 @@ impl Sample {
             "# TYPE graph_memory_sampler_source_last_success_timestamp_seconds gauge\n",
             "# TYPE graph_memory_sampler_source_available gauge\n",
         ));
-        for (source, status) in [
-            ("process", &self.process_status),
-            ("cgroup", &self.cgroup_status),
-        ] {
+        for (source, status) in [("process", &self.process_status), ("cgroup", &self.cgroup_status)] {
             output.push_str(&format!(
                 "graph_memory_sampler_source_samples_total{{source=\"{source}\"}} {}\n\
                  graph_memory_sampler_source_failures_total{{source=\"{source}\"}} {}\n\
@@ -144,22 +206,10 @@ impl Sample {
             append_process_memory_metrics(output, memory);
         }
         for (name, value) in [
-            (
-                "graph_process_resident_memory_sampled_peak_bytes",
-                self.rss_peak,
-            ),
-            (
-                "graph_process_allocator_live_sampled_peak_bytes",
-                self.live_peak,
-            ),
-            (
-                "graph_process_allocator_arena_free_sampled_peak_bytes",
-                self.free_peak,
-            ),
-            (
-                "graph_process_open_file_descriptors_sampled_peak",
-                self.open_file_descriptors_peak,
-            ),
+            ("graph_process_resident_memory_sampled_peak_bytes", self.rss_peak),
+            ("graph_process_allocator_live_sampled_peak_bytes", self.live_peak),
+            ("graph_process_allocator_arena_free_sampled_peak_bytes", self.free_peak),
+            ("graph_process_open_file_descriptors_sampled_peak", self.open_file_descriptors_peak),
             ("graph_cgroup_memory_sampled_peak_bytes", self.cgroup_peak),
         ] {
             if let Some(value) = value {
@@ -175,9 +225,7 @@ impl Sample {
                 ("kernel", memory.kernel),
             ] {
                 if let Some(value) = value {
-                    output.push_str(&format!(
-                        "graph_cgroup_memory_bytes{{kind=\"{kind}\"}} {value}\n"
-                    ));
+                    output.push_str(&format!("graph_cgroup_memory_bytes{{kind=\"{kind}\"}} {value}\n"));
                 }
             }
             if let Some(value) = memory.limit {
@@ -188,9 +236,7 @@ impl Sample {
             }
             output.push_str("# TYPE graph_cgroup_memory_events_total counter\n");
             for (event, value) in &memory.events {
-                output.push_str(&format!(
-                    "graph_cgroup_memory_events_total{{event=\"{event}\"}} {value}\n"
-                ));
+                output.push_str(&format!("graph_cgroup_memory_events_total{{event=\"{event}\"}} {value}\n"));
             }
         }
     }
@@ -212,26 +258,32 @@ impl MemorySampler {
             loop {
                 interval.tick().await;
                 let previous_cgroup = cgroup.clone();
+                let tokio = TokioRuntime::current();
                 match run_blocking(move || collect_sample(previous_cgroup)).await {
                     Ok(collected) => {
                         cgroup = collected.cgroup_directory;
-                        state.lock().unwrap_or_else(|e| e.into_inner()).observe(
+                        let mut sample = state.lock().unwrap_or_else(|e| e.into_inner());
+                        sample.observe(
                             collected.process,
                             collected.cgroup,
                             collected.now,
                             PROCESS_SAMPLING_SUPPORTED,
                             CGROUP_SAMPLING_SUPPORTED,
                         );
+                        sample.observe_runtime(RuntimeGauges {
+                            threads: collected.threads,
+                            cgroup_cpu: collected.cgroup_cpu,
+                            tokio,
+                        });
                     }
                     Err(_) => {
                         cgroup = None;
-                        state.lock().unwrap_or_else(|e| e.into_inner()).observe(
-                            None,
-                            None,
-                            0.0,
-                            PROCESS_SAMPLING_SUPPORTED,
-                            CGROUP_SAMPLING_SUPPORTED,
-                        );
+                        let mut sample = state.lock().unwrap_or_else(|e| e.into_inner());
+                        sample.observe(None, None, 0.0, PROCESS_SAMPLING_SUPPORTED, CGROUP_SAMPLING_SUPPORTED);
+                        sample.observe_runtime(RuntimeGauges {
+                            tokio,
+                            ..RuntimeGauges::default()
+                        });
                     }
                 }
             }
@@ -240,11 +292,18 @@ impl MemorySampler {
     }
 
     pub(super) fn render(&self, output: &mut String) {
-        self.sample
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .render(output);
+        self.sample.lock().unwrap_or_else(|e| e.into_inner()).clone().render(output);
+    }
+
+    pub(super) fn resource_snapshot(&self) -> serde_json::Value {
+        let s = self.sample.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        serde_json::json!({
+            "sample_unix_seconds": s.timestamp,
+            "process": s.process.filter(|_| s.process_status.available),
+            "threads": s.runtime.threads,
+            "cgroup_memory": s.cgroup.filter(|_| s.cgroup_status.available),
+            "cgroup_cpu": s.runtime.cgroup_cpu,
+        })
     }
 }
 
@@ -261,29 +320,32 @@ struct CollectedSample {
     cgroup: Option<CgroupMemory>,
     cgroup_directory: Option<std::path::PathBuf>,
     now: f64,
+    threads: Option<u64>,
+    cgroup_cpu: Option<CgroupCpu>,
 }
 
 fn collect_sample(mut directory: Option<std::path::PathBuf>) -> CollectedSample {
     // Keep allocator and procfs/cgroupfs calls off runtime workers. No heap
     // walking, task scan or trim occurs.
     let process = process_memory_metrics();
+    let threads = read_threads();
     if CGROUP_SAMPLING_SUPPORTED && directory.is_none() {
         directory = cgroup_directory();
     }
     let cgroup = directory.as_deref().and_then(read_cgroup);
+    let cgroup_cpu = directory.as_deref().and_then(read_cgroup_cpu);
     if CGROUP_SAMPLING_SUPPORTED && cgroup.is_none() {
         // Re-resolve next pass after either discovery or reading failed.
         directory = None;
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     CollectedSample {
         process,
         cgroup,
         cgroup_directory: directory,
         now,
+        threads,
+        cgroup_cpu,
     }
 }
 
@@ -296,25 +358,13 @@ impl Drop for MemorySampler {
 fn field(input: &str, key: &str) -> Option<u64> {
     input.lines().find_map(|line| {
         let mut words = line.split_ascii_whitespace();
-        (words.next()? == key)
-            .then(|| words.next()?.parse().ok())
-            .flatten()
+        (words.next()? == key).then(|| words.next()?.parse().ok()).flatten()
     })
 }
 
 fn read_cgroup(dir: &std::path::Path) -> Option<CgroupMemory> {
-    let current = std::fs::read_to_string(dir.join("memory.current"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let optional_number = |file| {
-        std::fs::read_to_string(dir.join(file))
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-    };
+    let current = std::fs::read_to_string(dir.join("memory.current")).ok()?.trim().parse().ok()?;
+    let optional_number = |file| std::fs::read_to_string(dir.join(file)).ok()?.trim().parse::<u64>().ok();
     let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
     let events = std::fs::read_to_string(dir.join("memory.events")).unwrap_or_default();
     Some(CgroupMemory {
@@ -331,40 +381,26 @@ fn read_cgroup(dir: &std::path::Path) -> Option<CgroupMemory> {
     })
 }
 
-fn cgroup_directory() -> Option<std::path::PathBuf> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    resolve_cgroup_directory(&membership, &mounts)
+fn read_cgroup_cpu(dir: &std::path::Path) -> Option<CgroupCpu> {
+    parse_cgroup_cpu(&std::fs::read_to_string(dir.join("cpu.stat")).ok()?)
 }
 
-/// Resolve cgroup v2 in both private container and host cgroup namespaces.
-/// Mountinfo paths are kernel-escaped; unsupported escapes fail closed.
-fn resolve_cgroup_directory(membership: &str, mounts: &str) -> Option<std::path::PathBuf> {
-    use std::path::{Component, Path};
-    let path = membership
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?;
-    if !path.starts_with('/')
-        || Path::new(path)
-            .components()
-            .any(|p| matches!(p, Component::ParentDir))
-    {
-        return None;
-    }
-    for line in mounts.lines() {
-        let (left, right) = line.split_once(" - ")?;
-        if right.split_ascii_whitespace().next() != Some("cgroup2") {
-            continue;
-        }
-        let parts: Vec<_> = left.split_ascii_whitespace().collect();
-        let root = *parts.get(3)?;
-        let mount = *parts.get(4)?;
-        if root.contains('\\') || mount.contains('\\') {
-            continue;
-        }
-        if let Ok(relative) = Path::new(path).strip_prefix(root) {
-            return Some(Path::new(mount).join(relative));
-        }
-    }
-    None
+/// `None` when the file carries none of the three rows, so an unreadable or
+/// foreign file is absent rather than a set of zeroes.
+fn parse_cgroup_cpu(stat: &str) -> Option<CgroupCpu> {
+    let cpu = CgroupCpu {
+        usage_usec: field(stat, "usage_usec"),
+        nr_throttled: field(stat, "nr_throttled"),
+        throttled_usec: field(stat, "throttled_usec"),
+    };
+    (cpu != CgroupCpu::default()).then_some(cpu)
+}
+
+/// `None` wherever `/proc` does not exist, which is every non-Linux target.
+fn read_threads() -> Option<u64> {
+    parse_threads(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+fn parse_threads(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
 }

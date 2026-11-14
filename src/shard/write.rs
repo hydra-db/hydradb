@@ -1,9 +1,8 @@
 use super::*;
-use crate::QueryFailureReason;
 use futures::{stream, FutureExt as _, StreamExt as _, TryStreamExt as _};
+pub(crate) use hydradb_graph_slate::write::*;
 use tracing::Instrument as _;
 
-const RELATIONSHIP_IMPORT_READ_CONCURRENCY: usize = 32;
 /// Largest relationship import whose guarded reads are warmed before the
 /// writer permit. Matches the cached-read limit (`MAX_CACHED_REMOTE_ITEMS`), so
 /// a bulk import cannot sweep the block cache.
@@ -24,7 +23,6 @@ const RELATIONSHIP_IMPORT_WARM_MAX_SCAN_ENTRIES: usize = 8;
 const RELATIONSHIP_IMPORT_WARM_MAX_READS: usize = 4_096;
 const VERTEX_DELETE_READ_CONCURRENCY: usize = 16;
 const METADATA_NOOP_PREFLIGHT_MAX_ITEMS: usize = 32;
-
 static DELETE_PREPARATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 const DELETE_PREPARATION_MAX_VERTICES: usize = 4096;
 const DELETE_PREPARATION_BYTES: u64 = 8 * 1024 * 1024;
@@ -34,6 +32,113 @@ const DELETE_APPLY_WARM_MAX_KEYS: usize = 1024;
 /// point keys and the survivor-check prefixes.
 #[cfg(feature = "opencypher")]
 const RELATIONSHIP_DELETE_WARM_MAX_READS: usize = DELETE_APPLY_WARM_MAX_KEYS;
+
+/// What [`GraphShard::set_property_on_existing_vertices`] did.
+#[cfg(feature = "opencypher")]
+pub(crate) struct WriteBackOutcome {
+    pub(crate) written: u64,
+    pub(crate) skipped: u64,
+    /// The written scores in index order, the copy the statistics counted.
+    pub(crate) ordered: crate::engine::IndexOrderedFloats,
+    /// Vertices outside the run whose value the new generation carries.
+    pub(crate) carried: u64,
+    /// Older-generation index entries the carry walked, and how long it took.
+    pub(crate) carry_scanned: u64,
+    pub(crate) carry_millis: u64,
+}
+
+/// What a write-back's carry-forward walk found
+/// ([`GraphShard::carry_forward_write_back_entries`]).
+#[cfg(feature = "opencypher")]
+#[derive(Default)]
+struct CarryForward {
+    values: crate::engine::CarriedIndexValues,
+    carried: u64,
+    scanned: u64,
+    millis: u64,
+}
+
+/// Older-generation index entries a carry-forward walks between two budget
+/// checks.
+#[cfg(feature = "opencypher")]
+const CARRY_FORWARD_CHECK_STRIDE: u64 = 4_096;
+
+/// A detached sweep's entry in the shard's pending sweep targets, from the
+/// spawn until the sweep takes its target. Dropped untaken, by a sweep that
+/// failed or was aborted before it took its target, it clears the entry, so
+/// the property's next write-back spawns a sweep rather than raising the
+/// target of one that will never run.
+#[cfg(feature = "opencypher")]
+struct PendingWriteBackSweep {
+    shard: std::sync::Arc<GraphShard>,
+    key: Option<(String, String)>,
+    published: StorageSequence,
+}
+
+#[cfg(feature = "opencypher")]
+impl PendingWriteBackSweep {
+    /// The newest generation published for the property while this sweep
+    /// was pending. From here on the property has no pending sweep, and its
+    /// next write-back spawns one.
+    fn take(&mut self) -> StorageSequence {
+        let Some(key) = self.key.take() else {
+            return self.published;
+        };
+        let target = self
+            .shard
+            .write_back_sweep_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        target.unwrap_or(self.published).max(self.published)
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Drop for PendingWriteBackSweep {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.shard
+                .write_back_sweep_targets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+        }
+    }
+}
+
+/// The span of one sweep of superseded write-back index generations. Its
+/// `deletes`, `batches`, `waited_ms`, `floor` and `scanned` fields are
+/// recorded by the sweep at its end: the time it spent waiting out
+/// write-backs, the generation its scan opened at, and the keys the scan
+/// yielded. A
+/// `root` span has no parent, for a sweep detached from the request that
+/// published the generation; otherwise the span hangs under the current one.
+#[cfg(feature = "opencypher")]
+fn write_back_sweep_span(cell_id: &str, root: bool) -> tracing::Span {
+    if root {
+        tracing::info_span!(
+            parent: None,
+            "gds.write_back.sweep",
+            hydradb.cell_id = %cell_id,
+            hydradb.write.deletes = tracing::field::Empty,
+            hydradb.write.batches = tracing::field::Empty,
+            hydradb.write.waited_ms = tracing::field::Empty,
+            hydradb.write.floor = tracing::field::Empty,
+            hydradb.write.scanned = tracing::field::Empty,
+        )
+    } else {
+        tracing::info_span!(
+            "gds.write_back.sweep",
+            hydradb.cell_id = %cell_id,
+            hydradb.write.deletes = tracing::field::Empty,
+            hydradb.write.batches = tracing::field::Empty,
+            hydradb.write.waited_ms = tracing::field::Empty,
+            hydradb.write.floor = tracing::field::Empty,
+            hydradb.write.scanned = tracing::field::Empty,
+        )
+    }
+}
 /// Most relationship deletions a batch may carry and still be warmed. Above it
 /// the warm is skipped before a key is built, so a bulk delete cannot spend its
 /// preparation assembling keys the read budget would never reach. Matches the
@@ -45,9 +150,7 @@ const RELATIONSHIP_DELETE_WARM_MAX_ROWS: usize = RELATIONSHIP_IMPORT_WARM_MAX_RO
 #[cfg(feature = "opencypher")]
 const RELATIONSHIP_DELETE_SURVIVOR_CONCURRENCY: usize = 16;
 
-async fn run_cancellable_delete_preparation<T>(
-    preparation: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
+async fn run_cancellable_delete_preparation<T>(preparation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     match crate::QueryCancellationToken::current() {
         Some(token) => tokio::select! {
             biased;
@@ -145,10 +248,7 @@ fn write_txn_span(cell_id: &str, edge_type: Option<&str>) -> tracing::Span {
 /// rather than a misleading one.
 fn common_edge_type(mutations: &[EdgeMutation]) -> Option<&str> {
     let first = mutations.first()?.edge_type.as_str();
-    mutations
-        .iter()
-        .all(|mutation| mutation.edge_type == first)
-        .then_some(first)
+    mutations.iter().all(|mutation| mutation.edge_type == first).then_some(first)
 }
 
 /// Records `hydradb.writer.retries` on `shard.write_txn` however the retry
@@ -199,13 +299,9 @@ async fn commit_txn_traced(
         hydradb.commit.local_only = crate::shard::write_pipeline::current().is_some(),
         error.class = tracing::field::Empty,
     );
-    async {
-        commit_txn_strict(txn, await_durable)
-            .await
-            .inspect_err(record_error_class)
-    }
-    .instrument(span)
-    .await
+    async { commit_txn_strict(txn, await_durable).await.inspect_err(record_error_class) }
+        .instrument(span)
+        .await
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -254,21 +350,11 @@ impl VertexDeleteBatchMode {
     }
 }
 
-fn vertex_matches_path_node_constraints(
-    vertex_id: VertexId,
-    metadata: &VertexMetadata,
-    constraints: &VertexMetadata,
-) -> bool {
-    constraints
-        .labels
-        .iter()
-        .all(|label| metadata.labels.contains(label))
+fn vertex_matches_path_node_constraints(vertex_id: VertexId, metadata: &VertexMetadata, constraints: &VertexMetadata) -> bool {
+    constraints.labels.iter().all(|label| metadata.labels.contains(label))
         && constraints.properties.iter().all(|(property, expected)| {
             if property == "id" {
-                return delete_constraint_property_values_equal(
-                    &VertexPropertyValue::Integer(vertex_id),
-                    expected,
-                );
+                return delete_constraint_property_values_equal(&VertexPropertyValue::Integer(vertex_id), expected);
             }
             metadata
                 .properties
@@ -277,10 +363,7 @@ fn vertex_matches_path_node_constraints(
         })
 }
 
-fn delete_constraint_property_values_equal(
-    left: &VertexPropertyValue,
-    right: &VertexPropertyValue,
-) -> bool {
+fn delete_constraint_property_values_equal(left: &VertexPropertyValue, right: &VertexPropertyValue) -> bool {
     #[cfg(feature = "opencypher")]
     {
         super::query::vertex_property_values_equal(left, right)
@@ -352,11 +435,7 @@ struct MergeIdentityLookup {
 /// because a pointer may only exist while exactly one live row carries its
 /// identity.
 #[cfg(feature = "opencypher")]
-fn note_merge_pointer(
-    updates: &mut BTreeMap<String, Option<RelationshipId>>,
-    pointer_key: &str,
-    relationship_id: RelationshipId,
-) {
+fn note_merge_pointer(updates: &mut BTreeMap<String, Option<RelationshipId>>, pointer_key: &str, relationship_id: RelationshipId) {
     match updates.get(pointer_key) {
         None => {
             updates.insert(pointer_key.to_string(), Some(relationship_id));
@@ -369,12 +448,980 @@ fn note_merge_pointer(
 }
 
 impl GraphShard {
-    pub async fn set_vertex_metadata(
+    /// Take a database built offline past storage sequence 0.
+    ///
+    /// SlateDB's offline image builder writes every row at sequence 0, and
+    /// the edge writers read a transaction at sequence 0 as a cell with no
+    /// data yet (`fresh_cell`): they skip reading endpoint vertex records,
+    /// degree and relationship counters, and existing edges. The first edge
+    /// batch on an imported image therefore replaced its endpoints' records
+    /// with empty ones, dropping their labels and properties. Sealing
+    /// commits one marker, so every later write reads what the image holds.
+    /// A database already past sequence 0 is left as it is; returns whether
+    /// this call committed the marker.
+    ///
+    /// The same transaction starts the topology changelog of every edge type
+    /// the image lists (`matrix_dirty`): its low-water mark is the seal's
+    /// commit sequence. Every image row is at sequence 0 and the seal changes
+    /// no edge, so every edge change from there on is logged. Without the
+    /// mark the first edge write would set it at its own sequence, past any
+    /// generation built from the image, and the indexer's next build of that
+    /// type would be a full one (`XlogDelta::CoverageGap`) instead of the
+    /// incremental build a loaded store gets.
+    pub async fn seal_offline_image(&self, cell_id: &str) -> Result<bool> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "seal_offline_image")?;
+        self.run_write_pipeline(async {
+            let _permit = self.acquire_graph_write_permit("seal_offline_image").await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            if txn.seqnum() > 0 {
+                return Ok(false);
+            }
+            self.validate_write_fence_txn(&txn, cell_id, "seal_offline_image").await?;
+            let commit_sequence = txn.seqnum() + 1;
+            let prefix = keys::matrix_dirty_prefix(cell_id);
+            let mut edge_types = Vec::new();
+            let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
+            while let Some(kv) = iter.next().await? {
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let edge_type = key
+                    .strip_prefix(&prefix)
+                    .filter(|edge_type| !edge_type.is_empty())
+                    .ok_or_else(|| GraphError::CorruptValue {
+                        key: key.clone(),
+                        reason: "invalid graph index dirty marker key".to_string(),
+                    })?
+                    .to_string();
+                edge_types.push(edge_type);
+            }
+            drop(iter);
+            for edge_type in edge_types {
+                let low_key = keys::xlog_low_water(cell_id, &edge_type);
+                if read_txn_remote(&txn, &low_key).await?.is_none() {
+                    txn.put(low_key.as_bytes(), encode_u64(commit_sequence))?;
+                }
+            }
+            txn.put(keys::offline_image_sealed(cell_id).as_bytes(), [1_u8].as_slice())?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Set `property` to `scores[i]` on `vertices[i]`: the write-back of a
+    /// `gds.*.write` call. Nothing is read. Each value goes to the vertex's own
+    /// [`keys::vertex_write_back_property`] key and its index entry to a
+    /// generation of [`keys::vertex_write_back_index`] fixed by this call's
+    /// first transaction; once every chunk is committed, one catalog key
+    /// ([`keys::vertex_write_back_generation`]) switches readers to the new
+    /// generation and the old one is swept. A vertex deleted after the
+    /// algorithm read its graph gets an orphan value key and index entry: no
+    /// read can see them, because a value is only overlaid on a record that
+    /// exists and every index hit is verified against its record, and the
+    /// vertex delete path removes them should the vertex be deleted later.
+    /// So nothing is skipped, and [`WriteBackOutcome::skipped`] is always
+    /// zero; it stays because the procedure reports it.
+    ///
+    /// Value keys are not per generation, so between the first chunk and the
+    /// switch the property's point reads and its index disagree. The run
+    /// marks the property pending first ([`keys::vertex_write_back_pending`])
+    /// and the switch clears the mark; reads and hand writes of a marked
+    /// property are refused, including after a run that stopped before its
+    /// switch, until a later run of the property completes. Before its switch
+    /// a run carries the property's live values on vertices outside it into
+    /// its generation ([`Self::carry_forward_write_back_entries`]), so the
+    /// generation it publishes indexes every vertex that holds a value, and
+    /// the sweep of the older ones takes nothing a read can still see.
+    ///
+    /// Each chunk is its own transaction under the write permit, the writer
+    /// lane and the fence check, and `budget` is checked between chunks. A
+    /// chunk builds its values from `vertices` and `scores` as it writes them,
+    /// so the call holds no value per vertex beyond the caller's two slices
+    /// and the sorted copy the statistics count, 8 bytes a vertex each, and
+    /// for vertices not given in ascending order a sorted copy of their ids
+    /// for the carry, 8 bytes more.
+    ///
+    /// The whole call runs as one write pipeline context, so it waits for
+    /// durability once, at the end, on the highest sequence any chunk
+    /// committed. Every chunk's commit already carries its own durability
+    /// wait in the background, and the reply only needs the last one; a wait
+    /// per chunk would serialise the call on the WAL upload latency once per
+    /// chunk for no extra guarantee. The trade-off is that the call holds one
+    /// of the pipeline's bounded admissions (`MAX_PENDING_DURABLE_WRITES`)
+    /// for its whole run instead of one per chunk, so a large write-back
+    /// occupies a slot other writers could use for longer. The writer-changed
+    /// check still happens per chunk: each chunk's pipeline call validates
+    /// the writer against the outer context before its transaction runs.
+    ///
+    /// The sweep of the previous generation starts once the catalog switch
+    /// is durable and runs on a task of its own, on the shard's owned
+    /// handle, outside that pipeline context and under its own span: the
+    /// reply does not wait for it, and its cost stays visible apart from the
+    /// write. A shard that was never shared has no handle a task could hold
+    /// and nothing can outlive it, so there the sweep runs inside the call.
+    ///
+    /// The call also publishes the property's planner statistics, counted
+    /// from `scores` and the carried values after the carry and written
+    /// beside the catalog in the switch's transaction
+    /// ([`keys::vertex_write_back_statistics`]). The write-back is the one
+    /// producer that holds every value of its generation and so can count it
+    /// exactly without a read; the indexer's object is built from a reader's
+    /// view pinned at its open, which may predate the property. The count
+    /// runs on a copy of the scores in index order, sorted before the first
+    /// chunk, which the call returns for the caller's own summary of them
+    /// rather than have it sort a second copy. The carried values are held
+    /// for the count, 8 bytes each for a float: none when the run covers
+    /// the vertices the last one did.
+    ///
+    /// The sort and the count each walk every value, so they run on the
+    /// shard's blocking compute path rather than on the async worker, under
+    /// `budget`: checked before each starts and periodically while it runs,
+    /// so a cancelled or expired call stops. GDS writes have no result-row
+    /// cap, which is why neither is left inline. The scores move to the
+    /// sort's blocking task and come back with their sorted copy, rather
+    /// than being copied for it.
+    ///
+    /// `gate` is the gds compute permit a caller holds over its scores. It
+    /// moves into each blocking task with what that task holds, the scores
+    /// for the sort and the sorted copy and carried values for the count,
+    /// and comes back with them, then is held to the end of the call: a call
+    /// dropped on a cancel or a disconnect cannot free the gate while a
+    /// detached task still runs and holds a value per vertex.
+    ///
+    /// `scores` holds one score per vertex; a different length is the
+    /// algorithm's error and is refused before anything is written.
+    /// `vertices` is in the projection's order, which need not be ascending.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn set_property_on_existing_vertices(
         &self,
         cell_id: &str,
-        vertex_id: VertexId,
-        metadata: VertexMetadata,
+        property: &str,
+        vertices: &[VertexId],
+        scores: Vec<f64>,
+        budget: &QueryBudget,
+        gate: Option<tokio::sync::SemaphorePermit<'static>>,
+    ) -> Result<WriteBackOutcome> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("property", property)?;
+        if scores.len() != vertices.len() {
+            return Err(GraphError::SparseKernel {
+                backend: "gds_write_back",
+                reason: format!("{} scores for {} vertices", scores.len(), vertices.len()),
+            });
+        }
+        self.ensure_write_authority(cell_id, "set_property_on_existing_vertices")?;
+        budget.check("gds_write_back_statistics")?;
+        // The carry looks vertices up by id. A label projection's are
+        // ascending already; a `'*'` projection numbers them as its edges
+        // meet them, and the lookup takes a sorted copy, sorted with the
+        // scores' copy off the async worker.
+        let unsorted_ids = (!vertices.is_sorted()).then(|| vertices.to_vec());
+        let (scores, ordered, sorted_ids, gate) = {
+            let span = tracing::info_span!("gds.write_back.statistics", hydradb.write.rows = scores.len());
+            let count_budget = budget.clone();
+            super::query::run_graph_compute(Arc::clone(&self.operation_metrics), "gds_write_back_statistics", move || {
+                let _span = span.entered();
+                let ordered = crate::engine::IndexOrderedFloats::sort(&scores, || count_budget.check("gds_write_back_statistics"))?;
+                let sorted_ids = unsorted_ids.map(|mut ids| {
+                    ids.sort_unstable();
+                    ids
+                });
+                count_budget.check("gds_write_back_statistics")?;
+                Ok((scores, ordered, sorted_ids, gate))
+            })
+            .await?
+        };
+        // In flight from the first chunk to the catalog switch. The sweeps
+        // wait on this count, so it is released before the sweep below is
+        // dispatched: the inline form would otherwise wait on this very call.
+        let in_flight = self.write_back_activity.begin();
+        let chunk_size = self.write_back_chunk();
+        let (written, generation, ordered, carry, _gate) = self
+            .run_write_pipeline(async {
+                if vertices.is_empty() {
+                    return Ok((0, None, ordered, CarryForward::default(), gate));
+                }
+                // Marked pending before the first value moves, so a run that
+                // stops anywhere from here to the switch leaves the property
+                // refused rather than torn.
+                let generation = self
+                    .write_back_locked(cell_id, "set_property_on_existing_vertices", 1, Some(budget), || {
+                        self.begin_write_back_generation_txn(cell_id, property)
+                    })
+                    .await?;
+                let mut written = 0_u64;
+                for (vertices, scores) in vertices.chunks(chunk_size).zip(scores.chunks(chunk_size)) {
+                    self.write_back_locked(cell_id, "set_property_on_existing_vertices", vertices.len(), Some(budget), || {
+                        self.set_property_on_existing_vertices_txn(cell_id, property, vertices, scores, generation)
+                    })
+                    .await?;
+                    written += vertices.len() as u64;
+                }
+                // Still marked: the older generations are unreadable and hand
+                // writes of the property refused, so carrying their live
+                // entries into this one races nothing. Read from a snapshot
+                // taken now, not the one the call's reads were pinned to
+                // before the algorithm ran: a hand write that landed between
+                // that pin and the marker must be carried as it is now.
+                let current = self.storage.writer_snapshot().await?;
+                let mut carry = SlateGraphStore::scope_snapshot(
+                    current,
+                    self.carry_forward_write_back_entries(cell_id, property, generation, sorted_ids.as_deref().unwrap_or(vertices), budget),
+                )
+                .await?;
+                let carried = std::mem::take(&mut carry.values);
+                // The gate goes with the sorted copy and the carried values,
+                // as it went with the scores to the sort: a call dropped
+                // mid-count must not free it while the count holds them.
+                let (ordered, statistics, gate) = {
+                    let span = tracing::info_span!(
+                        "gds.write_back.statistics",
+                        hydradb.write.rows = ordered.as_slice().len() + carried.len()
+                    );
+                    let count_budget = budget.clone();
+                    let count_property = property.to_string();
+                    super::query::run_graph_compute(Arc::clone(&self.operation_metrics), "gds_write_back_statistics", move || {
+                        let _span = span.entered();
+                        let statistics = crate::engine::exact_float_property_statistics(&count_property, &ordered, carried, || {
+                            count_budget.check("gds_write_back_statistics")
+                        })?;
+                        Ok((ordered, statistics, gate))
+                    })
+                    .await?
+                };
+                let statistics = crate::engine::encode_write_back_property_statistics(cell_id, property, generation, &statistics);
+                self.write_back_locked(cell_id, "publish_write_back_generation", 1, Some(budget), || {
+                    self.publish_write_back_generation_txn(cell_id, property, generation, &statistics)
+                })
+                .await?;
+                Ok((written, Some(generation), ordered, carry, gate))
+            })
+            .await?;
+        drop(in_flight);
+        // This node's planner reads the new counts on its next query rather
+        // than at the end of the TTL. Other nodes serving the cell have no
+        // such signal and pick them up at theirs.
+        #[cfg(feature = "experimental-cypher-engine")]
+        if generation.is_some() {
+            self.planner_statistics_cache.invalidate(cell_id);
+        }
+        if let Some(generation) = generation {
+            match self.self_handle.get().and_then(std::sync::Weak::upgrade) {
+                Some(shard) => shard.spawn_write_back_sweep(cell_id.to_string(), property.to_string(), generation),
+                None => {
+                    self.sweep_write_back_index_generations(cell_id, property, generation, budget)
+                        .await?;
+                }
+            }
+        }
+        Ok(WriteBackOutcome {
+            written,
+            skipped: 0,
+            ordered,
+            carried: carry.carried,
+            carry_scanned: carry.scanned,
+            carry_millis: carry.millis,
+        })
+    }
+
+    /// Carry `property`'s live values on vertices outside this run into its
+    /// generation, before the switch: at the switch the new generation
+    /// indexes every vertex that has a value key for the property, not only
+    /// the run's. A run leaves the property where it was on vertices it did
+    /// not score, as a GDS write does, and those stay found by the index.
+    ///
+    /// Walks the index entries of every generation below `generation` from
+    /// the sweep floor: the catalog's, those of stopped runs, and any a
+    /// running sweep has not reached. An entry of a vertex outside the run
+    /// (`vertices` is ascending) is carried when the vertex's value
+    /// key still holds the value the entry indexes; a value key that is gone
+    /// or holds another value makes the entry stale, and it is left to the
+    /// sweep. A vertex is carried once, however many generations index its
+    /// value. The run's marker refuses hand writes and deletes of the
+    /// property meanwhile, so the value keys hold still under the walk.
+    ///
+    /// One read walk of the older generations per run, plus a point read and
+    /// a put per vertex outside the run: a run over the same vertices as the
+    /// last reads the walk and writes nothing.
+    #[cfg(feature = "opencypher")]
+    async fn carry_forward_write_back_entries(
+        &self,
+        cell_id: &str,
+        property: &str,
+        generation: StorageSequence,
+        vertices: &[VertexId],
+        budget: &QueryBudget,
+    ) -> Result<CarryForward> {
+        let started = std::time::Instant::now();
+        let floor_key = keys::vertex_write_back_sweep_floor(cell_id, property);
+        let floor = match self.read_remote(&floor_key).await? {
+            Some(value) => Some(decode_u64(&floor_key, &value)?),
+            None => None,
+        };
+        let prefix = keys::vertex_write_back_index_property_prefix(cell_id, property);
+        let start = floor.map(|floor| keys::vertex_write_back_index_generation_suffix(floor).into_bytes());
+        let mut iter = self.scan_remote_prefix_from(&prefix, start).await?;
+        let chunk_size = self.write_back_chunk();
+        let mut carry = CarryForward::default();
+        let mut carried_vertices = std::collections::HashSet::new();
+        let mut batch = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let Some((_, entry_generation, encoded, vertex_id)) = keys::parse_vertex_write_back_index_key(&key) else {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "expected a write-back index key".to_string(),
+                });
+            };
+            if entry_generation >= generation {
+                break;
+            }
+            if carry.scanned % CARRY_FORWARD_CHECK_STRIDE == 0 {
+                budget.check("gds_write_back_carry_forward")?;
+            }
+            carry.scanned += 1;
+            if vertices.binary_search(&vertex_id).is_ok() || carried_vertices.contains(&vertex_id) {
+                continue;
+            }
+            let value_key = keys::vertex_write_back_property(cell_id, vertex_id, property);
+            let Some(held) = self.read_remote(&value_key).await? else {
+                continue;
+            };
+            let held = std::str::from_utf8(&held).map_err(|err| GraphError::CorruptValue {
+                key: value_key.clone(),
+                reason: err.to_string(),
+            })?;
+            let held = decode_vertex_property_value_record(&value_key, held)?;
+            if !held.is_scalar_indexable() || encode_vertex_property_value_key(&held) != encoded {
+                continue;
+            }
+            carried_vertices.insert(vertex_id);
+            carry.values.push(&held);
+            batch.push((
+                keys::vertex_write_back_index(cell_id, property, generation, &encoded, vertex_id),
+                vertex_id,
+            ));
+            if batch.len() >= chunk_size {
+                self.write_back_locked(cell_id, "carry_forward_write_back_entries", batch.len(), Some(budget), || {
+                    self.put_write_back_index_entries_txn(cell_id, &batch)
+                })
+                .await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.write_back_locked(cell_id, "carry_forward_write_back_entries", batch.len(), Some(budget), || {
+                self.put_write_back_index_entries_txn(cell_id, &batch)
+            })
+            .await?;
+        }
+        carry.carried = carried_vertices.len() as u64;
+        carry.millis = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        Ok(carry)
+    }
+
+    /// Put write-back index entries, each naming its vertex.
+    #[cfg(feature = "opencypher")]
+    async fn put_write_back_index_entries_txn(&self, cell_id: &str, entries: &[(String, VertexId)]) -> Result<()> {
+        let lock = self
+            .acquire_local_write_guard_no_fence(cell_id, "carry_forward_write_back_entries")
+            .await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, "carry_forward_write_back_entries")
+                .instrument(tracing::info_span!("write.fence_validate"))
+                .await?;
+            self.validate_changing_write().await?;
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            for (key, vertex_id) in entries {
+                txn.put(key.as_bytes(), encode_u64(*vertex_id).as_slice())?;
+            }
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// Run the sweep of `property`'s superseded index generations on a task
+    /// of its own, holding this owned handle, so the caller's reply does not
+    /// wait for it.
+    ///
+    /// The task has no query budget: the request that published the
+    /// generation has been answered, and a sweep stopped by a deadline would
+    /// only leave the old generation for the next sweep to find. The shard
+    /// bounds it instead: `close` aborts every sweep still running, which is
+    /// safe because a sweep is rebuildable work, since the next sweep of the
+    /// property deletes everything below the current generation, whatever an
+    /// earlier one left.
+    ///
+    /// The sweep yields to write-backs rather than share the writer with
+    /// them: it starts only once no write-back has run for the configured
+    /// grace, and parks between batches while one is in flight.
+    ///
+    /// A property has at most one pending sweep: one that has not yet taken
+    /// the generation it sweeps to, which it does once it holds the GC
+    /// permit. A write-back that completes while one is pending raises that
+    /// sweep's target and spawns nothing, so a batch of write-backs that
+    /// keeps restarting the grace leaves one task per property rather than
+    /// one per call, and that task sweeps to the newest generation. Beyond
+    /// that, sweeps of one property are not serialised: a pending sweep may
+    /// start while an earlier one still runs where the GC gate admits more
+    /// than one job. Each reads the catalog for its floor and deletes only
+    /// below it, so the overlap costs duplicate tombstones and nothing else,
+    /// and a lane per property would add state for no correctness.
+    ///
+    /// The span is a root that follows from the request's span rather than a
+    /// child of it: a child holds its parent open until it closes, which
+    /// would stretch the request's recorded duration over the very work this
+    /// detaches from it.
+    #[cfg(feature = "opencypher")]
+    fn spawn_write_back_sweep(self: std::sync::Arc<Self>, cell_id: String, property: String, published: StorageSequence) {
+        {
+            let mut targets = self
+                .write_back_sweep_targets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match targets.entry((cell_id.clone(), property.clone())) {
+                std::collections::hash_map::Entry::Occupied(mut pending) => {
+                    let target = pending.get_mut();
+                    *target = (*target).max(published);
+                    return;
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(published);
+                }
+            }
+        }
+        // Made before the task, so a task aborted before its first poll
+        // still clears its entry when its future is dropped.
+        let mut pending = PendingWriteBackSweep {
+            shard: std::sync::Arc::clone(&self),
+            key: Some((cell_id.clone(), property.clone())),
+            published,
+        };
+        let span = write_back_sweep_span(&cell_id, true);
+        span.follows_from(tracing::Span::current());
+        let shard = std::sync::Arc::clone(&self);
+        let grace = std::time::Duration::from_millis(self.limits.write_back_sweep_grace_ms);
+        let task = tokio::spawn(async move {
+            let budget = QueryBudget::new(None, None);
+            match shard
+                .sweep_write_back_index_generations_under(span, &cell_id, &property, || pending.take(), Some(grace), &budget)
+                .await
+            {
+                Ok(_outcome) => {}
+                Err(error) => tracing::warn!(
+                    hydradb.cell_id = %cell_id,
+                    hydradb.property = %property,
+                    error = %error,
+                    "write-back sweep failed; the next sweep of the property covers what it left"
+                ),
+            }
+        });
+        let mut sweeps = self.write_back_sweeps.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        sweeps.retain(|sweep| !sweep.is_finished());
+        sweeps.push(task);
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn take_write_back_sweeps(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut *self.write_back_sweeps.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Stop every detached sweep and wait until each has stopped, before the
+    /// store closes under them. Aborted rather than finished: a sweep is
+    /// rebuildable work, and a shutdown has nothing to gain from a batch of
+    /// tombstones it could as well leave to the next sweep.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn abort_write_back_sweeps(&self) {
+        for sweep in self.take_write_back_sweeps() {
+            sweep.abort();
+            // Cancellation is the expected outcome; a panic in a sweep was
+            // reported by the task that panicked.
+            let _ = sweep.await;
+        }
+    }
+
+    /// Rows one write-back transaction writes and one sweep transaction
+    /// deletes: the configured chunk, never more than a bulk import may
+    /// carry, never less than one. Each holds the writer lane for its
+    /// transaction, so the chunk also bounds how long other writes wait
+    /// behind a large write-back.
+    #[cfg(feature = "opencypher")]
+    fn write_back_chunk(&self) -> usize {
+        self.limits.write_back_chunk.min(self.limits.max_bulk_import_edges).max(1)
+    }
+
+    /// One write-back transaction under the write permit, the writer lane
+    /// and the conflict retry loop, inside its own pipeline context.
+    ///
+    /// With a `budget`, both waits give up at the call's deadline or
+    /// cancellation and the budget is checked once admitted: a gds call holds
+    /// its compute gate and its whole score vector while it waits, so a busy
+    /// writer must not keep them past the deadline, and an expired or
+    /// cancelled call must not start another transaction. Work with no
+    /// caller to answer passes none and waits its turn.
+    #[cfg(feature = "opencypher")]
+    async fn write_back_locked<T, F, Fut>(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        rows: usize,
+        budget: Option<&QueryBudget>,
+        txn: F,
+    ) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.run_write_pipeline(async {
+            let permit = self.acquire_graph_write_permit(operation).instrument(tracing::info_span!(
+                "shard.write_permit",
+                hydradb.cell_id = %cell_id,
+                hydradb.write.operation = operation
+            ));
+            let _permit = match budget {
+                Some(budget) => budget.until_deadline(operation, permit).await??,
+                None => permit.await?,
+            };
+            let lane = self
+                .writer_lane(cell_id)
+                .lock()
+                .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %cell_id));
+            let _writer = match budget {
+                Some(budget) => {
+                    let writer = budget.until_deadline(operation, lane).await?;
+                    budget.check(operation)?;
+                    writer
+                }
+                None => lane.await,
+            };
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match txn()
+                    .instrument(tracing::info_span!("storage.txn", hydradb.write.rows = rows))
+                    .await
+                {
+                    Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                        self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                    result => return result,
+                }
+            }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+        })
+        .await
+    }
+
+    /// The start of a write-back run: its generation, this transaction's
+    /// epoch, which is unique and increasing across runs, put as the
+    /// property's pending marker ([`keys::vertex_write_back_pending`]). A
+    /// marker a stopped run left is replaced. Returns the generation.
+    #[cfg(feature = "opencypher")]
+    async fn begin_write_back_generation_txn(&self, cell_id: &str, property: &str) -> Result<StorageSequence> {
+        let lock = self
+            .acquire_local_write_guard_no_fence(cell_id, "begin_write_back_generation")
+            .await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, "begin_write_back_generation")
+                .instrument(tracing::info_span!("write.fence_validate"))
+                .await?;
+            self.validate_changing_write().await?;
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            txn.put(
+                keys::vertex_write_back_pending(cell_id, property).as_bytes(),
+                encode_u64(epoch).as_slice(),
+            )?;
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(epoch)
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// One chunk of a write-back: a value key and an index entry in
+    /// `generation` per vertex, `scores[i]` on `vertices[i]`, put blind.
+    #[cfg(feature = "opencypher")]
+    async fn set_property_on_existing_vertices_txn(
+        &self,
+        cell_id: &str,
+        property: &str,
+        vertices: &[VertexId],
+        scores: &[f64],
+        generation: StorageSequence,
     ) -> Result<()> {
+        let lock = self
+            .acquire_local_write_guard_no_fence(cell_id, "set_property_on_existing_vertices")
+            .await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, "set_property_on_existing_vertices")
+                .await?;
+            self.validate_changing_write().await?;
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            for (&vertex_id, &score) in vertices.iter().zip(scores) {
+                let value = VertexPropertyValue::Float(QueryFloat(score));
+                txn.put(
+                    keys::vertex_write_back_property(cell_id, vertex_id, property).as_bytes(),
+                    encode_vertex_property_value_record(&value).as_bytes(),
+                )?;
+                txn.put(
+                    keys::vertex_write_back_index(cell_id, property, generation, &encode_vertex_property_value_key(&value), vertex_id)
+                        .as_bytes(),
+                    encode_u64(vertex_id).as_slice(),
+                )?;
+            }
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// The catalog switch: readers of `property` resolve `generation` from
+    /// here on. One key, committed after every entry of the generation, so
+    /// the switch is atomic and a reader never sees a generation still being
+    /// built. The generation's planner statistics go in the same
+    /// transaction, so a reader never sees the one without the other, and
+    /// the run's pending marker is deleted in it, so the property is never
+    /// both switched and refused, nor unrefused and unswitched.
+    #[cfg(feature = "opencypher")]
+    async fn publish_write_back_generation_txn(
+        &self,
+        cell_id: &str,
+        property: &str,
+        generation: StorageSequence,
+        statistics: &[u8],
+    ) -> Result<()> {
+        let lock = self
+            .acquire_local_write_guard_no_fence(cell_id, "publish_write_back_generation")
+            .await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, "publish_write_back_generation")
+                .instrument(tracing::info_span!("write.fence_validate"))
+                .await?;
+            self.validate_changing_write().await?;
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            txn.put(
+                keys::vertex_write_back_generation(cell_id, property).as_bytes(),
+                encode_u64(generation).as_slice(),
+            )?;
+            txn.put(keys::vertex_write_back_statistics(cell_id, property).as_bytes(), statistics)?;
+            // Cleared only when it is this run's: a marker another run of
+            // the property put after this one began is that run's, still
+            // writing.
+            let pending = keys::vertex_write_back_pending(cell_id, property);
+            let held = read_txn_remote(&txn, &pending)
+                .await?
+                .map(|value| decode_u64(&pending, &value))
+                .transpose()?;
+            if held == Some(generation) {
+                txn.delete(pending.as_bytes())?;
+            }
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// Raise the sweep floor of `property` to `floor`: no index entry below
+    /// it remains. Never lowered: two sweeps may overlap where the GC gate
+    /// admits more than one job, and the one that swept further must not
+    /// have its floor pulled back by the one that finishes later.
+    #[cfg(feature = "opencypher")]
+    async fn advance_write_back_sweep_floor_txn(&self, cell_id: &str, property: &str, floor: StorageSequence) -> Result<()> {
+        let lock = self
+            .acquire_local_write_guard_no_fence(cell_id, "advance_write_back_sweep_floor")
+            .await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, "advance_write_back_sweep_floor")
+                .instrument(tracing::info_span!("write.fence_validate"))
+                .await?;
+            self.validate_changing_write().await?;
+            let key = keys::vertex_write_back_sweep_floor(cell_id, property);
+            let held = match read_txn_remote(&txn, &key).await? {
+                Some(value) => decode_u64(&key, &value)?,
+                None => 0,
+            };
+            if held >= floor {
+                return Ok(());
+            }
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            txn.put(key.as_bytes(), encode_u64(floor).as_slice())?;
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    /// Delete every index generation of `property` older than the current
+    /// one, in batches, under the GC permit. Generations sort oldest first
+    /// under the property prefix, so one scan from its start yields every
+    /// entry to delete in order and stops at the first entry of the current
+    /// generation.
+    ///
+    /// The current generation is the newer of `published`, the one the
+    /// calling write-back just switched the catalog to, and what the catalog
+    /// holds. The caller's own switch is passed in because it may not be
+    /// visible to a read yet: a read at remote durability sees a commit only
+    /// once its WAL is uploaded, and a sweep that read the previous
+    /// generation back would stop at that generation's first entry and
+    /// delete nothing. The catalog is still read, inside the pipeline
+    /// context so the read is at memory durability, as a floor: a later run
+    /// may have published a newer generation since, and a sweep never
+    /// removes a generation the catalog names or one newer than it. A run
+    /// whose generation is still being written is safe either way, since its
+    /// generation is newer than anything published.
+    ///
+    /// The storage engine at this revision has no range delete, so a swept
+    /// generation costs one tombstone per entry through the writer, which
+    /// compaction later drops. A revision with range deletes turns a whole
+    /// generation into one range tombstone and makes this a single small
+    /// write; adopting one is a separate change. Returns the entries
+    /// deleted.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn sweep_write_back_index_generations(
+        &self,
+        cell_id: &str,
+        property: &str,
+        published: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("property", property)?;
+        let span = write_back_sweep_span(cell_id, false);
+        self.sweep_write_back_index_generations_under(span, cell_id, property, || published, None, budget)
+            .await
+            .map(|outcome| outcome.deleted)
+    }
+
+    /// Wait until no write-back has run for `grace`: none in flight now,
+    /// and none begun or in flight once the grace has elapsed. A write-back
+    /// that begins during the grace restarts it, so the calls of a batch of
+    /// algorithms that follow one another inside the grace keep the sweep
+    /// out until the batch ends. Returns the time spent waiting.
+    #[cfg(feature = "opencypher")]
+    async fn wait_for_write_back_quiet(&self, grace: std::time::Duration) -> std::time::Duration {
+        let waiting = std::time::Instant::now();
+        loop {
+            self.write_back_activity.wait_idle().await;
+            if grace.is_zero() {
+                break;
+            }
+            let begun = self.write_back_activity.started();
+            tokio::time::sleep(grace).await;
+            if self.write_back_activity.in_flight() == 0 && self.write_back_activity.started() == begun {
+                break;
+            }
+        }
+        waiting.elapsed()
+    }
+
+    /// [`Self::sweep_write_back_index_generations`] under a span the caller
+    /// made, so a sweep run inside a request and one detached from it differ
+    /// only in where their span hangs and whether they wait out write-backs
+    /// before starting: `grace` is that wait, and `None` starts at once, as
+    /// a sweep inside a request must. `published` is asked for once the
+    /// sweep holds the GC permit, so a detached sweep that waited takes the
+    /// newest generation published while it did.
+    #[cfg(feature = "opencypher")]
+    async fn sweep_write_back_index_generations_under(
+        &self,
+        span: tracing::Span,
+        cell_id: &str,
+        property: &str,
+        published: impl FnOnce() -> StorageSequence,
+        grace: Option<std::time::Duration>,
+        budget: &QueryBudget,
+    ) -> Result<crate::core::state::WriteBackSweepOutcome> {
+        // Recorded on the handle, not on the current span: the handle names
+        // this span whether or not the subscriber tracks entered spans.
+        let sweep = span.clone();
+        async {
+            // Before the GC permit: a sweep waiting out a batch of
+            // write-backs must not hold the permit from other GC meanwhile.
+            let mut waited = match grace {
+                Some(grace) => self.wait_for_write_back_quiet(grace).await,
+                None => std::time::Duration::ZERO,
+            };
+            let _gc = self.acquire_gc_permit("sweep_write_back_index_generations").await?;
+            let published = published();
+            let catalog_key = keys::vertex_write_back_generation(cell_id, property);
+            let floor_key = keys::vertex_write_back_sweep_floor(cell_id, property);
+            let prefix = keys::vertex_write_back_index_property_prefix(cell_id, property);
+            let batch_size = self.write_back_chunk();
+            // A pipeline context holds one of the pipeline's bounded
+            // admissions, and a write-back counts itself in flight before it
+            // asks for one. So the sweep never parks inside a context: where
+            // the GC gate admits as many sweeps as the pipeline has
+            // admissions, sweeps parked holding them all would wait on a
+            // write-back that waits on them, and every other writer behind
+            // it. The sweep runs its batches in a context that ends as soon
+            // as a write-back is in flight, parks outside it, and opens a
+            // new one to resume. The batches between two parks share their
+            // context, as the write path's chunks do, so durability is
+            // awaited once per run of batches rather than once per batch;
+            // the extra wait a park adds falls while a write-back has the
+            // writer anyway. The catalog read and the opening of the walk
+            // take a context of their own, so both read at memory
+            // durability.
+            //
+            // One iterator serves every batch. It is opened before the sweep
+            // deletes anything, so its snapshot holds no tombstone of the
+            // sweep's own and cannot hand back a key already deleted, whenever
+            // those tombstones would otherwise become visible; and one walk of
+            // the prefix is the least a sweep that has to find its keys can
+            // read. Reopening a scan per batch would start each one by
+            // climbing over every tombstone the earlier batches left in the
+            // memtables, so the scanning, not the committing, would grow with
+            // the number of batches.
+            //
+            // The walk opens at the floor the last completed sweep left, not
+            // at the property's first key: the tombstones of every generation
+            // swept before stay in the tree until compaction drops them, and
+            // a walk from the first key climbs over all of them, so its cost
+            // would grow with every sweep rather than with the generation
+            // being swept. A sweep that fails or is aborted leaves the floor
+            // where it was, and the next one re-walks from there: slower,
+            // never wrong.
+            let (current, floor, mut iter) = self
+                .run_write_pipeline(async {
+                    let catalog = match self.read_remote(&catalog_key).await? {
+                        Some(value) => decode_u64(&catalog_key, &value)?,
+                        None => 0,
+                    };
+                    let floor = match self.read_remote(&floor_key).await? {
+                        Some(value) => Some(decode_u64(&floor_key, &value)?),
+                        None => None,
+                    };
+                    let start = floor.map(|floor| keys::vertex_write_back_index_generation_suffix(floor).into_bytes());
+                    let iter = self.scan_remote_prefix_from(&prefix, start).await?;
+                    Ok((published.max(catalog), floor.unwrap_or(0), iter))
+                })
+                .await?;
+            let (mut deleted, mut batches, mut scanned) = (0_u64, 0_u64, 0_u64);
+            let mut exhausted = false;
+            loop {
+                let write_back_arrived = self
+                    .run_write_pipeline(async {
+                        while !exhausted {
+                            budget.check("sweep_write_back_index_generations")?;
+                            // A write-back that arrived since the last batch
+                            // has the writer: leave the context to park.
+                            if self.write_back_activity.in_flight() > 0 {
+                                return Ok(true);
+                            }
+                            let mut batch = Vec::with_capacity(batch_size);
+                            while batch.len() < batch_size {
+                                let Some(kv) = iter.next().await? else {
+                                    exhausted = true;
+                                    break;
+                                };
+                                scanned += 1;
+                                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                                let Some((_, generation, _, _)) = keys::parse_vertex_write_back_index_key(&key) else {
+                                    return Err(GraphError::CorruptValue {
+                                        key,
+                                        reason: "expected a write-back index key".to_string(),
+                                    });
+                                };
+                                if generation >= current {
+                                    exhausted = true;
+                                    break;
+                                }
+                                batch.push(key);
+                            }
+                            if batch.is_empty() {
+                                break;
+                            }
+                            self.write_back_locked(cell_id, "sweep_write_back_index_generations", batch.len(), Some(budget), || {
+                                self.delete_keys_txn(cell_id, "sweep_write_back_index_generations", &batch)
+                            })
+                            .await?;
+                            deleted += batch.len() as u64;
+                            batches += 1;
+                        }
+                        // Every exit above leaves nothing below `current`:
+                        // the walk either ran out of keys or met the first
+                        // entry at or past it. A floor already there is not
+                        // rewritten.
+                        if floor < current {
+                            self.write_back_locked(cell_id, "advance_write_back_sweep_floor", 1, Some(budget), || {
+                                self.advance_write_back_sweep_floor_txn(cell_id, property, current)
+                            })
+                            .await?;
+                        }
+                        Ok(false)
+                    })
+                    .await?;
+                if !write_back_arrived {
+                    break;
+                }
+                // Park until the write-back is done, then resume the walk.
+                // No new grace here: the sweep holds the GC permit and its
+                // iterator, and a batch slipped between two write-backs costs
+                // them no more than resuming would.
+                let parking = std::time::Instant::now();
+                self.write_back_activity.wait_idle().await;
+                waited += parking.elapsed();
+            }
+            let outcome = crate::core::state::WriteBackSweepOutcome {
+                deleted,
+                batches,
+                waited,
+                floor,
+                scanned,
+            };
+            sweep.record("hydradb.write.deletes", outcome.deleted);
+            sweep.record("hydradb.write.batches", outcome.batches);
+            sweep.record("hydradb.write.waited_ms", outcome.waited.as_millis() as u64);
+            sweep.record("hydradb.write.floor", outcome.floor);
+            sweep.record("hydradb.write.scanned", outcome.scanned);
+            Ok(outcome)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// One transaction that tombstones `keys`.
+    #[cfg(feature = "opencypher")]
+    async fn delete_keys_txn(&self, cell_id: &str, operation: &'static str, keys: &[String]) -> Result<()> {
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, operation).await?;
+        let result = async {
+            let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+            self.validate_write_fence_txn(&txn, cell_id, operation)
+                .instrument(tracing::info_span!("write.fence_validate"))
+                .await?;
+            self.validate_changing_write().await?;
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            for key in keys {
+                txn.delete(key.as_bytes())?;
+            }
+            commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        .await;
+        finish_local_write(lock, result).await
+    }
+
+    pub async fn set_vertex_metadata(&self, cell_id: &str, vertex_id: VertexId, metadata: VertexMetadata) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         validate_vertex_metadata(&metadata)?;
         self.ensure_write_authority(cell_id, "set_vertex_metadata")?;
@@ -420,6 +1467,37 @@ impl GraphShard {
         cell_id: &str,
         updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
     ) -> Result<usize> {
+        self.set_vertex_metadata_batch_checked(cell_id, updates, None).await
+    }
+
+    /// Replace each vertex's record with `next` only if it is still the
+    /// `read` record its statement computed `next` from, all or none. A
+    /// statement reads at a snapshot taken before this transaction: without
+    /// the check, a write committed in between (another `SET`, a node batch)
+    /// was overwritten, and a vertex deleted in between was recreated.
+    /// Refuses with `ConditionalWriteConflict` when any record changed or is
+    /// gone, writing nothing; the statement re-runs on a fresh snapshot.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn swap_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        swaps: BTreeMap<VertexId, (VertexMetadata, VertexMetadata)>,
+    ) -> Result<usize> {
+        let mut read = BTreeMap::new();
+        let mut next = Vec::with_capacity(swaps.len());
+        for (vertex_id, (before, after)) in swaps {
+            read.insert(vertex_id, before);
+            next.push((vertex_id, after));
+        }
+        self.set_vertex_metadata_batch_checked(cell_id, next, Some(&read)).await
+    }
+
+    async fn set_vertex_metadata_batch_checked(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+        read: Option<&BTreeMap<VertexId, VertexMetadata>>,
+    ) -> Result<usize> {
         validate_component("cell_id", cell_id)?;
         self.ensure_write_authority(cell_id, "set_vertex_metadata_batch")?;
         let updates = coalesce_vertex_metadata_updates(updates)?;
@@ -443,7 +1521,7 @@ impl GraphShard {
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .set_vertex_metadata_batch_txn(cell_id, updates.clone())
+                .set_vertex_metadata_batch_txn(cell_id, updates.clone(), read)
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
@@ -492,10 +1570,7 @@ impl GraphShard {
         // cloned on retry, so the limit counts patches rather than vertices.
         ensure_limit(
             "merge_vertex_metadata_batch",
-            updates
-                .iter()
-                .map(|(_, patches)| patches.len() as u64)
-                .sum(),
+            updates.iter().map(|(_, patches)| patches.len() as u64).sum(),
             self.limits.max_bulk_import_edges as u64,
         )?;
         #[cfg(feature = "opencypher")]
@@ -577,14 +1652,12 @@ impl GraphShard {
         // No new WAL means no create-only fencing barrier. Check ownership
         // after releasing the foreground gate before acknowledging a no-op.
         let result = if result.as_ref().is_ok_and(|changed| *changed == 0) {
-            self.db.refresh_writer_fence().await.map(|()| 0)
+            self.storage.refresh_writer_fence().await.map(|()| 0)
         } else {
             result
         };
         if result.as_ref().is_ok_and(|changed| *changed > 0) {
-            self.operation_metrics
-                .write_commits
-                .fetch_add(1, Ordering::Relaxed);
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(feature = "opencypher")]
         self.operation_metrics
@@ -598,10 +1671,7 @@ impl GraphShard {
         cell_id: &str,
         updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
     ) -> Result<usize> {
-        let _latency = self
-            .operation_metrics
-            .import_vertex_metadata_batch_latency
-            .start_timer();
+        let _latency = self.operation_metrics.import_vertex_metadata_batch_latency.start_timer();
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", cell_id)?;
@@ -615,17 +1685,11 @@ impl GraphShard {
             updates.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
-        self.run_write_pipeline_fencing_noops(
-            self.import_vertex_metadata_batch_inline(cell_id, updates),
-        )
-        .await
+        self.run_write_pipeline_fencing_noops(self.import_vertex_metadata_batch_inline(cell_id, updates))
+            .await
     }
 
-    async fn import_vertex_metadata_batch_inline(
-        &self,
-        cell_id: &str,
-        updates: Vec<(VertexId, VertexMetadata)>,
-    ) -> Result<usize> {
+    async fn import_vertex_metadata_batch_inline(&self, cell_id: &str, updates: Vec<(VertexId, VertexMetadata)>) -> Result<usize> {
         let _permit = self
             .acquire_graph_write_permit("import_vertex_metadata_batch")
             .instrument(tracing::info_span!("shard.write_permit", hydradb.cell_id = %cell_id, hydradb.write.operation = "import_vertex_metadata_batch"))
@@ -641,19 +1705,13 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(changed) => {
                     if changed > 0 {
-                        self.operation_metrics
-                            .write_commits
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(changed);
                 }
@@ -666,84 +1724,167 @@ impl GraphShard {
         })
     }
 
-    async fn set_vertex_metadata_txn(
-        &self,
-        cell_id: &str,
-        vertex_id: VertexId,
-        metadata: VertexMetadata,
-    ) -> Result<()> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(cell_id, "set_vertex_metadata")
-            .await?;
-        let result = self
-            .set_vertex_metadata_txn_locked(cell_id, vertex_id, metadata)
-            .await;
+    async fn set_vertex_metadata_txn(&self, cell_id: &str, vertex_id: VertexId, metadata: VertexMetadata) -> Result<()> {
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, "set_vertex_metadata").await?;
+        let result = self.set_vertex_metadata_txn_locked(cell_id, vertex_id, metadata).await;
         finish_local_write(lock, result).await
     }
 
-    async fn set_vertex_metadata_txn_locked(
-        &self,
-        cell_id: &str,
-        vertex_id: VertexId,
-        metadata: VertexMetadata,
-    ) -> Result<()> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+    async fn set_vertex_metadata_txn_locked(&self, cell_id: &str, vertex_id: VertexId, metadata: VertexMetadata) -> Result<()> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
         let vertex_key = keys::vertex(cell_id, vertex_id);
-        let existing = decode_vertex_record(
-            &vertex_key,
-            read_txn_remote(&txn, &vertex_key).await?.as_ref(),
-        )?;
-        if existing.as_ref() == Some(&metadata) {
-            self.db.refresh_writer_fence().await?;
+        let existing = decode_vertex_record(&vertex_key, read_txn_remote(&txn, &vertex_key).await?.as_ref())?;
+        // The replacement is the vertex as reads will see it, so it is
+        // compared with that view, and the write-back values it omits go.
+        let (seen, mut omitted) = overlaid_vertex_metadata_txn(&txn, cell_id, vertex_id, existing.as_ref()).await?;
+        if seen.as_ref() == Some(&metadata) {
+            self.storage.refresh_writer_fence().await?;
             return Ok(());
         }
-        let previous = existing.unwrap_or_default();
+        omitted.retain(|(property, _)| !metadata.properties.contains_key(property));
         self.validate_changing_write().await?;
         let epoch = next_epoch_txn(&txn, cell_id).await?;
-        apply_vertex_metadata_update_txn(&txn, cell_id, vertex_id, &previous, &metadata, epoch)?;
+        let mut generations = WriteBackGenerations::default();
+        apply_vertex_metadata_update_txn(&txn, cell_id, vertex_id, existing.as_ref(), &metadata, epoch, &mut generations).await?;
+        remove_write_back_properties_txn(&txn, cell_id, vertex_id, &omitted, &mut generations).await?;
         commit_txn_strict(txn, self.await_durable_writes).await
+    }
+
+    /// Creates one standalone vertex: the Cypher `CREATE (n:Label {id: ..., ...})`
+    /// with no relationship.
+    ///
+    /// Unlike the endpoints of a relationship `CREATE`, which merge into an
+    /// existing vertex, this follows Cypher `CREATE` and the DataFusion route:
+    /// an id that already exists is rejected with `node identity {id} already
+    /// exists`. A retry with the same idempotency key and payload replays the
+    /// original result instead, so a client that lost the response can resend.
+    pub async fn create_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+        idempotency_key: &str,
+    ) -> Result<VertexCreateResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("idempotency_key", idempotency_key)?;
+        validate_vertex_metadata(&metadata)?;
+        self.ensure_write_authority(cell_id, "create_vertex")?;
+        self.run_write_pipeline(async {
+            let _permit = self
+                .acquire_graph_write_permit("create_vertex")
+                .instrument(
+                    tracing::info_span!("shard.write_permit", hydradb.cell_id = %cell_id, hydradb.write.operation = "create_vertex"),
+                )
+                .await?;
+            let _writer = self
+                .writer_lane(cell_id)
+                .lock()
+                .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %cell_id))
+                .await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .create_vertex_txn(cell_id, vertex_id, &metadata, idempotency_key)
+                    .instrument(tracing::info_span!("storage.txn"))
+                    .await
+                {
+                    Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                        self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        if !result.already_created {
+                            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(result);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+        })
+        .await
+    }
+
+    async fn create_vertex_txn(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: &VertexMetadata,
+        idempotency_key: &str,
+    ) -> Result<VertexCreateResult> {
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, "create_vertex").await?;
+        let result = self.create_vertex_txn_locked(cell_id, vertex_id, metadata, idempotency_key).await;
+        finish_local_write(lock, result).await
+    }
+
+    async fn create_vertex_txn_locked(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: &VertexMetadata,
+        idempotency_key: &str,
+    ) -> Result<VertexCreateResult> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "create_vertex")
+            .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
+            .await?;
+        let fingerprint = vertex_create_fingerprint(cell_id, vertex_id, metadata);
+        let idem_key = keys::idempotency(cell_id, "vertex-create", idempotency_key);
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            let replayed = decode_vertex_create_idempotency(&idem_key, cell_id, vertex_id, idempotency_key, fingerprint, &value)?;
+            self.storage.refresh_writer_fence().await?;
+            return Ok(replayed);
+        }
+        let vertex_key = keys::vertex(cell_id, vertex_id);
+        if read_txn_remote(&txn, &vertex_key).await?.is_some() {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Mutation,
+                dialect: "Cypher25",
+                feature: format!("node identity {vertex_id} already exists"),
+            });
+        }
+        self.validate_changing_write().await?;
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        let mut generations = WriteBackGenerations::default();
+        apply_vertex_metadata_update_txn(&txn, cell_id, vertex_id, None, metadata, epoch, &mut generations).await?;
+        txn.put(
+            idem_key.as_bytes(),
+            encode_vertex_create_idempotency(cell_id, vertex_id, fingerprint, epoch),
+        )?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(VertexCreateResult {
+            epoch,
+            already_created: false,
+        })
     }
 
     async fn set_vertex_metadata_batch_txn(
         &self,
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
+        read: Option<&BTreeMap<VertexId, VertexMetadata>>,
     ) -> Result<usize> {
         let lock = self
             .acquire_local_write_guard_no_fence(cell_id, "set_vertex_metadata_batch")
             .await?;
-        let result = self
-            .set_vertex_metadata_batch_txn_locked(cell_id, updates)
-            .await;
+        let result = self.set_vertex_metadata_batch_txn_locked(cell_id, updates, read).await;
         finish_local_write(lock, result).await
     }
 
-    async fn vertex_metadata_merges_are_noops(
-        &self,
-        cell_id: &str,
-        updates: &[(VertexId, Vec<VertexMetadata>)],
-    ) -> Result<bool> {
+    async fn vertex_metadata_merges_are_noops(&self, cell_id: &str, updates: &[(VertexId, Vec<VertexMetadata>)]) -> Result<bool> {
         let Ok(_hydration_permit) = Arc::clone(&self.hydration_gate).try_acquire_owned() else {
             return Ok(false);
         };
-        let snapshot = self.db.writer()?.durable_snapshot().await?;
+        let snapshot = self.storage.writer()?.durable_snapshot().await?;
         let options = crate::codec::remote_read_options();
-        for marker in [
-            keys::cell_drop_marker(cell_id),
-            keys::cell_drop_pending_marker(cell_id),
-        ] {
-            if snapshot
-                .get_with_options(marker.as_bytes(), &options)
-                .await?
-                .is_some()
-            {
+        for marker in [keys::cell_drop_marker(cell_id), keys::cell_drop_pending_marker(cell_id)] {
+            if snapshot.get_with_options(marker.as_bytes(), &options).await?.is_some() {
                 return Err(GraphError::CellDropped {
                     operation: "merge_vertex_metadata_batch",
                     cell_id: cell_id.to_string(),
@@ -751,6 +1892,20 @@ impl GraphShard {
             }
         }
         self.ensure_write_authority(cell_id, "merge_vertex_metadata_batch")?;
+        // A write-back property's current value is not in the record this
+        // preflight compares with, so a patch naming one is left to the
+        // transaction. One bloom-filtered point miss per distinct name in
+        // the usual case, where the write-back never wrote it.
+        let named = updates
+            .iter()
+            .flat_map(|(_, patches)| patches.iter().flat_map(|patch| patch.properties.keys()))
+            .collect::<BTreeSet<_>>();
+        for property in named {
+            let catalog = keys::vertex_write_back_generation(cell_id, property);
+            if snapshot.get_with_options(catalog.as_bytes(), &options).await?.is_some() {
+                return Ok(false);
+            }
+        }
         let keys = updates
             .iter()
             .map(|(vertex_id, _)| keys::vertex(cell_id, *vertex_id))
@@ -767,9 +1922,7 @@ impl GraphShard {
         for (vertex_id, patches) in updates {
             let key = keys::vertex(cell_id, *vertex_id);
             // Merging into an absent vertex creates it, even with an empty patch.
-            let Some(previous) =
-                decode_vertex_record(&key, existing.get(&key).and_then(Option::as_ref))?
-            else {
+            let Some(previous) = decode_vertex_record(&key, existing.get(&key).and_then(Option::as_ref))? else {
                 return Ok(false);
             };
             for patch in patches {
@@ -795,9 +1948,7 @@ impl GraphShard {
         let lock = self
             .acquire_local_write_guard_no_fence(cell_id, "merge_vertex_metadata_batch")
             .await?;
-        let result = self
-            .merge_vertex_metadata_batch_txn_locked(cell_id, updates, merge_policy)
-            .await;
+        let result = self.merge_vertex_metadata_batch_txn_locked(cell_id, updates, merge_policy).await;
         finish_local_write(lock, result).await
     }
 
@@ -805,47 +1956,61 @@ impl GraphShard {
         &self,
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
+        read: Option<&BTreeMap<VertexId, VertexMetadata>>,
     ) -> Result<usize> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata_batch")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata_batch").await?;
         let mut changed = Vec::new();
+        // Properties a replacement drops that live in the write-back
+        // layout: the record diff cannot see them, so they are removed
+        // apart.
+        let mut removed = Vec::new();
         let read_options = relationship_import_read_options(updates.len());
         // Keep the extra raw read buffers bounded independently of batch size.
         // All reads still belong to this serializable transaction and its guard.
         for chunk in updates.chunks(RELATIONSHIP_IMPORT_READ_CONCURRENCY) {
             let existing = read_txn_remote_many_with_options(
                 &txn,
-                chunk
-                    .iter()
-                    .map(|(vertex, _)| keys::vertex(cell_id, *vertex))
-                    .collect(),
+                chunk.iter().map(|(vertex, _)| keys::vertex(cell_id, *vertex)).collect(),
                 &read_options,
             )
             .await?;
             for (vertex_id, metadata) in chunk {
                 let vertex_key = keys::vertex(cell_id, *vertex_id);
-                let existing = decode_vertex_record(
-                    &vertex_key,
-                    existing.get(&vertex_key).and_then(Option::as_ref),
-                )?;
-                if existing.as_ref() != Some(metadata) {
-                    changed.push((*vertex_id, existing.unwrap_or_default(), metadata.clone()));
+                let existing = decode_vertex_record(&vertex_key, existing.get(&vertex_key).and_then(Option::as_ref))?;
+                // A replacement is the vertex as reads will see it, and a
+                // statement's `read` is what it saw: both are compared with
+                // the record and its write-back values laid over it. The
+                // record diff still starts from the record alone, since a
+                // write-back value is never in it.
+                let (seen, mut values) = overlaid_vertex_metadata_txn(&txn, cell_id, *vertex_id, existing.as_ref()).await?;
+                if read.is_some_and(|read| seen.as_ref() != read.get(vertex_id)) {
+                    return Err(GraphError::ConditionalWriteConflict {
+                        operation: "swap_vertex_metadata_batch",
+                        key: vertex_key,
+                    });
+                }
+                if seen.as_ref() != Some(metadata) {
+                    values.retain(|(property, _)| !metadata.properties.contains_key(property));
+                    if !values.is_empty() {
+                        removed.push((*vertex_id, values));
+                    }
+                    changed.push((*vertex_id, existing, metadata.clone()));
                 }
             }
         }
         if changed.is_empty() {
-            self.db.refresh_writer_fence().await?;
+            self.storage.refresh_writer_fence().await?;
             return Ok(0);
         }
         self.validate_changing_write().await?;
         let epoch = next_epoch_txn(&txn, cell_id).await?;
+        let mut generations = WriteBackGenerations::default();
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous.as_ref(), metadata, epoch, &mut generations).await?;
+        }
+        for (vertex_id, values) in &removed {
+            remove_write_back_properties_txn(&txn, cell_id, *vertex_id, values, &mut generations).await?;
         }
         let changed_count = changed.len();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
@@ -860,35 +2025,39 @@ impl GraphShard {
     ) -> Result<usize> {
         let txn_started = std::time::Instant::now();
         let batch_items = updates.len() as u64;
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "merge_vertex_metadata_batch")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
         let read_started = std::time::Instant::now();
-        let vertex_keys: Vec<String> = updates
-            .iter()
-            .map(|(vertex_id, _)| keys::vertex(cell_id, *vertex_id))
-            .collect();
+        let vertex_keys: Vec<String> = updates.iter().map(|(vertex_id, _)| keys::vertex(cell_id, *vertex_id)).collect();
         let existing = read_txn_remote_many(&txn, vertex_keys.iter().cloned()).await?;
         let mut changed = Vec::new();
+        // Shared with the updates below, which look up the same names.
+        let mut generations = WriteBackGenerations::default();
         for (vertex_id, patches) in updates {
             let vertex_key = keys::vertex(cell_id, vertex_id);
-            let (previous, existed) = match existing.get(&vertex_key).and_then(Option::as_ref) {
-                Some(value) => (decode_vertex_metadata(&vertex_key, value)?, true),
-                None => (VertexMetadata::default(), false),
+            let previous = existing
+                .get(&vertex_key)
+                .and_then(Option::as_ref)
+                .map(|value| decode_vertex_metadata(&vertex_key, value))
+                .transpose()?;
+            // Merged into the vertex as reads see it, write-back values
+            // included, so a merge guard compares against the current value,
+            // and compared with that same view to tell whether it changed.
+            let (merged, changes) = match &previous {
+                Some(record) => {
+                    let base = write_back_patch_base_txn(&txn, cell_id, vertex_id, record, &mut generations).await?;
+                    let merged = apply_vertex_metadata_merges(&base, true, patches, merge_policy, &vertex_key)?;
+                    let changes = merged != *base;
+                    (merged, changes)
+                }
+                None => (
+                    apply_vertex_metadata_merges(&VertexMetadata::default(), false, patches, merge_policy, &vertex_key)?,
+                    true,
+                ),
             };
-            let merged = apply_vertex_metadata_merges(
-                &previous,
-                existed,
-                patches,
-                merge_policy,
-                &vertex_key,
-            )?;
-            if previous != merged || !existed {
+            if changes {
                 changed.push((vertex_id, previous, merged));
             }
         }
@@ -914,7 +2083,7 @@ impl GraphShard {
         self.validate_changing_write().await?;
         let epoch = next_epoch_txn(&txn, cell_id).await?;
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous.as_ref(), metadata, epoch, &mut generations).await?;
         }
         let changed_count = changed.len();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, "", epoch).await?;
@@ -933,83 +2102,51 @@ impl GraphShard {
         Ok(changed_count)
     }
 
-    async fn import_vertex_metadata_batch_txn(
-        &self,
-        cell_id: &str,
-        updates: Vec<(VertexId, VertexMetadata)>,
-    ) -> Result<usize> {
+    async fn import_vertex_metadata_batch_txn(&self, cell_id: &str, updates: Vec<(VertexId, VertexMetadata)>) -> Result<usize> {
         let lock = self
             .acquire_local_write_guard_no_fence(cell_id, "import_vertex_metadata_batch")
             .await?;
-        let result = self
-            .import_vertex_metadata_batch_txn_locked(cell_id, updates)
-            .await;
+        let result = self.import_vertex_metadata_batch_txn_locked(cell_id, updates).await;
         finish_local_write(lock, result).await
     }
 
-    async fn import_vertex_metadata_batch_txn_locked(
-        &self,
-        cell_id: &str,
-        updates: Vec<(VertexId, VertexMetadata)>,
-    ) -> Result<usize> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "import_vertex_metadata_batch")
-            .await?;
+    async fn import_vertex_metadata_batch_txn_locked(&self, cell_id: &str, updates: Vec<(VertexId, VertexMetadata)>) -> Result<usize> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "import_vertex_metadata_batch").await?;
         let mut changed = Vec::new();
         for (vertex_id, metadata) in updates {
             let vertex_key = keys::vertex(cell_id, vertex_id);
-            let existing = decode_vertex_record(
-                &vertex_key,
-                read_txn_remote(&txn, &vertex_key).await?.as_ref(),
-            )?;
+            let existing = decode_vertex_record(&vertex_key, read_txn_remote(&txn, &vertex_key).await?.as_ref())?;
             if existing.as_ref() == Some(&metadata) {
                 continue;
             }
-            let previous = existing.unwrap_or_default();
-            if previous != VertexMetadata::default() {
+            if existing.as_ref().is_some_and(|previous| *previous != VertexMetadata::default()) {
                 return Err(GraphError::CorruptValue {
                     key: vertex_key,
-                    reason: format!(
-                        "vertex {vertex_id} already has different metadata during import"
-                    ),
+                    reason: format!("vertex {vertex_id} already has different metadata during import"),
                 });
             }
-            changed.push((vertex_id, previous, metadata));
+            changed.push((vertex_id, existing, metadata));
         }
         if changed.is_empty() {
             return Ok(0);
         }
         let epoch = next_epoch_txn(&txn, cell_id).await?;
+        let mut generations = WriteBackGenerations::default();
         for (vertex_id, previous, metadata) in &changed {
-            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous.as_ref(), metadata, epoch, &mut generations).await?;
         }
         let changed_count = changed.len();
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(changed_count)
     }
 
-    pub async fn delete_vertex(
-        &self,
-        cell_id: &str,
-        vertex_id: VertexId,
-        idempotency_key: &str,
-    ) -> Result<VertexDeleteResult> {
-        self.delete_vertex_with_options(cell_id, vertex_id, idempotency_key, false)
-            .await
+    pub async fn delete_vertex(&self, cell_id: &str, vertex_id: VertexId, idempotency_key: &str) -> Result<VertexDeleteResult> {
+        self.delete_vertex_with_options(cell_id, vertex_id, idempotency_key, false).await
     }
 
-    pub async fn detach_delete_vertex(
-        &self,
-        cell_id: &str,
-        vertex_id: VertexId,
-        idempotency_key: &str,
-    ) -> Result<VertexDeleteResult> {
-        self.delete_vertex_with_options(cell_id, vertex_id, idempotency_key, true)
-            .await
+    pub async fn detach_delete_vertex(&self, cell_id: &str, vertex_id: VertexId, idempotency_key: &str) -> Result<VertexDeleteResult> {
+        self.delete_vertex_with_options(cell_id, vertex_id, idempotency_key, true).await
     }
 
     pub(crate) async fn delete_vertex_mutations_batch(
@@ -1024,9 +2161,7 @@ impl GraphShard {
             VertexDeleteBatchMode::RejectConnected
         };
         let started = std::time::Instant::now();
-        let result = self
-            .delete_vertex_mutations_batch_with_mode(cell_id, deletions, mode)
-            .await;
+        let result = self.delete_vertex_mutations_batch_with_mode(cell_id, deletions, mode).await;
         if detach {
             self.operation_metrics
                 .detach_delete_vertices_batch_latency
@@ -1035,7 +2170,7 @@ impl GraphShard {
         result
     }
 
-    #[cfg(any(feature = "opencypher", test))]
+    #[cfg(feature = "opencypher")]
     pub(crate) async fn delete_isolated_vertex_mutations_batch(
         &self,
         cell_id: &str,
@@ -1045,9 +2180,7 @@ impl GraphShard {
             cell_id,
             deletions
                 .into_iter()
-                .map(|(vertex_id, idempotency_key, constraints)| {
-                    (vertex_id, idempotency_key, false, constraints)
-                })
+                .map(|(vertex_id, idempotency_key, constraints)| (vertex_id, idempotency_key, false, constraints))
                 .collect(),
             VertexDeleteBatchMode::IsolatedOnly,
         )
@@ -1065,21 +2198,14 @@ impl GraphShard {
             cell_id,
             deletions
                 .into_iter()
-                .map(|(vertex_id, idempotency_key)| {
-                    (
-                        vertex_id,
-                        idempotency_key,
-                        detach,
-                        VertexMetadata::default(),
-                    )
-                })
+                .map(|(vertex_id, idempotency_key)| (vertex_id, idempotency_key, detach, VertexMetadata::default()))
                 .collect(),
             mode,
         )
         .await
     }
 
-    #[cfg(any(feature = "opencypher", test))]
+    #[cfg(feature = "opencypher")]
     pub(crate) async fn delete_vertices_and_isolated_candidates_batch(
         &self,
         cell_id: &str,
@@ -1087,11 +2213,7 @@ impl GraphShard {
     ) -> Result<Vec<VertexDeleteResult>> {
         let started = std::time::Instant::now();
         let result = self
-            .delete_vertex_mutation_requests_batch_with_mode(
-                cell_id,
-                deletions,
-                VertexDeleteBatchMode::DetachAndIsolated,
-            )
+            .delete_vertex_mutation_requests_batch_with_mode(cell_id, deletions, VertexDeleteBatchMode::DetachAndIsolated)
             .await;
         self.operation_metrics
             .delete_vertices_and_isolated_candidates_batch_latency
@@ -1114,11 +2236,7 @@ impl GraphShard {
         for (_, idempotency_key, _, _) in &deletions {
             validate_component("idempotency_key", idempotency_key)?;
         }
-        ensure_limit(
-            operation,
-            deletions.len() as u64,
-            self.limits.max_query_intermediate_rows as u64,
-        )?;
+        ensure_limit(operation, deletions.len() as u64, self.limits.max_query_intermediate_rows as u64)?;
         if deletions.is_empty() {
             return Ok(Vec::new());
         }
@@ -1248,10 +2366,7 @@ impl GraphShard {
                     Ok::<_, GraphError>(
                         snapshot
                             .storage_snapshot
-                            .get_with_options(
-                                key.as_bytes(),
-                                &slatedb::config::ReadOptions::default(),
-                            )
+                            .get_with_options(key.as_bytes(), &slatedb::config::ReadOptions::default())
                             .await?
                             .is_none()
                             .then_some((vertex, detach)),
@@ -1263,11 +2378,7 @@ impl GraphShard {
             .boxed()
             .try_collect::<Vec<_>>()
             .await?;
-        let vertices = pending
-            .iter()
-            .flatten()
-            .map(|(vertex, _)| *vertex)
-            .collect::<BTreeSet<_>>();
+        let vertices = pending.iter().flatten().map(|(vertex, _)| *vertex).collect::<BTreeSet<_>>();
         if vertices.is_empty() {
             return Ok(None);
         }
@@ -1277,11 +2388,8 @@ impl GraphShard {
             .filter(|(_, detach)| *detach)
             .map(|(vertex, _)| *vertex)
             .collect::<BTreeSet<_>>();
-        let isolation_detach = matches!(
-            mode,
-            VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated
-        )
-        .then_some(&detach);
+        let isolation_detach =
+            matches!(mode, VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated).then_some(&detach);
         match self
             .indexed_vertex_delete_discovery(
                 &snapshot,
@@ -1294,14 +2402,9 @@ impl GraphShard {
         {
             Ok(discovery) => {
                 if !detach.is_empty() && mode != VertexDeleteBatchMode::RejectConnected {
-                    self.warm_vertex_delete_apply_reads(
-                        &snapshot,
-                        &vertices,
-                        &detach,
-                        &discovery.edges,
-                    )
-                    .instrument(tracing::info_span!("write.delete_warm_apply_reads"))
-                    .await?;
+                    self.warm_vertex_delete_apply_reads(&snapshot, &vertices, &detach, &discovery.edges)
+                        .instrument(tracing::info_span!("write.delete_warm_apply_reads"))
+                        .await?;
                 }
                 Ok(Some(PreparedVertexDelete {
                     vertices,
@@ -1332,12 +2435,8 @@ impl GraphShard {
         // every writer. Values are discarded: the transaction still reads and
         // marks every key at its own snapshot, including concurrent updates.
         // Large cleanups keep the existing path and cannot sweep the cache.
-        if !self.db.has_block_cache()
-            || vertices
-                .len()
-                .saturating_add(edges.len().saturating_mul(5))
-                .saturating_add(2)
-                > DELETE_APPLY_WARM_MAX_KEYS
+        if !self.storage.has_block_cache()
+            || vertices.len().saturating_add(edges.len().saturating_mul(5)).saturating_add(2) > DELETE_APPLY_WARM_MAX_KEYS
         {
             return Ok(());
         }
@@ -1346,10 +2445,7 @@ impl GraphShard {
             .iter()
             .map(|vertex| keys::vertex(cell_id, *vertex))
             .collect::<BTreeSet<_>>();
-        keys.extend([
-            keys::cell_drop_marker(cell_id),
-            keys::cell_drop_pending_marker(cell_id),
-        ]);
+        keys.extend([keys::cell_drop_marker(cell_id), keys::cell_drop_pending_marker(cell_id)]);
         for edge in edges {
             keys.extend([
                 keys::out_edge(cell_id, &edge.edge_type, edge.src, edge.dst),
@@ -1369,6 +2465,29 @@ impl GraphShard {
                     .storage_snapshot
                     .get_with_options(key.as_bytes(), &ReadOptions::default())
                     .await?;
+                Ok::<_, GraphError>(())
+            })
+            .buffer_unordered(VERTEX_DELETE_READ_CONCURRENCY)
+            .try_for_each(|()| async { Ok(()) })
+            .await?;
+        // The guarded delete finds each vertex's write-back values by a scan
+        // of the vertex's value prefix (`delete_vertex_record_txn`). Warm that
+        // prefix too, under the same contract, so the scan inside the writer
+        // guard reads cached blocks; usually it finds nothing, but finding
+        // nothing still reads the block that would hold it.
+        stream::iter(vertices.iter().copied())
+            .map(|vertex| async move {
+                tokio::task::consume_budget().await;
+                let prefix = keys::vertex_write_back_property_prefix(cell_id, vertex);
+                let mut entries = snapshot
+                    .storage_snapshot
+                    .scan_prefix_with_options(
+                        prefix.as_bytes(),
+                        ..,
+                        &slatedb::config::ScanOptions::default().with_cache_blocks(true),
+                    )
+                    .await?;
+                while entries.next().await?.is_some() {}
                 Ok::<_, GraphError>(())
             })
             .buffer_unordered(VERTEX_DELETE_READ_CONCURRENCY)
@@ -1422,9 +2541,7 @@ impl GraphShard {
         let prefixes = edges
             .iter()
             .filter(|edge| detach.contains(&edge.src) || detach.contains(&edge.dst))
-            .map(|edge| {
-                keys::relationship_edge_prefix(cell_id, &edge.edge_type, edge.src, edge.dst)
-            })
+            .map(|edge| keys::relationship_edge_prefix(cell_id, &edge.edge_type, edge.src, edge.dst))
             .collect::<BTreeSet<_>>();
         if prefixes.is_empty() {
             return;
@@ -1493,10 +2610,7 @@ impl GraphShard {
             .instrument(span.clone())
             .await;
         span.record("hydradb.warm.seeks", seeks.load(Ordering::Relaxed) as u64);
-        span.record(
-            "hydradb.warm.entries",
-            entries.load(Ordering::Relaxed) as u64,
-        );
+        span.record("hydradb.warm.entries", entries.load(Ordering::Relaxed) as u64);
         span.record("hydradb.warm.truncated", truncated.load(Ordering::Relaxed));
         span.record("hydradb.warm.failed", failed.load(Ordering::Relaxed));
     }
@@ -1522,9 +2636,7 @@ impl GraphShard {
         // These bounded validation scans recur under contention. Reuse their
         // immutable blocks within the existing shared cache budget.
         let scan_options = ScanOptions::default().with_cache_blocks(true);
-        let mut iter = txn
-            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
-            .await?;
+        let mut iter = txn.scan_prefix_with_options(prefix.as_bytes(), .., &scan_options).await?;
         let mut expected = prepared.discovery.catalog.iter();
         let mut changed_types = Vec::new();
         while let Some(kv) = iter.next().await? {
@@ -1591,18 +2703,10 @@ impl GraphShard {
             .boxed();
         while let Some((current, reason)) = validations.try_next().await? {
             if !current {
-                return Ok(outcome(
-                    false,
-                    reason,
-                    changes_scanned.load(Ordering::Relaxed),
-                ));
+                return Ok(outcome(false, reason, changes_scanned.load(Ordering::Relaxed)));
             }
         }
-        Ok(outcome(
-            true,
-            "unchanged_targets",
-            changes_scanned.load(Ordering::Relaxed),
-        ))
+        Ok(outcome(true, "unchanged_targets", changes_scanned.load(Ordering::Relaxed)))
     }
 
     async fn delete_vertex_mutations_batch_txn_locked(
@@ -1616,30 +2720,21 @@ impl GraphShard {
     ) -> Result<Vec<VertexDeleteResult>> {
         let txn_started = std::time::Instant::now();
         let batch_items = deletions.len() as u64;
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
         let current_epoch = txn.seqnum();
-        let commit_epoch =
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "storage_sequence".to_string(),
-                    reason: "epoch overflow during vertex delete batch".to_string(),
-                })?;
+        let commit_epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "epoch overflow during vertex delete batch".to_string(),
+        })?;
 
         let mut results = vec![None; deletions.len()];
         let read_started = std::time::Instant::now();
         let idem_keys: Vec<String> = deletions
             .iter()
-            .map(|(_, idempotency_key, _, _)| {
-                keys::idempotency(cell_id, mode.idempotency_operation(), idempotency_key)
-            })
+            .map(|(_, idempotency_key, _, _)| keys::idempotency(cell_id, mode.idempotency_operation(), idempotency_key))
             .collect();
         let idem_values = read_txn_remote_many(&txn, idem_keys.iter().cloned()).await?;
         let mut non_replay_indices = Vec::new();
@@ -1666,23 +2761,13 @@ impl GraphShard {
         for (i, &index) in non_replay_indices.iter().enumerate() {
             let (vertex_id, idempotency_key, detach, constraints) = &deletions[index];
             let vertex_key = &vertex_keys[i];
-            let previous = decode_vertex_record(
-                vertex_key,
-                vertex_values.get(vertex_key).and_then(Option::as_ref),
-            )?;
-            pending.push((
-                index,
-                *vertex_id,
-                idempotency_key.clone(),
-                previous,
-                *detach,
-                constraints.clone(),
-            ));
+            let previous = decode_vertex_record(vertex_key, vertex_values.get(vertex_key).and_then(Option::as_ref))?;
+            pending.push((index, *vertex_id, idempotency_key.clone(), previous, *detach, constraints.clone()));
         }
         let read_us = read_started.elapsed().as_micros() as u64;
         if pending.is_empty() {
             // A replay has no durable WAL barrier to establish ownership.
-            self.db.refresh_writer_fence().await?;
+            self.storage.refresh_writer_fence().await?;
             self.operation_metrics
                 .delete_vertex_batch_batches_profiled
                 .fetch_add(1, Ordering::Relaxed);
@@ -1709,10 +2794,7 @@ impl GraphShard {
                 .collect();
         }
 
-        let vertices = pending
-            .iter()
-            .map(|(_, vertex_id, _, _, _, _)| *vertex_id)
-            .collect::<BTreeSet<_>>();
+        let vertices = pending.iter().map(|(_, vertex_id, _, _, _, _)| *vertex_id).collect::<BTreeSet<_>>();
         let detach_vertices = pending
             .iter()
             .filter(|(_, _, _, _, detach, _)| *detach)
@@ -1722,16 +2804,11 @@ impl GraphShard {
         let incident_edges = if let Some(prepared) = prepared {
             if !async {
                 if vertices != prepared.vertices {
-                    tracing::Span::current().record(
-                        "hydradb.delete.validation_result",
-                        "pending_vertices_changed",
-                    );
-                    tracing::Span::current()
-                        .record("hydradb.delete.validation_xlog_entries", 0_u64);
+                    tracing::Span::current().record("hydradb.delete.validation_result", "pending_vertices_changed");
+                    tracing::Span::current().record("hydradb.delete.validation_xlog_entries", 0_u64);
                     return Ok(false);
                 }
-                self.vertex_delete_preparation_is_current(&txn, cell_id, &prepared)
-                    .await
+                self.vertex_delete_preparation_is_current(&txn, cell_id, &prepared).await
             }
             .instrument(tracing::info_span!(
                 "write.delete_validate_preparation",
@@ -1749,26 +2826,17 @@ impl GraphShard {
             }
             prepared.discovery.edges
         } else if write_reverse_index {
-            let isolation_detach_set = matches!(
-                mode,
-                VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated
-            )
-            .then_some(&detach_vertices);
-            self.indexed_vertex_delete_incidents_at(
-                cell_id,
-                &vertices,
-                isolation_detach_set,
-                current_epoch,
-                lock,
-            )
-            .instrument(tracing::info_span!(
-                "write.delete_incident_discovery",
-                hydradb.delete.vertices = vertices.len(),
-                hydradb.delete.detach_vertices = detach_vertices.len(),
-                hydradb.delete.scanned_entries = tracing::field::Empty,
-                hydradb.delete.retained_edges = tracing::field::Empty,
-            ))
-            .await?
+            let isolation_detach_set =
+                matches!(mode, VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated).then_some(&detach_vertices);
+            self.indexed_vertex_delete_incidents_at(cell_id, &vertices, isolation_detach_set, current_epoch, lock)
+                .instrument(tracing::info_span!(
+                    "write.delete_incident_discovery",
+                    hydradb.delete.vertices = vertices.len(),
+                    hydradb.delete.detach_vertices = detach_vertices.len(),
+                    hydradb.delete.scanned_entries = tracing::field::Empty,
+                    hydradb.delete.retained_edges = tracing::field::Empty,
+                ))
+                .await?
         } else {
             self.full_scan_incident_edges_for_vertices_at(cell_id, &vertices, current_epoch, lock)
                 .await?
@@ -1791,27 +2859,18 @@ impl GraphShard {
             .collect::<BTreeMap<_, _>>();
         let connected_vertices = incident_edges
             .iter()
-            .filter(|edge| {
-                !detach_vertices.contains(&edge.src) && !detach_vertices.contains(&edge.dst)
-            })
+            .filter(|edge| !detach_vertices.contains(&edge.src) && !detach_vertices.contains(&edge.dst))
             .flat_map(|edge| [edge.src, edge.dst])
             .filter(|vertex_id| vertices.contains(vertex_id))
             .collect::<BTreeSet<_>>();
-        if matches!(
-            mode,
-            VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated
-        ) {
+        if matches!(mode, VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated) {
             let absent = VertexMetadata::default();
             let connected_constraint_mismatches = pending
                 .iter()
                 .filter(|(_, vertex_id, _, previous, detach, constraints)| {
                     !*detach
                         && connected_vertices.contains(vertex_id)
-                        && !vertex_matches_path_node_constraints(
-                            *vertex_id,
-                            previous.as_ref().unwrap_or(&absent),
-                            constraints,
-                        )
+                        && !vertex_matches_path_node_constraints(*vertex_id, previous.as_ref().unwrap_or(&absent), constraints)
                 })
                 .count();
             if connected_constraint_mismatches > 0 {
@@ -1828,39 +2887,27 @@ impl GraphShard {
         let mut relationship_counts = vec![0_u64; pending.len()];
         let mut out_decrements = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_decrements = BTreeMap::<(String, VertexId), u64>::new();
-        let mut segment_edges_by_type_src =
-            BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
+        let mut segment_edges_by_type_src = BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
         let relationship_reads = std::sync::atomic::AtomicU64::new(0);
         let mut prepared_edges = stream::iter(
             incident_edges
                 .into_iter()
-                .filter(|edge| {
-                    detach_vertices.contains(&edge.src) || detach_vertices.contains(&edge.dst)
-                })
+                .filter(|edge| detach_vertices.contains(&edge.src) || detach_vertices.contains(&edge.dst))
                 .enumerate(),
         )
         .map(|(index, edge)| {
             let txn = &txn;
             let relationship_reads = &relationship_reads;
             async move {
-                let state = prepare_vertex_delete_edge_txn(
-                    txn,
-                    cell_id,
-                    &edge,
-                    relationship_reads,
-                    self.limits.max_query_intermediate_rows,
-                )
-                .instrument(
-                    tracing::info_span!("write.delete_edge_prefetch", hydradb.cell_id = %cell_id),
-                )
-                .await?;
+                let state =
+                    prepare_vertex_delete_edge_txn(txn, cell_id, &edge, relationship_reads, self.limits.max_query_intermediate_rows)
+                        .instrument(tracing::info_span!("write.delete_edge_prefetch", hydradb.cell_id = %cell_id))
+                        .await?;
                 Ok::<_, GraphError>((index, edge, state))
             }
         })
         .buffered(VERTEX_DELETE_READ_CONCURRENCY);
-        while let Some((edge_index, edge, (canonical, previous_edge_metadata, relationships))) =
-            prepared_edges.try_next().await?
-        {
+        while let Some((edge_index, edge, (canonical, previous_edge_metadata, relationships))) = prepared_edges.try_next().await? {
             renew_vertex_delete_lock_after_items(lock, edge_index as u64).await?;
             let owner = [edge.src, edge.dst]
                 .into_iter()
@@ -1876,10 +2923,7 @@ impl GraphShard {
                 edge_type: edge.edge_type,
                 src: edge.src,
                 dst: edge.dst,
-                idempotency_key: format!(
-                    "{}.detach-edge.{}.{}.{}",
-                    pending[owner].2, edge.src, edge.dst, edge_index
-                ),
+                idempotency_key: format!("{}.detach-edge.{}.{}.{}", pending[owner].2, edge.src, edge.dst, edge_index),
             };
 
             let out_edge_key = keys::out_edge(cell_id, &mutation.edge_type, edge.src, edge.dst);
@@ -1890,34 +2934,17 @@ impl GraphShard {
                 match segment_edges_by_type_src.get(&cache_key) {
                     Some(edges) => edges.get(&edge.dst).copied(),
                     None => {
-                        let edges = out_segment_edges_for_src_txn(
-                            &txn,
-                            cell_id,
-                            &mutation.edge_type,
-                            edge.src,
-                            current_epoch,
-                        )
-                        .await?;
+                        let edges = out_segment_edges_for_src_txn(&txn, cell_id, &mutation.edge_type, edge.src, current_epoch).await?;
                         let epoch = edges.get(&edge.dst).copied();
                         segment_edges_by_type_src.insert(cache_key, edges);
                         epoch
                     }
                 }
             };
-            let relationships = delete_prepared_relationships_for_structural_edge_txn(
-                &txn,
-                &mutation,
-                &relationships,
-            )?;
+            let relationships = delete_prepared_relationships_for_structural_edge_txn(&txn, &mutation, &relationships)?;
             if canonical || segment_epoch.is_some() {
-                self.mark_topology_change_txn(
-                    &txn,
-                    cell_id,
-                    &mutation.edge_type,
-                    commit_epoch,
-                    &[(edge.src, edge.dst, false)],
-                )
-                .await?;
+                self.mark_topology_change_txn(&txn, cell_id, &mutation.edge_type, commit_epoch, &[(edge.src, edge.dst, false)])
+                    .await?;
                 if !previous_edge_metadata.properties.is_empty() {
                     apply_edge_metadata_update_txn(
                         &txn,
@@ -1934,34 +2961,19 @@ impl GraphShard {
                 }
 
                 if canonical {
-                    txn.delete(
-                        keys::edge(cell_id, &mutation.edge_type, edge.src, edge.dst).as_bytes(),
-                    )?;
+                    txn.delete(keys::edge(cell_id, &mutation.edge_type, edge.src, edge.dst).as_bytes())?;
                     txn.delete(out_edge_key.as_bytes())?;
                     if write_reverse_index {
-                        txn.delete(
-                            keys::in_edge(cell_id, &mutation.edge_type, edge.dst, edge.src)
-                                .as_bytes(),
-                        )?;
-                        *in_decrements
-                            .entry((mutation.edge_type.clone(), edge.dst))
-                            .or_insert(0) += 1;
+                        txn.delete(keys::in_edge(cell_id, &mutation.edge_type, edge.dst, edge.src).as_bytes())?;
+                        *in_decrements.entry((mutation.edge_type.clone(), edge.dst)).or_insert(0) += 1;
                     }
                 } else {
                     txn.put(
-                        keys::out_segment_tombstone(
-                            cell_id,
-                            &mutation.edge_type,
-                            edge.src,
-                            edge.dst,
-                        )
-                        .as_bytes(),
+                        keys::out_segment_tombstone(cell_id, &mutation.edge_type, edge.src, edge.dst).as_bytes(),
                         encode_u64(commit_epoch),
                     )?;
                 }
-                *out_decrements
-                    .entry((mutation.edge_type.clone(), edge.src))
-                    .or_insert(0) += 1;
+                *out_decrements.entry((mutation.edge_type.clone(), edge.src)).or_insert(0) += 1;
             }
             edge_counts[owner] = edge_counts[owner].saturating_add(1);
             relationship_counts[owner] = relationship_counts[owner].saturating_add(relationships);
@@ -1995,34 +3007,22 @@ impl GraphShard {
             txn.put(key.as_bytes(), encode_u64(base.saturating_sub(decrement)))?;
         }
 
-        for (
-            pending_index,
-            (result_index, vertex_id, idempotency_key, previous, detach, constraints),
-        ) in pending.into_iter().enumerate()
-        {
+        let mut generations = WriteBackGenerations::default();
+        for (pending_index, (result_index, vertex_id, idempotency_key, previous, detach, constraints)) in pending.into_iter().enumerate() {
             let existed = previous.is_some();
             let previous = previous.unwrap_or_default();
-            let isolation_mode = matches!(
-                mode,
-                VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated
-            );
-            let matches_pattern =
-                vertex_matches_path_node_constraints(vertex_id, &previous, &constraints);
-            let connected = !detach
-                && isolation_mode
-                && matches_pattern
-                && connected_vertices.contains(&vertex_id);
+            let isolation_mode = matches!(mode, VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated);
+            let matches_pattern = vertex_matches_path_node_constraints(vertex_id, &previous, &constraints);
+            let connected = !detach && isolation_mode && matches_pattern && connected_vertices.contains(&vertex_id);
             // An isolated candidate is the node of a `MATCH ... WHERE NOT (n)--()`
             // pattern, so one its pattern does not match is not deleted. An empty
             // record is a vertex too: deleting it is a deletion.
             let selected = detach || !isolation_mode || matches_pattern;
             let vertex_deleted = existed && selected && !connected;
             if vertex_deleted {
-                delete_vertex_record_txn(&txn, cell_id, vertex_id, &previous)?;
+                delete_vertex_record_txn(&txn, cell_id, vertex_id, &previous, &mut generations).await?;
             }
-            let changed = vertex_deleted
-                || edge_counts[pending_index] > 0
-                || relationship_counts[pending_index] > 0;
+            let changed = vertex_deleted || edge_counts[pending_index] > 0 || relationship_counts[pending_index] > 0;
             let result = VertexDeleteResult {
                 epoch: if changed { commit_epoch } else { current_epoch },
                 vertex_deleted,
@@ -2030,8 +3030,7 @@ impl GraphShard {
                 relationships_deleted: relationship_counts[pending_index],
             };
             txn.put(
-                keys::idempotency(cell_id, mode.idempotency_operation(), &idempotency_key)
-                    .as_bytes(),
+                keys::idempotency(cell_id, mode.idempotency_operation(), &idempotency_key).as_bytes(),
                 encode_vertex_delete_idempotency(cell_id, vertex_id, &result),
             )?;
             results[result_index] = Some(result);
@@ -2072,15 +3071,9 @@ impl GraphShard {
         detach: bool,
     ) -> Result<VertexDeleteResult> {
         let mut results = self
-            .delete_vertex_mutations_batch(
-                cell_id,
-                vec![(vertex_id, idempotency_key.to_string())],
-                detach,
-            )
+            .delete_vertex_mutations_batch(cell_id, vec![(vertex_id, idempotency_key.to_string())], detach)
             .await?;
-        Ok(results
-            .pop()
-            .expect("one requested vertex has one deletion result"))
+        Ok(results.pop().expect("one requested vertex has one deletion result"))
     }
 
     async fn indexed_vertex_delete_incidents_at(
@@ -2132,11 +3125,7 @@ impl GraphShard {
             if let Some(lock) = lock {
                 renew_vertex_delete_lock_after_items(lock, scanned).await?;
             }
-            ensure_limit(
-                "delete_vertex_scan_incident_edges",
-                scanned,
-                self.limits.max_query_scan_edges,
-            )?;
+            ensure_limit("delete_vertex_scan_incident_edges", scanned, self.limits.max_query_scan_edges)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let edge_type = key
                 .strip_prefix(&edge_type_prefix)
@@ -2147,16 +3136,10 @@ impl GraphShard {
                 })?;
             validate_component("edge_type", edge_type)?;
             edge_types.insert(edge_type.to_string());
-            let bytes = retained_bytes.fetch_add(
-                (key.len() * 2 + kv.value.len() + 128) as u64,
-                Ordering::Relaxed,
-            ) + (key.len() * 2 + kv.value.len() + 128) as u64;
+            let bytes = retained_bytes.fetch_add((key.len() * 2 + kv.value.len() + 128) as u64, Ordering::Relaxed)
+                + (key.len() * 2 + kv.value.len() + 128) as u64;
             if lock.is_none() {
-                ensure_limit(
-                    "prepare_vertex_delete_bytes",
-                    bytes,
-                    DELETE_PREPARATION_BYTES,
-                )?;
+                ensure_limit("prepare_vertex_delete_bytes", bytes, DELETE_PREPARATION_BYTES)?;
             }
             // Do not pin a whole SST block through an eight-byte Bytes slice
             // while prepared results wait for writer admission.
@@ -2170,31 +3153,25 @@ impl GraphShard {
         let edges = Mutex::new(BTreeSet::new());
         type Prefixes<'a> = Box<dyn Iterator<Item = String> + Send + 'a>;
         type ScanJob<'a> = (Prefixes<'a>, bool);
-        let jobs: Box<dyn Iterator<Item = ScanJob<'_>> + Send + '_> =
-            Box::new(vertex_ids.iter().flat_map(|vertex| {
-                let prefixes: Prefixes<'_> =
-                    Box::new(edge_types.iter().flat_map(move |edge_type| {
-                        [
-                            keys::out_prefix(cell_id, edge_type, *vertex),
-                            keys::in_prefix(cell_id, edge_type, *vertex),
-                        ]
-                        .into_iter()
-                    }));
-                let witness_only =
-                    isolation_detach_set.is_some_and(|detach| !detach.contains(vertex));
-                // Do not speculate past a candidate's first surviving edge.
-                // Detach needs every prefix; isolation needs one sequential
-                // search per candidate, overlapped with other candidates.
-                let jobs: Box<dyn Iterator<Item = ScanJob<'_>> + Send + '_> =
-                    if witness_only {
-                        Box::new(std::iter::once((prefixes, true)))
-                    } else {
-                        Box::new(prefixes.map(|prefix| {
-                            (Box::new(std::iter::once(prefix)) as Prefixes<'_>, false)
-                        }))
-                    };
-                jobs
+        let jobs: Box<dyn Iterator<Item = ScanJob<'_>> + Send + '_> = Box::new(vertex_ids.iter().flat_map(|vertex| {
+            let prefixes: Prefixes<'_> = Box::new(edge_types.iter().flat_map(move |edge_type| {
+                [
+                    keys::out_prefix(cell_id, edge_type, *vertex),
+                    keys::in_prefix(cell_id, edge_type, *vertex),
+                ]
+                .into_iter()
             }));
+            let witness_only = isolation_detach_set.is_some_and(|detach| !detach.contains(vertex));
+            // Do not speculate past a candidate's first surviving edge.
+            // Detach needs every prefix; isolation needs one sequential
+            // search per candidate, overlapped with other candidates.
+            let jobs: Box<dyn Iterator<Item = ScanJob<'_>> + Send + '_> = if witness_only {
+                Box::new(std::iter::once((prefixes, true)))
+            } else {
+                Box::new(prefixes.map(|prefix| (Box::new(std::iter::once(prefix)) as Prefixes<'_>, false)))
+            };
+            jobs
+        }));
         let mut scans = stream::iter(jobs)
             .map(|(prefixes, witness_only)| {
                 let snapshot = &snapshot;
@@ -2214,19 +3191,13 @@ impl GraphShard {
                             if let Some(lock) = lock {
                                 renew_vertex_delete_lock_after_items(lock, count).await?;
                             }
-                            ensure_limit(
-                                "delete_vertex_scan_incident_edges",
-                                count,
-                                self.limits.max_query_scan_edges,
-                            )?;
+                            ensure_limit("delete_vertex_scan_incident_edges", count, self.limits.max_query_scan_edges)?;
                             let key = String::from_utf8_lossy(&kv.key).into_owned();
                             let record = decode_edge_record(&key, &kv.value)?;
                             // Detach vertices own all removed edges. For an isolated
                             // candidate, only one edge surviving that detach is needed.
                             if witness_only
-                                && isolation_detach_set.is_some_and(|detach| {
-                                    detach.contains(&record.src) || detach.contains(&record.dst)
-                                })
+                                && isolation_detach_set.is_some_and(|detach| detach.contains(&record.src) || detach.contains(&record.dst))
                             {
                                 continue;
                             }
@@ -2238,13 +3209,8 @@ impl GraphShard {
                             };
                             if lock.is_none() && !edges.contains(&edge) {
                                 let size = (edge.edge_type.len() + 128) as u64;
-                                let bytes =
-                                    retained_bytes.fetch_add(size, Ordering::Relaxed) + size;
-                                ensure_limit(
-                                    "prepare_vertex_delete_bytes",
-                                    bytes,
-                                    DELETE_PREPARATION_BYTES,
-                                )?;
+                                let bytes = retained_bytes.fetch_add(size, Ordering::Relaxed) + size;
+                                ensure_limit("prepare_vertex_delete_bytes", bytes, DELETE_PREPARATION_BYTES)?;
                             }
                             edges.insert(edge);
                             ensure_limit(
@@ -2293,20 +3259,12 @@ impl GraphShard {
 
         let mut out_iter = snapshot
             .storage_snapshot
-            .scan_prefix_with_options(
-                keys::out_edge_cell_prefix(cell_id).as_bytes(),
-                ..,
-                &scan_options,
-            )
+            .scan_prefix_with_options(keys::out_edge_cell_prefix(cell_id).as_bytes(), .., &scan_options)
             .await?;
         while let Some(kv) = out_iter.next().await? {
             scanned = scanned.saturating_add(1);
             renew_vertex_delete_lock_after_items(lock, scanned).await?;
-            ensure_limit(
-                "delete_vertex_scan_edges",
-                scanned,
-                self.limits.max_query_scan_edges,
-            )?;
+            ensure_limit("delete_vertex_scan_edges", scanned, self.limits.max_query_scan_edges)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let record = parse_edge_record_key(&key)?;
             if vertex_ids.contains(&record.src) || vertex_ids.contains(&record.dst) {
@@ -2320,20 +3278,12 @@ impl GraphShard {
 
         let mut relationship_iter = snapshot
             .storage_snapshot
-            .scan_prefix_with_options(
-                keys::relationship_cell_prefix(cell_id).as_bytes(),
-                ..,
-                &scan_options,
-            )
+            .scan_prefix_with_options(keys::relationship_cell_prefix(cell_id).as_bytes(), .., &scan_options)
             .await?;
         while let Some(kv) = relationship_iter.next().await? {
             scanned = scanned.saturating_add(1);
             renew_vertex_delete_lock_after_items(lock, scanned).await?;
-            ensure_limit(
-                "delete_vertex_scan_relationships",
-                scanned,
-                self.limits.max_query_scan_edges,
-            )?;
+            ensure_limit("delete_vertex_scan_relationships", scanned, self.limits.max_query_scan_edges)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let record = decode_relationship_record(&key, &kv.value)?;
             if vertex_ids.contains(&record.src) || vertex_ids.contains(&record.dst) {
@@ -2347,20 +3297,12 @@ impl GraphShard {
 
         let mut segment_iter = snapshot
             .storage_snapshot
-            .scan_prefix_with_options(
-                keys::out_segment_cell_prefix(cell_id).as_bytes(),
-                ..,
-                &scan_options,
-            )
+            .scan_prefix_with_options(keys::out_segment_cell_prefix(cell_id).as_bytes(), .., &scan_options)
             .await?;
         while let Some(kv) = segment_iter.next().await? {
             scanned = scanned.saturating_add(1);
             renew_vertex_delete_lock_after_items(lock, scanned).await?;
-            ensure_limit(
-                "delete_vertex_scan_segments",
-                scanned,
-                self.limits.max_query_scan_edges,
-            )?;
+            ensure_limit("delete_vertex_scan_segments", scanned, self.limits.max_query_scan_edges)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
             if segment.storage_sequence > read_epoch {
@@ -2370,8 +3312,7 @@ impl GraphShard {
                 if !vertex_ids.contains(&segment.src) && !vertex_ids.contains(&dst) {
                     continue;
                 }
-                let tombstone_key =
-                    keys::out_segment_tombstone(cell_id, &segment.edge_type, segment.src, dst);
+                let tombstone_key = keys::out_segment_tombstone(cell_id, &segment.edge_type, segment.src, dst);
                 let tombstone_epoch = match snapshot
                     .storage_snapshot
                     .get_with_options(tombstone_key.as_bytes(), &read_options)
@@ -2398,11 +3339,7 @@ impl GraphShard {
         Ok(edges)
     }
 
-    pub async fn drop_cell(
-        &self,
-        cell_id: &str,
-        idempotency_key: &str,
-    ) -> Result<GraphCellDropResult> {
+    pub async fn drop_cell(&self, cell_id: &str, idempotency_key: &str) -> Result<GraphCellDropResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("idempotency_key", idempotency_key)?;
         self.ensure_write_authority(cell_id, "drop_cell")?;
@@ -2423,18 +3360,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await;
             match finish_local_write(lock, result).await {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -2446,20 +3377,11 @@ impl GraphShard {
         })
     }
 
-    async fn drop_cell_locked(
-        &self,
-        cell_id: &str,
-        idempotency_key: &str,
-        lock: &LocalWriteGuard,
-    ) -> Result<GraphCellDropResult> {
+    async fn drop_cell_locked(&self, cell_id: &str, idempotency_key: &str, lock: &LocalWriteGuard) -> Result<GraphCellDropResult> {
         let idem_key = keys::cell_drop_idempotency(cell_id, idempotency_key);
         let marker_key = keys::cell_drop_marker(cell_id);
         let pending_marker_key = keys::cell_drop_pending_marker(cell_id);
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_cell_drop_idempotency(&idem_key, cell_id, idempotency_key, &value);
         }
@@ -2470,15 +3392,11 @@ impl GraphShard {
                 batches: 0,
                 already_dropped: true,
             };
-            txn.put(
-                idem_key.as_bytes(),
-                encode_cell_drop_idempotency(cell_id, idempotency_key, &result),
-            )?;
+            txn.put(idem_key.as_bytes(), encode_cell_drop_idempotency(cell_id, idempotency_key, &result))?;
             commit_txn_strict(txn, self.await_durable_writes).await?;
             return Ok(result);
         }
-        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
-            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, "drop_cell").await?;
         let marker_epoch = match read_txn_remote(&txn, &pending_marker_key).await? {
             Some(value) => decode_u64(&pending_marker_key, &value)?,
             None => {
@@ -2521,42 +3439,25 @@ impl GraphShard {
             batches,
             already_dropped: false,
         };
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "drop_cell").await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_cell_drop_idempotency(&idem_key, cell_id, idempotency_key, &value);
         }
         txn.put(marker_key.as_bytes(), encode_u64(marker_epoch))?;
         txn.delete(pending_marker_key.as_bytes())?;
-        txn.put(
-            idem_key.as_bytes(),
-            encode_cell_drop_idempotency(cell_id, idempotency_key, &result),
-        )?;
+        txn.put(idem_key.as_bytes(), encode_cell_drop_idempotency(cell_id, idempotency_key, &result))?;
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(result)
     }
 
-    async fn flush_drop_cell_batch(
-        &self,
-        cell_id: &str,
-        keys_to_delete: &mut Vec<String>,
-    ) -> Result<u64> {
+    async fn flush_drop_cell_batch(&self, cell_id: &str, keys_to_delete: &mut Vec<String>) -> Result<u64> {
         if keys_to_delete.is_empty() {
             return Ok(0);
         }
         let keys = std::mem::take(keys_to_delete);
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "drop_cell").await?;
         for key in &keys {
             txn.delete(key.as_bytes())?;
         }
@@ -2573,20 +3474,15 @@ impl GraphShard {
         dst: VertexId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let _latency = self
-            .operation_metrics
-            .set_edge_metadata_latency
-            .start_timer();
+        let _latency = self.operation_metrics.set_edge_metadata_latency.start_timer();
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_edge_metadata(&metadata)?;
         self.ensure_write_authority(cell_id, "set_edge_metadata")?;
-        self.run_write_pipeline_fencing_noops(
-            self.set_edge_metadata_inline(cell_id, edge_type, src, dst, metadata),
-        )
-        .await
+        self.run_write_pipeline_fencing_noops(self.set_edge_metadata_inline(cell_id, edge_type, src, dst, metadata))
+            .await
     }
 
     async fn set_edge_metadata_inline(
@@ -2614,18 +3510,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -2643,10 +3533,7 @@ impl GraphShard {
         edge_type: &str,
         updates: impl IntoIterator<Item = (VertexId, VertexId, EdgeMetadata)>,
     ) -> Result<usize> {
-        let _latency = self
-            .operation_metrics
-            .set_edge_metadata_batch_latency
-            .start_timer();
+        let _latency = self.operation_metrics.set_edge_metadata_batch_latency.start_timer();
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", cell_id)?;
@@ -2661,10 +3548,8 @@ impl GraphShard {
             updates.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
-        self.run_write_pipeline_fencing_noops(
-            self.set_edge_metadata_batch_inline(cell_id, edge_type, updates),
-        )
-        .await
+        self.run_write_pipeline_fencing_noops(self.set_edge_metadata_batch_inline(cell_id, edge_type, updates))
+            .await
     }
 
     async fn set_edge_metadata_batch_inline(
@@ -2690,19 +3575,13 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(changed) => {
                     if changed > 0 {
-                        self.operation_metrics
-                            .write_commits
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(changed);
                 }
@@ -2783,19 +3662,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(error)
-                    if is_retryable_write_conflict(&error)
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(error) if is_retryable_write_conflict(&error) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(installed) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(installed);
                 }
                 result => return result,
@@ -2814,24 +3686,12 @@ impl GraphShard {
         relationships: &[RelationshipMutation],
     ) -> Result<u64> {
         self.validate_changing_write().await?;
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "install_relationship_merge_indexes_batch")
             .await?;
         let record_keys = relationships
             .iter()
-            .map(|relationship| {
-                keys::relationship(
-                    cell_id,
-                    edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    relationship.relationship_id,
-                )
-            })
+            .map(|relationship| keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship.relationship_id))
             .collect::<Vec<_>>();
         let records = read_txn_remote_many(&txn, record_keys.iter().cloned()).await?;
         let mut pointers = BTreeMap::<String, RelationshipId>::new();
@@ -2843,12 +3703,7 @@ impl GraphShard {
                 });
             }
             let expected_identity = VertexPropertyValue::Integer(relationship.relationship_id);
-            if relationship
-                .metadata
-                .properties
-                .get(RELATIONSHIP_IDENTITY_PROPERTY)
-                != Some(&expected_identity)
-            {
+            if relationship.metadata.properties.get(RELATIONSHIP_IDENTITY_PROPERTY) != Some(&expected_identity) {
                 return Err(GraphError::CorruptValue {
                     key: record_key,
                     reason: "offline relationship id property does not match its stable id".into(),
@@ -2882,9 +3737,7 @@ impl GraphShard {
                 relationship.src,
                 relationship.dst,
             );
-            if let Some(existing) =
-                pointers.insert(pointer_key.clone(), relationship.relationship_id)
-            {
+            if let Some(existing) = pointers.insert(pointer_key.clone(), relationship.relationship_id) {
                 if existing != relationship.relationship_id {
                     return Err(GraphError::CorruptValue {
                         key: pointer_key,
@@ -2999,11 +3852,7 @@ impl GraphShard {
         }
         self.ensure_write_authority(cell_id, options.operation)?;
 
-        let guarded_rows = mixed_guarded_relationship_rows(
-            &relationships,
-            options.merge_policy,
-            self.limits.max_bulk_import_edges,
-        )?;
+        let guarded_rows = mixed_guarded_relationship_rows(&relationships, options.merge_policy, self.limits.max_bulk_import_edges)?;
         let ordered_fingerprint = if guarded_rows.is_empty() {
             None
         } else {
@@ -3011,11 +3860,8 @@ impl GraphShard {
             // Hash every row: changing a losing patch must not replay a different
             // request as though only its eventual highest guard mattered.
             let mut ordered = relationships.clone();
-            ordered
-                .sort_by_key(|row| (row.relationship_id, row.src, row.dst, row.edge_type.clone()));
-            Some(relationship_import_fingerprint(
-                cell_id, edge_type, &ordered,
-            ))
+            ordered.sort_by_key(|row| (row.relationship_id, row.src, row.dst, row.edge_type.clone()));
+            Some(relationship_import_fingerprint(cell_id, edge_type, &ordered))
         };
         #[cfg(feature = "opencypher")]
         let options = RelationshipImportOptions {
@@ -3029,9 +3875,7 @@ impl GraphShard {
                 cell_id,
                 edge_type,
                 relationships,
-                options
-                    .update_existing_metadata
-                    .then_some(options.merge_policy),
+                options.update_existing_metadata.then_some(options.merge_policy),
             )?
         };
         if relationships.is_empty() {
@@ -3058,8 +3902,7 @@ impl GraphShard {
                 relationship.edge_type.clone(),
             )
         });
-        let fingerprint = ordered_fingerprint
-            .unwrap_or_else(|| relationship_import_fingerprint(cell_id, edge_type, &relationships));
+        let fingerprint = ordered_fingerprint.unwrap_or_else(|| relationship_import_fingerprint(cell_id, edge_type, &relationships));
 
         let span = write_txn_span(cell_id, Some(edge_type));
         let result = self.run_write_pipeline(async {
@@ -3121,9 +3964,7 @@ impl GraphShard {
         .instrument(span))
         .await;
         if result.is_ok() {
-            self.operation_metrics
-                .write_commits
-                .fetch_add(1, Ordering::Relaxed);
+            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -3155,7 +3996,7 @@ impl GraphShard {
         idempotency_key: &str,
         options: RelationshipImportOptions<'_>,
     ) -> Result<()> {
-        if !self.db.has_block_cache() || relationships.len() > RELATIONSHIP_IMPORT_WARM_MAX_ROWS {
+        if !self.storage.has_block_cache() || relationships.len() > RELATIONSHIP_IMPORT_WARM_MAX_ROWS {
             return Ok(());
         }
         let span = tracing::info_span!(
@@ -3179,8 +4020,7 @@ impl GraphShard {
         // stop; the guarded read of it is warm either way. A key recorded for a
         // different batch is the same story — that request fails on the
         // fingerprint rather than reading the rows.
-        let idempotency_key_name =
-            keys::idempotency(cell_id, "relationship-import", idempotency_key);
+        let idempotency_key_name = keys::idempotency(cell_id, "relationship-import", idempotency_key);
         let replay = storage
             .get_with_options(idempotency_key_name.as_bytes(), &read_options)
             .await?
@@ -3209,22 +4049,12 @@ impl GraphShard {
                 point_keys.insert(keys::vertex(cell_id, relationship.src));
                 point_keys.insert(keys::vertex(cell_id, relationship.dst));
             }
-            point_keys.insert(keys::out_edge(
-                cell_id,
-                edge_type,
-                relationship.src,
-                relationship.dst,
-            ));
+            point_keys.insert(keys::out_edge(cell_id, edge_type, relationship.src, relationship.dst));
             point_keys.insert(keys::degree_out(cell_id, edge_type, relationship.src));
             if write_reverse_index {
                 point_keys.insert(keys::degree_in(cell_id, edge_type, relationship.dst));
             }
-            point_keys.insert(keys::relationship_count(
-                cell_id,
-                edge_type,
-                relationship.src,
-                relationship.dst,
-            ));
+            point_keys.insert(keys::relationship_count(cell_id, edge_type, relationship.src, relationship.dst));
         }
         span.record("hydradb.warm.point_keys", point_keys.len() as u64);
         let warm_points = stream::iter(point_keys)
@@ -3235,9 +4065,7 @@ impl GraphShard {
                     if !budget.charge() {
                         return Ok::<_, GraphError>(());
                     }
-                    storage
-                        .get_with_options(key.as_bytes(), read_options)
-                        .await?;
+                    storage.get_with_options(key.as_bytes(), read_options).await?;
                     Ok::<_, GraphError>(())
                 }
                 .boxed()
@@ -3248,14 +4076,7 @@ impl GraphShard {
 
         #[cfg(feature = "opencypher")]
         let warm_identities = self
-            .warm_relationship_merge_identities(
-                storage,
-                cell_id,
-                edge_type,
-                relationships,
-                options,
-                &budget,
-            )
+            .warm_relationship_merge_identities(storage, cell_id, edge_type, relationships, options, &budget)
             .boxed();
         #[cfg(not(feature = "opencypher"))]
         let warm_identities = {
@@ -3298,20 +4119,14 @@ impl GraphShard {
         let scans = std::sync::atomic::AtomicU64::new(0);
         stream::iter(relationships)
             .map(|relationship| {
-                let (read_options, scan_options, pointers, scans, budget) =
-                    (&read_options, &scan_options, &pointers, &scans, budget);
+                let (read_options, scan_options, pointers, scans, budget) = (&read_options, &scan_options, &pointers, &scans, budget);
                 async move {
                     tokio::task::consume_budget().await;
                     if budget.spent() {
                         return Ok::<_, GraphError>(());
                     }
                     let identity = VertexPropertyValue::Integer(relationship.relationship_id);
-                    if relationship
-                        .metadata
-                        .properties
-                        .get(RELATIONSHIP_IDENTITY_PROPERTY)
-                        != Some(&identity)
-                    {
+                    if relationship.metadata.properties.get(RELATIONSHIP_IDENTITY_PROPERTY) != Some(&identity) {
                         // The guarded lookup rejects this row; nothing to warm.
                         return Ok::<_, GraphError>(());
                     }
@@ -3328,18 +4143,9 @@ impl GraphShard {
                         return Ok(());
                     }
                     pointers.fetch_add(1, Ordering::Relaxed);
-                    if let Some(pointer) = storage
-                        .get_with_options(pointer_key.as_bytes(), read_options)
-                        .await?
-                    {
+                    if let Some(pointer) = storage.get_with_options(pointer_key.as_bytes(), read_options).await? {
                         if let Ok(relationship_id) = decode_u64(&pointer_key, &pointer) {
-                            let record_key = keys::relationship(
-                                cell_id,
-                                edge_type,
-                                relationship.src,
-                                relationship.dst,
-                                relationship_id,
-                            );
+                            let record_key = keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship_id);
                             if !budget.charge() {
                                 return Ok(());
                             }
@@ -3351,20 +4157,10 @@ impl GraphShard {
                             // permit. A record that fails to decode is the same
                             // case — corruption stays loud in the guarded read,
                             // which is where it can be reported.
-                            let named = storage
-                                .get_with_options(record_key.as_bytes(), read_options)
-                                .await?;
+                            let named = storage.get_with_options(record_key.as_bytes(), read_options).await?;
                             let answered = named
-                                .and_then(|value| {
-                                    decode_relationship_record(&record_key, &value).ok()
-                                })
-                                .is_some_and(|record| {
-                                    record
-                                        .metadata
-                                        .properties
-                                        .get(RELATIONSHIP_IDENTITY_PROPERTY)
-                                        == Some(&identity)
-                                });
+                                .and_then(|value| decode_relationship_record(&record_key, &value).ok())
+                                .is_some_and(|record| record.metadata.properties.get(RELATIONSHIP_IDENTITY_PROPERTY) == Some(&identity));
                             if answered {
                                 return Ok(());
                             }
@@ -3382,9 +4178,7 @@ impl GraphShard {
                         relationship.src,
                         relationship.dst,
                     );
-                    let mut iter = storage
-                        .scan_prefix_with_options(prefix.as_bytes(), .., scan_options)
-                        .await?;
+                    let mut iter = storage.scan_prefix_with_options(prefix.as_bytes(), .., scan_options).await?;
                     // One identity names one row except for legitimately
                     // parallel relationships; a few entries admit the blocks.
                     for _ in 0..RELATIONSHIP_IMPORT_WARM_MAX_SCAN_ENTRIES {
@@ -3421,12 +4215,8 @@ impl GraphShard {
         dst: VertexId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(cell_id, "set_edge_metadata")
-            .await?;
-        let result = self
-            .set_edge_metadata_txn_locked(cell_id, edge_type, src, dst, metadata)
-            .await;
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, "set_edge_metadata").await?;
+        let result = self.set_edge_metadata_txn_locked(cell_id, edge_type, src, dst, metadata).await;
         finish_local_write(lock, result).await
     }
 
@@ -3438,11 +4228,7 @@ impl GraphShard {
         dst: VertexId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
@@ -3488,12 +4274,8 @@ impl GraphShard {
         edge_type: &str,
         updates: Vec<(VertexId, VertexId, EdgeMetadata)>,
     ) -> Result<usize> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(cell_id, "set_edge_metadata_batch")
-            .await?;
-        let result = self
-            .set_edge_metadata_batch_txn_locked(cell_id, edge_type, updates)
-            .await;
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, "set_edge_metadata_batch").await?;
+        let result = self.set_edge_metadata_batch_txn_locked(cell_id, edge_type, updates).await;
         finish_local_write(lock, result).await
     }
 
@@ -3503,13 +4285,8 @@ impl GraphShard {
         edge_type: &str,
         updates: Vec<(VertexId, VertexId, EdgeMetadata)>,
     ) -> Result<usize> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata_batch")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata_batch").await?;
         let current_epoch = txn.seqnum();
         let mut changed = Vec::new();
         for (src, dst, metadata) in updates {
@@ -3520,9 +4297,7 @@ impl GraphShard {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::Mutation,
                     dialect: "GraphQuery",
-                    feature: format!(
-                        "cannot set metadata for missing edge {edge_type}({src}->{dst})"
-                    ),
+                    feature: format!("cannot set metadata for missing edge {edge_type}({src}->{dst})"),
                 });
             }
             let edge_metadata_key = keys::edge_metadata(cell_id, edge_type, src, dst);
@@ -3566,18 +4341,9 @@ impl GraphShard {
         fingerprint: u64,
         options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(cell_id, options.operation)
-            .await?;
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, options.operation).await?;
         let result = self
-            .import_relationships_batch_txn_locked(
-                cell_id,
-                edge_type,
-                relationships,
-                idempotency_key,
-                fingerprint,
-                options,
-            )
+            .import_relationships_batch_txn_locked(cell_id, edge_type, relationships, idempotency_key, fingerprint, options)
             .await;
         finish_local_write(lock, result).await
     }
@@ -3592,13 +4358,8 @@ impl GraphShard {
         options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
         self.validate_changing_write().await?;
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, options.operation)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, options.operation).await?;
 
         // A replay is defined by the original request, not by whether its
         // MATCH endpoints still exist at replay time. Consult the durable
@@ -3607,16 +4368,19 @@ impl GraphShard {
         if let Some(value) = read_txn_remote_uncached(&txn, &idem_key).await? {
             // This branch does not commit, so it cannot validate ownership at
             // the WAL barrier. Preserve the explicit replay fencing check.
-            self.db.refresh_writer_fence().await?;
+            self.storage.refresh_writer_fence().await?;
             self.operation_metrics
                 .relationship_import_idempotency_replays
                 .fetch_add(1, Ordering::Relaxed);
-            return decode_relationship_import_idempotency(
-                &idem_key,
-                idempotency_key,
-                fingerprint,
-                &value,
-            );
+            return decode_relationship_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
+        }
+        // Checked here, after the receipt: a retry of an import an older node
+        // accepted replays its result above, whatever ids it carried; only
+        // rows about to be written may not take a generated id.
+        for relationship in relationships {
+            crate::stored_relationship_id(relationship.relationship_id, || {
+                format!("cell/{cell_id}/relationship_import/{edge_type}/{}", relationship.relationship_id)
+            })?;
         }
 
         let mut relationships = relationships.to_vec();
@@ -3630,16 +4394,11 @@ impl GraphShard {
         if let Some((source_label, destination_label)) = options.endpoint_labels {
             let mut required_labels = BTreeMap::<VertexId, BTreeSet<&str>>::new();
             for relationship in &relationships {
-                for (vertex, label) in [
-                    (relationship.src, source_label),
-                    (relationship.dst, destination_label),
-                ] {
+                for (vertex, label) in [(relationship.src, source_label), (relationship.dst, destination_label)] {
                     required_labels.entry(vertex).or_default().insert(label);
                 }
             }
-            let endpoint_keys = required_labels
-                .keys()
-                .map(|vertex| keys::vertex(cell_id, *vertex));
+            let endpoint_keys = required_labels.keys().map(|vertex| keys::vertex(cell_id, *vertex));
             let endpoint_values = read_txn_remote_many(&txn, endpoint_keys).await?;
             let mut matched_labels = BTreeMap::<VertexId, BTreeSet<String>>::new();
             for (vertex, labels) in required_labels {
@@ -3650,10 +4409,7 @@ impl GraphShard {
                 let metadata = decode_vertex_metadata(&key, value)?;
                 for label in labels {
                     if metadata.labels.contains(label) {
-                        matched_labels
-                            .entry(vertex)
-                            .or_default()
-                            .insert(label.to_string());
+                        matched_labels.entry(vertex).or_default().insert(label.to_string());
                     }
                 }
             }
@@ -3678,14 +4434,10 @@ impl GraphShard {
         }
         if options.endpoint_labels.is_some() {
             profile.endpoint_check = endpoint_check_started.elapsed();
-            txn_span.record(
-                "hydradb.relimport.endpoint_check_us",
-                duration_micros_u64(profile.endpoint_check),
-            );
+            txn_span.record("hydradb.relimport.endpoint_check_us", duration_micros_u64(profile.endpoint_check));
         }
         let current_epoch = txn.seqnum();
-        let current_relationship_id =
-            read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
+        let current_relationship_id = read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
         let mut prefetched_relationships = BTreeMap::<RelationshipId, RelationshipRecord>::new();
         let mut next_relationship_id = current_relationship_id;
         // `rmerge_idx` pointer writes the MERGE branch has proven correct:
@@ -3696,14 +4448,8 @@ impl GraphShard {
         #[cfg(feature = "opencypher")]
         let mut merge_pointer_updates = BTreeMap::<String, Option<RelationshipId>>::new();
         if options.create_always {
-            let allocated = next_available_relationship_ids_txn(
-                &txn,
-                cell_id,
-                &mut next_relationship_id,
-                relationships.len(),
-                "CREATE",
-            )
-            .await?;
+            let allocated =
+                next_available_relationship_ids_txn(&txn, cell_id, &mut next_relationship_id, relationships.len(), "CREATE").await?;
             for (relationship, relationship_id) in relationships.iter_mut().zip(allocated) {
                 relationship.relationship_id = relationship_id;
             }
@@ -3828,17 +4574,11 @@ impl GraphShard {
                 for lookup in &lookups {
                     match lookup.outcome {
                         MergePointerOutcome::Hit(_) => profile.identity_pointer_hits += 1,
-                        MergePointerOutcome::Miss(_) | MergePointerOutcome::Stale(_) => {
-                            profile.identity_pointer_misses += 1
-                        }
+                        MergePointerOutcome::Miss(_) | MergePointerOutcome::Stale(_) => profile.identity_pointer_misses += 1,
                     }
                     let pointer_key = lookup.outcome.pointer_key();
                     match lookup.existing.as_slice() {
-                        [record] => note_merge_pointer(
-                            &mut merge_pointer_updates,
-                            pointer_key,
-                            record.relationship_id,
-                        ),
+                        [record] => note_merge_pointer(&mut merge_pointer_updates, pointer_key, record.relationship_id),
                         [] => {}
                         _ => {
                             merge_pointer_updates.insert(pointer_key.to_string(), None);
@@ -3846,30 +4586,11 @@ impl GraphShard {
                     }
                 }
                 profile.identity_scan = identity_scan_started.elapsed();
-                txn_span.record(
-                    "hydradb.relimport.identity_scan_us",
-                    duration_micros_u64(profile.identity_scan),
-                );
-                txn_span.record(
-                    "hydradb.relimport.identity_pointer_hits",
-                    profile.identity_pointer_hits,
-                );
-                txn_span.record(
-                    "hydradb.relimport.identity_pointer_misses",
-                    profile.identity_pointer_misses,
-                );
-                let missing = lookups
-                    .iter()
-                    .filter(|lookup| lookup.existing.is_empty())
-                    .count();
-                let allocated = next_available_relationship_ids_txn(
-                    &txn,
-                    cell_id,
-                    &mut next_relationship_id,
-                    missing,
-                    "MERGE",
-                )
-                .await?;
+                txn_span.record("hydradb.relimport.identity_scan_us", duration_micros_u64(profile.identity_scan));
+                txn_span.record("hydradb.relimport.identity_pointer_hits", profile.identity_pointer_hits);
+                txn_span.record("hydradb.relimport.identity_pointer_misses", profile.identity_pointer_misses);
+                let missing = lookups.iter().filter(|lookup| lookup.existing.is_empty()).count();
+                let allocated = next_available_relationship_ids_txn(&txn, cell_id, &mut next_relationship_id, missing, "MERGE").await?;
                 let mut allocated = allocated.into_iter();
                 let mut resolved = Vec::with_capacity(lookups.len());
                 for lookup in lookups {
@@ -3878,9 +4599,7 @@ impl GraphShard {
                         existing,
                         outcome,
                     } = lookup;
-                    let patches = options
-                        .guarded_rows
-                        .and_then(|rows| rows.get(&relationship.relationship_id));
+                    let patches = options.guarded_rows.and_then(|rows| rows.get(&relationship.relationship_id));
                     if existing.is_empty() {
                         let mut inserted = relationship;
                         if let (Some(patches), Some(policy)) = (patches, options.merge_policy) {
@@ -3892,17 +4611,11 @@ impl GraphShard {
                                 &keys::relationship_id(cell_id, inserted.relationship_id),
                             )?;
                         }
-                        inserted.relationship_id =
-                            allocated.next().ok_or_else(|| GraphError::CorruptValue {
-                                key: keys::last_relationship_id(cell_id),
-                                reason: "relationship id allocation returned too few ids"
-                                    .to_string(),
-                            })?;
-                        note_merge_pointer(
-                            &mut merge_pointer_updates,
-                            outcome.pointer_key(),
-                            inserted.relationship_id,
-                        );
+                        inserted.relationship_id = allocated.next().ok_or_else(|| GraphError::CorruptValue {
+                            key: keys::last_relationship_id(cell_id),
+                            reason: "relationship id allocation returned too few ids".to_string(),
+                        })?;
+                        note_merge_pointer(&mut merge_pointer_updates, outcome.pointer_key(), inserted.relationship_id);
                         resolved.push(inserted);
                     } else {
                         for record in existing {
@@ -3936,19 +4649,11 @@ impl GraphShard {
         let mut relationships_already_existed = 0_u64;
         let unresolved = relationships
             .iter()
-            .filter(|relationship| {
-                !prefetched_relationships.contains_key(&relationship.relationship_id)
-            })
+            .filter(|relationship| !prefetched_relationships.contains_key(&relationship.relationship_id))
             .map(|relationship| {
                 (
                     relationship.relationship_id,
-                    keys::relationship(
-                        cell_id,
-                        edge_type,
-                        relationship.src,
-                        relationship.dst,
-                        relationship.relationship_id,
-                    ),
+                    keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship.relationship_id),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -3964,18 +4669,11 @@ impl GraphShard {
             let Some(value) = id_values.get(&id_key).and_then(Option::as_ref) else {
                 continue;
             };
-            let target_key =
-                std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-                    key: id_key,
-                    reason: format!("relationship id pointer is not UTF-8: {err}"),
-                })?;
-            let prefetched_key = keys::relationship(
-                &record.cell_id,
-                &record.edge_type,
-                record.src,
-                record.dst,
-                record.relationship_id,
-            );
+            let target_key = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+                key: id_key,
+                reason: format!("relationship id pointer is not UTF-8: {err}"),
+            })?;
+            let prefetched_key = keys::relationship(&record.cell_id, &record.edge_type, record.src, record.dst, record.relationship_id);
             if target_key != prefetched_key {
                 // Preserve the durable id pointer as the authority when the
                 // property index and id index disagree. The identity check
@@ -3987,11 +4685,10 @@ impl GraphShard {
             let id_key = keys::relationship_id(cell_id, *relationship_id);
             match id_values.get(&id_key).and_then(Option::as_ref) {
                 Some(value) => {
-                    let target_key =
-                        std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-                            key: id_key,
-                            reason: format!("relationship id pointer is not UTF-8: {err}"),
-                        })?;
+                    let target_key = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+                        key: id_key,
+                        reason: format!("relationship id pointer is not UTF-8: {err}"),
+                    })?;
                     record_keys.insert(*relationship_id, (target_key.to_string(), true));
                 }
                 None => {
@@ -4000,20 +4697,13 @@ impl GraphShard {
             }
         }
         let record_read_started = std::time::Instant::now();
-        let record_values =
-            read_txn_remote_many(&txn, record_keys.values().map(|(key, _)| key.clone())).await?;
+        let record_values = read_txn_remote_many(&txn, record_keys.values().map(|(key, _)| key.clone())).await?;
         profile.record_read += record_read_started.elapsed();
-        txn_span.record(
-            "hydradb.relimport.record_read_us",
-            duration_micros_u64(profile.record_read),
-        );
+        txn_span.record("hydradb.relimport.record_read_us", duration_micros_u64(profile.record_read));
         for (relationship_id, (record_key, required)) in record_keys {
             match record_values.get(&record_key).and_then(Option::as_ref) {
                 Some(value) => {
-                    prefetched_relationships.insert(
-                        relationship_id,
-                        decode_relationship_record(&record_key, value)?,
-                    );
+                    prefetched_relationships.insert(relationship_id, decode_relationship_record(&record_key, value)?);
                 }
                 None if required => {
                     return Err(GraphError::CorruptValue {
@@ -4025,16 +4715,8 @@ impl GraphShard {
             }
         }
         for relationship in &relationships {
-            let rel_key = keys::relationship(
-                cell_id,
-                edge_type,
-                relationship.src,
-                relationship.dst,
-                relationship.relationship_id,
-            );
-            let existing = prefetched_relationships
-                .get(&relationship.relationship_id)
-                .cloned();
+            let rel_key = keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship.relationship_id);
+            let existing = prefetched_relationships.get(&relationship.relationship_id).cloned();
             if let Some(existing) = existing {
                 let requested = RelationshipRecord {
                     cell_id: cell_id.to_string(),
@@ -4090,21 +4772,15 @@ impl GraphShard {
                     }
                     let mut requested_metadata = requested.metadata.clone();
                     if let Some(policy) = options.merge_policy {
-                        let Some(properties) = guarded_metadata_patch(
-                            &existing.metadata.properties,
-                            requested_metadata.properties,
-                            policy,
-                            &rel_key,
-                        )?
+                        let Some(properties) =
+                            guarded_metadata_patch(&existing.metadata.properties, requested_metadata.properties, policy, &rel_key)?
                         else {
-                            relationships_already_existed =
-                                relationships_already_existed.saturating_add(1);
+                            relationships_already_existed = relationships_already_existed.saturating_add(1);
                             continue;
                         };
                         requested_metadata.properties = properties;
                     }
-                    let next_metadata =
-                        merge_edge_metadata(&existing.metadata, &requested_metadata);
+                    let next_metadata = merge_edge_metadata(&existing.metadata, &requested_metadata);
                     if next_metadata != existing.metadata {
                         let previous_metadata = existing.metadata.clone();
                         let mut updated = existing;
@@ -4135,11 +4811,7 @@ impl GraphShard {
             let mut missing_by_src = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
             for (src, dst) in &structural_edges {
                 let key = keys::out_edge(cell_id, edge_type, *src, *dst);
-                if direct_edge_values
-                    .get(&key)
-                    .and_then(Option::as_ref)
-                    .is_some()
-                {
+                if direct_edge_values.get(&key).and_then(Option::as_ref).is_some() {
                     structural_edges_to_insert.remove(&(*src, *dst));
                 } else {
                     missing_by_src.entry(*src).or_default().insert(*dst);
@@ -4148,14 +4820,7 @@ impl GraphShard {
             let segment_neighbors = stream::iter(missing_by_src.keys().copied().map(|src| {
                 let txn = &txn;
                 async move {
-                    let neighbors = out_segment_neighbors_for_src_txn(
-                        txn,
-                        cell_id,
-                        edge_type,
-                        src,
-                        current_epoch,
-                    )
-                    .await?;
+                    let neighbors = out_segment_neighbors_for_src_txn(txn, cell_id, edge_type, src, current_epoch).await?;
                     Ok::<_, GraphError>((src, neighbors))
                 }
             }))
@@ -4167,10 +4832,7 @@ impl GraphShard {
             // destinations those scans materialised to answer per-pair
             // yes/no existence checks.
             profile.segment_scans = segment_neighbors.len() as u64;
-            profile.segment_neighbors = segment_neighbors
-                .values()
-                .map(|neighbors| neighbors.len() as u64)
-                .sum();
+            profile.segment_neighbors = segment_neighbors.values().map(|neighbors| neighbors.len() as u64).sum();
             for (src, destinations) in missing_by_src {
                 if let Some(neighbors) = segment_neighbors.get(&src) {
                     for dst in destinations {
@@ -4187,43 +4849,26 @@ impl GraphShard {
             duration_micros_u64(profile.structural_check),
         );
         txn_span.record("hydradb.relimport.segment_scans", profile.segment_scans);
-        txn_span.record(
-            "hydradb.relimport.segment_neighbors",
-            profile.segment_neighbors,
-        );
-        let structural_edges_inserted =
-            u64::try_from(structural_edges_to_insert.len()).map_err(|err| {
-                GraphError::CorruptValue {
-                    key: "relationship_import".to_string(),
-                    reason: format!("too many structural edges in one import: {err}"),
-                }
-            })?;
-        let structural_edges_already_existed = u64::try_from(
-            structural_edges
-                .len()
-                .saturating_sub(structural_edges_to_insert.len()),
-        )
-        .map_err(|err| GraphError::CorruptValue {
+        txn_span.record("hydradb.relimport.segment_neighbors", profile.segment_neighbors);
+        let structural_edges_inserted = u64::try_from(structural_edges_to_insert.len()).map_err(|err| GraphError::CorruptValue {
             key: "relationship_import".to_string(),
-            reason: format!("too many existing structural edges in one import: {err}"),
+            reason: format!("too many structural edges in one import: {err}"),
         })?;
-        let relationships_inserted_count =
-            u64::try_from(relationships_inserted.len()).map_err(|err| {
-                GraphError::CorruptValue {
-                    key: "relationship_import".to_string(),
-                    reason: format!("too many relationships in one import: {err}"),
-                }
+        let structural_edges_already_existed = u64::try_from(structural_edges.len().saturating_sub(structural_edges_to_insert.len()))
+            .map_err(|err| GraphError::CorruptValue {
+                key: "relationship_import".to_string(),
+                reason: format!("too many existing structural edges in one import: {err}"),
             })?;
-        let changed = relationships_inserted_count > 0
-            || structural_edges_inserted > 0
-            || !relationships_updated.is_empty();
+        let relationships_inserted_count = u64::try_from(relationships_inserted.len()).map_err(|err| GraphError::CorruptValue {
+            key: "relationship_import".to_string(),
+            reason: format!("too many relationships in one import: {err}"),
+        })?;
+        let changed = relationships_inserted_count > 0 || structural_edges_inserted > 0 || !relationships_updated.is_empty();
         let epoch = if changed {
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "storage_sequence".to_string(),
-                    reason: "epoch overflow during relationship import".to_string(),
-                })?
+            current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+                key: "storage_sequence".to_string(),
+                reason: "epoch overflow during relationship import".to_string(),
+            })?
         } else {
             current_epoch
         };
@@ -4254,11 +4899,7 @@ impl GraphShard {
         let counter_keys = out_increments
             .keys()
             .map(|src| keys::degree_out(cell_id, edge_type, *src))
-            .chain(
-                in_increments
-                    .keys()
-                    .map(|dst| keys::degree_in(cell_id, edge_type, *dst)),
-            )
+            .chain(in_increments.keys().map(|dst| keys::degree_in(cell_id, edge_type, *dst)))
             .chain(
                 relationship_count_increments
                     .keys()
@@ -4271,10 +4912,7 @@ impl GraphShard {
             read_txn_remote_many(&txn, counter_keys).await?
         };
         profile.counter_read = counter_read_started.elapsed();
-        txn_span.record(
-            "hydradb.relimport.counter_read_us",
-            duration_micros_u64(profile.counter_read),
-        );
+        txn_span.record("hydradb.relimport.counter_read_us", duration_micros_u64(profile.counter_read));
         let topology_changes = structural_edges_to_insert
             .iter()
             .map(|(src, dst)| (*src, *dst, true))
@@ -4291,15 +4929,9 @@ impl GraphShard {
                 dst,
             };
             let edge_value = encode_edge_record(&record);
-            txn.put(
-                keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
-                &edge_value,
-            )?;
+            txn.put(keys::out_edge(cell_id, edge_type, src, dst).as_bytes(), &edge_value)?;
             if write_reverse_index {
-                txn.put(
-                    keys::in_edge(cell_id, edge_type, dst, src).as_bytes(),
-                    &edge_value,
-                )?;
+                txn.put(keys::in_edge(cell_id, edge_type, dst, src).as_bytes(), &edge_value)?;
             }
         }
         for (src, increment) in out_increments {
@@ -4325,41 +4957,18 @@ impl GraphShard {
             };
             let value = encode_relationship_record(&record);
             txn.put(
-                keys::relationship(
-                    cell_id,
-                    edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    relationship.relationship_id,
-                )
-                .as_bytes(),
+                keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship.relationship_id).as_bytes(),
                 &value,
             )?;
             txn.put(
                 keys::relationship_id(cell_id, relationship.relationship_id).as_bytes(),
-                keys::relationship(
-                    cell_id,
-                    edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    relationship.relationship_id,
-                )
-                .as_bytes(),
+                keys::relationship(cell_id, edge_type, relationship.src, relationship.dst, relationship.relationship_id).as_bytes(),
             )?;
             put_relationship_property_indexes_txn(&txn, &record)?;
         }
         for (record, previous_metadata) in &relationships_updated {
-            let key = keys::relationship(
-                cell_id,
-                edge_type,
-                record.src,
-                record.dst,
-                record.relationship_id,
-            );
-            txn.put(
-                key.as_bytes(),
-                encode_relationship_record(record).as_slice(),
-            )?;
+            let key = keys::relationship(cell_id, edge_type, record.src, record.dst, record.relationship_id);
+            txn.put(key.as_bytes(), encode_relationship_record(record).as_slice())?;
             delete_relationship_property_indexes_txn(&txn, record, previous_metadata)?;
             put_relationship_property_indexes_txn(&txn, record)?;
         }
@@ -4396,36 +5005,21 @@ impl GraphShard {
         #[cfg(feature = "opencypher")]
         for (pointer_key, update) in &merge_pointer_updates {
             match update {
-                Some(relationship_id) => txn.put(
-                    pointer_key.as_bytes(),
-                    encode_u64(*relationship_id).as_slice(),
-                )?,
+                Some(relationship_id) => txn.put(pointer_key.as_bytes(), encode_u64(*relationship_id).as_slice())?,
                 None => txn.delete(pointer_key.as_bytes())?,
             }
         }
         let commit_started = std::time::Instant::now();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, edge_type, epoch).await?;
         profile.commit = commit_started.elapsed();
-        txn_span.record(
-            "hydradb.relimport.commit_us",
-            duration_micros_u64(profile.commit),
-        );
+        txn_span.record("hydradb.relimport.commit_us", duration_micros_u64(profile.commit));
         self.record_relationship_import_profile(&profile);
         Ok(result)
     }
 
-    pub async fn create_relationship(
-        &self,
-        mutation: EdgeMutation,
-        edge_metadata: EdgeMetadata,
-    ) -> Result<RelationshipCreateResult> {
-        self.create_relationship_with_full_metadata(
-            mutation,
-            VertexMetadata::default(),
-            VertexMetadata::default(),
-            edge_metadata,
-        )
-        .await
+    pub async fn create_relationship(&self, mutation: EdgeMutation, edge_metadata: EdgeMetadata) -> Result<RelationshipCreateResult> {
+        self.create_relationship_with_full_metadata(mutation, VertexMetadata::default(), VertexMetadata::default(), edge_metadata)
+            .await
     }
 
     pub async fn create_relationship_with_vertex_metadata(
@@ -4434,13 +5028,8 @@ impl GraphShard {
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
     ) -> Result<RelationshipCreateResult> {
-        self.create_relationship_with_full_metadata(
-            mutation,
-            src_metadata,
-            dst_metadata,
-            EdgeMetadata::default(),
-        )
-        .await
+        self.create_relationship_with_full_metadata(mutation, src_metadata, dst_metadata, EdgeMetadata::default())
+            .await
     }
 
     pub async fn create_relationship_with_full_metadata(
@@ -4450,10 +5039,7 @@ impl GraphShard {
         dst_metadata: VertexMetadata,
         edge_metadata: EdgeMetadata,
     ) -> Result<RelationshipCreateResult> {
-        let _latency = self
-            .operation_metrics
-            .create_relationship_latency
-            .start_timer();
+        let _latency = self.operation_metrics.create_relationship_latency.start_timer();
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", &mutation.cell_id)?;
@@ -4464,16 +5050,9 @@ impl GraphShard {
         validate_edge_metadata(&edge_metadata)?;
         self.ensure_write_authority(&mutation.cell_id, "create_relationship")?;
         // A self-loop with conflicting endpoint metadata fails here.
-        let metadata_updates = coalesce_vertex_metadata_updates([
-            (mutation.src, src_metadata),
-            (mutation.dst, dst_metadata),
-        ])?;
-        self.run_write_pipeline_fencing_noops(self.create_relationship_with_full_metadata_inline(
-            mutation,
-            metadata_updates,
-            edge_metadata,
-        ))
-        .await
+        let metadata_updates = coalesce_vertex_metadata_updates([(mutation.src, src_metadata), (mutation.dst, dst_metadata)])?;
+        self.run_write_pipeline_fencing_noops(self.create_relationship_with_full_metadata_inline(mutation, metadata_updates, edge_metadata))
+            .await
     }
 
     async fn create_relationship_with_full_metadata_inline(
@@ -4482,8 +5061,7 @@ impl GraphShard {
         metadata_updates: Vec<(VertexId, VertexMetadata)>,
         edge_metadata: EdgeMetadata,
     ) -> Result<RelationshipCreateResult> {
-        let fingerprint =
-            relationship_create_fingerprint(&mutation, metadata_updates.as_slice(), &edge_metadata);
+        let fingerprint = relationship_create_fingerprint(&mutation, metadata_updates.as_slice(), &edge_metadata);
         let _permit = self
             .acquire_graph_write_permit("create_relationship")
             .instrument(
@@ -4493,9 +5071,7 @@ impl GraphShard {
         let _writer = self
             .writer_lane(&mutation.cell_id)
             .lock()
-            .instrument(
-                tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id))
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -4503,18 +5079,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -4549,28 +5119,13 @@ impl GraphShard {
         edge_metadata: &EdgeMetadata,
         fingerprint: u64,
     ) -> Result<RelationshipCreateResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "create_relationship")
-            .instrument(
-                tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id))
             .await?;
-        let idem_key = keys::idempotency(
-            &mutation.cell_id,
-            "relationship-create",
-            &mutation.idempotency_key,
-        );
+        let idem_key = keys::idempotency(&mutation.cell_id, "relationship-create", &mutation.idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-            return decode_relationship_create_idempotency(
-                &idem_key,
-                mutation,
-                fingerprint,
-                &value,
-            );
+            return decode_relationship_create_idempotency(&idem_key, mutation, fingerprint, &value);
         }
 
         let current_epoch = txn.seqnum();
@@ -4584,52 +5139,44 @@ impl GraphShard {
         )
         .await?;
         let structural_edge_inserted = existing_edge_epoch.is_none();
-        let epoch = current_epoch
-            .checked_add(1)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: "storage_sequence".to_string(),
-                reason: "epoch overflow during relationship create".to_string(),
-            })?;
+        let epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "epoch overflow during relationship create".to_string(),
+        })?;
 
-        let mut relationship_id =
-            read_counter_txn(&txn, &keys::last_relationship_id(&mutation.cell_id))
-                .await?
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: keys::last_relationship_id(&mutation.cell_id),
-                    reason: "relationship id overflow".to_string(),
-                })?;
+        let mut relationship_id = next_relationship_id(
+            read_counter_txn(&txn, &keys::last_relationship_id(&mutation.cell_id)).await?,
+            &mutation.cell_id,
+        )?;
         loop {
-            if read_txn_remote(
-                &txn,
-                &keys::relationship_id(&mutation.cell_id, relationship_id),
-            )
-            .await?
-            .is_none()
+            if read_txn_remote(&txn, &keys::relationship_id(&mutation.cell_id, relationship_id))
+                .await?
+                .is_none()
             {
                 break;
             }
-            relationship_id =
-                relationship_id
-                    .checked_add(1)
-                    .ok_or_else(|| GraphError::CorruptValue {
-                        key: keys::last_relationship_id(&mutation.cell_id),
-                        reason: "relationship id overflow".to_string(),
-                    })?;
+            relationship_id = next_relationship_id(relationship_id, &mutation.cell_id)?;
         }
 
         let mut changed_metadata = Vec::new();
+        // Shared with the updates below, which look up the same names.
+        let mut generations = WriteBackGenerations::default();
         for (vertex_id, requested) in metadata_updates {
             let vertex_key = keys::vertex(&mutation.cell_id, *vertex_id);
-            let existing = decode_vertex_record(
-                &vertex_key,
-                read_txn_remote(&txn, &vertex_key).await?.as_ref(),
-            )?;
-            let existed = existing.is_some();
-            let previous = existing.unwrap_or_default();
-            let next = merge_vertex_metadata(&previous, requested);
-            if previous != next || !existed {
-                changed_metadata.push((*vertex_id, previous, next));
+            let existing = decode_vertex_record(&vertex_key, read_txn_remote(&txn, &vertex_key).await?.as_ref())?;
+            // Merged into the vertex as reads see it, and compared with that
+            // view: write-back values are not in the record.
+            let (next, changes) = match &existing {
+                Some(record) => {
+                    let base = write_back_patch_base_txn(&txn, &mutation.cell_id, *vertex_id, record, &mut generations).await?;
+                    let next = merge_vertex_metadata(&base, requested);
+                    let changes = next != *base;
+                    (next, changes)
+                }
+                None => (merge_vertex_metadata(&VertexMetadata::default(), requested), true),
+            };
+            if changes {
+                changed_metadata.push((*vertex_id, existing, next));
             }
         }
         txn.put(
@@ -4641,23 +5188,15 @@ impl GraphShard {
                 &txn,
                 &mutation.cell_id,
                 *vertex_id,
-                previous,
+                previous.as_ref(),
                 next,
                 epoch,
-            )?;
+                &mut generations,
+            )
+            .await?;
         }
-        let written = metadata_updates
-            .iter()
-            .map(|(vertex_id, _)| *vertex_id)
-            .collect::<BTreeSet<_>>();
-        ensure_vertex_records_txn(
-            &txn,
-            &mutation.cell_id,
-            [mutation.src, mutation.dst],
-            &written,
-            false,
-        )
-        .await?;
+        let written = metadata_updates.iter().map(|(vertex_id, _)| *vertex_id).collect::<BTreeSet<_>>();
+        ensure_vertex_records_txn(&txn, &mutation.cell_id, [mutation.src, mutation.dst], &written, false).await?;
 
         if structural_edge_inserted {
             let record = EdgeRecord {
@@ -4675,36 +5214,22 @@ impl GraphShard {
                 &[(mutation.src, mutation.dst, true)],
             )
             .await?;
-            let out_degree_key =
-                keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
+            let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
             let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
             let in_degree = if self.writes_reverse_index() {
-                let in_degree_key =
-                    keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+                let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
                 let in_degree = read_counter_txn(&txn, &in_degree_key).await? + 1;
                 Some((in_degree_key, in_degree))
             } else {
                 None
             };
             txn.put(
-                keys::out_edge(
-                    &mutation.cell_id,
-                    &mutation.edge_type,
-                    mutation.src,
-                    mutation.dst,
-                )
-                .as_bytes(),
+                keys::out_edge(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
                 &edge_value,
             )?;
             if self.writes_reverse_index() {
                 txn.put(
-                    keys::in_edge(
-                        &mutation.cell_id,
-                        &mutation.edge_type,
-                        mutation.dst,
-                        mutation.src,
-                    )
-                    .as_bytes(),
+                    keys::in_edge(&mutation.cell_id, &mutation.edge_type, mutation.dst, mutation.src).as_bytes(),
                     &edge_value,
                 )?;
             }
@@ -4722,32 +5247,15 @@ impl GraphShard {
             relationship_id,
             metadata: edge_metadata.clone(),
         };
-        let relationship_key = keys::relationship(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-            relationship_id,
-        );
-        txn.put(
-            relationship_key.as_bytes(),
-            encode_relationship_record(&record),
-        )?;
+        let relationship_key = keys::relationship(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst, relationship_id);
+        txn.put(relationship_key.as_bytes(), encode_relationship_record(&record))?;
         txn.put(
             keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes(),
             relationship_key.as_bytes(),
         )?;
-        let relationship_count_key = keys::relationship_count(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
+        let relationship_count_key = keys::relationship_count(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
         let relationship_count = read_counter_txn(&txn, &relationship_count_key).await? + 1;
-        txn.put(
-            relationship_count_key.as_bytes(),
-            encode_u64(relationship_count),
-        )?;
+        txn.put(relationship_count_key.as_bytes(), encode_u64(relationship_count))?;
         put_relationship_property_indexes_txn(&txn, &record)?;
 
         let result = RelationshipCreateResult {
@@ -4810,30 +5318,17 @@ impl GraphShard {
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .set_relationship_metadata_txn(
-                    cell_id,
-                    edge_type,
-                    src,
-                    dst,
-                    relationship_id,
-                    metadata.clone(),
-                )
+                .set_relationship_metadata_txn(cell_id, edge_type, src, dst, relationship_id, metadata.clone())
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(changed) => {
                     if changed {
-                        self.operation_metrics
-                            .write_commits
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(changed);
                 }
@@ -4859,14 +5354,7 @@ impl GraphShard {
             .acquire_local_write_guard_no_fence(cell_id, "set_relationship_metadata")
             .await?;
         let result = self
-            .set_relationship_metadata_txn_locked(
-                cell_id,
-                edge_type,
-                src,
-                dst,
-                relationship_id,
-                metadata,
-            )
+            .set_relationship_metadata_txn_locked(cell_id, edge_type, src, dst, relationship_id, metadata)
             .await;
         finish_local_write(lock, result).await
     }
@@ -4880,11 +5368,7 @@ impl GraphShard {
         relationship_id: RelationshipId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "set_relationship_metadata")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
@@ -4902,38 +5386,236 @@ impl GraphShard {
         }
         let previous = record.metadata.clone();
         record.metadata = metadata.clone();
-        txn.put(
-            key.as_bytes(),
-            encode_relationship_record(&record).as_slice(),
-        )?;
+        txn.put(key.as_bytes(), encode_relationship_record(&record).as_slice())?;
         delete_relationship_property_indexes_txn(&txn, &record, &previous)?;
         put_relationship_property_indexes_txn(&txn, &record)?;
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(true)
     }
 
-    pub async fn delete_relationship(
-        &self,
-        mutation: EdgeMutation,
-        relationship_id: RelationshipId,
-    ) -> Result<DeleteResult> {
+    /// Every relationship and structural-edge property update of one Cypher
+    /// statement in one transaction: [`Self::set_relationship_metadata`] and
+    /// [`Self::set_edge_metadata`] applied together, so the statement commits
+    /// all of its updates or none of them and pays one durable WAL wait.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn set_relationship_metadata_batch(&self, cell_id: &str, updates: Vec<RelationshipMetadataUpdate>) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        let mut by_target = BTreeMap::<(String, VertexId, VertexId, Option<RelationshipId>), (EdgeMetadata, Option<EdgeMetadata>)>::new();
+        for update in updates {
+            validate_component("edge_type", &update.edge_type)?;
+            validate_edge_metadata(&update.metadata)?;
+            let target = (update.edge_type, update.src, update.dst, update.relationship_id);
+            match by_target.get(&target) {
+                Some(existing) if existing != &(update.metadata.clone(), update.read.clone()) => {
+                    return Err(GraphError::BatchValueConflict {
+                        target: format!("relationship {}({}->{}) {:?}", target.0, target.1, target.2, target.3),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    by_target.insert(target, (update.metadata, update.read));
+                }
+            }
+        }
+        self.ensure_write_authority(cell_id, "set_relationship_metadata_batch")?;
+        if by_target.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "set_relationship_metadata_batch",
+            by_target.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let updates = by_target
+            .into_iter()
+            .map(
+                |((edge_type, src, dst, relationship_id), (metadata, read))| RelationshipMetadataUpdate {
+                    edge_type,
+                    src,
+                    dst,
+                    relationship_id,
+                    metadata,
+                    read,
+                },
+            )
+            .collect::<Vec<_>>();
+        self.run_write_pipeline_fencing_noops(async {
+            let _permit = self
+                .acquire_graph_write_permit("set_relationship_metadata_batch")
+                .instrument(tracing::info_span!(
+                    "shard.write_permit",
+                    hydradb.cell_id = %cell_id,
+                    hydradb.write.operation = "set_relationship_metadata_batch"
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(cell_id)
+                .lock()
+                .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %cell_id))
+                .await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                let lock = self
+                    .acquire_local_write_guard_no_fence(cell_id, "set_relationship_metadata_batch")
+                    .await?;
+                let result = self
+                    .set_relationship_metadata_batch_txn_locked(cell_id, &updates)
+                    .instrument(tracing::info_span!("storage.txn"))
+                    .await;
+                match finish_local_write(lock, result).await {
+                    Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                        self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(changed) => {
+                        if changed > 0 {
+                            self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(changed);
+                    }
+                    result => return result,
+                }
+            }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+        })
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn set_relationship_metadata_batch_txn_locked(&self, cell_id: &str, updates: &[RelationshipMetadataUpdate]) -> Result<usize> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_relationship_metadata_batch")
+            .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
+            .await?;
+        let current_epoch = txn.seqnum();
+        let record_keys = updates
+            .iter()
+            .filter_map(|update| {
+                update
+                    .relationship_id
+                    .map(|relationship_id| keys::relationship(cell_id, &update.edge_type, update.src, update.dst, relationship_id))
+            })
+            .collect::<Vec<_>>();
+        let edge_metadata_keys = updates
+            .iter()
+            .filter(|update| update.relationship_id.is_none())
+            .map(|update| keys::edge_metadata(cell_id, &update.edge_type, update.src, update.dst))
+            .collect::<Vec<_>>();
+        let existing = read_txn_remote_many(&txn, record_keys.into_iter().chain(edge_metadata_keys)).await?;
+
+        let mut changed_records = Vec::new();
+        let mut changed_edges = Vec::new();
+        for update in updates {
+            match update.relationship_id {
+                Some(relationship_id) => {
+                    let key = keys::relationship(cell_id, &update.edge_type, update.src, update.dst, relationship_id);
+                    let Some(value) = existing.get(&key).and_then(Option::as_ref) else {
+                        // Deleted after the statement read it: a lost race.
+                        if update.read.is_some() {
+                            return Err(GraphError::ConditionalWriteConflict {
+                                operation: "set_relationship_metadata_batch",
+                                key,
+                            });
+                        }
+                        return Err(GraphError::UnsupportedQuery {
+                            reason: QueryFailureReason::Mutation,
+                            dialect: "GraphQuery",
+                            feature: "cannot set metadata for a missing relationship".to_string(),
+                        });
+                    };
+                    let mut record = decode_relationship_record(&key, value)?;
+                    if update.read.as_ref().is_some_and(|read| read != &record.metadata) {
+                        return Err(GraphError::ConditionalWriteConflict {
+                            operation: "set_relationship_metadata_batch",
+                            key,
+                        });
+                    }
+                    if record.metadata != update.metadata {
+                        let previous = std::mem::replace(&mut record.metadata, update.metadata.clone());
+                        changed_records.push((key, record, previous));
+                    }
+                }
+                None => {
+                    if edge_epoch_at_txn(&txn, cell_id, &update.edge_type, update.src, update.dst, current_epoch)
+                        .await?
+                        .is_none()
+                    {
+                        if update.read.is_some() {
+                            return Err(GraphError::ConditionalWriteConflict {
+                                operation: "set_relationship_metadata_batch",
+                                key: keys::edge_metadata(cell_id, &update.edge_type, update.src, update.dst),
+                            });
+                        }
+                        return Err(GraphError::UnsupportedQuery {
+                            reason: QueryFailureReason::Mutation,
+                            dialect: "GraphQuery",
+                            feature: format!(
+                                "cannot set metadata for missing edge {}({}->{})",
+                                update.edge_type, update.src, update.dst
+                            ),
+                        });
+                    }
+                    let key = keys::edge_metadata(cell_id, &update.edge_type, update.src, update.dst);
+                    let previous = match existing.get(&key).and_then(Option::as_ref) {
+                        Some(value) => decode_edge_metadata(&key, value)?,
+                        None => EdgeMetadata::default(),
+                    };
+                    if update.read.as_ref().is_some_and(|read| read != &previous) {
+                        return Err(GraphError::ConditionalWriteConflict {
+                            operation: "set_relationship_metadata_batch",
+                            key,
+                        });
+                    }
+                    if previous != update.metadata {
+                        changed_edges.push((update, previous));
+                    }
+                }
+            }
+        }
+        let changed = changed_records.len() + changed_edges.len();
+        if changed == 0 {
+            return Ok(0);
+        }
+        for (key, record, previous) in &changed_records {
+            txn.put(key.as_bytes(), encode_relationship_record(record).as_slice())?;
+            delete_relationship_property_indexes_txn(&txn, record, previous)?;
+            put_relationship_property_indexes_txn(&txn, record)?;
+        }
+        if !changed_edges.is_empty() {
+            let epoch = next_epoch_txn(&txn, cell_id).await?;
+            for (update, previous) in &changed_edges {
+                apply_edge_metadata_update_txn(
+                    &txn,
+                    EdgeMetadataTarget {
+                        cell_id,
+                        edge_type: &update.edge_type,
+                        src: update.src,
+                        dst: update.dst,
+                    },
+                    previous,
+                    &update.metadata,
+                    epoch,
+                )?;
+            }
+        }
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed)
+    }
+
+    pub async fn delete_relationship(&self, mutation: EdgeMutation, relationship_id: RelationshipId) -> Result<DeleteResult> {
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", &mutation.cell_id)?;
         validate_component("edge_type", &mutation.edge_type)?;
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "delete_relationship")?;
-        self.run_write_pipeline_fencing_noops(
-            self.delete_relationship_inline(mutation, relationship_id),
-        )
-        .await
+        self.run_write_pipeline_fencing_noops(self.delete_relationship_inline(mutation, relationship_id))
+            .await
     }
 
-    async fn delete_relationship_inline(
-        &self,
-        mutation: EdgeMutation,
-        relationship_id: RelationshipId,
-    ) -> Result<DeleteResult> {
+    async fn delete_relationship_inline(&self, mutation: EdgeMutation, relationship_id: RelationshipId) -> Result<DeleteResult> {
         let _permit = self
             .acquire_graph_write_permit("delete_relationship")
             .instrument(
@@ -4943,9 +5625,7 @@ impl GraphShard {
         let _writer = self
             .writer_lane(&mutation.cell_id)
             .lock()
-            .instrument(
-                tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id))
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -4953,18 +5633,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -4976,57 +5650,26 @@ impl GraphShard {
         })
     }
 
-    async fn delete_relationship_txn(
-        &self,
-        mutation: &EdgeMutation,
-        relationship_id: RelationshipId,
-    ) -> Result<DeleteResult> {
+    async fn delete_relationship_txn(&self, mutation: &EdgeMutation, relationship_id: RelationshipId) -> Result<DeleteResult> {
         let lock = self
             .acquire_local_write_guard_no_fence(&mutation.cell_id, "delete_relationship")
             .await?;
-        let result = self
-            .delete_relationship_txn_locked(mutation, relationship_id)
-            .await;
+        let result = self.delete_relationship_txn_locked(mutation, relationship_id).await;
         finish_local_write(lock, result).await
     }
 
-    async fn delete_relationship_txn_locked(
-        &self,
-        mutation: &EdgeMutation,
-        relationship_id: RelationshipId,
-    ) -> Result<DeleteResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+    async fn delete_relationship_txn_locked(&self, mutation: &EdgeMutation, relationship_id: RelationshipId) -> Result<DeleteResult> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_relationship")
-            .instrument(
-                tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id))
             .await?;
-        let idem_key = keys::idempotency(
-            &mutation.cell_id,
-            "relationship-delete",
-            &mutation.idempotency_key,
-        );
+        let idem_key = keys::idempotency(&mutation.cell_id, "relationship-delete", &mutation.idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-            return decode_relationship_delete_idempotency(
-                &idem_key,
-                mutation,
-                relationship_id,
-                &value,
-            );
+            return decode_relationship_delete_idempotency(&idem_key, mutation, relationship_id, &value);
         }
 
         let current_epoch = txn.seqnum();
-        let key = keys::relationship(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-            relationship_id,
-        );
+        let key = keys::relationship(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst, relationship_id);
         let Some(value) = read_txn_remote(&txn, &key).await? else {
             let result = DeleteResult {
                 epoch: current_epoch,
@@ -5047,12 +5690,10 @@ impl GraphShard {
             return Ok(result);
         };
         let record = decode_relationship_record(&key, &value)?;
-        let epoch = current_epoch
-            .checked_add(1)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: "storage_sequence".to_string(),
-                reason: "epoch overflow during relationship delete".to_string(),
-            })?;
+        let epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "epoch overflow during relationship delete".to_string(),
+        })?;
         let other_live_relationships = live_relationships_for_edge_txn(
             &txn,
             &mutation.cell_id,
@@ -5066,45 +5707,25 @@ impl GraphShard {
         .any(|record| record.relationship_id != relationship_id);
         txn.delete(key.as_bytes())?;
         txn.delete(keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes())?;
-        let relationship_count_key = keys::relationship_count(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
-        let relationship_count = read_counter_txn(&txn, &relationship_count_key)
-            .await?
-            .saturating_sub(1);
+        let relationship_count_key = keys::relationship_count(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
+        let relationship_count = read_counter_txn(&txn, &relationship_count_key).await?.saturating_sub(1);
         if relationship_count == 0 {
             txn.delete(relationship_count_key.as_bytes())?;
         } else {
-            txn.put(
-                relationship_count_key.as_bytes(),
-                encode_u64(relationship_count),
-            )?;
+            txn.put(relationship_count_key.as_bytes(), encode_u64(relationship_count))?;
         }
         delete_relationship_property_indexes_txn(&txn, &record, &record.metadata)?;
 
         if !other_live_relationships {
-            delete_structural_edge_txn(self, &txn, mutation, epoch).await?;
+            delete_structural_edge_txn(self.writes_reverse_index(), &self.xlog_floor_ensured, &txn, mutation, epoch).await?;
         }
 
-        let result = DeleteResult {
-            epoch,
-            deleted: true,
-        };
+        let result = DeleteResult { epoch, deleted: true };
         txn.put(
             idem_key.as_bytes(),
             encode_relationship_delete_idempotency(mutation, relationship_id, &result),
         )?;
-        commit_txn_traced(
-            txn,
-            self.await_durable_writes,
-            &mutation.cell_id,
-            &mutation.edge_type,
-            epoch,
-        )
-        .await?;
+        commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, epoch).await?;
         Ok(result)
     }
 
@@ -5117,9 +5738,7 @@ impl GraphShard {
         deletions: Vec<(EdgeMutation, RelationshipId)>,
     ) -> Result<(u64, u64)> {
         let started = std::time::Instant::now();
-        let result = self
-            .delete_relationship_mutations_batch_with_topology(cell_id, deletions)
-            .await;
+        let result = self.delete_relationship_mutations_batch_with_topology(cell_id, deletions).await;
         self.operation_metrics
             .delete_relationship_mutations_batch_latency
             .record_micros(started.elapsed().as_micros() as u64);
@@ -5156,25 +5775,14 @@ impl GraphShard {
             deletions.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
-        let mutations = deletions
-            .iter()
-            .map(|(mutation, _)| mutation.clone())
-            .collect::<Vec<_>>();
-        validate_edge_mutations_for_cell(
-            cell_id,
-            &mutations,
-            "delete_relationship_mutations_batch",
-        )?;
+        let mutations = deletions.iter().map(|(mutation, _)| mutation.clone()).collect::<Vec<_>>();
+        validate_edge_mutations_for_cell(cell_id, &mutations, "delete_relationship_mutations_batch")?;
         ensure_limit(
             "reserve_edge_delete_noops_batch",
             structural_delete_guards.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
-        validate_edge_mutations_for_cell(
-            cell_id,
-            &structural_delete_guards,
-            "reserve_edge_delete_noops_batch",
-        )?;
+        validate_edge_mutations_for_cell(cell_id, &structural_delete_guards, "reserve_edge_delete_noops_batch")?;
         validate_unique_delete_mutation_identities(&structural_delete_guards)?;
         let mut identities = BTreeSet::new();
         let mut idempotency_keys = BTreeSet::new();
@@ -5186,12 +5794,7 @@ impl GraphShard {
                     reason: "the same idempotency key appears twice in one batch",
                 });
             }
-            if !identities.insert((
-                mutation.edge_type.clone(),
-                mutation.src,
-                mutation.dst,
-                *relationship_id,
-            )) {
+            if !identities.insert((mutation.edge_type.clone(), mutation.src, mutation.dst, *relationship_id)) {
                 return Err(GraphError::IdempotencyConflict {
                     operation: "relationship-delete",
                     idempotency_key: mutation.idempotency_key.clone(),
@@ -5199,13 +5802,11 @@ impl GraphShard {
                 });
             }
         }
-        self.run_write_pipeline_fencing_noops(
-            self.delete_relationship_mutations_batch_with_guards_inline(
-                cell_id,
-                deletions,
-                structural_delete_guards,
-            ),
-        )
+        self.run_write_pipeline_fencing_noops(self.delete_relationship_mutations_batch_with_guards_inline(
+            cell_id,
+            deletions,
+            structural_delete_guards,
+        ))
         .await
     }
 
@@ -5216,10 +5817,7 @@ impl GraphShard {
         deletions: Vec<(EdgeMutation, RelationshipId)>,
         structural_delete_guards: Vec<EdgeMutation>,
     ) -> Result<RelationshipDeleteBatchResult> {
-        let mutations = deletions
-            .iter()
-            .map(|(mutation, _)| mutation.clone())
-            .collect::<Vec<_>>();
+        let mutations = deletions.iter().map(|(mutation, _)| mutation.clone()).collect::<Vec<_>>();
         let span = write_txn_span(cell_id, common_edge_type(&mutations));
         async {
             let mut retries = WriteRetryCount::new();
@@ -5329,7 +5927,7 @@ impl GraphShard {
         deletions: &[(EdgeMutation, RelationshipId)],
         structural_delete_guards: &[EdgeMutation],
     ) -> Result<()> {
-        if !self.db.has_block_cache() {
+        if !self.storage.has_block_cache() {
             return Ok(());
         }
         let span = tracing::info_span!(
@@ -5355,10 +5953,7 @@ impl GraphShard {
         let scan_options = ScanOptions::default().with_cache_blocks(true);
 
         let write_reverse_index = self.writes_reverse_index();
-        let mut point_keys = BTreeSet::from([
-            keys::cell_drop_marker(cell_id),
-            keys::cell_drop_pending_marker(cell_id),
-        ]);
+        let mut point_keys = BTreeSet::from([keys::cell_drop_marker(cell_id), keys::cell_drop_pending_marker(cell_id)]);
         // More guard keys than one budget could never all be read.
         point_keys.extend(
             structural_delete_guards
@@ -5366,14 +5961,9 @@ impl GraphShard {
                 .take(RELATIONSHIP_DELETE_WARM_MAX_READS)
                 .map(|guard| keys::idempotency(cell_id, "delete", &guard.idempotency_key)),
         );
-        let mut deleting_by_edge =
-            BTreeMap::<(&str, VertexId, VertexId), BTreeSet<RelationshipId>>::new();
+        let mut deleting_by_edge = BTreeMap::<(&str, VertexId, VertexId), BTreeSet<RelationshipId>>::new();
         for (mutation, relationship_id) in deletions {
-            point_keys.insert(keys::idempotency(
-                cell_id,
-                "relationship-delete",
-                &mutation.idempotency_key,
-            ));
+            point_keys.insert(keys::idempotency(cell_id, "relationship-delete", &mutation.idempotency_key));
             point_keys.insert(keys::relationship(
                 cell_id,
                 &mutation.edge_type,
@@ -5401,11 +5991,10 @@ impl GraphShard {
         span.record("hydradb.warm.point_keys", point_keys.len() as u64);
         span.record("hydradb.warm.prefixes", deleting_by_edge.len() as u64);
         // A prefix costs its seek plus at most `deleting + 1` records.
-        let prefix_need = deleting_by_edge.values().fold(0_usize, |need, deleting| {
-            need.saturating_add(deleting.len().saturating_add(2))
-        });
-        let (point_share, prefix_share) =
-            split_relationship_delete_warm_budget(point_keys.len(), prefix_need);
+        let prefix_need = deleting_by_edge
+            .values()
+            .fold(0_usize, |need, deleting| need.saturating_add(deleting.len().saturating_add(2)));
+        let (point_share, prefix_share) = split_relationship_delete_warm_budget(point_keys.len(), prefix_need);
         let point_budget = WarmBudget::new(point_share);
         let prefix_budget = WarmBudget::new(prefix_share);
 
@@ -5417,9 +6006,7 @@ impl GraphShard {
                     if !budget.charge() {
                         return Ok::<_, GraphError>(());
                     }
-                    storage
-                        .get_with_options(key.as_bytes(), read_options)
-                        .await?;
+                    storage.get_with_options(key.as_bytes(), read_options).await?;
                     Ok::<_, GraphError>(())
                 }
                 .boxed()
@@ -5438,9 +6025,7 @@ impl GraphShard {
                         return Ok::<_, GraphError>(());
                     }
                     let prefix = keys::relationship_edge_prefix(cell_id, edge_type, *src, *dst);
-                    let mut iter = storage
-                        .scan_prefix_with_options(prefix.as_bytes(), .., scan_options)
-                        .await?;
+                    let mut iter = storage.scan_prefix_with_options(prefix.as_bytes(), .., scan_options).await?;
                     // Read exactly what the guarded check reads: records up to
                     // and including the first one it is not deleting. Each
                     // deleted id appears once, so that is at most every deleted
@@ -5474,14 +6059,8 @@ impl GraphShard {
         // it early still spent what it spent.
         span.record("hydradb.warm.point_reads", point_budget.reads());
         span.record("hydradb.warm.prefix_reads", prefix_budget.reads());
-        span.record(
-            "hydradb.warm.reads",
-            point_budget.reads() + prefix_budget.reads(),
-        );
-        span.record(
-            "hydradb.warm.truncated",
-            point_budget.spent() || prefix_budget.spent(),
-        );
+        span.record("hydradb.warm.reads", point_budget.reads() + prefix_budget.reads());
+        span.record("hydradb.warm.truncated", point_budget.spent() || prefix_budget.spent());
         warmed.map(|_| ())
     }
 
@@ -5496,11 +6075,7 @@ impl GraphShard {
             .acquire_local_write_guard_no_fence(cell_id, "delete_relationship_mutations_batch")
             .await?;
         let result = self
-            .delete_relationship_mutations_batch_txn_locked(
-                cell_id,
-                deletions,
-                structural_delete_guards,
-            )
+            .delete_relationship_mutations_batch_txn_locked(cell_id, deletions, structural_delete_guards)
             .await;
         finish_local_write(lock, result).await
     }
@@ -5512,11 +6087,7 @@ impl GraphShard {
         deletions: &[(EdgeMutation, RelationshipId)],
         structural_delete_guards: &[EdgeMutation],
     ) -> Result<RelationshipDeleteBatchResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "delete_relationship_mutations_batch")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
@@ -5529,13 +6100,10 @@ impl GraphShard {
                 items = structural_delete_guards.len()
             ))
             .await?;
-        let commit_epoch =
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "storage_sequence".to_string(),
-                    reason: "epoch overflow during relationship delete batch".to_string(),
-                })?;
+        let commit_epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "epoch overflow during relationship delete batch".to_string(),
+        })?;
         let mut deleted = 0_u64;
         let mut already_deleted = 0_u64;
         let mut pending = Vec::new();
@@ -5543,31 +6111,16 @@ impl GraphShard {
         let read_keys = deletions.iter().flat_map(|(mutation, relationship_id)| {
             [
                 keys::idempotency(cell_id, "relationship-delete", &mutation.idempotency_key),
-                keys::relationship(
-                    cell_id,
-                    &mutation.edge_type,
-                    mutation.src,
-                    mutation.dst,
-                    *relationship_id,
-                ),
+                keys::relationship(cell_id, &mutation.edge_type, mutation.src, mutation.dst, *relationship_id),
             ]
         });
         let existing = read_txn_remote_many(&txn, read_keys)
-            .instrument(tracing::info_span!(
-                "write.delete_canonical_read",
-                items = deletions.len()
-            ))
+            .instrument(tracing::info_span!("write.delete_canonical_read", items = deletions.len()))
             .await?;
         for (mutation, relationship_id) in deletions {
-            let idem_key =
-                keys::idempotency(cell_id, "relationship-delete", &mutation.idempotency_key);
+            let idem_key = keys::idempotency(cell_id, "relationship-delete", &mutation.idempotency_key);
             if let Some(value) = existing.get(&idem_key).and_then(Option::as_ref) {
-                let result = decode_relationship_delete_idempotency(
-                    &idem_key,
-                    mutation,
-                    *relationship_id,
-                    value,
-                )?;
+                let result = decode_relationship_delete_idempotency(&idem_key, mutation, *relationship_id, value)?;
                 if result.deleted {
                     deleted = deleted.saturating_add(1);
                 } else {
@@ -5576,13 +6129,7 @@ impl GraphShard {
                 continue;
             }
 
-            let relationship_key = keys::relationship(
-                cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-                *relationship_id,
-            );
+            let relationship_key = keys::relationship(cell_id, &mutation.edge_type, mutation.src, mutation.dst, *relationship_id);
             let Some(value) = existing.get(&relationship_key).and_then(Option::as_ref) else {
                 let result = DeleteResult {
                     epoch: current_epoch,
@@ -5596,27 +6143,15 @@ impl GraphShard {
                 continue;
             };
             let record = decode_relationship_record(&relationship_key, value)?;
-            pending.push((
-                mutation.clone(),
-                *relationship_id,
-                relationship_key,
-                idem_key,
-                record,
-            ));
+            pending.push((mutation.clone(), *relationship_id, relationship_key, idem_key, record));
         }
 
-        let mut deleting_by_edge =
-            BTreeMap::<(String, VertexId, VertexId), BTreeSet<RelationshipId>>::new();
+        let mut deleting_by_edge = BTreeMap::<(String, VertexId, VertexId), BTreeSet<RelationshipId>>::new();
         let mut mutation_by_edge = BTreeMap::<(String, VertexId, VertexId), EdgeMutation>::new();
         for (mutation, relationship_id, _, _, _) in &pending {
             let edge = (mutation.edge_type.clone(), mutation.src, mutation.dst);
-            deleting_by_edge
-                .entry(edge.clone())
-                .or_default()
-                .insert(*relationship_id);
-            mutation_by_edge
-                .entry(edge)
-                .or_insert_with(|| mutation.clone());
+            deleting_by_edge.entry(edge.clone()).or_default().insert(*relationship_id);
+            mutation_by_edge.entry(edge).or_insert_with(|| mutation.clone());
         }
 
         // Every read the batch needs before it writes: whether each edge keeps a
@@ -5631,14 +6166,9 @@ impl GraphShard {
             .map(|((edge_type, src, dst), deleting)| {
                 let txn = &txn;
                 async move {
-                    let has_survivor = has_surviving_relationship_txn(
-                        txn, cell_id, edge_type, *src, *dst, deleting,
-                    )
-                    .instrument(tracing::info_span!(
-                        "write.delete_survivor_check",
-                        items = deleting.len()
-                    ))
-                    .await?;
+                    let has_survivor = has_surviving_relationship_txn(txn, cell_id, edge_type, *src, *dst, deleting)
+                        .instrument(tracing::info_span!("write.delete_survivor_check", items = deleting.len()))
+                        .await?;
                     Ok::<_, GraphError>((!has_survivor).then(|| (edge_type.clone(), *src, *dst)))
                 }
                 .boxed()
@@ -5687,32 +6217,17 @@ impl GraphShard {
                 .get(&edge)
                 .expect("structural delete came from a pending relationship");
             topology_changed |=
-                delete_structural_edge_txn(self, &txn, mutation, commit_epoch).await?;
+                delete_structural_edge_txn(self.writes_reverse_index(), &self.xlog_floor_ensured, &txn, mutation, commit_epoch).await?;
         }
         let topology_sequence = topology_changed.then_some(commit_epoch);
 
-        let recorded_epoch = if deleted > 0 {
-            commit_epoch
-        } else {
-            current_epoch
-        };
+        let recorded_epoch = if deleted > 0 { commit_epoch } else { current_epoch };
         let edge_type = deletions
             .first()
             .map(|(mutation, _)| mutation.edge_type.as_str())
-            .filter(|first| {
-                deletions
-                    .iter()
-                    .all(|(mutation, _)| mutation.edge_type == *first)
-            })
+            .filter(|first| deletions.iter().all(|(mutation, _)| mutation.edge_type == *first))
             .unwrap_or("");
-        commit_txn_traced(
-            txn,
-            self.await_durable_writes,
-            cell_id,
-            edge_type,
-            recorded_epoch,
-        )
-        .await?;
+        commit_txn_traced(txn, self.await_durable_writes, cell_id, edge_type, recorded_epoch).await?;
         Ok(RelationshipDeleteBatchResult {
             deleted,
             already_deleted,
@@ -5728,8 +6243,7 @@ impl GraphShard {
         validate_component("edge_type", &mutation.edge_type)?;
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "write_edge")?;
-        self.run_write_pipeline_fencing_noops(self.write_edge_inline(mutation))
-            .await
+        self.run_write_pipeline_fencing_noops(self.write_edge_inline(mutation)).await
     }
 
     pub(crate) async fn write_edge_inline(&self, mutation: EdgeMutation) -> Result<CommitResult> {
@@ -5773,21 +6287,14 @@ impl GraphShard {
     }
 
     pub(crate) async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(&mutation.cell_id, "write_edge")
-            .await?;
+        let lock = self.acquire_local_write_guard_no_fence(&mutation.cell_id, "write_edge").await?;
         let result = self.write_edge_txn_locked(mutation).await;
         finish_local_write(lock, result).await
     }
 
     async fn write_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
-        self.write_edge_txn_locked_with_metadata(
-            mutation,
-            &[],
-            &EdgeMetadata::default(),
-            "write_edge",
-        )
-        .await
+        self.write_edge_txn_locked_with_metadata(mutation, &[], &EdgeMetadata::default(), "write_edge")
+            .await
     }
 
     pub async fn write_edge_with_vertex_metadata(
@@ -5805,14 +6312,9 @@ impl GraphShard {
         validate_vertex_metadata(&dst_metadata)?;
         self.ensure_write_authority(&mutation.cell_id, "write_edge_with_vertex_metadata")?;
         // A self-loop with conflicting endpoint metadata fails here.
-        let metadata_updates = coalesce_vertex_metadata_updates([
-            (mutation.src, src_metadata),
-            (mutation.dst, dst_metadata),
-        ])?;
-        self.run_write_pipeline_fencing_noops(
-            self.write_edge_with_vertex_metadata_inline(mutation, metadata_updates),
-        )
-        .await
+        let metadata_updates = coalesce_vertex_metadata_updates([(mutation.src, src_metadata), (mutation.dst, dst_metadata)])?;
+        self.run_write_pipeline_fencing_noops(self.write_edge_with_vertex_metadata_inline(mutation, metadata_updates))
+            .await
     }
 
     async fn write_edge_with_vertex_metadata_inline(
@@ -5829,9 +6331,7 @@ impl GraphShard {
         let _writer = self
             .writer_lane(&mutation.cell_id)
             .lock()
-            .instrument(
-                tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id))
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -5839,18 +6339,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -5868,10 +6362,7 @@ impl GraphShard {
         metadata_updates: &[(VertexId, VertexMetadata)],
     ) -> Result<CommitResult> {
         let lock = self
-            .acquire_local_write_guard_no_fence(
-                &mutation.cell_id,
-                "write_edge_with_vertex_metadata",
-            )
+            .acquire_local_write_guard_no_fence(&mutation.cell_id, "write_edge_with_vertex_metadata")
             .await?;
         let result = self
             .write_edge_txn_locked_with_metadata(
@@ -5901,16 +6392,9 @@ impl GraphShard {
         validate_edge_metadata(&edge_metadata)?;
         self.ensure_write_authority(&mutation.cell_id, "write_edge_with_full_metadata")?;
         // A self-loop with conflicting endpoint metadata fails here.
-        let metadata_updates = coalesce_vertex_metadata_updates([
-            (mutation.src, src_metadata),
-            (mutation.dst, dst_metadata),
-        ])?;
-        self.run_write_pipeline_fencing_noops(self.write_edge_with_full_metadata_inline(
-            mutation,
-            metadata_updates,
-            edge_metadata,
-        ))
-        .await
+        let metadata_updates = coalesce_vertex_metadata_updates([(mutation.src, src_metadata), (mutation.dst, dst_metadata)])?;
+        self.run_write_pipeline_fencing_noops(self.write_edge_with_full_metadata_inline(mutation, metadata_updates, edge_metadata))
+            .await
     }
 
     async fn write_edge_with_full_metadata_inline(
@@ -5928,9 +6412,7 @@ impl GraphShard {
         let _writer = self
             .writer_lane(&mutation.cell_id)
             .lock()
-            .instrument(
-                tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("shard.writer_lane", hydradb.cell_id = %mutation.cell_id))
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -5938,18 +6420,12 @@ impl GraphShard {
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -5971,12 +6447,7 @@ impl GraphShard {
             .acquire_local_write_guard_no_fence(&mutation.cell_id, "write_edge_with_full_metadata")
             .await?;
         let result = self
-            .write_edge_txn_locked_with_metadata(
-                mutation,
-                metadata_updates,
-                edge_metadata,
-                "write_edge_with_full_metadata",
-            )
+            .write_edge_txn_locked_with_metadata(mutation, metadata_updates, edge_metadata, "write_edge_with_full_metadata")
             .await;
         finish_local_write(lock, result).await
     }
@@ -5988,15 +6459,9 @@ impl GraphShard {
         edge_metadata: &EdgeMetadata,
         operation: &'static str,
     ) -> Result<CommitResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, operation)
-            .instrument(
-                tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id),
-            )
+            .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %mutation.cell_id))
             .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
 
@@ -6016,25 +6481,27 @@ impl GraphShard {
         .await?;
 
         let mut changed_metadata = Vec::new();
+        // Shared with the updates below, which look up the same names.
+        let mut generations = WriteBackGenerations::default();
         for (vertex_id, requested) in metadata_updates {
             let vertex_key = keys::vertex(&mutation.cell_id, *vertex_id);
-            let existing = decode_vertex_record(
-                &vertex_key,
-                read_txn_remote(&txn, &vertex_key).await?.as_ref(),
-            )?;
-            let existed = existing.is_some();
-            let previous = existing.unwrap_or_default();
-            let next = merge_vertex_metadata(&previous, requested);
-            if previous != next || !existed {
-                changed_metadata.push((*vertex_id, previous, next));
+            let existing = decode_vertex_record(&vertex_key, read_txn_remote(&txn, &vertex_key).await?.as_ref())?;
+            // Merged into the vertex as reads see it, and compared with that
+            // view: write-back values are not in the record.
+            let (next, changes) = match &existing {
+                Some(record) => {
+                    let base = write_back_patch_base_txn(&txn, &mutation.cell_id, *vertex_id, record, &mut generations).await?;
+                    let next = merge_vertex_metadata(&base, requested);
+                    let changes = next != *base;
+                    (next, changes)
+                }
+                None => (merge_vertex_metadata(&VertexMetadata::default(), requested), true),
+            };
+            if changes {
+                changed_metadata.push((*vertex_id, existing, next));
             }
         }
-        let edge_metadata_key = keys::edge_metadata(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
+        let edge_metadata_key = keys::edge_metadata(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
         let previous_edge_metadata = match read_txn_remote(&txn, &edge_metadata_key).await? {
             Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
             None => EdgeMetadata::default(),
@@ -6048,28 +6515,16 @@ impl GraphShard {
                     epoch: existing_epoch,
                     already_existed: true,
                 };
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
-                )?;
-                commit_txn_traced(
-                    txn,
-                    self.await_durable_writes,
-                    &mutation.cell_id,
-                    &mutation.edge_type,
-                    result.epoch,
-                )
-                .await?;
+                txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
+                commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, result.epoch).await?;
                 return Ok(result);
             }
         }
 
-        let epoch = current_epoch
-            .checked_add(1)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: "storage_sequence".to_string(),
-                reason: "epoch overflow".to_string(),
-            })?;
+        let epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "epoch overflow".to_string(),
+        })?;
         let result = CommitResult {
             epoch,
             already_existed: existing_edge_epoch.is_some(),
@@ -6079,10 +6534,12 @@ impl GraphShard {
                 &txn,
                 &mutation.cell_id,
                 *vertex_id,
-                previous,
+                previous.as_ref(),
                 next,
                 epoch,
-            )?;
+                &mut generations,
+            )
+            .await?;
         }
         if edge_metadata_changed {
             apply_edge_metadata_update_txn(
@@ -6099,18 +6556,8 @@ impl GraphShard {
             )?;
         }
         if existing_edge_epoch.is_some() {
-            txn.put(
-                idem_key.as_bytes(),
-                encode_commit_idempotency(mutation, &result),
-            )?;
-            commit_txn_traced(
-                txn,
-                self.await_durable_writes,
-                &mutation.cell_id,
-                &mutation.edge_type,
-                epoch,
-            )
-            .await?;
+            txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
+            commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, epoch).await?;
             return Ok(result);
         }
 
@@ -6121,18 +6568,8 @@ impl GraphShard {
             dst: mutation.dst,
         };
         let edge_value = encode_edge_record(&record);
-        let written = metadata_updates
-            .iter()
-            .map(|(vertex_id, _)| *vertex_id)
-            .collect::<BTreeSet<_>>();
-        ensure_vertex_records_txn(
-            &txn,
-            &mutation.cell_id,
-            [mutation.src, mutation.dst],
-            &written,
-            false,
-        )
-        .await?;
+        let written = metadata_updates.iter().map(|(vertex_id, _)| *vertex_id).collect::<BTreeSet<_>>();
+        ensure_vertex_records_txn(&txn, &mutation.cell_id, [mutation.src, mutation.dst], &written, false).await?;
         self.mark_topology_change_txn(
             &txn,
             &mutation.cell_id,
@@ -6144,8 +6581,7 @@ impl GraphShard {
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
         let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
         let in_degree = if self.writes_reverse_index() {
-            let in_degree_key =
-                keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+            let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
             let in_degree = read_counter_txn(&txn, &in_degree_key).await? + 1;
             Some((in_degree_key, in_degree))
         } else {
@@ -6153,24 +6589,12 @@ impl GraphShard {
         };
 
         txn.put(
-            keys::out_edge(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-            )
-            .as_bytes(),
+            keys::out_edge(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
             &edge_value,
         )?;
         if self.writes_reverse_index() {
             txn.put(
-                keys::in_edge(
-                    &mutation.cell_id,
-                    &mutation.edge_type,
-                    mutation.dst,
-                    mutation.src,
-                )
-                .as_bytes(),
+                keys::in_edge(&mutation.cell_id, &mutation.edge_type, mutation.dst, mutation.src).as_bytes(),
                 &edge_value,
             )?;
         }
@@ -6178,19 +6602,9 @@ impl GraphShard {
         if let Some((in_degree_key, in_degree)) = in_degree {
             txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
         }
-        txn.put(
-            idem_key.as_bytes(),
-            encode_commit_idempotency(mutation, &result),
-        )?;
+        txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
 
-        commit_txn_traced(
-            txn,
-            self.await_durable_writes,
-            &mutation.cell_id,
-            &mutation.edge_type,
-            epoch,
-        )
-        .await?;
+        commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, epoch).await?;
         Ok(result)
     }
 
@@ -6205,11 +6619,7 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
         let mut edges: Vec<_> = edges.into_iter().collect();
-        ensure_limit(
-            "delete_edges_batch",
-            edges.len() as u64,
-            self.limits.max_bulk_import_edges as u64,
-        )?;
+        ensure_limit("delete_edges_batch", edges.len() as u64, self.limits.max_bulk_import_edges as u64)?;
         edges.sort_unstable();
         edges.dedup();
         let mutations = edges.into_iter().map(|(src, dst)| EdgeMutation {
@@ -6266,9 +6676,7 @@ impl GraphShard {
                 )
                 .await?;
             if result.deleted > 0 {
-                start_epoch = Some(
-                    start_epoch.map_or(result.start_epoch, |epoch| epoch.min(result.start_epoch)),
-                );
+                start_epoch = Some(start_epoch.map_or(result.start_epoch, |epoch| epoch.min(result.start_epoch)));
             }
             end_epoch = end_epoch.max(result.end_epoch);
             deleted = deleted.saturating_add(result.deleted);
@@ -6286,9 +6694,7 @@ impl GraphShard {
                 )
                 .await?;
             if result.deleted > 0 {
-                start_epoch = Some(
-                    start_epoch.map_or(result.start_epoch, |epoch| epoch.min(result.start_epoch)),
-                );
+                start_epoch = Some(start_epoch.map_or(result.start_epoch, |epoch| epoch.min(result.start_epoch)));
             }
             end_epoch = end_epoch.max(result.end_epoch);
             deleted = deleted.saturating_add(result.deleted);
@@ -6333,17 +6739,11 @@ impl GraphShard {
         )?;
         validate_edge_mutations_for_cell(cell_id, &mutations, "delete_edge_mutations_batch")?;
         validate_unique_delete_mutation_identities(&mutations)?;
-        self.run_write_pipeline_fencing_noops(
-            self.delete_edge_mutations_batch_inline(cell_id, mutations),
-        )
-        .await
+        self.run_write_pipeline_fencing_noops(self.delete_edge_mutations_batch_inline(cell_id, mutations))
+            .await
     }
 
-    async fn delete_edge_mutations_batch_inline(
-        &self,
-        cell_id: &str,
-        mutations: Vec<EdgeMutation>,
-    ) -> Result<EdgeDeleteBatchResult> {
+    async fn delete_edge_mutations_batch_inline(&self, cell_id: &str, mutations: Vec<EdgeMutation>) -> Result<EdgeDeleteBatchResult> {
         let span = write_txn_span(cell_id, common_edge_type(&mutations));
         async {
             let mut retries = WriteRetryCount::new();
@@ -6392,51 +6792,32 @@ impl GraphShard {
         .await
     }
 
-    async fn delete_edge_mutations_batch_txn(
-        &self,
-        cell_id: &str,
-        mutations: &[EdgeMutation],
-    ) -> Result<EdgeDeleteBatchResult> {
+    async fn delete_edge_mutations_batch_txn(&self, cell_id: &str, mutations: &[EdgeMutation]) -> Result<EdgeDeleteBatchResult> {
         let lock = self
             .acquire_local_write_guard_no_fence(cell_id, "delete_edge_mutations_batch")
             .await?;
-        let result = self
-            .delete_edge_mutations_batch_txn_locked(cell_id, mutations)
-            .await;
+        let result = self.delete_edge_mutations_batch_txn_locked(cell_id, mutations).await;
         finish_local_write(lock, result).await
     }
 
-    async fn delete_edge_mutations_batch_txn_locked(
-        &self,
-        cell_id: &str,
-        mutations: &[EdgeMutation],
-    ) -> Result<EdgeDeleteBatchResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+    async fn delete_edge_mutations_batch_txn_locked(&self, cell_id: &str, mutations: &[EdgeMutation]) -> Result<EdgeDeleteBatchResult> {
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "delete_edge_mutations_batch")
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
 
         let current_epoch = txn.seqnum();
-        let commit_epoch =
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "storage_sequence".to_string(),
-                    reason: "SlateDB storage sequence overflow during edge delete batch"
-                        .to_string(),
-                })?;
+        let commit_epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: "storage_sequence".to_string(),
+            reason: "SlateDB storage sequence overflow during edge delete batch".to_string(),
+        })?;
         let mut next_epoch = current_epoch;
         let mut results = Vec::with_capacity(mutations.len());
         let mut deleted = 0_u64;
         let mut already_deleted = 0_u64;
         let mut out_decrements = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_decrements = BTreeMap::<(String, VertexId), u64>::new();
-        let mut segment_edges_by_type_src =
-            BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
+        let mut segment_edges_by_type_src = BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
         let write_reverse_index = self.writes_reverse_index();
 
         for mutation in mutations {
@@ -6462,14 +6843,7 @@ impl GraphShard {
                 match segment_edges_by_type_src.get(&cache_key) {
                     Some(edges) => edges.get(&mutation.dst).copied(),
                     None => {
-                        let edges = out_segment_edges_for_src_txn(
-                            &txn,
-                            cell_id,
-                            &mutation.edge_type,
-                            mutation.src,
-                            current_epoch,
-                        )
-                        .await?;
+                        let edges = out_segment_edges_for_src_txn(&txn, cell_id, &mutation.edge_type, mutation.src, current_epoch).await?;
                         let epoch = edges.get(&mutation.dst).copied();
                         segment_edges_by_type_src.insert(cache_key, edges);
                         epoch
@@ -6484,10 +6858,7 @@ impl GraphShard {
                     epoch: current_epoch,
                     deleted: false,
                 };
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_delete_idempotency(mutation, &result),
-                )?;
+                txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
                 already_deleted = already_deleted.saturating_add(1);
                 results.push(result);
                 continue;
@@ -6506,8 +6877,7 @@ impl GraphShard {
                 &[(mutation.src, mutation.dst, false)],
             )
             .await?;
-            let edge_metadata_key =
-                keys::edge_metadata(cell_id, &mutation.edge_type, mutation.src, mutation.dst);
+            let edge_metadata_key = keys::edge_metadata(cell_id, &mutation.edge_type, mutation.src, mutation.dst);
             let previous_edge_metadata = match read_txn_remote(&txn, &edge_metadata_key).await? {
                 Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
                 None => EdgeMetadata::default(),
@@ -6529,40 +6899,22 @@ impl GraphShard {
             }
 
             if canonical.is_some() {
-                txn.delete(
-                    keys::edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
-                )?;
+                txn.delete(keys::edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes())?;
                 txn.delete(edge_key.as_bytes())?;
                 if write_reverse_index {
-                    txn.delete(
-                        keys::in_edge(cell_id, &mutation.edge_type, mutation.dst, mutation.src)
-                            .as_bytes(),
-                    )?;
+                    txn.delete(keys::in_edge(cell_id, &mutation.edge_type, mutation.dst, mutation.src).as_bytes())?;
                 }
                 if write_reverse_index {
-                    *in_decrements
-                        .entry((mutation.edge_type.clone(), mutation.dst))
-                        .or_insert(0) += 1;
+                    *in_decrements.entry((mutation.edge_type.clone(), mutation.dst)).or_insert(0) += 1;
                 }
             } else {
                 txn.put(
-                    keys::out_segment_tombstone(
-                        cell_id,
-                        &mutation.edge_type,
-                        mutation.src,
-                        mutation.dst,
-                    )
-                    .as_bytes(),
+                    keys::out_segment_tombstone(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
                     encode_u64(next_epoch),
                 )?;
             }
-            *out_decrements
-                .entry((mutation.edge_type.clone(), mutation.src))
-                .or_insert(0) += 1;
-            txn.put(
-                idem_key.as_bytes(),
-                encode_delete_idempotency(mutation, &result),
-            )?;
+            *out_decrements.entry((mutation.edge_type.clone(), mutation.src)).or_insert(0) += 1;
+            txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
             deleted = deleted.saturating_add(1);
             results.push(result);
         }
@@ -6578,16 +6930,8 @@ impl GraphShard {
                 txn.put(key.as_bytes(), encode_u64(base.saturating_sub(decrement)))?;
             }
         }
-        let deleted_start_epoch = results
-            .iter()
-            .filter(|result| result.deleted)
-            .map(|result| result.epoch)
-            .min();
-        let deleted_end_epoch = results
-            .iter()
-            .filter(|result| result.deleted)
-            .map(|result| result.epoch)
-            .max();
+        let deleted_start_epoch = results.iter().filter(|result| result.deleted).map(|result| result.epoch).min();
+        let deleted_end_epoch = results.iter().filter(|result| result.deleted).map(|result| result.epoch).max();
         commit_txn_traced(txn, self.await_durable_writes, cell_id, "", commit_epoch).await?;
         Ok(EdgeDeleteBatchResult {
             start_epoch: deleted_start_epoch.unwrap_or(current_epoch),
@@ -6605,8 +6949,7 @@ impl GraphShard {
         validate_component("edge_type", &mutation.edge_type)?;
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "delete_edge")?;
-        self.run_write_pipeline_fencing_noops(self.delete_edge_inline(mutation))
-            .await
+        self.run_write_pipeline_fencing_noops(self.delete_edge_inline(mutation)).await
     }
 
     async fn delete_edge_inline(&self, mutation: EdgeMutation) -> Result<DeleteResult> {
@@ -6650,63 +6993,37 @@ impl GraphShard {
     }
 
     pub(crate) async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(&mutation.cell_id, "delete_edge")
-            .await?;
+        let lock = self.acquire_local_write_guard_no_fence(&mutation.cell_id, "delete_edge").await?;
         let result = self.delete_edge_txn_locked(mutation).await;
         finish_local_write(lock, result).await
     }
 
     async fn delete_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_edge")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_edge").await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "delete", &mutation.idempotency_key);
 
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_delete_idempotency(&idem_key, mutation, &value);
         }
 
-        let canonical_key = keys::edge(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
-        let edge_key = keys::out_edge(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
+        let canonical_key = keys::edge(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
+        let edge_key = keys::out_edge(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
 
         let Some(existing) = read_txn_remote(&txn, &edge_key).await? else {
             let current_epoch = txn.seqnum();
             let segment_edge = if self.writes_reverse_index() {
                 None
             } else {
-                self.out_segment_edge_record_at(
-                    &mutation.cell_id,
-                    &mutation.edge_type,
-                    mutation.src,
-                    mutation.dst,
-                    current_epoch,
-                )
-                .await?
+                self.out_segment_edge_record_at(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst, current_epoch)
+                    .await?
             };
             let Some((segment_sequence, _segment_edge)) = segment_edge else {
                 let result = DeleteResult {
                     epoch: current_epoch,
                     deleted: false,
                 };
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_delete_idempotency(mutation, &result),
-                )?;
+                txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
                 commit_txn_traced(
                     txn,
                     self.await_durable_writes,
@@ -6717,12 +7034,7 @@ impl GraphShard {
                 .await?;
                 return Ok(result);
             };
-            let tombstone_key = keys::out_segment_tombstone(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-            );
+            let tombstone_key = keys::out_segment_tombstone(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
             if let Some(value) = read_txn_remote(&txn, &tombstone_key).await? {
                 let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
                 if !segment_edge_visible(segment_sequence, Some(tombstone_epoch)) {
@@ -6730,10 +7042,7 @@ impl GraphShard {
                         epoch: current_epoch,
                         deleted: false,
                     };
-                    txn.put(
-                        idem_key.as_bytes(),
-                        encode_delete_idempotency(mutation, &result),
-                    )?;
+                    txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
                     commit_txn_traced(
                         txn,
                         self.await_durable_writes,
@@ -6745,16 +7054,11 @@ impl GraphShard {
                     return Ok(result);
                 }
             }
-            let epoch = current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "storage_sequence".to_string(),
-                    reason: "epoch overflow".to_string(),
-                })?;
-            let result = DeleteResult {
-                epoch,
-                deleted: true,
-            };
+            let epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+                key: "storage_sequence".to_string(),
+                reason: "epoch overflow".to_string(),
+            })?;
+            let result = DeleteResult { epoch, deleted: true };
             self.mark_topology_change_txn(
                 &txn,
                 &mutation.cell_id,
@@ -6763,17 +7067,9 @@ impl GraphShard {
                 &[(mutation.src, mutation.dst, false)],
             )
             .await?;
-            let out_degree_key =
-                keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
-            let out_degree = read_counter_txn(&txn, &out_degree_key)
-                .await?
-                .saturating_sub(1);
-            let edge_metadata_key = keys::edge_metadata(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-            );
+            let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
+            let out_degree = read_counter_txn(&txn, &out_degree_key).await?.saturating_sub(1);
+            let edge_metadata_key = keys::edge_metadata(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
             let previous_edge_metadata = match read_txn_remote(&txn, &edge_metadata_key).await? {
                 Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
                 None => EdgeMetadata::default(),
@@ -6796,27 +7092,14 @@ impl GraphShard {
             }
             txn.put(tombstone_key.as_bytes(), encode_u64(epoch))?;
             txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
-            txn.put(
-                idem_key.as_bytes(),
-                encode_delete_idempotency(mutation, &result),
-            )?;
-            commit_txn_traced(
-                txn,
-                self.await_durable_writes,
-                &mutation.cell_id,
-                &mutation.edge_type,
-                epoch,
-            )
-            .await?;
+            txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
+            commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, epoch).await?;
             return Ok(result);
         };
 
         decode_edge_record(&edge_key, &existing)?;
         let epoch = next_epoch_txn(&txn, &mutation.cell_id).await?;
-        let result = DeleteResult {
-            epoch,
-            deleted: true,
-        };
+        let result = DeleteResult { epoch, deleted: true };
         self.mark_topology_change_txn(
             &txn,
             &mutation.cell_id,
@@ -6827,32 +7110,21 @@ impl GraphShard {
         .await?;
 
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
-        let out_degree = read_counter_txn(&txn, &out_degree_key)
-            .await?
-            .saturating_sub(1);
+        let out_degree = read_counter_txn(&txn, &out_degree_key).await?.saturating_sub(1);
         let in_degree = if self.writes_reverse_index() {
-            let in_degree_key =
-                keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
-            let in_degree = read_counter_txn(&txn, &in_degree_key)
-                .await?
-                .saturating_sub(1);
+            let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+            let in_degree = read_counter_txn(&txn, &in_degree_key).await?.saturating_sub(1);
             Some((in_degree_key, in_degree))
         } else {
             None
         };
-        let edge_metadata_key = keys::edge_metadata(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        );
+        let edge_metadata_key = keys::edge_metadata(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst);
         let previous_edge_metadata = match read_txn_remote(&txn, &edge_metadata_key).await? {
             Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
             None => EdgeMetadata::default(),
         };
 
-        delete_relationships_for_structural_edge_txn(&txn, mutation, epoch.saturating_sub(1))
-            .await?;
+        delete_relationships_for_structural_edge_txn(&txn, mutation, epoch.saturating_sub(1)).await?;
         if !previous_edge_metadata.properties.is_empty() {
             apply_edge_metadata_update_txn(
                 &txn,
@@ -6868,41 +7140,15 @@ impl GraphShard {
             )?;
         }
         txn.delete(canonical_key.as_bytes())?;
-        txn.delete(
-            keys::out_edge(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-            )
-            .as_bytes(),
-        )?;
-        txn.delete(
-            keys::in_edge(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.dst,
-                mutation.src,
-            )
-            .as_bytes(),
-        )?;
+        txn.delete(keys::out_edge(&mutation.cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes())?;
+        txn.delete(keys::in_edge(&mutation.cell_id, &mutation.edge_type, mutation.dst, mutation.src).as_bytes())?;
         txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
         if let Some((in_degree_key, in_degree)) = in_degree {
             txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
         }
-        txn.put(
-            idem_key.as_bytes(),
-            encode_delete_idempotency(mutation, &result),
-        )?;
+        txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &result))?;
 
-        commit_txn_traced(
-            txn,
-            self.await_durable_writes,
-            &mutation.cell_id,
-            &mutation.edge_type,
-            epoch,
-        )
-        .await?;
+        commit_txn_traced(txn, self.await_durable_writes, &mutation.cell_id, &mutation.edge_type, epoch).await?;
         Ok(result)
     }
 
@@ -6913,14 +7159,8 @@ impl GraphShard {
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
         idempotency_key: &str,
     ) -> Result<BulkImportResult> {
-        self.bulk_import_edges_with_options(
-            cell_id,
-            edge_type,
-            edges,
-            idempotency_key,
-            BulkImportOptions::default(),
-        )
-        .await
+        self.bulk_import_edges_with_options(cell_id, edge_type, edges, idempotency_key, BulkImportOptions::default())
+            .await
     }
 
     pub async fn bulk_append_edges_trusted(
@@ -6930,14 +7170,8 @@ impl GraphShard {
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
         idempotency_key: &str,
     ) -> Result<BulkImportResult> {
-        self.bulk_append_edges_trusted_bounded(
-            cell_id,
-            edge_type,
-            edges,
-            idempotency_key,
-            DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
-        )
-        .await
+        self.bulk_append_edges_trusted_bounded(cell_id, edge_type, edges, idempotency_key, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES)
+            .await
     }
 
     pub async fn bulk_append_edges_trusted_bounded(
@@ -7028,29 +7262,16 @@ impl GraphShard {
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .bulk_append_out_adjacency_segment_trusted_txn(
-                    cell_id,
-                    edge_type,
-                    src,
-                    &dsts,
-                    idempotency_key,
-                    fingerprint,
-                )
+                .bulk_append_out_adjacency_segment_trusted_txn(cell_id, edge_type, src, &dsts, idempotency_key, fingerprint)
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -7076,11 +7297,7 @@ impl GraphShard {
         self.ensure_write_authority(cell_id, "bulk_import_edges")?;
 
         let mut edges: Vec<_> = edges.into_iter().collect();
-        ensure_limit(
-            "bulk_import_edges",
-            edges.len() as u64,
-            self.limits.max_bulk_import_edges as u64,
-        )?;
+        ensure_limit("bulk_import_edges", edges.len() as u64, self.limits.max_bulk_import_edges as u64)?;
         edges.sort_unstable();
         edges.dedup();
         let fingerprint = bulk_import_fingerprint(cell_id, edge_type, &edges);
@@ -7098,29 +7315,16 @@ impl GraphShard {
             .await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .bulk_import_edges_txn(
-                    cell_id,
-                    edge_type,
-                    &edges,
-                    idempotency_key,
-                    fingerprint,
-                    options,
-                )
+                .bulk_import_edges_txn(cell_id, edge_type, &edges, idempotency_key, fingerprint, options)
                 .instrument(tracing::info_span!("storage.txn"))
                 .await
             {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.operation_metrics.write_commits.fetch_add(1, Ordering::Relaxed);
                     return Ok(result);
                 }
                 result => return result,
@@ -7137,13 +7341,8 @@ impl GraphShard {
         cell_id: &str,
         mutations: impl IntoIterator<Item = EdgeMutation>,
     ) -> Result<EdgeMutationBatchResult> {
-        self.write_edge_mutations_batch_with_endpoint_labels(
-            cell_id,
-            mutations.into_iter().collect(),
-            None,
-            "write_edge_mutations_batch",
-        )
-        .await
+        self.write_edge_mutations_batch_with_endpoint_labels(cell_id, mutations.into_iter().collect(), None, "write_edge_mutations_batch")
+            .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -7172,10 +7371,7 @@ impl GraphShard {
         endpoint_labels: Option<(&str, &str)>,
         operation: &'static str,
     ) -> Result<EdgeMutationBatchResult> {
-        let _latency = self
-            .operation_metrics
-            .write_edge_mutations_batch_latency
-            .start_timer();
+        let _latency = self.operation_metrics.write_edge_mutations_batch_latency.start_timer();
         // Validate before pipeline admission: a rejected request must not
         // wait for other writes' WAL uploads or hold a pending-write slot.
         validate_component("cell_id", cell_id)?;
@@ -7191,11 +7387,7 @@ impl GraphShard {
                 results: Vec::new(),
             });
         }
-        ensure_limit(
-            operation,
-            mutations.len() as u64,
-            self.limits.max_bulk_import_edges as u64,
-        )?;
+        ensure_limit(operation, mutations.len() as u64, self.limits.max_bulk_import_edges as u64)?;
         for mutation in &mutations {
             validate_component("cell_id", &mutation.cell_id)?;
             validate_component("edge_type", &mutation.edge_type)?;
@@ -7203,21 +7395,16 @@ impl GraphShard {
             if mutation.cell_id != cell_id {
                 return Err(GraphError::CorruptValue {
                     key: format!("cell/{cell_id}/write_edge_mutations_batch"),
-                    reason: format!(
-                        "batch contains mutation for different cell {}",
-                        mutation.cell_id
-                    ),
+                    reason: format!("batch contains mutation for different cell {}", mutation.cell_id),
                 });
             }
         }
-        self.run_write_pipeline_fencing_noops(
-            self.write_edge_mutations_batch_with_endpoint_labels_inline(
-                cell_id,
-                mutations,
-                endpoint_labels,
-                operation,
-            ),
-        )
+        self.run_write_pipeline_fencing_noops(self.write_edge_mutations_batch_with_endpoint_labels_inline(
+            cell_id,
+            mutations,
+            endpoint_labels,
+            operation,
+        ))
         .await
     }
 
@@ -7303,9 +7490,7 @@ impl GraphShard {
             mutations_seen = mutations_seen.saturating_add(1);
             chunk.push(mutation);
             if chunk.len() == batch_size {
-                let result = self
-                    .write_edge_mutations_batch(cell_id, std::mem::take(&mut chunk))
-                    .await?;
+                let result = self.write_edge_mutations_batch(cell_id, std::mem::take(&mut chunk)).await?;
                 merge_ingest_batch(
                     &result,
                     &mut start_epoch,
@@ -7346,9 +7531,7 @@ impl GraphShard {
         operation: &'static str,
         endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
-        let lock = self
-            .acquire_local_write_guard_no_fence(cell_id, operation)
-            .await?;
+        let lock = self.acquire_local_write_guard_no_fence(cell_id, operation).await?;
         let result = self
             .write_edge_mutations_batch_txn_locked(cell_id, mutations, operation, endpoint_labels)
             .await;
@@ -7362,11 +7545,7 @@ impl GraphShard {
         operation: &'static str,
         endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .instrument(tracing::info_span!("write.fence_validate", hydradb.cell_id = %cell_id))
             .await?;
@@ -7383,20 +7562,15 @@ impl GraphShard {
         }
 
         let current_epoch = txn.seqnum();
-        let commit_epoch =
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: operation.to_string(),
-                    reason: "SlateDB storage sequence overflow during edge mutation batch"
-                        .to_string(),
-                })?;
+        let commit_epoch = current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+            key: operation.to_string(),
+            reason: "SlateDB storage sequence overflow during edge mutation batch".to_string(),
+        })?;
         let mut next_epoch = current_epoch;
         let mut results = Vec::with_capacity(mutations.len());
         let mut known_edges = BTreeMap::<(String, VertexId, VertexId), StorageSequence>::new();
         let mut validated_endpoints = BTreeSet::<(VertexId, String)>::new();
-        let mut segment_edges_by_type_src =
-            BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
+        let mut segment_edges_by_type_src = BTreeMap::<(String, VertexId), BTreeMap<VertexId, StorageSequence>>::new();
         let mut out_increments = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_increments = BTreeMap::<(String, VertexId), u64>::new();
         let write_reverse_index = self.writes_reverse_index();
@@ -7420,10 +7594,7 @@ impl GraphShard {
             }
 
             if let Some((source_label, destination_label)) = endpoint_labels {
-                for (vertex, label) in [
-                    (mutation.src, source_label),
-                    (mutation.dst, destination_label),
-                ] {
+                for (vertex, label) in [(mutation.src, source_label), (mutation.dst, destination_label)] {
                     if !validated_endpoints.insert((vertex, label.to_string())) {
                         continue;
                     }
@@ -7432,9 +7603,7 @@ impl GraphShard {
                         return Err(GraphError::UnsupportedQuery {
                             reason: QueryFailureReason::Mutation,
                             dialect: "OpenCypher",
-                            feature: format!(
-                                "MATCH endpoint vertex {vertex} with label {label} does not exist"
-                            ),
+                            feature: format!("MATCH endpoint vertex {vertex} with label {label} does not exist"),
                         });
                     };
                     let metadata = decode_vertex_metadata(&key, &value)?;
@@ -7442,9 +7611,7 @@ impl GraphShard {
                         return Err(GraphError::UnsupportedQuery {
                             reason: QueryFailureReason::Mutation,
                             dialect: "OpenCypher",
-                            feature: format!(
-                                "MATCH endpoint vertex {vertex} does not have label {label}"
-                            ),
+                            feature: format!("MATCH endpoint vertex {vertex} does not have label {label}"),
                         });
                     }
                 }
@@ -7456,10 +7623,7 @@ impl GraphShard {
                     epoch,
                     already_existed: true,
                 };
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
-                )?;
+                txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
                 continue;
@@ -7473,10 +7637,7 @@ impl GraphShard {
                     already_existed: true,
                 };
                 known_edges.insert(identity, current_epoch);
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
-                )?;
+                txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
                 continue;
@@ -7486,14 +7647,7 @@ impl GraphShard {
             let segment_epoch = match segment_edges_by_type_src.get(&segment_cache_key) {
                 Some(edges) => edges.get(&mutation.dst).copied(),
                 None => {
-                    let edges = out_segment_edges_for_src_txn(
-                        &txn,
-                        cell_id,
-                        &mutation.edge_type,
-                        mutation.src,
-                        current_epoch,
-                    )
-                    .await?;
+                    let edges = out_segment_edges_for_src_txn(&txn, cell_id, &mutation.edge_type, mutation.src, current_epoch).await?;
                     let epoch = edges.get(&mutation.dst).copied();
                     segment_edges_by_type_src.insert(segment_cache_key, edges);
                     epoch
@@ -7505,10 +7659,7 @@ impl GraphShard {
                     already_existed: true,
                 };
                 known_edges.insert(identity, epoch);
-                txn.put(
-                    idem_key.as_bytes(),
-                    encode_commit_idempotency(mutation, &result),
-                )?;
+                txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
                 already_existed = already_existed.saturating_add(1);
                 results.push(result);
                 continue;
@@ -7540,26 +7691,18 @@ impl GraphShard {
             )?;
             if write_reverse_index {
                 txn.put(
-                    keys::in_edge(cell_id, &mutation.edge_type, mutation.dst, mutation.src)
-                        .as_bytes(),
+                    keys::in_edge(cell_id, &mutation.edge_type, mutation.dst, mutation.src).as_bytes(),
                     &edge_value,
                 )?;
             }
-            txn.put(
-                idem_key.as_bytes(),
-                encode_commit_idempotency(mutation, &result),
-            )?;
+            txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &result))?;
             known_edges.insert(identity, next_epoch);
             if endpoint_labels.is_none() {
                 inserted_endpoints.extend([mutation.src, mutation.dst]);
             }
-            *out_increments
-                .entry((mutation.edge_type.clone(), mutation.src))
-                .or_insert(0) += 1;
+            *out_increments.entry((mutation.edge_type.clone(), mutation.src)).or_insert(0) += 1;
             if write_reverse_index {
-                *in_increments
-                    .entry((mutation.edge_type.clone(), mutation.dst))
-                    .or_insert(0) += 1;
+                *in_increments.entry((mutation.edge_type.clone(), mutation.dst)).or_insert(0) += 1;
             }
             inserted = inserted.saturating_add(1);
             results.push(result);
@@ -7577,14 +7720,7 @@ impl GraphShard {
                 txn.put(key.as_bytes(), encode_u64(base + increment))?;
             }
         }
-        ensure_vertex_records_txn(
-            &txn,
-            cell_id,
-            inserted_endpoints,
-            &BTreeSet::new(),
-            current_epoch == 0,
-        )
-        .await?;
+        ensure_vertex_records_txn(&txn, cell_id, inserted_endpoints, &BTreeSet::new(), current_epoch == 0).await?;
         let inserted_start_epoch = results
             .iter()
             .filter(|result| !result.already_existed)
@@ -7612,8 +7748,7 @@ impl GraphShard {
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
         idempotency_key: &str,
     ) -> Result<BulkImportResult> {
-        self.bulk_import_edges(cell_id, edge_type, edges, idempotency_key)
-            .await
+        self.bulk_import_edges(cell_id, edge_type, edges, idempotency_key).await
     }
 
     pub async fn write_edges_batch_chunked(
@@ -7636,15 +7771,8 @@ impl GraphShard {
         idempotency_key: &str,
         chunk_size: usize,
     ) -> Result<BulkImportResult> {
-        self.bulk_import_edges_chunked_with_options(
-            cell_id,
-            edge_type,
-            edges,
-            idempotency_key,
-            chunk_size,
-            BulkImportOptions::default(),
-        )
-        .await
+        self.bulk_import_edges_chunked_with_options(cell_id, edge_type, edges, idempotency_key, chunk_size, BulkImportOptions::default())
+            .await
     }
 
     pub async fn bulk_append_edges_trusted_chunked(
@@ -7753,14 +7881,7 @@ impl GraphShard {
             .acquire_local_write_guard(cell_id, "bulk_append_out_adjacency_segment_trusted")
             .await?;
         let result = self
-            .bulk_append_out_adjacency_segment_trusted_txn_locked(
-                cell_id,
-                edge_type,
-                src,
-                dsts,
-                idempotency_key,
-                fingerprint,
-            )
+            .bulk_append_out_adjacency_segment_trusted_txn_locked(cell_id, edge_type, src, dsts, idempotency_key, fingerprint)
             .await;
         finish_local_write(lock, result).await
     }
@@ -7774,11 +7895,7 @@ impl GraphShard {
         idempotency_key: &str,
         fingerprint: u64,
     ) -> Result<BulkImportResult> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
         self.validate_write_fence_txn(&txn, cell_id, "bulk_append_out_adjacency_segment_trusted")
             .await?;
         let idem_key = keys::idempotency(cell_id, "segment-import", idempotency_key);
@@ -7786,32 +7903,23 @@ impl GraphShard {
             return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
         }
         let current_epoch = txn.seqnum();
-        let existing =
-            out_neighbors_for_src_txn(&txn, cell_id, edge_type, src, current_epoch).await?;
-        let inserted_dsts: Vec<_> = dsts
-            .iter()
-            .copied()
-            .filter(|dst| !existing.contains(dst))
-            .collect();
-        let already_existed = u64::try_from(dsts.len().saturating_sub(inserted_dsts.len()))
-            .map_err(|err| GraphError::CorruptValue {
-                key: "segment_import".to_string(),
-                reason: format!("too many existing edges in one segment import: {err}"),
-            })?;
-        let inserted =
-            u64::try_from(inserted_dsts.len()).map_err(|err| GraphError::CorruptValue {
-                key: "segment_import".to_string(),
-                reason: format!("too many edges in one segment import: {err}"),
-            })?;
+        let existing = out_neighbors_for_src_txn(&txn, cell_id, edge_type, src, current_epoch).await?;
+        let inserted_dsts: Vec<_> = dsts.iter().copied().filter(|dst| !existing.contains(dst)).collect();
+        let already_existed = u64::try_from(dsts.len().saturating_sub(inserted_dsts.len())).map_err(|err| GraphError::CorruptValue {
+            key: "segment_import".to_string(),
+            reason: format!("too many existing edges in one segment import: {err}"),
+        })?;
+        let inserted = u64::try_from(inserted_dsts.len()).map_err(|err| GraphError::CorruptValue {
+            key: "segment_import".to_string(),
+            reason: format!("too many edges in one segment import: {err}"),
+        })?;
         let start_epoch = if inserted == 0 {
             current_epoch
         } else {
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "segment_import".to_string(),
-                    reason: "SlateDB storage sequence overflow during segment import".to_string(),
-                })?
+            current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+                key: "segment_import".to_string(),
+                reason: "SlateDB storage sequence overflow during segment import".to_string(),
+            })?
         };
         let end_epoch = start_epoch;
         let result = BulkImportResult {
@@ -7830,10 +7938,8 @@ impl GraphShard {
                 current_epoch == 0,
             )
             .await?;
-            let changes: Vec<(VertexId, VertexId, bool)> =
-                inserted_dsts.iter().map(|dst| (src, *dst, true)).collect();
-            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &changes)
-                .await?;
+            let changes: Vec<(VertexId, VertexId, bool)> = inserted_dsts.iter().map(|dst| (src, *dst, true)).collect();
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &changes).await?;
             for dst in &inserted_dsts {
                 txn.delete(keys::out_segment_tombstone(cell_id, edge_type, src, *dst).as_bytes())?;
             }
@@ -7866,18 +7972,9 @@ impl GraphShard {
         fingerprint: u64,
         options: BulkImportOptions,
     ) -> Result<BulkImportResult> {
-        let lock = self
-            .acquire_local_write_guard(cell_id, "bulk_import_edges")
-            .await?;
+        let lock = self.acquire_local_write_guard(cell_id, "bulk_import_edges").await?;
         let result = self
-            .bulk_import_edges_txn_locked(
-                cell_id,
-                edge_type,
-                edges,
-                idempotency_key,
-                fingerprint,
-                options,
-            )
+            .bulk_import_edges_txn_locked(cell_id, edge_type, edges, idempotency_key, fingerprint, options)
             .await;
         finish_local_write(lock, result).await
     }
@@ -7892,13 +7989,8 @@ impl GraphShard {
         options: BulkImportOptions,
     ) -> Result<BulkImportResult> {
         let preflight_started = std::time::Instant::now();
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "bulk_import_edges")
-            .await?;
+        let txn = self.storage.writer()?.begin(IsolationLevel::SerializableSnapshot)?;
+        self.validate_write_fence_txn(&txn, cell_id, "bulk_import_edges").await?;
         let idem_key = keys::idempotency(cell_id, "bulk-import", idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
@@ -7921,14 +8013,7 @@ impl GraphShard {
                 let segment_exists = match segment_neighbors_by_src.get(&src) {
                     Some(neighbors) => neighbors.contains(&dst),
                     None => {
-                        let neighbors = out_segment_neighbors_for_src_txn(
-                            &txn,
-                            cell_id,
-                            edge_type,
-                            src,
-                            current_epoch,
-                        )
-                        .await?;
+                        let neighbors = out_segment_neighbors_for_src_txn(&txn, cell_id, edge_type, src, current_epoch).await?;
                         let exists = neighbors.contains(&dst);
                         segment_neighbors_by_src.insert(src, neighbors);
                         exists
@@ -7943,20 +8028,17 @@ impl GraphShard {
         }
         let preflight_elapsed = preflight_started.elapsed();
 
-        let inserted =
-            u64::try_from(inserted_edges.len()).map_err(|err| GraphError::CorruptValue {
-                key: "bulk_import".to_string(),
-                reason: format!("too many edges in one import: {err}"),
-            })?;
+        let inserted = u64::try_from(inserted_edges.len()).map_err(|err| GraphError::CorruptValue {
+            key: "bulk_import".to_string(),
+            reason: format!("too many edges in one import: {err}"),
+        })?;
         let start_epoch = if inserted == 0 {
             current_epoch
         } else {
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "bulk_import".to_string(),
-                    reason: "SlateDB storage sequence overflow during bulk import".to_string(),
-                })?
+            current_epoch.checked_add(1).ok_or_else(|| GraphError::CorruptValue {
+                key: "bulk_import".to_string(),
+                reason: "SlateDB storage sequence overflow during bulk import".to_string(),
+            })?
         };
         let end_epoch = start_epoch;
         let result = BulkImportResult {
@@ -7981,15 +8063,9 @@ impl GraphShard {
             let edge_value = encode_edge_record(&record);
             self.mark_topology_change_txn(&txn, cell_id, edge_type, epoch, &[(src, dst, true)])
                 .await?;
-            txn.put(
-                keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
-                &edge_value,
-            )?;
+            txn.put(keys::out_edge(cell_id, edge_type, src, dst).as_bytes(), &edge_value)?;
             if write_reverse_index {
-                txn.put(
-                    keys::in_edge(cell_id, edge_type, dst, src).as_bytes(),
-                    &edge_value,
-                )?;
+                txn.put(keys::in_edge(cell_id, edge_type, dst, src).as_bytes(), &edge_value)?;
             }
             *out_increments.entry(src).or_insert(0) += 1;
             if write_reverse_index {
@@ -8001,21 +8077,13 @@ impl GraphShard {
         let counter_read_started = std::time::Instant::now();
         for (src, increment) in out_increments {
             let key = keys::degree_out(cell_id, edge_type, src);
-            let base = if fresh_cell {
-                0
-            } else {
-                read_counter_txn(&txn, &key).await?
-            };
+            let base = if fresh_cell { 0 } else { read_counter_txn(&txn, &key).await? };
             txn.put(key.as_bytes(), encode_u64(base + increment))?;
         }
         if write_reverse_index {
             for (dst, increment) in in_increments {
                 let key = keys::degree_in(cell_id, edge_type, dst);
-                let base = if fresh_cell {
-                    0
-                } else {
-                    read_counter_txn(&txn, &key).await?
-                };
+                let base = if fresh_cell { 0 } else { read_counter_txn(&txn, &key).await? };
                 txn.put(key.as_bytes(), encode_u64(base + increment))?;
             }
         }
@@ -8032,8 +8100,7 @@ impl GraphShard {
             // The per-edge loop above already logged each inserted edge to the
             // xlog at this same epoch; this re-mark only refreshes the dirty
             // marker, so it carries no changes.
-            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &[])
-                .await?;
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &[]).await?;
         }
         txn.put(
             idem_key.as_bytes(),
@@ -8043,12 +8110,7 @@ impl GraphShard {
         let commit_started = std::time::Instant::now();
         commit_txn_strict(txn, self.await_durable_writes).await?;
         let commit_elapsed = commit_started.elapsed();
-        self.record_bulk_import_profile(
-            preflight_elapsed,
-            batch_build_elapsed,
-            counter_read_elapsed,
-            commit_elapsed,
-        );
+        self.record_bulk_import_profile(preflight_elapsed, batch_build_elapsed, counter_read_elapsed, commit_elapsed);
         Ok(result)
     }
 }
@@ -8070,27 +8132,9 @@ fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Res
 
 async fn renew_vertex_delete_lock_after_items(lock: &LocalWriteGuard, items: u64) -> Result<()> {
     if items == 0
-        || (items >= VERTEX_DELETE_LOCK_RENEW_ITEMS
-            && items / VERTEX_DELETE_LOCK_RENEW_ITEMS * VERTEX_DELETE_LOCK_RENEW_ITEMS == items)
+        || (items >= VERTEX_DELETE_LOCK_RENEW_ITEMS && items / VERTEX_DELETE_LOCK_RENEW_ITEMS * VERTEX_DELETE_LOCK_RENEW_ITEMS == items)
     {
         lock.renew().await?;
-    }
-    Ok(())
-}
-
-fn validate_vertex_metadata(metadata: &VertexMetadata) -> Result<()> {
-    for label in &metadata.labels {
-        validate_component("label", label)?;
-    }
-    for property in metadata.properties.keys() {
-        validate_component("property", property)?;
-    }
-    Ok(())
-}
-
-fn validate_edge_metadata(metadata: &EdgeMetadata) -> Result<()> {
-    for property in metadata.properties.keys() {
-        validate_component("property", property)?;
     }
     Ok(())
 }
@@ -8125,7 +8169,7 @@ fn coalesce_vertex_metadata_updates(
 ///
 /// Without a guard every row lands, so a vertex's rows fold into one patch:
 /// labels accumulate and a later value replaces an earlier one. With an
-/// `update_if_newer_by` guard whether a row lands depends on what the rows
+/// update guard whether a row lands depends on what the rows
 /// before it wrote, so every row that carries the guard property is its own
 /// patch, and so is each run of rows without it; the transaction applies them
 /// in order with [`apply_vertex_metadata_merges`]. Only adjacent rows without
@@ -8134,10 +8178,8 @@ fn group_vertex_metadata_merges(
     updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
     merge_policy: Option<&QueryBatchMergePolicy>,
 ) -> Result<Vec<(VertexId, Vec<VertexMetadata>)>> {
-    let carries_guard = |metadata: &VertexMetadata| {
-        merge_policy
-            .is_some_and(|policy| metadata.properties.contains_key(&policy.update_if_newer_by))
-    };
+    let guard = merge_policy.and_then(QueryBatchMergePolicy::guard);
+    let carries_guard = |metadata: &VertexMetadata| guard.is_some_and(|guard| metadata.properties.contains_key(guard));
     let mut by_vertex = BTreeMap::<VertexId, Vec<VertexMetadata>>::new();
     for (vertex_id, metadata) in updates {
         validate_vertex_metadata(&metadata)?;
@@ -8155,15 +8197,10 @@ fn group_vertex_metadata_merges(
 /// Folds `row` into the row before it: labels accumulate and a later value
 /// replaces an earlier one. Create-only properties belong to the first row,
 /// including its absent properties: a follower cannot fill a missing value.
-fn fold_vertex_metadata_row(
-    folded: &mut VertexMetadata,
-    row: VertexMetadata,
-    merge_policy: Option<&QueryBatchMergePolicy>,
-) {
+fn fold_vertex_metadata_row(folded: &mut VertexMetadata, row: VertexMetadata, merge_policy: Option<&QueryBatchMergePolicy>) {
     folded.labels.extend(row.labels);
     for (property, value) in row.properties {
-        let create_only =
-            merge_policy.is_some_and(|policy| policy.create_only_properties.contains(&property));
+        let create_only = merge_policy.is_some_and(|policy| policy.create_only_properties.contains(&property));
         if !create_only {
             folded.properties.insert(property, value);
         }
@@ -8196,13 +8233,27 @@ fn apply_vertex_metadata_merges(
         }
         return Ok(merged);
     };
+    let Some(guard) = policy.guard() else {
+        // Every row lands; one that finds the vertex leaves its create-only
+        // properties as they are.
+        for patch in patches {
+            merged.labels.extend(patch.labels);
+            for (property, value) in patch.properties {
+                if !(existed && policy.create_only_properties.contains(&property)) {
+                    merged.properties.insert(property, value);
+                }
+            }
+            existed = true;
+        }
+        return Ok(merged);
+    };
     // Rows without the guard that have not landed yet.
     let mut waiting: Option<VertexMetadata> = None;
     // Whether the last guarded row landed.
     let mut landed = false;
     let mut guarded = false;
     for patch in patches {
-        if !patch.properties.contains_key(&policy.update_if_newer_by) {
+        if !patch.properties.contains_key(guard) {
             if landed {
                 // Riding on the row that just landed, as if folded into it.
                 merged.labels.extend(patch.labels);
@@ -8228,9 +8279,7 @@ fn apply_vertex_metadata_merges(
         };
         guarded = true;
         if existed {
-            let Some(properties) =
-                guarded_metadata_patch(&merged.properties, row.properties, policy, vertex_key)?
-            else {
+            let Some(properties) = guarded_metadata_patch(&merged.properties, row.properties, policy, vertex_key)? else {
                 landed = false;
                 continue;
             };
@@ -8273,10 +8322,7 @@ fn coalesce_edge_metadata_updates(
             }
         }
     }
-    Ok(by_edge
-        .into_iter()
-        .map(|((src, dst), metadata)| (src, dst, metadata))
-        .collect())
+    Ok(by_edge.into_iter().map(|((src, dst), metadata)| (src, dst, metadata)).collect())
 }
 
 fn validate_relationship_creates(
@@ -8293,30 +8339,20 @@ fn validate_relationship_creates(
         .collect()
 }
 
-fn validate_relationship_batch_entry(
-    cell_id: &str,
-    edge_type: &str,
-    relationship: &RelationshipMutation,
-) -> Result<()> {
+fn validate_relationship_batch_entry(cell_id: &str, edge_type: &str, relationship: &RelationshipMutation) -> Result<()> {
     validate_component("cell_id", &relationship.cell_id)?;
     validate_component("edge_type", &relationship.edge_type)?;
     validate_edge_metadata(&relationship.metadata)?;
     if relationship.cell_id != cell_id {
         return Err(GraphError::CorruptValue {
             key: format!("cell/{cell_id}/relationship_import"),
-            reason: format!(
-                "batch contains relationship for different cell {}",
-                relationship.cell_id
-            ),
+            reason: format!("batch contains relationship for different cell {}", relationship.cell_id),
         });
     }
     if relationship.edge_type != edge_type {
         return Err(GraphError::CorruptValue {
             key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
-            reason: format!(
-                "batch contains relationship for different edge type {}",
-                relationship.edge_type
-            ),
+            reason: format!("batch contains relationship for different edge type {}", relationship.edge_type),
         });
     }
     Ok(())
@@ -8339,29 +8375,18 @@ fn mixed_guarded_relationship_rows(
     for row in relationships {
         if let Some(shape) = first.get(&row.relationship_id) {
             if !shape.properties.keys().eq(row.metadata.properties.keys()) {
-                ensure_limit(
-                    "import_relationships_batch",
-                    relationships.len() as u64,
-                    limit as u64,
-                )?;
+                ensure_limit("import_relationships_batch", relationships.len() as u64, limit as u64)?;
                 mixed.insert(row.relationship_id);
             }
         } else {
             first.insert(row.relationship_id, &row.metadata);
-            ensure_limit(
-                "import_relationships_batch",
-                first.len() as u64,
-                limit as u64,
-            )?;
+            ensure_limit("import_relationships_batch", first.len() as u64, limit as u64)?;
         }
     }
     let mut groups = BTreeMap::<RelationshipId, Vec<EdgeMetadata>>::new();
     for row in relationships {
         if mixed.contains(&row.relationship_id) {
-            groups
-                .entry(row.relationship_id)
-                .or_default()
-                .push(row.metadata.clone());
+            groups.entry(row.relationship_id).or_default().push(row.metadata.clone());
         }
     }
     Ok(groups)
@@ -8381,17 +8406,14 @@ fn apply_guarded_relationship_rows(
         if patch.properties.get(RELATIONSHIP_IDENTITY_PROPERTY) != Some(&identity) {
             return Err(GraphError::CorruptValue {
                 key: key.to_string(),
-                reason: "relationship MERGE row identity metadata does not match the parsed id"
-                    .into(),
+                reason: "relationship MERGE row identity metadata does not match the parsed id".into(),
             });
         }
         if let Some(existing) = &mut current {
             if *existing == *patch {
                 continue;
             }
-            if let Some(properties) =
-                guarded_metadata_patch(&existing.properties, patch.properties.clone(), policy, key)?
-            {
+            if let Some(properties) = guarded_metadata_patch(&existing.properties, patch.properties.clone(), policy, key)? {
                 existing.properties.extend(properties);
             }
         } else {
@@ -8408,7 +8430,8 @@ fn apply_guarded_relationship_rows(
 /// rows of `UNWIND … MERGE … SET` apply in Neo4j, one at a time and in order,
 /// instead of failing the batch. Without a guard a later value replaces an
 /// earlier one. With an `update_if_newer_by` guard the row with the highest
-/// guard value stands (the first, among equal values) and create-only values
+/// guard value stands (among equal values the first, or with
+/// `update_if_not_older_by` the last) and create-only values
 /// come from the first row, which is what applying the rows in order produces
 /// against any stored relationship when all rows set the same properties.
 /// Mixed property sets retain their ordered patches separately and are applied
@@ -8424,16 +8447,15 @@ fn coalesce_relationship_imports(
     relationships: impl IntoIterator<Item = RelationshipMutation>,
     fold: Option<Option<&QueryBatchMergePolicy>>,
 ) -> Result<Vec<RelationshipMutation>> {
-    let conflict =
-        |relationship_id: RelationshipId, reason: &'static str| GraphError::IdempotencyConflict {
-            operation: "relationship-import",
-            // Not the request key — this check runs before the request
-            // key is in scope, so the id that collided stands in for it.
-            // The reason says so, because a key shaped like a padded
-            // integer otherwise reads as a truncated request key.
-            idempotency_key: format!("{relationship_id:020}"),
-            reason,
-        };
+    let conflict = |relationship_id: RelationshipId, reason: &'static str| GraphError::IdempotencyConflict {
+        operation: "relationship-import",
+        // Not the request key — this check runs before the request
+        // key is in scope, so the id that collided stands in for it.
+        // The reason says so, because a key shaped like a padded
+        // integer otherwise reads as a truncated request key.
+        idempotency_key: format!("{relationship_id:020}"),
+        reason,
+    };
     let mut by_id = BTreeMap::<RelationshipId, RelationshipMutation>::new();
     for relationship in relationships {
         validate_relationship_batch_entry(cell_id, edge_type, &relationship)?;
@@ -8451,41 +8473,36 @@ fn coalesce_relationship_imports(
                  endpoints or properties (key shown is the relationship id)",
             ));
         };
-        if (
-            &existing.cell_id,
-            &existing.edge_type,
-            existing.src,
-            existing.dst,
-        ) != (
-            &relationship.cell_id,
-            &relationship.edge_type,
-            relationship.src,
-            relationship.dst,
-        ) {
+        if (&existing.cell_id, &existing.edge_type, existing.src, existing.dst)
+            != (&relationship.cell_id, &relationship.edge_type, relationship.src, relationship.dst)
+        {
             return Err(conflict(
                 relationship.relationship_id,
                 "the batch binds this relationship id to two different edges (key shown is the relationship id)",
             ));
         }
         let Some(policy) = merge_policy else {
-            existing
-                .metadata
-                .properties
-                .extend(relationship.metadata.properties);
+            existing.metadata.properties.extend(relationship.metadata.properties);
             continue;
         };
-        let guard = &policy.update_if_newer_by;
-        let (Some(kept_guard), Some(requested_guard)) = (
-            existing.metadata.properties.get(guard),
-            relationship.metadata.properties.get(guard),
-        ) else {
+        let Some(guard) = policy.guard() else {
+            for (property, value) in relationship.metadata.properties {
+                if !policy.create_only_properties.contains(&property) {
+                    existing.metadata.properties.insert(property, value);
+                }
+            }
+            continue;
+        };
+        let (Some(kept_guard), Some(requested_guard)) =
+            (existing.metadata.properties.get(guard), relationship.metadata.properties.get(guard))
+        else {
             return Err(conflict(
                 relationship.relationship_id,
                 "the batch carries this relationship id twice without its update guard (key shown is the relationship id)",
             ));
         };
         let key = keys::relationship_id(cell_id, relationship.relationship_id);
-        if guard_ordering(kept_guard, requested_guard, policy, &key)? == std::cmp::Ordering::Less {
+        if guard_lands(guard_ordering(kept_guard, requested_guard, guard, &key)?, policy) {
             for (property, value) in relationship.metadata.properties {
                 if !policy.create_only_properties.contains(&property) {
                     existing.metadata.properties.insert(property, value);
@@ -8515,347 +8532,65 @@ fn guarded_metadata_patch(
     key: &str,
 ) -> Result<Option<BTreeMap<String, VertexPropertyValue>>> {
     policy.validate()?;
-    let requested_guard = requested
-        .get(&policy.update_if_newer_by)
-        .cloned()
-        .ok_or_else(|| GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Mutation,
-            dialect: "QueryBatch",
-            feature: format!(
-                "guarded merge is missing incoming property {}",
-                policy.update_if_newer_by
-            ),
-        })?;
     for property in &policy.create_only_properties {
         requested.remove(property);
     }
-    let Some(previous_guard) = previous.get(&policy.update_if_newer_by) else {
+    let Some(guard) = policy.guard() else {
         return Ok(Some(requested));
     };
-    if guard_ordering(previous_guard, &requested_guard, policy, key)? != std::cmp::Ordering::Less {
+    let requested_guard = requested.get(guard).ok_or_else(|| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Mutation,
+        dialect: "QueryBatch",
+        feature: format!("guarded merge is missing incoming property {guard}"),
+    })?;
+    let Some(previous_guard) = previous.get(guard) else {
+        return Ok(Some(requested));
+    };
+    if !guard_lands(guard_ordering(previous_guard, requested_guard, guard, key)?, policy) {
         return Ok(None);
     }
     Ok(Some(requested))
 }
 
-/// Orders two values of a merge policy's `update_if_newer_by` property.
-fn guard_ordering(
-    previous: &VertexPropertyValue,
-    requested: &VertexPropertyValue,
-    policy: &QueryBatchMergePolicy,
-    key: &str,
-) -> Result<std::cmp::Ordering> {
+/// Whether a row lands given how the stored guard value orders against the
+/// row's: a newer value always does, an equal one under `update_if_not_older_by`.
+fn guard_lands(stored_against_incoming: std::cmp::Ordering, policy: &QueryBatchMergePolicy) -> bool {
+    match stored_against_incoming {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => policy.lands_on_equal(),
+        std::cmp::Ordering::Greater => false,
+    }
+}
+
+/// Orders two values of a merge policy's update guard property.
+fn guard_ordering(previous: &VertexPropertyValue, requested: &VertexPropertyValue, guard: &str, key: &str) -> Result<std::cmp::Ordering> {
     match (previous, requested) {
-        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
-            Ok(left.cmp(right))
-        }
-        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => {
-            Ok(left.cmp(right))
-        }
-        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => {
-            Ok(left.cmp(right))
-        }
-        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => {
-            Ok(left.cmp(right))
-        }
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => Ok(left.cmp(right)),
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => Ok(left.cmp(right)),
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => Ok(left.cmp(right)),
+        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => Ok(left.cmp(right)),
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
-            reason: format!(
-                "guarded merge property {} must have matching ordered scalar types",
-                policy.update_if_newer_by
-            ),
+            reason: format!("guarded merge property {guard} must have matching ordered scalar types"),
         }),
     }
 }
 
-fn merge_edge_metadata(previous: &EdgeMetadata, requested: &EdgeMetadata) -> EdgeMetadata {
-    let mut next = previous.clone();
-    next.properties.extend(
-        requested
-            .properties
-            .iter()
-            .map(|(property, value)| (property.clone(), value.clone())),
-    );
-    next
-}
-
-fn apply_vertex_metadata_update_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    vertex_id: VertexId,
-    previous: &VertexMetadata,
-    next: &VertexMetadata,
-    _epoch: StorageSequence,
-) -> Result<()> {
-    validate_vertex_metadata(next)?;
-    let vertex_key = keys::vertex(cell_id, vertex_id);
-    delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
-    // The canonical record is the vertex's membership, so clearing its last
-    // label or property writes an empty record rather than deleting it. Only
-    // `delete_vertex_record_txn` removes a vertex.
-    txn.put(
-        vertex_key.as_bytes(),
-        encode_vertex_metadata(next).as_slice(),
-    )?;
-    put_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, next)?;
-    Ok(())
-}
-
-/// Removes a vertex: its canonical record and the indexes over its metadata.
-fn delete_vertex_record_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    vertex_id: VertexId,
-    previous: &VertexMetadata,
-) -> Result<()> {
-    delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
-    txn.delete(keys::vertex(cell_id, vertex_id).as_bytes())?;
-    Ok(())
-}
-
-/// Gives every vertex in `endpoints` that has no canonical record an empty
-/// one, inside the transaction that inserts their edges, so a committed edge
-/// never names an endpoint that is absent. Existing records are left as they
-/// are, and `skip` names vertices this transaction already writes a record for.
-/// Callers pass the endpoints of edges they insert only: rewriting an edge
-/// that already exists does not repair an endpoint stored without a record
-/// before this rule, which is migration work, not a cost every write pays.
-/// A fresh cell (`fresh`) has no records yet, so its endpoints are written
-/// without reading them first. Returns the number of records created.
-async fn ensure_vertex_records_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    endpoints: impl IntoIterator<Item = VertexId>,
-    skip: &BTreeSet<VertexId>,
-    fresh: bool,
-) -> Result<usize> {
-    let pending = endpoints
-        .into_iter()
-        .filter(|vertex| !skip.contains(vertex))
-        .map(|vertex| keys::vertex(cell_id, vertex))
-        .collect::<BTreeSet<_>>();
-    if pending.is_empty() {
-        return Ok(0);
-    }
-    let existing = if fresh {
-        BTreeMap::new()
-    } else {
-        read_txn_remote_many(txn, pending.iter().cloned()).await?
-    };
-    let empty = encode_vertex_metadata(&VertexMetadata::default());
-    let mut created = 0;
-    for key in &pending {
-        if existing.get(key).and_then(Option::as_ref).is_none() {
-            txn.put(key.as_bytes(), empty.as_slice())?;
-            created += 1;
-        }
-    }
-    Ok(created)
-}
-
-/// Decodes a canonical vertex read: `None` when the vertex has no record.
-fn decode_vertex_record(key: &str, value: Option<&Bytes>) -> Result<Option<VertexMetadata>> {
-    value
-        .map(|value| decode_vertex_metadata(key, value))
-        .transpose()
-}
-
-fn put_vertex_metadata_indexes_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    vertex_id: VertexId,
-    metadata: &VertexMetadata,
-) -> Result<()> {
-    for label in &metadata.labels {
-        txn.put(
-            keys::vertex_label(cell_id, label, vertex_id).as_bytes(),
-            encode_u64(vertex_id).as_slice(),
-        )?;
-    }
-    for (property, value) in &metadata.properties {
-        txn.put(
-            keys::vertex_property_index(
-                cell_id,
-                property,
-                &encode_vertex_property_value_key(value),
-                vertex_id,
-            )
-            .as_bytes(),
-            encode_u64(vertex_id).as_slice(),
-        )?;
-    }
-    Ok(())
-}
-
-fn delete_vertex_metadata_indexes_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    vertex_id: VertexId,
-    metadata: &VertexMetadata,
-) -> Result<()> {
-    for label in &metadata.labels {
-        txn.delete(keys::vertex_label(cell_id, label, vertex_id).as_bytes())?;
-    }
-    for (property, value) in &metadata.properties {
-        txn.delete(
-            keys::vertex_property_index(
-                cell_id,
-                property,
-                &encode_vertex_property_value_key(value),
-                vertex_id,
-            )
-            .as_bytes(),
-        )?;
-    }
-    Ok(())
-}
-
-fn apply_edge_metadata_update_txn(
-    txn: &DbTransaction,
-    target: EdgeMetadataTarget<'_>,
-    previous: &EdgeMetadata,
-    next: &EdgeMetadata,
-    _epoch: StorageSequence,
-) -> Result<()> {
-    validate_edge_metadata(next)?;
-    let edge_metadata_key =
-        keys::edge_metadata(target.cell_id, target.edge_type, target.src, target.dst);
-    delete_edge_metadata_indexes_txn(txn, target, previous)?;
-    if next.properties.is_empty() {
-        txn.delete(edge_metadata_key.as_bytes())?;
-    } else {
-        txn.put(
-            edge_metadata_key.as_bytes(),
-            encode_edge_metadata(next).as_slice(),
-        )?;
-        put_edge_metadata_indexes_txn(txn, target, next)?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct EdgeMetadataTarget<'a> {
-    cell_id: &'a str,
-    edge_type: &'a str,
-    src: VertexId,
-    dst: VertexId,
-}
-
-fn put_edge_metadata_indexes_txn(
-    txn: &DbTransaction,
-    target: EdgeMetadataTarget<'_>,
-    metadata: &EdgeMetadata,
-) -> Result<()> {
-    for (property, value) in &metadata.properties {
-        txn.put(
-            keys::edge_property_index(
-                target.cell_id,
-                target.edge_type,
-                property,
-                &encode_vertex_property_value_key(value),
-                target.src,
-                target.dst,
-            )
-            .as_bytes(),
-            encode_u64(target.dst).as_slice(),
-        )?;
-    }
-    Ok(())
-}
-
-/// The property MERGE resolves relationship identity by. Not guaranteed
-/// unique: parallel relationships between the same endpoints may share a
-/// value, and MERGE matches all of them. The `rmerge_idx` pointer therefore
-/// only exists while exactly one live row carries an identity — the MERGE
-/// path writes it under that proof, and every other write that could mint a
-/// duplicate invalidates it (see the index hooks below).
-const RELATIONSHIP_IDENTITY_PROPERTY: &str = "id";
-
-fn put_relationship_property_indexes_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-) -> Result<()> {
-    for (property, value) in &record.metadata.properties {
-        txn.put(
-            keys::relationship_property_index(
-                &record.cell_id,
-                &record.edge_type,
-                property,
-                &encode_vertex_property_value_key(value),
-                record.src,
-                record.dst,
-                record.relationship_id,
-            )
-            .as_bytes(),
-            encode_u64(record.relationship_id).as_slice(),
-        )?;
-    }
-    // Invalidate, never write: this hook runs on every path that puts a
-    // relationship record — CREATE and plain imports included — any of which
-    // may be minting a second row with the same identity value. A deleted
-    // pointer costs the next MERGE one fallback scan, which re-earns it if
-    // the identity is still unique; the MERGE path's deferred pointer writes
-    // run after these hooks and overrule this delete inside its own
-    // transaction.
-    if let Some(value) = record
-        .metadata
-        .properties
-        .get(RELATIONSHIP_IDENTITY_PROPERTY)
-    {
-        txn.delete(
-            keys::relationship_merge_index(
-                &record.cell_id,
-                &record.edge_type,
-                RELATIONSHIP_IDENTITY_PROPERTY,
-                &encode_vertex_property_value_key(value),
-                record.src,
-                record.dst,
-            )
-            .as_bytes(),
-        )?;
-    }
-    Ok(())
-}
-
-async fn read_txn_remote_many(
-    txn: &DbTransaction,
-    keys: impl IntoIterator<Item = String>,
-) -> Result<BTreeMap<String, Option<Bytes>>> {
-    let keys = keys.into_iter().collect::<BTreeSet<_>>();
-    let options = relationship_import_read_options(keys.len());
-    read_txn_remote_many_with_options(txn, keys, &options).await
-}
-
-async fn read_txn_remote_many_with_options(
-    txn: &DbTransaction,
-    keys: BTreeSet<String>,
-    options: &ReadOptions,
-) -> Result<BTreeMap<String, Option<Bytes>>> {
-    // Small point-read sets repeat across adjacent relationship batches and
-    // are safe to admit to the process-wide bounded cache. Large sets remain
-    // uncached so migration traffic cannot replace the complete hot working
-    // set with one-use blocks. mark_read still preserves serializable conflict
-    // detection in either case.
-    stream::iter(keys.into_iter().map(|key| async move {
-        let value = read_txn_remote_with_options(txn, &key, options).await?;
-        Ok::<_, GraphError>((key, value))
-    }))
-    .buffer_unordered(RELATIONSHIP_IMPORT_READ_CONCURRENCY)
-    .try_collect()
-    .await
-}
-
-async fn read_txn_remote_uncached(txn: &DbTransaction, key: &str) -> Result<Option<Bytes>> {
-    read_txn_remote_with_options(txn, key, &relationship_import_uncached_read_options()).await
-}
-
-async fn read_txn_remote_with_options(
-    txn: &DbTransaction,
-    key: &str,
-    options: &ReadOptions,
-) -> Result<Option<Bytes>> {
-    txn.mark_read([key.as_bytes()])?;
-    Ok(txn.get_with_options(key.as_bytes(), options).await?)
+/// One property update for [`GraphShard::set_relationship_metadata_batch`]:
+/// an identified relationship when `relationship_id` is set, otherwise the
+/// structural edge's own metadata.
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug)]
+pub(crate) struct RelationshipMetadataUpdate {
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) dst: VertexId,
+    pub(crate) relationship_id: Option<RelationshipId>,
+    pub(crate) metadata: EdgeMetadata,
+    /// The metadata `metadata` was computed from. When set, the update
+    /// applies only if the relationship still carries it, and otherwise the
+    /// batch refuses with `ConditionalWriteConflict`, writing nothing.
+    pub(crate) read: Option<EdgeMetadata>,
 }
 
 /// One read allowance shared by every phase of a warm.
@@ -8891,12 +8626,7 @@ impl WarmBudget {
     /// not make the read: the charge is taken before the read, so no more than
     /// `budget` of them ever happen.
     fn charge(&self) -> bool {
-        if self
-            .charged
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1)
-            > self.budget
-        {
+        if self.charged.fetch_add(1, Ordering::Relaxed).saturating_add(1) > self.budget {
             self.truncated.store(true, Ordering::Relaxed);
             return false;
         }
@@ -8927,72 +8657,9 @@ fn split_relationship_delete_warm_budget(point_need: usize, prefix_need: usize) 
     (point_need.min(total - prefix), prefix)
 }
 
-fn relationship_import_read_options(expected_items: usize) -> ReadOptions {
-    remote_read_options_for_expected_items(expected_items as u64)
-}
-
-fn relationship_import_uncached_read_options() -> ReadOptions {
-    remote_read_options_for_expected_items(u64::MAX)
-}
-
 #[cfg(feature = "opencypher")]
 fn relationship_import_scan_options() -> ScanOptions {
     ScanOptions::default().with_cache_blocks(false)
-}
-
-fn counter_value(
-    values: &BTreeMap<String, Option<Bytes>>,
-    key: &str,
-    fresh_cell: bool,
-) -> Result<u64> {
-    if fresh_cell {
-        return Ok(0);
-    }
-    match values.get(key) {
-        Some(Some(value)) => decode_u64(key, value),
-        Some(None) => Ok(0),
-        None => Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "batched counter read did not include the requested key".to_string(),
-        }),
-    }
-}
-
-async fn next_available_relationship_ids_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    cursor: &mut RelationshipId,
-    count: usize,
-    operation: &str,
-) -> Result<Vec<RelationshipId>> {
-    let mut available = Vec::with_capacity(count);
-    while available.len() < count {
-        let remaining = count - available.len();
-        let mut candidates = Vec::with_capacity(remaining);
-        for _ in 0..remaining {
-            *cursor = cursor
-                .checked_add(1)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: keys::last_relationship_id(cell_id),
-                    reason: format!("relationship id overflow during {operation}"),
-                })?;
-            candidates.push(*cursor);
-        }
-        let existing = read_txn_remote_many(
-            txn,
-            candidates
-                .iter()
-                .map(|relationship_id| keys::relationship_id(cell_id, *relationship_id)),
-        )
-        .await?;
-        for relationship_id in candidates {
-            let key = keys::relationship_id(cell_id, relationship_id);
-            if existing.get(&key).and_then(Option::as_ref).is_none() {
-                available.push(relationship_id);
-            }
-        }
-    }
-    Ok(available)
 }
 
 #[cfg(feature = "opencypher")]
@@ -9008,26 +8675,30 @@ async fn relationship_records_for_edge_property_txn(
         property,
         value,
     } = lookup;
+    if !value.is_scalar_indexable() {
+        let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
+        let mut iter = txn
+            .scan_prefix_with_options(prefix.as_bytes(), .., &relationship_import_scan_options())
+            .await?;
+        let mut relationships = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_relationship_record(&key, &kv.value)?;
+            if record.metadata.properties.get(property) == Some(value) {
+                relationships.push(record);
+            }
+        }
+        return Ok(relationships);
+    }
     let encoded = encode_vertex_property_value_key(value);
-    let prefix = keys::relationship_property_index_edge_prefix(
-        cell_id, edge_type, property, &encoded, src, dst,
-    );
+    let prefix = keys::relationship_property_index_edge_prefix(cell_id, edge_type, property, &encoded, src, dst);
     let scan_options = relationship_import_scan_options();
-    let mut iter = txn
-        .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
-        .await?;
+    let mut iter = txn.scan_prefix_with_options(prefix.as_bytes(), .., &scan_options).await?;
     let mut relationship_keys = BTreeMap::new();
     while let Some(kv) = iter.next().await? {
         let key = String::from_utf8_lossy(&kv.key).into_owned();
-        let (
-            parsed_cell_id,
-            parsed_edge_type,
-            parsed_property,
-            parsed_encoded,
-            parsed_src,
-            parsed_dst,
-            relationship_id,
-        ) = parse_relationship_property_index_key(&key)?;
+        let (parsed_cell_id, parsed_edge_type, parsed_property, parsed_encoded, parsed_src, parsed_dst, relationship_id) =
+            parse_relationship_property_index_key(&key)?;
         if parsed_cell_id != cell_id
             || parsed_edge_type != edge_type
             || parsed_property != property
@@ -9040,25 +8711,14 @@ async fn relationship_records_for_edge_property_txn(
                 reason: "relationship property index escaped its requested prefix".to_string(),
             });
         }
-        relationship_keys.insert(
-            relationship_id,
-            keys::relationship(cell_id, edge_type, src, dst, relationship_id),
-        );
+        relationship_keys.insert(relationship_id, keys::relationship(cell_id, edge_type, src, dst, relationship_id));
     }
     let record_values = read_txn_remote_many(txn, relationship_keys.values().cloned()).await?;
     let mut relationships = Vec::with_capacity(relationship_keys.len());
     for (relationship_id, record_key) in relationship_keys {
         let Some(record_value) = record_values.get(&record_key).and_then(Option::as_ref) else {
             return Err(GraphError::CorruptValue {
-                key: keys::relationship_property_index(
-                    cell_id,
-                    edge_type,
-                    property,
-                    &encoded,
-                    src,
-                    dst,
-                    relationship_id,
-                ),
+                key: keys::relationship_property_index(cell_id, edge_type, property, &encoded, src, dst, relationship_id),
                 reason: format!("relationship property index points at missing {record_key}"),
             });
         };
@@ -9073,11 +8733,7 @@ async fn relationship_records_for_edge_property_txn(
 }
 
 #[cfg(feature = "opencypher")]
-async fn reserve_edge_delete_noops_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    mutations: &[EdgeMutation],
-) -> Result<()> {
+async fn reserve_edge_delete_noops_txn(txn: &DbTransaction, cell_id: &str, mutations: &[EdgeMutation]) -> Result<()> {
     let idem_keys = mutations
         .iter()
         .map(|mutation| keys::idempotency(cell_id, "delete", &mutation.idempotency_key))
@@ -9123,113 +8779,6 @@ async fn has_surviving_relationship_txn(
     Ok(false)
 }
 
-async fn live_relationships_for_edge_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    edge_type: &str,
-    src: VertexId,
-    dst: VertexId,
-    _read_epoch: StorageSequence,
-) -> Result<Vec<RelationshipRecord>> {
-    let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
-    let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
-    let mut records = Vec::new();
-    while let Some(kv) = iter.next().await? {
-        let key = String::from_utf8_lossy(&kv.key).into_owned();
-        records.push(decode_relationship_record(&key, &kv.value)?);
-    }
-    Ok(records)
-}
-
-async fn delete_structural_edge_txn(
-    shard: &GraphShard,
-    txn: &DbTransaction,
-    mutation: &EdgeMutation,
-    epoch: StorageSequence,
-) -> Result<bool> {
-    let edge_key = keys::out_edge(
-        &mutation.cell_id,
-        &mutation.edge_type,
-        mutation.src,
-        mutation.dst,
-    );
-    if read_txn_remote(txn, &edge_key).await?.is_none() {
-        return Ok(false);
-    }
-    shard
-        .mark_topology_change_txn(
-            txn,
-            &mutation.cell_id,
-            &mutation.edge_type,
-            epoch,
-            &[(mutation.src, mutation.dst, false)],
-        )
-        .await?;
-    let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
-    let out_degree = read_counter_txn(txn, &out_degree_key)
-        .await?
-        .saturating_sub(1);
-    let in_degree = if shard.writes_reverse_index() {
-        let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
-        let in_degree = read_counter_txn(txn, &in_degree_key)
-            .await?
-            .saturating_sub(1);
-        Some((in_degree_key, in_degree))
-    } else {
-        None
-    };
-    let edge_metadata_key = keys::edge_metadata(
-        &mutation.cell_id,
-        &mutation.edge_type,
-        mutation.src,
-        mutation.dst,
-    );
-    let previous_edge_metadata = match read_txn_remote(txn, &edge_metadata_key).await? {
-        Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
-        None => EdgeMetadata::default(),
-    };
-    if !previous_edge_metadata.properties.is_empty() {
-        apply_edge_metadata_update_txn(
-            txn,
-            EdgeMetadataTarget {
-                cell_id: &mutation.cell_id,
-                edge_type: &mutation.edge_type,
-                src: mutation.src,
-                dst: mutation.dst,
-            },
-            &previous_edge_metadata,
-            &EdgeMetadata::default(),
-            epoch,
-        )?;
-    }
-    txn.delete(
-        keys::edge(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        )
-        .as_bytes(),
-    )?;
-    txn.delete(edge_key.as_bytes())?;
-    if shard.writes_reverse_index() {
-        txn.delete(
-            keys::in_edge(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.dst,
-                mutation.src,
-            )
-            .as_bytes(),
-        )?;
-    }
-    txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
-    if let Some((in_degree_key, in_degree)) = in_degree {
-        txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
-    }
-    Ok(true)
-}
-
 /// `write.index_update`: the dirty marker, adjacency generation, and xlog
 /// entries — everything the indexer later consumes, written in the mutating
 /// transaction itself.
@@ -9262,61 +8811,7 @@ impl GraphShard {
         epoch: StorageSequence,
         changes: &[(VertexId, VertexId, bool)],
     ) -> Result<()> {
-        let span = tracing::info_span!(
-            "write.index_update",
-            hydradb.cell_id = %cell_id,
-            hydradb.edge_type = %edge_type,
-            hydradb.commit_epoch = epoch,
-            hydradb.xlog_changes = changes.len() as u64,
-        );
-        span.in_scope(|| {
-            txn.put(
-                keys::matrix_dirty(cell_id, edge_type).as_bytes(),
-                encode_u64(epoch),
-            )?;
-            txn.put(
-                keys::adjacency_generation(cell_id, edge_type).as_bytes(),
-                encode_u64(epoch),
-            )
-        })?;
-        if changes.is_empty() {
-            return Ok(());
-        }
-        // Coverage floor: the first-ever logged change for the pair sets the
-        // low-water mark to its own epoch, so the builder knows coverage
-        // begins here. The in-memory set only caches *confirmed presence* —
-        // a pending put is never cached, so a rolled-back transaction cannot
-        // strand the floor.
-        let floor_token = format!("{cell_id}/{edge_type}");
-        let ensured = self
-            .xlog_floor_ensured
-            .read()
-            .expect("xlog floor cache poisoned")
-            .contains(&floor_token);
-        if !ensured {
-            let low_key = keys::xlog_low_water(cell_id, edge_type);
-            match read_txn_remote(txn, &low_key).await? {
-                Some(_) if crate::shard::write_pipeline::current().is_none() => {
-                    self.xlog_floor_ensured
-                        .write()
-                        .expect("xlog floor cache poisoned")
-                        .insert(floor_token);
-                }
-                Some(_) => {}
-                None => {
-                    txn.put(low_key.as_bytes(), encode_u64(epoch))?;
-                }
-            }
-        }
-        span.in_scope(|| {
-            for (src, dst, exists) in changes {
-                txn.put(
-                    keys::xlog_entry(cell_id, edge_type, epoch, *src, *dst).as_bytes(),
-                    if *exists { &[1u8][..] } else { &[0u8][..] },
-                )?;
-            }
-            Ok(())
-        })
+        mark_topology_change_txn_inner(&self.xlog_floor_ensured, txn, cell_id, edge_type, epoch, changes).await
     }
 }
 
@@ -9354,8 +8849,7 @@ async fn prepare_vertex_delete_edge_txn(
     let read_relationships = {
         let span = relationships_span.clone();
         async move {
-            let prefix =
-                keys::relationship_edge_prefix(cell_id, &edge.edge_type, edge.src, edge.dst);
+            let prefix = keys::relationship_edge_prefix(cell_id, &edge.edge_type, edge.src, edge.dst);
             // Admit fetched blocks to the bounded block cache, as the incident
             // discovery and validation scans already do. The default scan
             // options discard them, so every repeat of this prefix went back to
@@ -9363,21 +8857,13 @@ async fn prepare_vertex_delete_edge_txn(
             // admission changes: this read still runs in the guarded
             // transaction and sees every write committed before it.
             let scan_options = ScanOptions::default().with_cache_blocks(true);
-            let mut iter = txn
-                .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
-                .await?;
+            let mut iter = txn.scan_prefix_with_options(prefix.as_bytes(), .., &scan_options).await?;
             let mut records = Vec::new();
             while let Some(kv) = iter.next().await? {
                 // One shared allowance covers all concurrently prepared edges, not
                 // a fresh record budget for every edge or prefetch window.
-                let count = relationship_reads
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
-                ensure_limit(
-                    "delete_vertex_relationship_records",
-                    count,
-                    relationship_limit as u64,
-                )?;
+                let count = relationship_reads.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                ensure_limit("delete_vertex_relationship_records", count, relationship_limit as u64)?;
                 let key = String::from_utf8_lossy(&kv.key);
                 records.push(decode_relationship_record(&key, &kv.value)?);
             }
@@ -9406,128 +8892,8 @@ async fn prepare_vertex_delete_edge_txn(
 }
 
 /// `read_txn_remote` inside `span`, recording whether the key existed.
-async fn read_txn_remote_traced(
-    txn: &DbTransaction,
-    key: &str,
-    span: tracing::Span,
-) -> Result<Option<Bytes>> {
+async fn read_txn_remote_traced(txn: &DbTransaction, key: &str, span: tracing::Span) -> Result<Option<Bytes>> {
     let value = read_txn_remote(txn, key).instrument(span.clone()).await?;
     span.record("hydradb.read.found", value.is_some());
     Ok(value)
-}
-
-async fn delete_relationships_for_structural_edge_txn(
-    txn: &DbTransaction,
-    mutation: &EdgeMutation,
-    read_epoch: StorageSequence,
-) -> Result<u64> {
-    let relationships = live_relationships_for_edge_txn(
-        txn,
-        &mutation.cell_id,
-        &mutation.edge_type,
-        mutation.src,
-        mutation.dst,
-        read_epoch,
-    )
-    .await?;
-    delete_prepared_relationships_for_structural_edge_txn(txn, mutation, &relationships)
-}
-
-fn delete_prepared_relationships_for_structural_edge_txn(
-    txn: &DbTransaction,
-    mutation: &EdgeMutation,
-    relationships: &[RelationshipRecord],
-) -> Result<u64> {
-    for record in relationships {
-        txn.delete(
-            keys::relationship(
-                &record.cell_id,
-                &record.edge_type,
-                record.src,
-                record.dst,
-                record.relationship_id,
-            )
-            .as_bytes(),
-        )?;
-        txn.delete(keys::relationship_id(&record.cell_id, record.relationship_id).as_bytes())?;
-        delete_relationship_property_indexes_txn(txn, record, &record.metadata)?;
-    }
-    txn.delete(
-        keys::relationship_count(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        )
-        .as_bytes(),
-    )?;
-    u64::try_from(relationships.len()).map_err(|err| GraphError::CorruptValue {
-        key: keys::relationship_edge_prefix(
-            &mutation.cell_id,
-            &mutation.edge_type,
-            mutation.src,
-            mutation.dst,
-        ),
-        reason: format!("too many relationships to delete with structural edge: {err}"),
-    })
-}
-
-fn delete_relationship_property_indexes_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-    metadata: &EdgeMetadata,
-) -> Result<()> {
-    for (property, value) in &metadata.properties {
-        txn.delete(
-            keys::relationship_property_index(
-                &record.cell_id,
-                &record.edge_type,
-                property,
-                &encode_vertex_property_value_key(value),
-                record.src,
-                record.dst,
-                record.relationship_id,
-            )
-            .as_bytes(),
-        )?;
-    }
-    // A blind delete: the pointer may name a different relationship if two
-    // live rows ever shared an identity, but a missing pointer only costs the
-    // next MERGE one fallback scan, which rewrites it (heal-on-read). A wrong
-    // surviving pointer is the outcome this avoids.
-    if let Some(value) = metadata.properties.get(RELATIONSHIP_IDENTITY_PROPERTY) {
-        txn.delete(
-            keys::relationship_merge_index(
-                &record.cell_id,
-                &record.edge_type,
-                RELATIONSHIP_IDENTITY_PROPERTY,
-                &encode_vertex_property_value_key(value),
-                record.src,
-                record.dst,
-            )
-            .as_bytes(),
-        )?;
-    }
-    Ok(())
-}
-
-fn delete_edge_metadata_indexes_txn(
-    txn: &DbTransaction,
-    target: EdgeMetadataTarget<'_>,
-    metadata: &EdgeMetadata,
-) -> Result<()> {
-    for (property, value) in &metadata.properties {
-        txn.delete(
-            keys::edge_property_index(
-                target.cell_id,
-                target.edge_type,
-                property,
-                &encode_vertex_property_value_key(value),
-                target.src,
-                target.dst,
-            )
-            .as_bytes(),
-        )?;
-    }
-    Ok(())
 }

@@ -1,5 +1,10 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "admin/cpu_profile.rs"]
+mod cpu_profile;
 #[path = "admin/memory_sampler.rs"]
-mod memory_sampler;
+pub(crate) mod memory_sampler;
+#[path = "admin/resource_profile.rs"]
+mod resource_profile;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -11,10 +16,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use hydradb::{
-    CellOperationalCounterTotals, ClientQueryService, CypherEngineMode, CypherEngineSelection,
-    DurationHistogramSnapshot, ExperimentalOperatorMetricsSnapshot, GraphCacheMetricsSnapshot,
-    GraphOperationalMetricsSnapshot, Result, ScopedGraphShardRuntimeMetrics,
-    ScopedRoutedGraphCluster,
+    CellOperationalCounterTotals, ClientQueryService, CypherEngineMode, CypherEngineSelection, DurationHistogramSnapshot,
+    ExperimentalOperatorMetricsSnapshot, GraphCacheMetricsSnapshot, GraphOperationalMetricsSnapshot, MutationAtomicityPolicy,
+    MutationAtomicitySelection, Result, ScopedGraphShardRuntimeMetrics, ScopedRoutedGraphCluster,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -41,7 +45,7 @@ pub struct PrometheusHistogram {
     ///
     /// Must match the OTel row's, and
     /// `crate::otel_metrics::tests::only_the_transport_histograms_declare_no_graph_node_source`
-    /// says so. Three of the five rows below are
+    /// says so. Twenty-six of the twenty-eight rows below are
     /// [`FieldSource::GraphNode`]; the other two are named and rendered but have
     /// no source in this process, which is a property of the *binary* and not of
     /// the endpoint — see [`FieldSource`].
@@ -70,7 +74,7 @@ pub struct PrometheusHistogram {
 /// seconds, and one of these families is in seconds because semconv fixes it
 /// there — the rest stay in microseconds so the two exports report the same
 /// numbers, and `_microseconds` says so where `_us` would invite a guess.
-/// The two execution families each have one row per engine. They are two
+/// The two execution families each have one row per engine. They are three
 /// series of one family, told apart by [`CYPHER_ENGINE_LABEL`] and not by
 /// their name, so a dashboard sees the family it always saw; what the split
 /// buys is that the label comes from the field rather than from the node at
@@ -91,6 +95,13 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
         source: FieldSource::GraphNode,
     },
     PrometheusHistogram {
+        field: "read_latency_datafusion",
+        name: "graph_client_operation_read_duration_seconds",
+        unit: ExportUnit::Seconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
         field: "write_latency_legacy",
         name: "graph_client_operation_write_duration_seconds",
         unit: ExportUnit::Seconds,
@@ -104,8 +115,15 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
         carries_scope: false,
         source: FieldSource::GraphNode,
     },
+    PrometheusHistogram {
+        field: "write_latency_datafusion",
+        name: "graph_client_operation_write_duration_seconds",
+        unit: ExportUnit::Seconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
     // Read-your-writes latency, and the instrument change 4 of
-    // the cell-affine read-routing design exists to add. In
+    // the cell-affine read routing design exists to add. In
     // microseconds rather than seconds because it is a HydraDB metric and not a
     // semconv one — only `db.client.operation.duration` is fixed in seconds —
     // and because the two counters it sits beside are counts of the same waits,
@@ -275,9 +293,7 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
 
 /// The Prometheus name and unit for a kernel field identifier.
 pub fn prometheus_histogram(field: &str) -> Option<&'static PrometheusHistogram> {
-    PROMETHEUS_HISTOGRAMS
-        .iter()
-        .find(|export| export.field == field)
+    PROMETHEUS_HISTOGRAMS.iter().find(|export| export.field == field)
 }
 
 /// How one counter is rendered on `/metrics`.
@@ -304,7 +320,7 @@ pub enum PrometheusCounterExport {
     /// (`ScopedRoutedGraphCluster::cell_operational_counter_totals`). A sum over
     /// open scopes alone falls when one closes, and `rate()`/`increase()` do
     /// not undercount across a fall — they read it as a reset to zero and
-    /// count the whole remaining sum again as new increase. On staging
+    /// count the whole remaining sum again as new increase. In practice
     /// that turned scope evictions into phantom spikes of thousands
     /// of `graph_write_commits` a minute with no client writes at all.
     PerCell(&'static str),
@@ -424,7 +440,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     // The bookmark-wait family: one denominator and four fractions of it, all
     // `Global` because the wait is a property of the *node* the read landed on
     // and not of the cell it asked for — the whole point of
-    // the cell-affine read-routing design is that two nodes
+    // the cell-affine read routing design is that two nodes
     // serving the same cell answer this differently. A `cell_id` label would
     // therefore split the one series an operator wants to read.
     //
@@ -532,16 +548,12 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_endpoint_check_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_endpoint_check_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_endpoint_check_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_identity_scan_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_identity_scan_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_identity_scan_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -551,23 +563,17 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_identity_pointer_misses",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_identity_pointer_misses",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_identity_pointer_misses"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_record_read_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_record_read_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_record_read_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_structural_check_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_structural_check_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_structural_check_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -582,9 +588,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "relationship_import_counter_read_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_relationship_import_counter_read_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_relationship_import_counter_read_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -649,9 +653,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_batches_profiled",
-        export: PrometheusCounterExport::PerCell(
-            "graph_reserve_edge_delete_noops_batches_profiled",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_reserve_edge_delete_noops_batches_profiled"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -661,16 +663,12 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_read_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_reserve_edge_delete_noops_read_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_reserve_edge_delete_noops_read_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_txn_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_reserve_edge_delete_noops_txn_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_reserve_edge_delete_noops_txn_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -773,16 +771,12 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_relationship_expand_requests",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_relationship_expand_requests",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_relationship_expand_requests"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_ordered_property_scan_requests",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_ordered_property_scan_requests",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_ordered_property_scan_requests"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -812,9 +806,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_statistics_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_statistics_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_statistics_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -849,16 +841,12 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_statistics_requests",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_statistics_requests",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_statistics_requests"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_statistics_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_statistics_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_statistics_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -868,9 +856,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_probe_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_probe_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_probe_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -880,23 +866,17 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_guard_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_guard_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_guard_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_default_requests",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_default_requests",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_default_requests"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_default_us",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_access_default_microseconds",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_default_microseconds"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -906,9 +886,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     PrometheusCounter {
         source: CounterSource::Shard,
         field: "query_experimental_planned_without_statistics",
-        export: PrometheusCounterExport::PerCell(
-            "graph_query_experimental_planned_without_statistics",
-        ),
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_planned_without_statistics"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -1047,8 +1025,34 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     },
     PrometheusCounter {
         source: CounterSource::Shard,
+        field: "gds_assemblies",
+        export: PrometheusCounterExport::PerCell("graph_gds_assemblies"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
         field: "backpressure_waits",
         export: PrometheusCounterExport::PerCell("graph_backpressure_waits"),
+    },
+    // The graph write permit. `PerCell` because the permit *is*
+    // per cell: `max_concurrent_graph_writes` is one per shard, so
+    // `rate(graph_write_permit_held_microseconds[5m]) / 1e6` is the fraction
+    // of wall time the cell's single writer slot was occupied. A `scope`
+    // label is ruled out by the same §1.4 cardinality decision as every
+    // other row here.
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_acquisitions",
+        export: PrometheusCounterExport::PerCell("graph_write_permit_acquisitions"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_wait_us",
+        export: PrometheusCounterExport::PerCell("graph_write_permit_wait_microseconds"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_held_us",
+        export: PrometheusCounterExport::PerCell("graph_write_permit_held_microseconds"),
     },
     // `GraphCacheMetricsSnapshot`. The nineteen counters that reached nothing
     // at all before M2, under the `graph_cache_*` prefix the two existing cache
@@ -1187,16 +1191,18 @@ pub const PROMETHEUS_FAILURE_COUNTERS: &[PrometheusCounter] = &[
         field: "queries_failed_by_reason_experimental",
         export: PrometheusCounterExport::Global("graph_query_failed_by_reason"),
     },
+    PrometheusCounter {
+        source: CounterSource::Client,
+        field: "queries_failed_by_reason_datafusion",
+        export: PrometheusCounterExport::Global("graph_query_failed_by_reason"),
+    },
 ];
 
 /// The Prometheus row for a `(source, field)` pair, over every counter table.
 ///
 /// Keyed by the pair and not by the identifier: `backpressure_waits` is a field
 /// of two different snapshots.
-pub fn prometheus_counter(
-    source: CounterSource,
-    field: &str,
-) -> Option<&'static PrometheusCounter> {
+pub fn prometheus_counter(source: CounterSource, field: &str) -> Option<&'static PrometheusCounter> {
     PROMETHEUS_COUNTERS
         .iter()
         .chain(PROMETHEUS_CLASS_COUNTERS)
@@ -1225,8 +1231,8 @@ const FAILURE_REASON_LABEL: &str = "reason";
 ///
 /// `cypher_engine` here, `hydradb.cypher_engine` on the OTLP side: same
 /// convention as `cell_id`, the Prometheus name being the registry key without
-/// its namespace. The value is `legacy` or `experimental`, so it costs at most
-/// two series per family per node and buys a legacy-versus-experimental
+/// its namespace. The value is from a fixed engine-mode set, so it costs at most
+/// three series per family per node and buys a cross-engine
 /// overlay that needs no join on `instance`.
 const CYPHER_ENGINE_LABEL: &str = "cypher_engine";
 
@@ -1234,8 +1240,8 @@ const CYPHER_ENGINE_LABEL: &str = "cypher_engine";
 /// a field that carries no [`CYPHER_ENGINE_LABEL`] at all.
 ///
 /// The value is a property of the **field**, not of the node: a node that has
-/// served both engines — which the kill switch allows — has two populations,
-/// and reading the label off the service at scrape time would hand both to
+/// served multiple engines — which the kill switch allows — has multiple populations,
+/// and reading the label off the service at scrape time would hand all of them to
 /// whichever engine is effective when Prometheus happens to ask. Shared with
 /// the OTLP export through [`hydradb::ClientQueryMetricsSnapshot`]'s field
 /// names so the two exports cannot label a family differently.
@@ -1244,11 +1250,10 @@ pub fn cypher_engine_label(field: &str) -> Option<&'static str> {
         "read_latency_legacy" | "write_latency_legacy" | "queries_failed_by_reason_legacy" => {
             Some(hydradb::CypherEngineMode::Legacy.as_str())
         }
-        "read_latency_experimental"
-        | "write_latency_experimental"
-        | "queries_failed_by_reason_experimental" => {
+        "read_latency_experimental" | "write_latency_experimental" | "queries_failed_by_reason_experimental" => {
             Some(hydradb::CypherEngineMode::Experimental.as_str())
         }
+        "read_latency_datafusion" | "write_latency_datafusion" | "queries_failed_by_reason_datafusion" => Some("datafusion"),
         _ => None,
     }
 }
@@ -1266,9 +1271,12 @@ struct AdminState {
     query: ClientQueryService,
     routed_node: Arc<ScopedRoutedGraphCluster>,
     memory_sampler: Arc<memory_sampler::MemorySampler>,
-    /// The node's graph auth token. Only the mutating control routes check
-    /// it; the probes and `/metrics` stay unauthenticated as before.
+    /// The node's graph auth token. Controls and scope diagnostics check it;
+    /// the probes and `/metrics` stay unauthenticated.
     control_token: Arc<str>,
+    /// Buddy WAL's series, when the node runs it (`GRAPH_BUDDY_WAL`). Off,
+    /// `/metrics` carries no `graph_buddy_wal_*` family at all.
+    buddy_wal: Option<Arc<hydradb_buddy_wal::BuddyWalMetrics>>,
 }
 
 pub struct AdminServer {
@@ -1284,6 +1292,7 @@ impl AdminServer {
         query: ClientQueryService,
         node: Arc<ScopedRoutedGraphCluster>,
         control_token: String,
+        buddy_wal: Option<Arc<hydradb_buddy_wal::BuddyWalMetrics>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await.map_err(admin_io_error)?;
         let local_addr = listener.local_addr().map_err(admin_io_error)?;
@@ -1293,6 +1302,7 @@ impl AdminServer {
             routed_node: node,
             memory_sampler: memory_sampler::MemorySampler::start(),
             control_token: Arc::from(control_token),
+            buddy_wal,
         };
         Self::serve(listener, local_addr, state)
     }
@@ -1303,10 +1313,21 @@ impl AdminServer {
             .route("/readyz", get(readiness))
             .route("/metrics", get(metrics))
             .route(
-                CYPHER_ENGINE_ROUTE,
-                get(cypher_engine_state).put(set_cypher_engine_override),
+                "/debug/resource-profile",
+                get(resource_profile::handle).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
             )
-            .with_state(state);
+            .route("/debug/slatedb-cache", get(slatedb_cache_diagnostics))
+            .route(CYPHER_ENGINE_ROUTE, get(cypher_engine_state).put(set_cypher_engine_override))
+            .route(
+                CYPHER_MUTATION_ATOMICITY_ROUTE,
+                get(mutation_atomicity_state).put(set_mutation_atomicity_override),
+            );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let router = router.route(
+            "/debug/pprof/profile",
+            get(cpu_profile::handle).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        );
+        let router = router.with_state(state);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
@@ -1320,11 +1341,7 @@ impl AdminServer {
                 .await
                 .map_err(admin_io_error)
         });
-        Ok(Self {
-            local_addr,
-            stop_tx,
-            task,
-        })
+        Ok(Self { local_addr, stop_tx, task })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -1333,12 +1350,10 @@ impl AdminServer {
 
     pub async fn stop(self) -> Result<()> {
         let _ = self.stop_tx.send(true);
-        self.task
-            .await
-            .map_err(|err| hydradb::GraphError::CorruptValue {
-                key: "runtime/admin".to_string(),
-                reason: err.to_string(),
-            })?
+        self.task.await.map_err(|err| hydradb::GraphError::CorruptValue {
+            key: "runtime/admin".to_string(),
+            reason: err.to_string(),
+        })?
     }
 }
 
@@ -1348,51 +1363,124 @@ async fn live() -> StatusCode {
 
 /// The Cypher engine kill switch (Workstream 13).
 ///
-/// `GET` reports `{configured, override, effective, experimental_compiled}`.
+/// `GET` reports `{configured, override, effective, experimental_compiled,
+/// datafusion_compiled, mutation_atomicity}`.
 /// `PUT` with `Authorization: Bearer <graph auth token>` and a body of
-/// `{"override": "legacy" | "experimental" | null}` sets or clears the
+/// `{"override": "legacy" | "experimental" | "datafusion" | null}` sets or clears the
 /// override for this node, with no restart, and answers with the new state.
 /// `null` returns to `GRAPH_CYPHER_ENGINE`; so does a restart, because the
 /// override is deliberately not persisted.
 ///
 /// Statements prepared or executing when it flips keep the engine they were
-/// admitted with. A binary built without `experimental-cypher-engine` answers
-/// `422` to `"experimental"` and leaves the state unchanged.
+/// admitted with. A binary built without an engine's feature will not accept
+/// that engine as an override.
 pub const CYPHER_ENGINE_ROUTE: &str = "/v1/cypher-engine";
+/// Runtime mutation atomicity policy control route.
+pub const CYPHER_MUTATION_ATOMICITY_ROUTE: &str = "/v1/cypher-mutation-atomicity";
 
-fn cypher_engine_document(selection: CypherEngineSelection) -> serde_json::Value {
+fn cypher_engine_document(selection: CypherEngineSelection, mutation_atomicity: MutationAtomicitySelection) -> serde_json::Value {
     serde_json::json!({
         "configured": selection.configured.as_str(),
         "override": selection.override_mode.map(CypherEngineMode::as_str),
         "effective": selection.effective().as_str(),
         "experimental_compiled": cfg!(feature = "experimental-cypher-engine"),
+        "datafusion_compiled": cfg!(feature = "datafusion-cypher-engine"),
+        "mutation_atomicity": mutation_atomicity_document(mutation_atomicity),
+    })
+}
+
+fn mutation_atomicity_document(selection: MutationAtomicitySelection) -> serde_json::Value {
+    serde_json::json!({
+        "configured": selection.configured.as_str(),
+        "override": selection.override_policy.map(MutationAtomicityPolicy::as_str),
+        "effective": selection.effective().as_str(),
     })
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (
         status,
-        [
-            ("content-type", "application/json"),
-            ("cache-control", "no-store"),
-        ],
+        [("content-type", "application/json"), ("cache-control", "no-store")],
         body.to_string(),
     )
         .into_response()
 }
 
+async fn slatedb_cache_diagnostics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if !valid_control_bearer(&headers, &state.control_token) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "a bearer graph auth token is required"}),
+        );
+    }
+    json_response(StatusCode::OK, cache_observe_document(&state.routed_node.slatedb_cache_metrics()))
+}
+
+fn cache_observe_document(cache: &hydradb::SlateDbCacheMetricsSnapshot) -> serde_json::Value {
+    let observe = &cache.observe;
+    let scopes: Vec<_> = observe
+        .scopes
+        .iter()
+        .map(|scope| {
+            serde_json::json!({
+                    "path": scope.path,
+            "pending_admissions": scope.pending_admissions,
+                    "evictions": scope.evictions,
+                    "evicted_bytes": scope.evicted_bytes,
+                    "misses_after_eviction": scope.misses_after_eviction,
+                    "reload_executions": scope.reload_executions,
+                    "reload_bytes": scope.reload_bytes,
+                    "reload_failures": scope.reload_failures,
+                    "reload_duration_us": scope.reload_duration_us,
+                    "resident_tracked": scope.resident_tracked,
+                    "resident_bytes": scope.resident_bytes,
+                    "ghost_records": scope.ghost_records,
+                    "metadata_bytes_estimate": scope.metadata_bytes,
+                    "resident_dropped": scope.resident_dropped,
+                    "ghost_dropped": scope.ghost_dropped,
+                    "ghost_expired": scope.ghost_expired,
+                })
+        })
+        .collect();
+    serde_json::json!({
+        "enabled": observe.generation != 0,
+        "generation": observe.generation,
+        "cache": {
+            "capacity_bytes": cache.capacity_bytes,
+            "resident_bytes": cache.resident_bytes,
+            "entries": cache.entries,
+        },
+        "limits": {
+            "max_named_scopes": hydradb::MAX_OBSERVED_SCOPES,
+            "max_scope_path_bytes": hydradb::MAX_SCOPE_PATH_BYTES,
+            "max_metadata_bytes": observe.max_metadata_bytes,
+            "max_resident_records_per_shard": observe.max_resident_records,
+            "max_ghost_records_per_shard": observe.max_ghost_records,
+            "ghost_retention_secs": observe.ghost_retention_secs,
+        },
+        "coverage": {
+            "metadata_bytes_estimate": observe.metadata_bytes,
+            "fixed_metadata_bytes_estimate": observe.fixed_metadata_bytes,
+            "envelope_metadata_bytes_estimate": observe.envelope_metadata_bytes,
+            "scope_overflow": observe.scope_overflow,
+            "ordering_gaps": observe.ordering_gaps,
+            "pending_admissions": observe.pending_admissions,
+            "resident_dropped": observe.resident_overflow,
+            "ghost_dropped": observe.ghost_dropped,
+            "ghost_expired": observe.ghost_expired,
+        },
+        "scopes": scopes,
+    })
+}
+
 async fn cypher_engine_state(State(state): State<AdminState>) -> Response {
     json_response(
         StatusCode::OK,
-        cypher_engine_document(state.query.cypher_engine_selection()),
+        cypher_engine_document(state.query.cypher_engine_selection(), state.query.mutation_atomicity_selection()),
     )
 }
 
-async fn set_cypher_engine_override(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
+async fn set_cypher_engine_override(State(state): State<AdminState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     if !valid_control_bearer(&headers, &state.control_token) {
         return json_response(
             StatusCode::UNAUTHORIZED,
@@ -1402,10 +1490,12 @@ async fn set_cypher_engine_override(
     let requested = match parse_engine_override(&body) {
         Ok(requested) => requested,
         Err(reason) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({"error": reason}),
-            )
+            let status = if reason.contains("requires the datafusion-cypher-engine Cargo feature") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_response(status, serde_json::json!({"error": reason}));
         }
     };
     match state.query.set_cypher_engine_override(requested) {
@@ -1417,42 +1507,91 @@ async fn set_cypher_engine_override(
                 cypher_engine.effective = selection.effective().as_str(),
                 "cypher engine override changed"
             );
-            json_response(StatusCode::OK, cypher_engine_document(selection))
+            json_response(
+                StatusCode::OK,
+                cypher_engine_document(selection, state.query.mutation_atomicity_selection()),
+            )
         }
         Err(error) => json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             serde_json::json!({
                 "error": error.to_string(),
-                "state": cypher_engine_document(state.query.cypher_engine_selection()),
+                "state": cypher_engine_document(state.query.cypher_engine_selection(), state.query.mutation_atomicity_selection()),
             }),
         ),
     }
 }
 
+async fn mutation_atomicity_state(State(state): State<AdminState>) -> Response {
+    json_response(
+        StatusCode::OK,
+        mutation_atomicity_document(state.query.mutation_atomicity_selection()),
+    )
+}
+
+async fn set_mutation_atomicity_override(State(state): State<AdminState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if !valid_control_bearer(&headers, &state.control_token) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "a bearer graph auth token is required"}),
+        );
+    }
+    let requested = match parse_mutation_atomicity_override(&body) {
+        Ok(requested) => requested,
+        Err(reason) => return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"error": reason})),
+    };
+    let (previous, selection) = state.query.set_mutation_atomicity_override(requested);
+    tracing::warn!(
+        cypher_mutation_atomicity.configured = selection.configured.as_str(),
+        cypher_mutation_atomicity.previous_override = previous.map_or("none", MutationAtomicityPolicy::as_str),
+        cypher_mutation_atomicity.override = requested.map_or("none", MutationAtomicityPolicy::as_str),
+        cypher_mutation_atomicity.effective = selection.effective().as_str(),
+        "cypher mutation atomicity override changed"
+    );
+    json_response(StatusCode::OK, mutation_atomicity_document(selection))
+}
+
 /// `{"override": ...}` with the key required, so an empty or mistyped body
 /// cannot silently clear an override an operator set on purpose.
 fn parse_engine_override(body: &[u8]) -> std::result::Result<Option<CypherEngineMode>, String> {
-    let document: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| format!("body must be a JSON object: {error}"))?;
-    let Some(value) = document
-        .as_object()
-        .and_then(|object| object.get("override"))
-    else {
-        return Err(r#"body must be {"override": "legacy" | "experimental" | null}"#.to_string());
+    let document: serde_json::Value = serde_json::from_slice(body).map_err(|error| format!("body must be a JSON object: {error}"))?;
+    let Some(value) = document.as_object().and_then(|object| object.get("override")) else {
+        return Err(r#"body must be {"override": "legacy" | "experimental" | "datafusion" | null}"#.to_string());
     };
     match value {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(mode) if mode == "legacy" => Ok(Some(CypherEngineMode::Legacy)),
-        serde_json::Value::String(mode) if mode == "experimental" => {
-            Ok(Some(CypherEngineMode::Experimental))
+        serde_json::Value::String(mode) if mode == "experimental" => Ok(Some(CypherEngineMode::Experimental)),
+        serde_json::Value::String(mode) if mode == "datafusion" => {
+            #[cfg(feature = "datafusion-cypher-engine")]
+            {
+                Ok(Some(CypherEngineMode::DataFusion))
+            }
+            #[cfg(not(feature = "datafusion-cypher-engine"))]
+            {
+                Err("DataFusion engine override requires the datafusion-cypher-engine Cargo feature".to_string())
+            }
         }
         other => Err(format!(
-            r#"override must be "legacy", "experimental" or null, not {other}"#
+            r#"override must be "legacy", "experimental", "datafusion" or null, not {other}"#
         )),
     }
 }
 
-fn valid_control_bearer(headers: &HeaderMap, expected: &str) -> bool {
+fn parse_mutation_atomicity_override(body: &[u8]) -> std::result::Result<Option<MutationAtomicityPolicy>, String> {
+    let document: serde_json::Value = serde_json::from_slice(body).map_err(|error| format!("body must be a JSON object: {error}"))?;
+    let Some(value) = document.as_object().and_then(|object| object.get("override")) else {
+        return Err(r#"body must be {"override": "statement" | "legacy_chunked" | null}"#.to_string());
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(policy) if policy == "statement" => Ok(Some(MutationAtomicityPolicy::Statement)),
+        serde_json::Value::String(policy) if policy == "legacy_chunked" => Ok(Some(MutationAtomicityPolicy::LegacyChunked)),
+        other => Err(format!(r#"override must be "statement", "legacy_chunked" or null, not {other}"#)),
+    }
+}
+
+pub(crate) fn valid_control_bearer(headers: &HeaderMap, expected: &str) -> bool {
     use subtle::ConstantTimeEq as _;
     let Some((scheme, supplied)) = headers
         .get(AUTHORIZATION)
@@ -1492,6 +1631,7 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         u8::from(state.ready.is_ready()),
     ));
     output.push_str(&cypher_engine_gauge(&state.query));
+    output.push_str(&mutation_atomicity_gauge(&state.query));
     let query = state.query.metrics();
     // The five pre-existing client series come out of this loop, under their
     // original names and in their original relative order, because the loop is
@@ -1500,42 +1640,28 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     // declares them; a scrape does not care about order and a diff shows them
     // as insertions.
     append_global_counters(&mut output, CounterSource::Client, query.counter_fields());
-    append_global_class_counters(
-        &mut output,
-        CounterSource::Client,
-        query.class_counter_fields(),
-    );
+    append_global_class_counters(&mut output, CounterSource::Client, query.class_counter_fields());
     // Carries the engine label for the same reason the execution histograms
     // do, and takes it from the same place: the field. The
-    // legacy-versus-experimental failure comparison is the point of the
-    // family, and a node the kill switch has flipped holds both populations.
-    append_global_failure_counters(
-        &mut output,
-        CounterSource::Client,
-        query.failure_counter_fields(),
-    );
+    // per-engine failure comparison is the point of the family, and a node
+    // the kill switch has flipped can hold multiple populations.
+    append_global_failure_counters(&mut output, CounterSource::Client, query.failure_counter_fields());
     // Additive, and deliberately after the counters rather than interleaved
     // with them: every series above keeps the exact name, labels and value it
     // had before the histograms existed.
     append_histogram_types(&mut output, query.histogram_fields());
     // The engine label goes on the execution families and nothing else, and
-    // its value comes from the field: the legacy and experimental histograms
-    // are two series of one family, and a node that was flipped holds both.
+    // its value comes from the field: the per-engine histograms are separate
+    // series of one family, and a node that was flipped holds every population.
     // Bookmark wait is time spent before a query is admitted, which no engine
     // choice can move, and its family is pinned label-free by
     // `the_bookmark_wait_family_renders`.
-    let (engine_fields, plain_fields): (Vec<_>, Vec<_>) = query
-        .histogram_fields()
-        .partition(|(field, _)| carries_cypher_engine(field));
+    let (engine_fields, plain_fields): (Vec<_>, Vec<_>) = query.histogram_fields().partition(|(field, _)| carries_cypher_engine(field));
     for (field, histogram) in engine_fields {
         let Some(engine) = cypher_engine_label(field) else {
             continue;
         };
-        append_histograms(
-            &mut output,
-            std::iter::once((field, histogram)),
-            &[(CYPHER_ENGINE_LABEL, engine)],
-        );
+        append_histograms(&mut output, std::iter::once((field, histogram)), &[(CYPHER_ENGINE_LABEL, engine)]);
     }
     append_histograms(&mut output, plain_fields.into_iter(), &[]);
     append_bounded_node_metrics(
@@ -1544,14 +1670,21 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         std::time::Duration::from_secs(1),
     )
     .await;
-    append_per_cell_counters(
-        &mut output,
-        &state.routed_node.cell_operational_counter_totals(),
-    );
+    append_per_cell_counters(&mut output, &state.routed_node.cell_operational_counter_totals());
     append_cache_counters(&mut output, &state.routed_node.graph_cache_metrics());
+    prometheus::TextEncoder::new()
+        .encode_utf8(&state.routed_node.writer_lease_directory().collect_metrics(), &mut output)
+        .expect("writer lease collectors emit valid metric families");
     append_slatedb_cache_metrics(&mut output, state.routed_node.slatedb_cache_metrics());
+    // The node's one disk cache, read from its own counters: not per shard,
+    // and not inside the shard budget above.
+    crate::otel_metrics::storage_caches::append(&mut output, state.routed_node.shared_disk_cache_metrics());
     crate::otel_metrics::memory_diagnostics::append(&mut output);
+    crate::otel_metrics::remote_object_store::append(&mut output);
     state.memory_sampler.render(&mut output);
+    if let Some(buddy_wal) = &state.buddy_wal {
+        output.push_str(&buddy_wal.render());
+    }
     (
         [
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
@@ -1564,7 +1697,7 @@ async fn metrics(State(state): State<AdminState>) -> Response {
 
 /// One info-style series naming the configured and effective engine, so an
 /// active kill-switch override is visible fleet-wide as
-/// `configured != effective`. Two closed two-value labels: four series at most.
+/// `configured != effective`. Two closed three-value labels: nine series at most.
 fn cypher_engine_gauge(query: &ClientQueryService) -> String {
     let selection = query.cypher_engine_selection();
     format!(
@@ -1574,13 +1707,22 @@ fn cypher_engine_gauge(query: &ClientQueryService) -> String {
     )
 }
 
+/// One bounded gauge reporting the startup and effective mutation policy.
+/// Both labels come from two-value enums, so this family has at most four
+/// series per node regardless of statement volume.
+fn mutation_atomicity_gauge(query: &ClientQueryService) -> String {
+    let selection = query.mutation_atomicity_selection();
+    format!(
+        "# TYPE graph_cypher_mutation_atomicity gauge\ngraph_cypher_mutation_atomicity{{configured=\"{}\",effective=\"{}\"}} 1\n",
+        selection.configured.as_str(),
+        selection.effective().as_str(),
+    )
+}
+
 /// A slow scope open must not hide process-wide OOM diagnostics. Missing shard
 /// samples are omitted rather than reset to zero; this gauge marks that gap.
-async fn append_bounded_node_metrics<F>(
-    output: &mut String,
-    collect: F,
-    budget: std::time::Duration,
-) where
+async fn append_bounded_node_metrics<F>(output: &mut String, collect: F, budget: std::time::Duration)
+where
     F: std::future::Future<Output = Vec<ScopedGraphShardRuntimeMetrics>>,
 {
     let result = tokio::time::timeout(budget, collect).await;
@@ -1598,15 +1740,171 @@ fn append_slatedb_cache_metrics(output: &mut String, cache: hydradb::SlateDbCach
     output.push_str("# TYPE graph_slatedb_cache_capacity_bytes gauge\n");
     output.push_str("# TYPE graph_slatedb_cache_resident_bytes gauge\n");
     output.push_str("# TYPE graph_slatedb_cache_entries gauge\n");
-    output.push_str(&format!(
-        "graph_slatedb_cache_capacity_bytes {}\n",
-        cache.capacity_bytes
-    ));
-    output.push_str(&format!(
-        "graph_slatedb_cache_resident_bytes {}\n",
-        cache.resident_bytes
-    ));
+    output.push_str(&format!("graph_slatedb_cache_capacity_bytes {}\n", cache.capacity_bytes));
+    output.push_str(&format!("graph_slatedb_cache_resident_bytes {}\n", cache.resident_bytes));
     output.push_str(&format!("graph_slatedb_cache_entries {}\n", cache.entries));
+    append_cache_observe_metrics(output, &cache.observe);
+}
+
+/// Bounded observer series (ENG-3466). Kind and reason label sets are
+/// closed enums, so series count is fixed regardless of traffic. When
+/// observation is disabled only the `observe_enabled` gauge is emitted;
+/// enabling it later adds the bounded families below, never per-key series.
+fn append_cache_observe_metrics(output: &mut String, observe: &hydradb::CacheObserveSnapshot) {
+    let enabled = observe.generation != 0;
+    output.push_str("# TYPE graph_slatedb_cache_observe_enabled gauge\n");
+    output.push_str(&format!("graph_slatedb_cache_observe_enabled {}\n", u8::from(enabled)));
+    if !enabled {
+        return;
+    }
+    use hydradb::{EntryKind, RemovalReason};
+    let kinds: Vec<EntryKind> = (0..hydradb::ENTRY_KIND_COUNT)
+        .map(|i| match i {
+            0 => EntryKind::Unknown,
+            1 => EntryKind::DataBlock,
+            2 => EntryKind::Index,
+            3 => EntryKind::Filter,
+            _ => EntryKind::Stats,
+        })
+        .collect();
+    let kind_series: [(&str, &Vec<u64>); 12] = [
+        ("graph_slatedb_cache_fetches", &observe.fetches),
+        ("graph_slatedb_cache_gets", &observe.gets),
+        ("graph_slatedb_cache_hits", &observe.hits),
+        ("graph_slatedb_cache_tracked_hits", &observe.tracked_hits),
+        ("graph_slatedb_cache_misses_after_eviction", &observe.misses_after_eviction),
+        ("graph_slatedb_cache_misses_unknown", &observe.misses_unknown),
+        ("graph_slatedb_cache_admissions", &observe.admissions),
+        ("graph_slatedb_cache_loader_executions", &observe.loader_executions),
+        ("graph_slatedb_cache_loader_success_bytes", &observe.loader_success_bytes),
+        ("graph_slatedb_cache_loader_failures", &observe.loader_failures),
+        ("graph_slatedb_cache_coalesced_waiters", &observe.coalesced_waiters),
+        (
+            "graph_slatedb_cache_fetch_served_from_resident",
+            &observe.fetch_served_from_resident,
+        ),
+    ];
+    for (name, values) in kind_series {
+        output.push_str(&format!("# TYPE {name} counter\n"));
+        for (kind, value) in kinds.iter().zip(values.iter()) {
+            output.push_str(&format!("{name}{{entry_kind=\"{}\"}} {value}\n", kind.as_str()));
+        }
+    }
+    let reasons = [
+        RemovalReason::CapacityEviction,
+        RemovalReason::Replacement,
+        RemovalReason::ExplicitRemove,
+        RemovalReason::Clear,
+    ];
+    output.push_str("# TYPE graph_slatedb_cache_removals counter\n");
+    for (reason, value) in reasons.iter().zip(observe.removals_by_reason.iter()) {
+        output.push_str(&format!("graph_slatedb_cache_removals{{reason=\"{}\"}} {value}\n", reason.as_str()));
+    }
+    output.push_str("# TYPE graph_slatedb_cache_removed_bytes counter\n");
+    for (reason, value) in reasons.iter().zip(&observe.removal_bytes_by_reason) {
+        output.push_str(&format!(
+            "graph_slatedb_cache_removed_bytes{{reason=\"{}\"}} {value}\n",
+            reason.as_str()
+        ));
+    }
+    for (name, values) in [
+        ("graph_slatedb_cache_misses_after_removal", &observe.misses_by_removal_reason),
+        ("graph_slatedb_cache_returns_after_removal", &observe.returns_by_removal_reason),
+    ] {
+        output.push_str(&format!("# TYPE {name} counter\n"));
+        for (reason, value) in reasons.iter().zip(values) {
+            output.push_str(&format!("{name}{{reason=\"{}\"}} {value}\n", reason.as_str()));
+        }
+    }
+    let scalars: [(&str, u64); 15] = [
+        ("graph_slatedb_cache_removals_untracked", observe.removals_untracked),
+        ("graph_slatedb_cache_episodes_opened", observe.episodes_opened),
+        ("graph_slatedb_cache_episodes_closed_returned", observe.episodes_closed_returned),
+        ("graph_slatedb_cache_episodes_closed_expired", observe.episodes_closed_expired),
+        ("graph_slatedb_cache_episodes_closed_dropped", observe.episodes_closed_dropped),
+        ("graph_slatedb_cache_reinsertion_intervals", observe.reinsertion_intervals),
+        (
+            "graph_slatedb_cache_reinsertion_interval_ms_avg",
+            observe.reinsertion_interval_ms_avg,
+        ),
+        (
+            "graph_slatedb_cache_reinsertion_interval_ms_max",
+            observe.reinsertion_interval_ms_max,
+        ),
+        ("graph_slatedb_cache_zero_hit_evictions", observe.zero_hit_evictions),
+        (
+            "graph_slatedb_cache_readmissions_while_resident",
+            observe.readmissions_while_resident,
+        ),
+        ("graph_slatedb_cache_ghost_dropped", observe.ghost_dropped),
+        ("graph_slatedb_cache_ghost_expired", observe.ghost_expired),
+        ("graph_slatedb_cache_resident_overflow", observe.resident_overflow),
+        ("graph_slatedb_cache_untracked_hits", observe.untracked_hits),
+        ("graph_slatedb_cache_observe_resident_tracked", observe.resident_tracked),
+    ];
+    for (name, value) in scalars {
+        let metric_type = match name {
+            "graph_slatedb_cache_observe_resident_tracked"
+            | "graph_slatedb_cache_reinsertion_interval_ms_avg"
+            | "graph_slatedb_cache_reinsertion_interval_ms_max" => "gauge",
+            _ => "counter",
+        };
+        output.push_str(&format!("# TYPE {name} {metric_type}\n{name} {value}\n"));
+    }
+    output.push_str("# TYPE graph_slatedb_cache_observe_ghost_records gauge\n");
+    output.push_str(&format!("graph_slatedb_cache_observe_ghost_records {}\n", observe.ghost_records));
+    output.push_str("# TYPE graph_slatedb_cache_observe_drops_observed gauge\n");
+    output.push_str(&format!("graph_slatedb_cache_observe_drops_observed {}\n", observe.drops_observed));
+    for (name, value, metric_type) in [
+        ("graph_slatedb_cache_reload_executions", observe.reload_executions, "counter"),
+        ("graph_slatedb_cache_reload_success_bytes", observe.reload_success_bytes, "counter"),
+        ("graph_slatedb_cache_reload_failures", observe.reload_failures, "counter"),
+        ("graph_slatedb_cache_loader_cancelled", observe.loader_cancelled, "counter"),
+        ("graph_slatedb_cache_ordering_gaps", observe.ordering_gaps, "counter"),
+        ("graph_slatedb_cache_pending_admissions", observe.pending_admissions, "gauge"),
+        ("graph_slatedb_cache_scope_overflow", observe.scope_overflow, "counter"),
+        (
+            "graph_slatedb_cache_observe_metadata_bytes_estimate",
+            observe.metadata_bytes,
+            "gauge",
+        ),
+        (
+            "graph_slatedb_cache_observe_fixed_metadata_bytes_estimate",
+            observe.fixed_metadata_bytes,
+            "gauge",
+        ),
+        (
+            "graph_slatedb_cache_observe_envelope_metadata_bytes_estimate",
+            observe.envelope_metadata_bytes,
+            "gauge",
+        ),
+        (
+            "graph_slatedb_cache_observe_metadata_budget_bytes",
+            observe.max_metadata_bytes,
+            "gauge",
+        ),
+    ] {
+        output.push_str(&format!("# TYPE {name} {metric_type}\n{name} {value}\n"));
+    }
+    for (name, histogram) in [
+        ("graph_slatedb_cache_eviction_to_miss_microseconds", &observe.eviction_to_miss),
+        ("graph_slatedb_cache_reload_duration_microseconds", &observe.reload_duration),
+        (
+            "graph_slatedb_cache_reload_failed_duration_microseconds",
+            &observe.reload_failed_duration,
+        ),
+    ] {
+        append_cache_observe_histogram(output, name, histogram);
+    }
+}
+
+fn append_cache_observe_histogram(output: &mut String, name: &str, histogram: &DurationHistogramSnapshot) {
+    output.push_str(&format!("# TYPE {name} histogram\n"));
+    for (bound, count) in histogram.cumulative() {
+        let le = bound.map_or_else(|| LE_INFINITY.to_string(), |value| value.to_string());
+        output.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {count}\n"));
+    }
+    output.push_str(&format!("{name}_sum {}\n{name}_count {}\n", histogram.sum_us, histogram.count()));
 }
 
 /// A point-in-time process-memory snapshot for the Linux graph-node process.
@@ -1617,7 +1915,7 @@ fn append_slatedb_cache_metrics(output: &mut String, cache: hydradb::SlateDbCach
 /// `allocator_live_bytes` adds the two in-use domains. The retained-memory
 /// diagnosis is `allocator_arena_free_bytes / allocator_arena_bytes`; mmap
 /// memory must never dilute that ratio.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 struct ProcessMemoryMetrics {
     resident_bytes: u64,
     allocator_arena_bytes: u64,
@@ -1638,14 +1936,8 @@ fn append_process_memory_metrics(output: &mut String, memory: ProcessMemoryMetri
         "# TYPE graph_process_allocator_mmap_bytes gauge\n",
         "# TYPE graph_process_allocator_live_bytes gauge\n",
     ));
-    output.push_str(&format!(
-        "graph_process_resident_memory_bytes {}\n",
-        memory.resident_bytes
-    ));
-    output.push_str(&format!(
-        "graph_process_allocator_arena_bytes {}\n",
-        memory.allocator_arena_bytes
-    ));
+    output.push_str(&format!("graph_process_resident_memory_bytes {}\n", memory.resident_bytes));
+    output.push_str(&format!("graph_process_allocator_arena_bytes {}\n", memory.allocator_arena_bytes));
     output.push_str(&format!(
         "graph_process_allocator_arena_in_use_bytes {}\n",
         memory.allocator_arena_in_use_bytes
@@ -1654,30 +1946,21 @@ fn append_process_memory_metrics(output: &mut String, memory: ProcessMemoryMetri
         "graph_process_allocator_arena_free_bytes {}\n",
         memory.allocator_arena_free_bytes
     ));
-    output.push_str(&format!(
-        "graph_process_allocator_mmap_bytes {}\n",
-        memory.allocator_mmap_bytes
-    ));
-    output.push_str(&format!(
-        "graph_process_allocator_live_bytes {}\n",
-        memory.allocator_live_bytes
-    ));
+    output.push_str(&format!("graph_process_allocator_mmap_bytes {}\n", memory.allocator_mmap_bytes));
+    output.push_str(&format!("graph_process_allocator_live_bytes {}\n", memory.allocator_live_bytes));
     if let Some(open) = memory.open_file_descriptors {
         output.push_str("# TYPE graph_process_open_file_descriptors gauge\n");
         output.push_str(&format!("graph_process_open_file_descriptors {open}\n"));
     }
     if let Some(limit) = memory.open_file_descriptor_soft_limit {
         output.push_str("# TYPE graph_process_open_file_descriptor_soft_limit gauge\n");
-        output.push_str(&format!(
-            "graph_process_open_file_descriptor_soft_limit {limit}\n"
-        ));
+        output.push_str(&format!("graph_process_open_file_descriptor_soft_limit {limit}\n"));
     }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn process_memory_metrics() -> Option<ProcessMemoryMetrics> {
-    let resident_bytes =
-        parse_linux_rss_bytes(&std::fs::read_to_string("/proc/self/status").ok()?)?;
+    let resident_bytes = parse_linux_rss_bytes(&std::fs::read_to_string("/proc/self/status").ok()?)?;
     // Reading this directory briefly owns one descriptor which appears in its
     // own listing. Subtract it so the gauge describes the process before the
     // sample. Individual entry errors still count as occupied descriptor slots.
@@ -1723,12 +2006,27 @@ fn process_memory_metrics() -> Option<ProcessMemoryMetrics> {
 /// malformed and missing input has a small, deterministic unit-test surface.
 fn parse_linux_rss_bytes(status: &str) -> Option<u64> {
     status.lines().find_map(|line| {
-        let value = line
-            .strip_prefix("VmRSS:")?
-            .split_ascii_whitespace()
-            .next()?;
+        let value = line.strip_prefix("VmRSS:")?.split_ascii_whitespace().next()?;
         value.parse::<u64>().ok()?.checked_mul(1024)
     })
+}
+
+/// Highest write-permit utilization (in use / capacity) across the scopes
+/// hosted on each cell, skipping shards with no permit capacity.
+fn max_scope_write_permit_utilization(shard_metrics: &[ScopedGraphShardRuntimeMetrics]) -> BTreeMap<&str, f64> {
+    let mut max_scope_utilization = BTreeMap::<&str, f64>::new();
+    for metrics in shard_metrics {
+        let shard = &metrics.shard;
+        if shard.write_permit_capacity == 0 {
+            continue;
+        }
+        let utilization = shard.write_permits_in_use as f64 / shard.write_permit_capacity as f64;
+        max_scope_utilization
+            .entry(shard.cell_id.as_str())
+            .and_modify(|current| *current = current.max(utilization))
+            .or_insert(utilization);
+    }
+    max_scope_utilization
 }
 
 /// The per-shard half of the endpoint.
@@ -1762,6 +2060,8 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
         "# TYPE graph_cache_entries gauge\n",
         "# TYPE graph_cache_resident_bytes gauge\n",
         "# TYPE graph_storage_l0_sst_count gauge\n",
+        "# TYPE graph_storage_sorted_run_count gauge\n",
+        "# TYPE graph_storage_sst_count gauge\n",
         "# TYPE graph_storage_segment_max_l0_sst_count gauge\n",
         "# TYPE graph_storage_immutable_memtable_flushes counter\n",
         "# TYPE graph_storage_get_requests counter\n",
@@ -1781,10 +2081,19 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
     ));
     // From the same enumeration the series below come from, so a family whose
     // shards are all absent still declares itself.
-    append_histogram_types(
-        output,
-        GraphOperationalMetricsSnapshot::default().histogram_fields(),
-    );
+    append_histogram_types(output, GraphOperationalMetricsSnapshot::default().histogram_fields());
+    // A point-in-time gauge derived from each live scope's semaphore state.
+    // Fold scopes sharing a cell with `max`, not `sum`, and never label by
+    // scope: this is the maximum single-scope occupancy with bounded
+    // per-cell cardinality. Consumers average the available scrape samples and
+    // separately require adequate sample coverage; the average alone is not a
+    // continuous-time utilization measurement when scrapes are sparse.
+    output.push_str("# TYPE graph_write_permit_max_scope_utilization_ratio gauge\n");
+    for (cell_id, utilization) in max_scope_write_permit_utilization(shard_metrics) {
+        output.push_str(&format!(
+            "graph_write_permit_max_scope_utilization_ratio{{cell_id=\"{cell_id}\"}} {utilization}\n"
+        ));
+    }
     // Histograms that do not carry `scope` are keyed by `cell_id` alone, and a
     // node may hold several scopes on one cell -- every scope on a query node
     // uses the same `GRAPH_CELL_ID`, so this is the normal case rather than a
@@ -1793,18 +2102,14 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
     // Prometheus rejects outright. They are summed here and rendered once,
     // exactly as `append_per_cell_counters` does for the counters that made
     // this same choice.
-    let mut per_cell_histograms: BTreeMap<&str, BTreeMap<&'static str, DurationHistogramSnapshot>> =
-        BTreeMap::new();
+    let mut per_cell_histograms: BTreeMap<&str, BTreeMap<&'static str, DurationHistogramSnapshot>> = BTreeMap::new();
     for metrics in shard_metrics {
         let scope = metrics.scope.to_string();
         let metrics = &metrics.shard;
         let scoped = render_labels(&[("scope", &scope), ("cell_id", &metrics.cell_id)], None);
         for (field, value) in metrics.operational.counter_fields() {
             let Some(export) = prometheus_counter(CounterSource::Shard, field) else {
-                debug_assert!(
-                    false,
-                    "{field} is enumerated but absent from PROMETHEUS_COUNTERS"
-                );
+                debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_COUNTERS");
                 continue;
             };
             if let PrometheusCounterExport::ScopePerCell(name) = export.export {
@@ -1813,26 +2118,11 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
         }
         for (cache, entries) in [
             ("matrix_artifacts", metrics.cache_entries.matrix_artifacts),
-            (
-                "matrix_adjacencies",
-                metrics.cache_entries.matrix_adjacencies,
-            ),
-            (
-                "graphblas_matrices",
-                metrics.cache_entries.graphblas_matrices,
-            ),
-            (
-                "parsed_row_queries",
-                metrics.cache_entries.parsed_row_queries,
-            ),
-            (
-                "relationship_rows",
-                metrics.cache_entries.relationship_row_sets,
-            ),
-            (
-                "relationship_property_rows",
-                metrics.cache_entries.relationship_property_row_sets,
-            ),
+            ("matrix_adjacencies", metrics.cache_entries.matrix_adjacencies),
+            ("graphblas_matrices", metrics.cache_entries.graphblas_matrices),
+            ("parsed_row_queries", metrics.cache_entries.parsed_row_queries),
+            ("relationship_rows", metrics.cache_entries.relationship_row_sets),
+            ("relationship_property_rows", metrics.cache_entries.relationship_property_row_sets),
         ] {
             output.push_str(&format!(
                 "graph_cache_entries{{scope=\"{}\",cell_id=\"{}\",cache=\"{cache}\"}} {entries}\n",
@@ -1840,26 +2130,15 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
             ));
         }
         for (cache, bytes) in [
-            (
-                "matrix_adjacencies",
-                metrics.cache_resident_bytes.matrix_adjacencies,
-            ),
-            (
-                "graphblas_matrices",
-                metrics.cache_resident_bytes.graphblas_matrices,
-            ),
-            (
-                "relationship_rows",
-                metrics.cache_resident_bytes.relationship_rows,
-            ),
-            (
-                "source_relationship_rows",
-                metrics.cache_resident_bytes.source_relationship_rows,
-            ),
+            ("matrix_adjacencies", metrics.cache_resident_bytes.matrix_adjacencies),
+            ("graphblas_matrices", metrics.cache_resident_bytes.graphblas_matrices),
+            ("relationship_rows", metrics.cache_resident_bytes.relationship_rows),
+            ("source_relationship_rows", metrics.cache_resident_bytes.source_relationship_rows),
             (
                 "relationship_property_rows",
                 metrics.cache_resident_bytes.relationship_property_rows,
             ),
+            ("gds_projected_graphs", metrics.cache_resident_bytes.gds_projected_graphs),
         ] {
             output.push_str(&format!(
                 "graph_cache_resident_bytes{{scope=\"{}\",cell_id=\"{}\",cache=\"{cache}\"}} {bytes}\n",
@@ -1877,47 +2156,22 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
         let storage = &metrics.storage;
         for (name, value) in [
             ("graph_storage_l0_sst_count", storage.l0_sst_count),
-            (
-                "graph_storage_segment_max_l0_sst_count",
-                storage.segment_max_l0_sst_count,
-            ),
-            (
-                "graph_storage_immutable_memtable_flushes",
-                storage.immutable_memtable_flushes,
-            ),
+            ("graph_storage_sorted_run_count", storage.sorted_run_count),
+            ("graph_storage_sst_count", storage.sst_count),
+            ("graph_storage_segment_max_l0_sst_count", storage.segment_max_l0_sst_count),
+            ("graph_storage_immutable_memtable_flushes", storage.immutable_memtable_flushes),
             ("graph_storage_get_requests", storage.get_requests),
             ("graph_storage_scan_requests", storage.scan_requests),
-            (
-                "graph_storage_total_mem_size_bytes",
-                storage.total_mem_size_bytes,
-            ),
-            (
-                "graph_storage_backpressure_writes",
-                storage.backpressure_writes,
-            ),
+            ("graph_storage_total_mem_size_bytes", storage.total_mem_size_bytes),
+            ("graph_storage_backpressure_writes", storage.backpressure_writes),
             ("graph_storage_l0_write_stalls", storage.l0_write_stalls),
             ("graph_storage_compaction_bytes", storage.compaction_bytes),
-            (
-                "graph_storage_running_compactions",
-                storage.running_compactions,
-            ),
-            (
-                "graph_storage_last_compaction_timestamp_sec",
-                storage.last_compaction_timestamp_sec,
-            ),
-            (
-                "graph_storage_wal_buffer_flushes",
-                storage.wal_buffer_flushes,
-            ),
-            (
-                "graph_storage_wal_buffer_flush_requests",
-                storage.wal_buffer_flush_requests,
-            ),
+            ("graph_storage_running_compactions", storage.running_compactions),
+            ("graph_storage_last_compaction_timestamp_sec", storage.last_compaction_timestamp_sec),
+            ("graph_storage_wal_buffer_flushes", storage.wal_buffer_flushes),
+            ("graph_storage_wal_buffer_flush_requests", storage.wal_buffer_flush_requests),
         ] {
-            output.push_str(&format!(
-                "{name}{{scope=\"{}\",cell_id=\"{}\"}} {value}\n",
-                scope, metrics.cell_id
-            ));
+            output.push_str(&format!("{name}{{scope=\"{}\",cell_id=\"{}\"}} {value}\n", scope, metrics.cell_id));
         }
         // Filter outcomes are the direct measurement of file fan-in: for the
         // legacy whole-key-only policy `kind="prefix"` records no negatives;
@@ -1929,18 +2183,10 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
         for (kind, outcome, value) in [
             ("point", "positive", storage.sst_filter_point_positives),
             ("point", "negative", storage.sst_filter_point_negatives),
-            (
-                "point",
-                "false_positive",
-                storage.sst_filter_point_false_positives,
-            ),
+            ("point", "false_positive", storage.sst_filter_point_false_positives),
             ("prefix", "positive", storage.sst_filter_prefix_positives),
             ("prefix", "negative", storage.sst_filter_prefix_negatives),
-            (
-                "prefix",
-                "false_positive",
-                storage.sst_filter_prefix_false_positives,
-            ),
+            ("prefix", "false_positive", storage.sst_filter_prefix_false_positives),
         ] {
             output.push_str(&format!(
                 "graph_storage_sst_filter_checks{{scope=\"{}\",cell_id=\"{}\",kind=\"{kind}\",outcome=\"{outcome}\"}} {value}\n",
@@ -1970,14 +2216,19 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
                 scope, metrics.cell_id
             ));
         }
-        for (op, value) in [
-            ("get", storage.object_store_get_requests),
-            ("put", storage.object_store_put_requests),
+        // Per SlateDB component, one label set for the name: the compactor's
+        // and the garbage collector's requests are not foreground reads, and
+        // `sum without(component)` gives the store's total.
+        for (op, by_component) in [
+            ("get", storage.object_store_get_requests_by_component),
+            ("put", storage.object_store_put_requests_by_component),
         ] {
-            output.push_str(&format!(
-                "graph_storage_object_store_requests{{scope=\"{}\",cell_id=\"{}\",op=\"{op}\"}} {value}\n",
-                scope, metrics.cell_id
-            ));
+            for (component, value) in by_component.by_label() {
+                output.push_str(&format!(
+                    "graph_storage_object_store_requests{{scope=\"{}\",cell_id=\"{}\",op=\"{op}\",component=\"{component}\"}} {value}\n",
+                    scope, metrics.cell_id
+                ));
+            }
         }
         // `scope` and `cell_id`, and nothing else. Never `edge_type`: a
         // 21-bucket family times 96 cell×type pairs is 2,016 series per
@@ -2009,9 +2260,7 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
     for (cell_id, histograms) in &per_cell_histograms {
         append_histograms(
             output,
-            histograms
-                .iter()
-                .map(|(field, snapshot)| (*field, snapshot)),
+            histograms.iter().map(|(field, snapshot)| (*field, snapshot)),
             &[("cell_id", cell_id)],
         );
     }
@@ -2029,52 +2278,21 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
 /// only for now: the OTLP meter's structured-counter path does not exist yet.
 pub const EXPERIMENTAL_OPERATOR_FAMILIES: &[(&str, &str)] = &[
     ("requests", "graph_query_experimental_operator_requests"),
-    (
-        "invocations",
-        "graph_query_experimental_operator_invocations",
-    ),
+    ("invocations", "graph_query_experimental_operator_invocations"),
     ("rows_in", "graph_query_experimental_operator_rows_in"),
     ("rows_out", "graph_query_experimental_operator_rows_out"),
-    (
-        "self_us",
-        "graph_query_experimental_operator_self_microseconds",
-    ),
-    (
-        "storage_us",
-        "graph_query_experimental_operator_storage_microseconds",
-    ),
-    (
-        "storage_requests",
-        "graph_query_experimental_operator_storage_requests",
-    ),
-    (
-        "storage_bytes",
-        "graph_query_experimental_operator_storage_bytes",
-    ),
-    (
-        "hydrated_vertices",
-        "graph_query_experimental_operator_hydrated_vertices",
-    ),
-    (
-        "scanned_relationships",
-        "graph_query_experimental_operator_scanned_relationships",
-    ),
-    (
-        "peak_retained_rows",
-        "graph_query_experimental_operator_peak_retained_rows",
-    ),
-    (
-        "estimate_misses",
-        "graph_query_experimental_operator_estimate_misses",
-    ),
+    ("self_us", "graph_query_experimental_operator_self_microseconds"),
+    ("storage_us", "graph_query_experimental_operator_storage_microseconds"),
+    ("storage_requests", "graph_query_experimental_operator_storage_requests"),
+    ("storage_bytes", "graph_query_experimental_operator_storage_bytes"),
+    ("hydrated_vertices", "graph_query_experimental_operator_hydrated_vertices"),
+    ("scanned_relationships", "graph_query_experimental_operator_scanned_relationships"),
+    ("peak_retained_rows", "graph_query_experimental_operator_peak_retained_rows"),
+    ("estimate_misses", "graph_query_experimental_operator_estimate_misses"),
 ];
 
-fn append_experimental_operator_families(
-    output: &mut String,
-    shard_metrics: &[ScopedGraphShardRuntimeMetrics],
-) {
-    let mut per_cell: BTreeMap<&str, BTreeMap<&'static str, ExperimentalOperatorMetricsSnapshot>> =
-        BTreeMap::new();
+fn append_experimental_operator_families(output: &mut String, shard_metrics: &[ScopedGraphShardRuntimeMetrics]) {
+    let mut per_cell: BTreeMap<&str, BTreeMap<&'static str, ExperimentalOperatorMetricsSnapshot>> = BTreeMap::new();
     for metrics in shard_metrics {
         for operator in &metrics.shard.operational.experimental_operators {
             per_cell
@@ -2138,10 +2356,7 @@ fn merge_histogram(total: &mut DurationHistogramSnapshot, shard: &DurationHistog
 /// Family-major rather than shard-major: all of a family's cells are known at
 /// once and can be emitted under a single `# TYPE` line, which is what the
 /// exposition format actually asks for.
-fn append_per_cell_counters(
-    output: &mut String,
-    totals: &BTreeMap<String, CellOperationalCounterTotals>,
-) {
+fn append_per_cell_counters(output: &mut String, totals: &BTreeMap<String, CellOperationalCounterTotals>) {
     let operational = totals
         .iter()
         .map(|(cell_id, cell)| (cell_id.as_str(), cell.counters.clone()))
@@ -2164,10 +2379,7 @@ fn append_per_cell_counters(
     );
 }
 
-fn append_cache_counters(
-    output: &mut String,
-    metrics: &BTreeMap<String, GraphCacheMetricsSnapshot>,
-) {
+fn append_cache_counters(output: &mut String, metrics: &BTreeMap<String, GraphCacheMetricsSnapshot>) {
     let totals = metrics
         .iter()
         .map(|(cell, snapshot)| (cell.as_str(), snapshot.counter_fields().collect()))
@@ -2193,10 +2405,7 @@ fn append_counter_types(
 ) {
     for (field, _) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_COUNTERS");
             continue;
         };
         if !wanted(export.export) {
@@ -2224,10 +2433,7 @@ fn append_per_cell_family(
 ) {
     for (field, _) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_COUNTERS");
             continue;
         };
         let PrometheusCounterExport::PerCell(name) = export.export else {
@@ -2235,10 +2441,7 @@ fn append_per_cell_family(
         };
         output.push_str(&format!("# TYPE {name} counter\n"));
         for (cell_id, cell) in totals {
-            let value = cell
-                .iter()
-                .find(|(name, _)| *name == field)
-                .map_or(0, |(_, value)| *value);
+            let value = cell.iter().find(|(name, _)| *name == field).map_or(0, |(_, value)| *value);
             output.push_str(&format!("{name}{{cell_id=\"{cell_id}\"}} {value}\n"));
         }
     }
@@ -2257,10 +2460,7 @@ fn append_per_cell_class_family(
     let mut declared: Option<&'static str> = None;
     for (field, class, _) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_CLASS_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_CLASS_COUNTERS");
             continue;
         };
         let PrometheusCounterExport::PerCell(name) = export.export else {
@@ -2284,17 +2484,10 @@ fn append_per_cell_class_family(
 
 /// Render every [`PrometheusCounterExport::Global`] counter a snapshot
 /// enumerates, unlabelled.
-fn append_global_counters(
-    output: &mut String,
-    source: CounterSource,
-    fields: impl Iterator<Item = (&'static str, u64)>,
-) {
+fn append_global_counters(output: &mut String, source: CounterSource, fields: impl Iterator<Item = (&'static str, u64)>) {
     for (field, value) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_COUNTERS");
             continue;
         };
         let PrometheusCounterExport::Global(name) = export.export else {
@@ -2313,10 +2506,7 @@ fn append_global_class_counters(
     let mut declared: Option<&'static str> = None;
     for (field, class, value) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_CLASS_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_CLASS_COUNTERS");
             continue;
         };
         let PrometheusCounterExport::Global(name) = export.export else {
@@ -2326,9 +2516,7 @@ fn append_global_class_counters(
             output.push_str(&format!("# TYPE {name} counter\n"));
             declared = Some(field);
         }
-        output.push_str(&format!(
-            "{name}{{{ERROR_CLASS_LABEL}=\"{class}\"}} {value}\n"
-        ));
+        output.push_str(&format!("{name}{{{ERROR_CLASS_LABEL}=\"{class}\"}} {value}\n"));
     }
 }
 
@@ -2337,15 +2525,12 @@ fn append_global_failure_counters(
     source: CounterSource,
     fields: impl Iterator<Item = (&'static str, &'static str, &'static str, u64)>,
 ) {
-    // Declared by name, not by field: the two engines are two series of one
-    // family, and a repeated `# TYPE` is a rejected scrape.
+    // Declared by name, not by field: engine modes are series of one family,
+    // and a repeated `# TYPE` is a rejected scrape.
     let mut declared: Option<&'static str> = None;
     for (field, stage, reason, value) in fields {
         let Some(export) = prometheus_counter(source, field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_FAILURE_COUNTERS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_FAILURE_COUNTERS");
             continue;
         };
         let PrometheusCounterExport::Global(name) = export.export else {
@@ -2371,10 +2556,7 @@ fn append_global_failure_counters(
 /// Split from the series rendering because a per-shard family declares its type
 /// once and renders its series once per shard, and a repeated `# TYPE` line is
 /// a scrape error rather than a cosmetic one.
-fn append_histogram_types<'a>(
-    output: &mut String,
-    fields: impl Iterator<Item = (&'static str, &'a DurationHistogramSnapshot)>,
-) {
+fn append_histogram_types<'a>(output: &mut String, fields: impl Iterator<Item = (&'static str, &'a DurationHistogramSnapshot)>) {
     // Two fields can share a family name — the per-engine execution
     // histograms do — and a repeated `# TYPE` for one name makes the whole
     // scrape unparseable, so a name is declared once however many series
@@ -2382,10 +2564,7 @@ fn append_histogram_types<'a>(
     let mut declared: Vec<&'static str> = Vec::new();
     for (field, _) in fields {
         let Some(export) = prometheus_histogram(field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_HISTOGRAMS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_HISTOGRAMS");
             continue;
         };
         if declared.contains(&export.name) {
@@ -2411,31 +2590,21 @@ fn append_histograms<'a>(
 ) {
     for (field, snapshot) in fields {
         let Some(export) = prometheus_histogram(field) else {
-            debug_assert!(
-                false,
-                "{field} is enumerated but absent from PROMETHEUS_HISTOGRAMS"
-            );
+            debug_assert!(false, "{field} is enumerated but absent from PROMETHEUS_HISTOGRAMS");
             continue;
         };
         let owned: Vec<(&str, &str)>;
         let labels: &[(&str, &str)] = if export.carries_scope {
             labels
         } else {
-            owned = labels
-                .iter()
-                .copied()
-                .filter(|(key, _)| *key != "scope")
-                .collect();
+            owned = labels.iter().copied().filter(|(key, _)| *key != "scope").collect();
             &owned
         };
         // Cumulative, because that is what `le` means. The kernel counts per
         // bucket -- one `fetch_add` -- and `DurationHistogramSnapshot` owns the
         // accumulation, so this rendering and the meter's cannot drift.
         for (bound, cumulative) in snapshot.cumulative() {
-            let le = bound.map_or_else(
-                || LE_INFINITY.to_string(),
-                |bound| export.unit.render_bound(bound),
-            );
+            let le = bound.map_or_else(|| LE_INFINITY.to_string(), |bound| export.unit.render_bound(bound));
             output.push_str(&format!(
                 "{}_bucket{} {cumulative}\n",
                 export.name,
@@ -2450,11 +2619,7 @@ fn append_histograms<'a>(
         ));
         // Derived from the buckets, not carried alongside them, so `_count` and
         // `le="+Inf"` are equal by construction.
-        output.push_str(&format!(
-            "{}_count{labelled} {}\n",
-            export.name,
-            snapshot.count()
-        ));
+        output.push_str(&format!("{}_count{labelled} {}\n", export.name, snapshot.count()));
     }
 }
 

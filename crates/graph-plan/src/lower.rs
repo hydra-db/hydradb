@@ -1,11 +1,7 @@
-use hydradb_cypher_ast::{
-    BinaryOperator, Clause, Document, Expression, Literal, PatternElement, ProjectionItems,
-    Statement,
-};
+use hydradb_cypher_ast::{BinaryOperator, Clause, Document, Expression, Literal, PatternElement, ProjectionItems, Statement};
 
 use crate::{
-    GraphLogicalPlan, GraphPlanError, GraphPlanResult, LogicalBinaryOperator, LogicalExpression,
-    LogicalProjection, ScalarValue, Symbol,
+    GraphLogicalPlan, GraphPlanError, GraphPlanResult, LogicalBinaryOperator, LogicalExpression, LogicalProjection, ScalarValue, Symbol,
 };
 
 pub fn lower_cypher_ast(document: &Document) -> GraphPlanResult<GraphLogicalPlan> {
@@ -15,9 +11,7 @@ pub fn lower_cypher_ast(document: &Document) -> GraphPlanResult<GraphLogicalPlan
         ));
     };
     let [Clause::Match(matched), Clause::Return(returned)] = query.clauses.as_slice() else {
-        return Err(GraphPlanError::UnsupportedCypher(
-            "expected MATCH followed by RETURN".to_string(),
-        ));
+        return Err(GraphPlanError::UnsupportedCypher("expected MATCH followed by RETURN".to_string()));
     };
     if matched.optional || matched.mode.is_some() || matched.patterns.len() != 1 {
         return Err(GraphPlanError::UnsupportedCypher(
@@ -34,16 +28,13 @@ pub fn lower_cypher_ast(document: &Document) -> GraphPlanResult<GraphLogicalPlan
             "inline node predicates are not lowered yet".to_string(),
         ));
     }
-    let binding = node.variable.as_ref().ok_or_else(|| {
-        GraphPlanError::UnsupportedCypher("the matched node must have a binding".to_string())
-    })?;
+    let binding = node
+        .variable
+        .as_ref()
+        .ok_or_else(|| GraphPlanError::UnsupportedCypher("the matched node must have a binding".to_string()))?;
     let mut plan = GraphLogicalPlan::NodeScan {
         binding: Symbol::from(binding.as_str()),
-        labels: node
-            .labels
-            .iter()
-            .map(|label| Symbol::from(label.as_str()))
-            .collect(),
+        labels: node.labels.iter().map(|label| Symbol::from(label.as_str())).collect(),
     };
     if let Some(predicate) = &matched.predicate {
         plan = GraphLogicalPlan::Filter {
@@ -62,19 +53,14 @@ pub fn lower_cypher_ast(document: &Document) -> GraphPlanResult<GraphLogicalPlan
         ));
     }
     let ProjectionItems::Items(items) = &returned.items else {
-        return Err(GraphPlanError::UnsupportedCypher(
-            "RETURN * is not lowered yet".to_string(),
-        ));
+        return Err(GraphPlanError::UnsupportedCypher("RETURN * is not lowered yet".to_string()));
     };
     let items = items
         .iter()
         .map(|item| {
             Ok(LogicalProjection {
                 expression: lower_expression(&item.expression)?,
-                alias: item
-                    .alias
-                    .as_ref()
-                    .map(|alias| Symbol::from(alias.as_str())),
+                alias: item.alias.as_ref().map(|alias| Symbol::from(alias.as_str())),
             })
         })
         .collect::<GraphPlanResult<Vec<_>>>()?;
@@ -86,35 +72,30 @@ pub fn lower_cypher_ast(document: &Document) -> GraphPlanResult<GraphLogicalPlan
 
 fn lower_expression(expression: &Expression) -> GraphPlanResult<LogicalExpression> {
     Ok(match expression {
-        Expression::Identifier(identifier) => {
-            LogicalExpression::Binding(Symbol::from(identifier.as_str()))
-        }
+        Expression::Identifier(identifier) => LogicalExpression::Binding(Symbol::from(identifier.as_str())),
         Expression::Property { target, key } => {
             let Expression::Identifier(binding) = target.as_ref() else {
-                return Err(GraphPlanError::UnsupportedCypher(
-                    "property targets must be bindings".to_string(),
-                ));
+                return Err(GraphPlanError::UnsupportedCypher("property targets must be bindings".to_string()));
             };
             LogicalExpression::Property {
                 binding: Symbol::from(binding.as_str()),
                 property: Symbol::from(key.as_str()),
             }
         }
-        Expression::Parameter(parameter) => {
-            LogicalExpression::Parameter(Symbol::from(parameter.as_str()))
-        }
+        Expression::Parameter(parameter) => LogicalExpression::Parameter(Symbol::from(parameter.as_str())),
         Expression::Literal(literal) => LogicalExpression::Literal(match literal {
             Literal::Null => ScalarValue::Null,
             Literal::Boolean(value) => ScalarValue::Boolean(*value),
             Literal::Integer(value) => ScalarValue::Integer(*value),
             Literal::Float(value) => ScalarValue::Float(value.clone()),
             Literal::String(value) => ScalarValue::String(value.clone()),
+            Literal::Decimal(_) | Literal::Bytes(_) => {
+                return Err(GraphPlanError::UnsupportedCypher(
+                    "decimal and byte string literals are not supported".to_string(),
+                ))
+            }
         }),
-        Expression::Binary {
-            left,
-            operator,
-            right,
-        } => LogicalExpression::Binary {
+        Expression::Binary { left, operator, right } => LogicalExpression::Binary {
             left: Box::new(lower_expression(left)?),
             operator: match operator {
                 BinaryOperator::Equal => LogicalBinaryOperator::Equal,

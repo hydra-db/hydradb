@@ -1,0 +1,13 @@
+[package]
+name = "hydradb-usage-report"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+description = "The anonymous usage report a Turbolay install sends: its install ID, format and checks"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

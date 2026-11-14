@@ -1,6 +1,6 @@
 use hydradb::{
-    local_object_store, object_store_from_env, EdgeIngestOptions, EdgeMutation, GraphError,
-    GraphIndexPolicy, GraphOpenOptions, GraphShard, Result, SparseKernelBackend,
+    local_object_store, object_store_from_env, EdgeIngestOptions, EdgeMutation, GraphError, GraphIndexPolicy, GraphOpenOptions, GraphShard,
+    Result, SparseKernelBackend,
 };
 use std::time::Duration;
 
@@ -25,24 +25,16 @@ async fn main() -> Result<()> {
     let start = parse_arg(&args, 6, 1);
     let op_delay = parse_env_u64("GRAPH_OP_DELAY_MICROS").map(Duration::from_micros);
     let cell_id = std::env::var("GRAPH_CELL_ID").unwrap_or_else(|_| DEFAULT_CELL_ID.to_string());
-    let edge_type =
-        std::env::var("GRAPH_EDGE_TYPE").unwrap_or_else(|_| DEFAULT_EDGE_TYPE.to_string());
+    let edge_type = std::env::var("GRAPH_EDGE_TYPE").unwrap_or_else(|_| DEFAULT_EDGE_TYPE.to_string());
 
     let object_store = load_object_store(store_arg)?;
     let open_options = graph_open_options();
     let shard = match mode {
-        "writer" | "batch" | "chunked-batch" | "deleter" | "segment" | "segment-delete"
-        | "segment-compact" | "segment-gc" | "matrix" | "artifact" | "delta-gc" => {
-            GraphShard::open_standalone_writer_with_options(
-                db_path.to_string(),
-                object_store,
-                open_options,
-            )
-            .await?
+        "writer" | "batch" | "chunked-batch" | "deleter" | "segment" | "segment-delete" | "segment-compact" | "segment-gc" | "matrix"
+        | "artifact" | "delta-gc" => {
+            GraphShard::open_standalone_writer_with_options(db_path.to_string(), object_store, open_options).await?
         }
-        "reader" | "verify" | "digest" => {
-            GraphShard::open_with_options(db_path.to_string(), object_store, open_options).await?
-        }
+        "reader" | "verify" | "digest" => GraphShard::open_with_options(db_path.to_string(), object_store, open_options).await?,
         _ => {
             eprintln!("unknown mode {mode}");
             std::process::exit(2);
@@ -90,13 +82,7 @@ async fn main() -> Result<()> {
                         }
                     });
                     let result = shard
-                        .ingest_edge_mutations(
-                            &cell_id,
-                            mutations,
-                            EdgeIngestOptions {
-                                batch_size: writer_batch,
-                            },
-                        )
+                        .ingest_edge_mutations(&cell_id, mutations, EdgeIngestOptions { batch_size: writer_batch })
                         .await?;
                     inserted = inserted.saturating_add(result.inserted);
                     already_existed = already_existed.saturating_add(result.already_existed);
@@ -206,9 +192,7 @@ async fn main() -> Result<()> {
         }
         "segment-delete" => {
             let src = parse_env_u64("GRAPH_SRC_ID").unwrap_or(start);
-            let stride = parse_env_u64("GRAPH_SEGMENT_DELETE_STRIDE")
-                .unwrap_or(2)
-                .max(1);
+            let stride = parse_env_u64("GRAPH_SEGMENT_DELETE_STRIDE").unwrap_or(2).max(1);
             let mut deletes = 0_u64;
             for offset in (0..ops).filter(|offset| offset % stride == 0) {
                 let dst = start + offset;
@@ -234,12 +218,7 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .build_adjacency_image(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                    )
+                    .build_adjacency_image(&cell_id, &edge_type, epoch, parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096))
                     .await?;
                 let compact = shard
                     .compact_out_adjacency_segments(
@@ -260,9 +239,7 @@ async fn main() -> Result<()> {
                     compact.output_edges
                 );
             } else {
-                println!(
-                    "graph worker segment-compact node={node_id} cell={cell_id} epoch=0 skipped"
-                );
+                println!("graph worker segment-compact node={node_id} cell={cell_id} epoch=0 skipped");
             }
         }
         "segment-gc" => {
@@ -270,12 +247,7 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .build_adjacency_image(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                    )
+                    .build_adjacency_image(&cell_id, &edge_type, epoch, parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096))
                     .await?;
                 let compact = shard
                     .compact_out_adjacency_segments(
@@ -298,12 +270,7 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 let artifact = shard
-                    .build_matrix_tiles(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                    )
+                    .build_matrix_tiles(&cell_id, &edge_type, epoch, parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096))
                     .await?;
                 println!(
                     "graph worker matrix node={node_id} cell={cell_id} epoch={} edges={} out_tiles={} transpose_tiles={}",
@@ -317,12 +284,7 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 let artifact = shard
-                    .build_adjacency_image(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                    )
+                    .build_adjacency_image(&cell_id, &edge_type, epoch, parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096))
                     .await?;
                 println!(
                     "graph worker artifact node={node_id} cell={cell_id} epoch={} matrix_edges={}",
@@ -336,12 +298,7 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .build_adjacency_image(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                    )
+                    .build_adjacency_image(&cell_id, &edge_type, epoch, parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096))
                     .await?;
                 println!("graph worker delta-gc node={node_id} cell={cell_id} epoch={epoch} skipped=no-graph-delta-log");
             } else {
@@ -353,18 +310,9 @@ async fn main() -> Result<()> {
             if epoch > 0 {
                 let src = parse_env_u64("GRAPH_SRC_ID").unwrap_or(start);
                 let hops = parse_env_u8("GRAPH_HOPS").unwrap_or(1);
-                let direct = shard
-                    .direct_snapshot_reachable(&cell_id, &edge_type, &[src], hops, epoch)
-                    .await?;
+                let direct = shard.direct_snapshot_reachable(&cell_id, &edge_type, &[src], hops, epoch).await?;
                 let matrix = shard
-                    .matrix_reachable_with_kernel(
-                        &cell_id,
-                        &edge_type,
-                        &[src],
-                        hops,
-                        epoch,
-                        selected_matrix_kernel(),
-                    )
+                    .matrix_reachable_with_kernel(&cell_id, &edge_type, &[src], hops, epoch, selected_matrix_kernel())
                     .await?;
                 assert_eq!(direct.vertices, matrix.vertices);
                 println!(
@@ -405,9 +353,7 @@ async fn main() -> Result<()> {
         }
         "digest" => {
             let epoch = shard.current_epoch(&cell_id).await?;
-            let digest = shard
-                .export_live_graph_digest(&cell_id, &edge_type, epoch)
-                .await?;
+            let digest = shard.export_live_graph_digest(&cell_id, &edge_type, epoch).await?;
             println!(
                 "graph worker digest node={node_id} cell={cell_id} epoch={} edges={} edge_checksum={} out_degree_checksum={} in_degree_checksum={}",
                 digest.read_epoch,
@@ -428,9 +374,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_object_store(
-    value: &str,
-) -> Result<std::sync::Arc<dyn slatedb::object_store::ObjectStore>> {
+fn load_object_store(value: &str) -> Result<std::sync::Arc<dyn slatedb::object_store::ObjectStore>> {
     if let Some(path) = value.strip_prefix("local:") {
         local_object_store(path)
     } else if value == "-" {
@@ -455,28 +399,21 @@ fn graph_open_options() -> GraphOpenOptions {
         _ => GraphIndexPolicy::default(),
     };
     {
-        let mut options = GraphOpenOptions::default();
-        options.index_policy = index_policy;
-        options
+        let options = GraphOpenOptions::default();
+        GraphOpenOptions { index_policy, ..options }
     }
 }
 
 fn parse_arg(args: &[String], index: usize, default: u64) -> u64 {
-    args.get(index)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    args.get(index).and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 fn parse_env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
+    std::env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
 fn parse_env_u8(name: &str) -> Option<u8> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
+    std::env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

@@ -1,9 +1,15 @@
 #[allow(dead_code)]
 #[path = "graph_node/admin.rs"]
 mod admin;
+#[path = "graph_node/buddy_wal.rs"]
+mod buddy_wal;
 #[allow(dead_code)]
 #[path = "graph_node/config.rs"]
 mod config;
+#[path = "graph_node/dial9_trace.rs"]
+mod dial9_trace;
+#[path = "graph_node/listeners.rs"]
+mod listeners;
 #[allow(dead_code)]
 #[path = "graph_node/otel_metrics.rs"]
 mod otel_metrics;
@@ -13,6 +19,8 @@ mod readiness;
 #[allow(dead_code)]
 #[path = "graph_node/tls.rs"]
 mod tls;
+#[path = "graph_node/usage_report.rs"]
+mod usage_report;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,16 +29,15 @@ use chrono::{DateTime, Utc};
 
 use config::RuntimeConfig;
 use hydradb::{
-    object_store_from_env, probe_create_only_puts, BoltServerConfig, ClientBoltServer,
-    ClientHttpServer, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
-    HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
-    ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
-    QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
-    WriterGate,
+    object_store_from_env, probe_create_only_puts, BoltServerConfig, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
+    HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider, ObjectStoreNodeDirectory,
+    PlacementConfig, PlacementView, QueryTransportAction, QueryTransportScopeGrant, ScopedRoutedGraphCluster,
+    StaticQueryTransportScopeAuthorizer, WriterGate,
 };
 use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 use hydradb_placement::liveness::HeartbeatAction;
 use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
+use listeners::{ClientListenerAddrs, ClientListeners};
 use readiness::NodeReadiness;
 use slatedb::object_store::{path::Path, ObjectStore};
 
@@ -65,22 +72,11 @@ fn start_create_only_probe(
         let mut delay = CREATE_ONLY_PROBE_RETRY_FIRST;
         let mut attempt: u64 = 0;
         loop {
-            let prefix = Path::from(format!(
-                "{data_path}/_create_only_probe/{node_id}-{run}-{attempt}"
-            ));
-            match probe_create_only_puts(
-                object_store.as_ref(),
-                &prefix,
-                CREATE_ONLY_PROBE_CONTENDERS,
-            )
-            .await
-            {
+            let prefix = Path::from(format!("{data_path}/_create_only_probe/{node_id}-{run}-{attempt}"));
+            match probe_create_only_puts(object_store.as_ref(), &prefix, CREATE_ONLY_PROBE_CONTENDERS).await {
                 Ok(()) => {
                     gate.set_open(true);
-                    tracing::info!(
-                        attempt,
-                        "object store passed the create-only probe: writers allowed"
-                    );
+                    tracing::info!(attempt, "object store passed the create-only probe: writers allowed");
                     return;
                 }
                 Err(error) if attempt == 0 => tracing::error!(
@@ -88,9 +84,7 @@ fn start_create_only_probe(
                     retry_in = ?delay,
                     "object store failed the create-only probe: serving reads only, not ready, retrying"
                 ),
-                Err(error) => {
-                    tracing::warn!(%error, attempt, retry_in = ?delay, "create-only probe failed again")
-                }
+                Err(error) => tracing::warn!(%error, attempt, retry_in = ?delay, "create-only probe failed again"),
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(CREATE_ONLY_PROBE_RETRY_LAST);
@@ -138,8 +132,7 @@ fn install_trace_context_bridge() {
 #[cfg(not(feature = "otlp"))]
 fn install_trace_context_bridge() {}
 
-#[tokio::main]
-async fn main() -> RuntimeResult<()> {
+fn main() -> RuntimeResult<()> {
     // Ahead of the subscriber on purpose: `--version` is asked from a shell,
     // usually `docker run --rm <image> --version` against an image nobody can
     // otherwise identify, and the answer has to be one plain block on stdout
@@ -153,7 +146,17 @@ async fn main() -> RuntimeResult<()> {
         return Ok(());
     }
 
-    // First statement in the process: everything after it, including a config
+    // The runtime `#[tokio::main]` would build, recorded by dial9 only when
+    // `DIAL9_ENABLED` asks for it. `finish` runs after the node has stopped, so
+    // the last trace segment is sealed and shipped on the way out.
+    let runtime = dial9_trace::NodeRuntime::from_env()?;
+    let result = runtime.block_on(serve());
+    runtime.finish();
+    result
+}
+
+async fn serve() -> RuntimeResult<()> {
+    // First statement on the runtime: everything after it, including a config
     // error, is logged rather than lost. `init` is total — with no
     // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
     // missing collector is never why a node fails to boot.
@@ -190,10 +193,7 @@ async fn main() -> RuntimeResult<()> {
 /// `TelemetryGuard::providers()`, and the guard has to outlive that task so the
 /// meter's final collection at shutdown happens after the task has stopped
 /// publishing into it.
-async fn boot(
-    telemetry: &hydradb_telemetry::TelemetryGuard,
-    metric_export_interval: Duration,
-) -> RuntimeResult<()> {
+async fn boot(telemetry: &hydradb_telemetry::TelemetryGuard, metric_export_interval: Duration) -> RuntimeResult<()> {
     let config = RuntimeConfig::from_env()?;
     tracing::info!(scope = %config.scope, "starting graph node");
     run_node(config, telemetry, metric_export_interval).await
@@ -210,13 +210,39 @@ async fn run_node(
     // a failure with no symptom other than a warning every heartbeat interval.
     validate_node_id(&config.node_id)?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
-    let object_store = object_store_from_env(None)?;
-    let open_options = config.graph_open_options();
+    let remote_store = object_store_from_env(None)?;
+    let token = config.read_auth_token()?;
+    let mut open_options = config.graph_open_options();
+    // One disk cache for every scope, with the node's whole budget, instead of
+    // one per scope with a fixed slice of it: the scopes read through
+    // `object_store`, and nothing else on the node does anything a cache
+    // would change (placement, leases and fencing see only manifests and
+    // conditional writes, which pass straight through).
+    let shared_disk_cache = hydradb::SharedDiskCache::take(Arc::clone(&remote_store), &mut open_options.cache).await?;
+    let object_store = shared_disk_cache
+        .as_ref()
+        .map_or_else(|| Arc::clone(&remote_store), hydradb::SharedDiskCache::object_store);
+    // The replica side of buddy WAL: follow peers' feeds so this node's readers
+    // catch up from their writers' frontiers instead of polling object storage.
+    // Peers serve the feed on their public HTTP listener, so it travels over
+    // the same TLS as client queries whenever the node has TLS.
+    // One set of buddy WAL metrics for the node: the feed it serves, the peers
+    // it follows, its stores' readers, and /metrics all share it.
+    let buddy_wal_metrics = config.buddy_wal.then(|| Arc::new(hydradb_buddy_wal::BuddyWalMetrics::new()));
+    let buddy_wal_followers = if let Some(metrics) = &buddy_wal_metrics {
+        let transport = match &config.tls_ca_certificate {
+            Some(ca_certificate) => buddy_wal::PeerTransport::Tls { ca_certificate },
+            None => buddy_wal::PeerTransport::Plaintext,
+        };
+        buddy_wal::start_replica(&config.buddy_wal_peers(), &token, &transport, Arc::clone(metrics)).map(|(feed, followers)| {
+            open_options.wal_feed = Some(feed);
+            followers
+        })
+    } else {
+        None
+    };
     let memory_config = config.graph_memory_config();
-    let directory = ObjectStoreNodeDirectory::new(
-        config.cells.iter().cloned(),
-        config.bolt_node_addresses.keys().cloned(),
-    )?;
+    let directory = ObjectStoreNodeDirectory::new(config.cells.iter().cloned(), config.bolt_node_addresses.keys().cloned())?;
     // One placement handle for the whole process, cloned into the routed
     // cluster and the Bolt routing provider. A second handle over the same
     // store would be a second live set, and rendezvous only converges while
@@ -232,15 +258,9 @@ async fn run_node(
     // Refreshed before the listeners open, so the first request cannot race the
     // task's first tick and be answered from the assumed-fleet grace view.
     let placement_base = Path::from(config.data_path.as_str());
-    let _ = placement
-        .refresh(object_store.as_ref(), &placement_base)
-        .await;
+    let _ = placement.refresh(object_store.as_ref(), &placement_base).await;
     let placement_refresh = placement.spawn_refresh(Arc::clone(&object_store), placement_base);
-    let token = config.read_auth_token()?;
-    let indexer_change_wake = config
-        .indexer_notify_url
-        .as_ref()
-        .map(|_| Arc::new(tokio::sync::Notify::new()));
+    let indexer_change_wake = config.indexer_notify_url.as_ref().map(|_| Arc::new(tokio::sync::Notify::new()));
     let mut node = ScopedRoutedGraphCluster::new_with_writer_lease_duration(
         config.data_path.clone(),
         config.scope.namespace.clone(),
@@ -256,6 +276,9 @@ async fn run_node(
     )?;
     if let Some(wake) = &indexer_change_wake {
         node = node.with_indexer_change_wake(Arc::clone(wake));
+    }
+    if let Some(cache) = shared_disk_cache {
+        node = node.with_shared_disk_cache(cache);
     }
     let node = Arc::new(node);
     // Before any listener opens: WAL fencing needs create-only PUTs, and a store
@@ -275,17 +298,11 @@ async fn run_node(
         (Some(url), Some(wake)) => Some(start_indexer_change_notifier(url, wake, token.clone())?),
         _ => None,
     };
-    let (writer_reconcile_stop, writer_reconcile_task) =
-        start_writer_ownership_reconciler(Arc::clone(&node), config.heartbeat_interval);
-    let (writer_lease_stop, writer_lease_task) = start_writer_lease_reconciler(
-        Arc::clone(&node),
-        (config.writer_lease_duration / 3).max(Duration::from_secs(1)),
-    );
-    let (index_discovery_stop, index_discovery_task) = start_index_discovery(
-        Arc::clone(&node),
-        config.cells.clone(),
-        config.index_discovery_interval,
-    );
+    let (writer_reconcile_stop, writer_reconcile_task) = start_writer_ownership_reconciler(Arc::clone(&node), config.heartbeat_interval);
+    let (writer_lease_stop, writer_lease_task) =
+        start_writer_lease_reconciler(Arc::clone(&node), (config.writer_lease_duration / 3).max(Duration::from_secs(1)));
+    let (index_discovery_stop, index_discovery_task) =
+        start_index_discovery(Arc::clone(&node), config.cells.clone(), config.index_discovery_interval);
 
     let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
         token.clone(),
@@ -301,37 +318,43 @@ async fn run_node(
             ],
         ),
     )?;
-    let service = ClientQueryService::new(
-        Arc::clone(&node) as Arc<dyn hydradb::QueryCellClient>,
-        ClientQueryServiceConfig::default()
-            .with_required_bearer_token(token.clone())
-            .with_scope_authorizer(Arc::new(authorizer))
-            .with_max_concurrent_queries(config.max_concurrent_queries)
-            .with_max_query_runtime_ms(config.max_query_runtime_ms)
-            .with_server_cursor_limits(
-                config.max_server_cursors,
-                config.max_cursor_buffer_bytes,
-                config.cursor_ttl.as_millis().try_into()?,
-            )
-            .with_cypher_engine(config.cypher_engine),
-    )?;
+    #[cfg(feature = "query-telemetry")]
+    let failure_reporter = if let Some(url) = &config.query_telemetry_url {
+        let token = config
+            .query_telemetry_token_file
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        Some(hydradb::QueryFailureReporter::new(url.clone(), token.as_deref())?)
+    } else {
+        None
+    };
+    let service_config = ClientQueryServiceConfig::default()
+        .with_required_bearer_token(token.clone())
+        .with_scope_authorizer(Arc::new(authorizer))
+        .with_max_concurrent_queries(config.max_concurrent_queries)
+        .with_max_query_runtime_ms(config.max_query_runtime_ms)
+        .with_server_cursor_limits(
+            config.max_server_cursors,
+            config.max_cursor_buffer_bytes,
+            config.cursor_ttl.as_millis().try_into()?,
+        )
+        .with_cypher_engine(config.cypher_engine)
+        .with_mutation_atomicity_policy(config.mutation_atomicity_policy);
+    #[cfg(feature = "query-telemetry")]
+    let service_config = match &failure_reporter {
+        Some(reporter) => service_config.with_failure_reporter(config.node_id.clone(), reporter.clone()),
+        None => service_config,
+    };
+    let service = ClientQueryService::new(Arc::clone(&node) as Arc<dyn hydradb::QueryCellClient>, service_config)?;
     let target = ClientQueryTarget::new(config.scope.clone(), config.cell_id.clone())?;
-    let resolver = Arc::new(HierarchicalClientDatabaseResolver::new(
-        config.database.clone(),
-        target,
-    )?);
+    let resolver = Arc::new(HierarchicalClientDatabaseResolver::new(config.database.clone(), target)?);
     let tls_reloader = if config.allow_plaintext {
         None
     } else {
         Some(tls::FileTlsReloader::start(
-            config
-                .tls_certificate
-                .as_ref()
-                .expect("validated TLS certificate"),
-            config
-                .tls_private_key
-                .as_ref()
-                .expect("validated TLS private key"),
+            config.tls_certificate.as_ref().expect("validated TLS certificate"),
+            config.tls_private_key.as_ref().expect("validated TLS private key"),
             Duration::from_secs(1),
         )?)
     };
@@ -351,21 +374,11 @@ async fn run_node(
     // `GRAPH_READ_ROUTING` decides whether `READ` names the whole live fleet or
     // just the cell's owner. Default `fleet`, i.e. inert, so the flip is an env
     // change per environment rather than a fleet-wide behaviour change carried
-    // by an image (the cell-affine read-routing design, change 2).
-    let routing = ObjectStoreBoltRoutingTableProvider::new(
-        config.bolt_node_addresses.clone(),
-        30,
-        placement.clone(),
-    )?
-    .with_read_routing(config.read_routing)
-    .with_writer_lease_directory(node.writer_lease_directory());
+    // by an image (the cell-affine read routing design, change 2).
+    let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30, placement.clone())?
+        .with_read_routing(config.read_routing)
+        .with_writer_lease_directory(node.writer_lease_directory());
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
-    if let Some(provider) = &tls_provider {
-        bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));
-    } else {
-        bolt_config = bolt_config.insecure_allow_plaintext();
-    }
-    let bolt = ClientBoltServer::bind(config.bolt_addr, service.clone(), bolt_config).await?;
 
     let mut http_config = HttpQueryServerConfig::default()
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout)
@@ -373,12 +386,18 @@ async fn run_node(
     if config.scope.is_default() {
         http_config = http_config.allow_default_namespace();
     }
-    if let Some(provider) = tls_provider {
-        http_config = http_config.with_tls_provider(provider);
-    } else {
-        http_config = http_config.insecure_allow_plaintext();
-    }
-    let http = ClientHttpServer::bind(config.http_addr, service.clone(), http_config).await?;
+    let buddy_wal_feed = buddy_wal_metrics
+        .as_ref()
+        .map(|metrics| buddy_wal::feed_routes(&node, &token, Arc::clone(metrics)));
+    let listeners = ClientListeners::bind(
+        ClientListenerAddrs::from(&config),
+        &service,
+        bolt_config,
+        http_config,
+        tls_provider,
+        move |stopping| buddy_wal_feed.map_or_else(axum::Router::new, |feed| feed(stopping)),
+    )
+    .await?;
 
     // One readiness answer for `/readyz` and the publisher, and it accounts for
     // placement: a node that has shed its view of the fleet (decision 7) is not
@@ -391,18 +410,29 @@ async fn run_node(
         service.clone(),
         Arc::clone(&node),
         token,
+        buddy_wal_metrics.clone(),
     )
     .await?;
     ready.mark_ready();
     // The OTel half of the same numbers `/metrics` serves. Inert without the
     // `otlp` feature and inert with it when no collector endpoint is
     // configured, so the ordinary build spawns nothing and takes no lock.
-    let metric_collection = otel_metrics::MetricCollection::start(
-        telemetry,
-        metric_export_interval,
-        service.clone(),
-        Arc::clone(&node),
-    );
+    let metric_collection = otel_metrics::MetricCollection::start(telemetry, metric_export_interval, service.clone(), Arc::clone(&node));
+    // Resolve the install ID in the background so store retries cannot delay startup.
+    let usage_reporter = match &config.usage_report_url {
+        Some(url) => Some(usage_report::UsageReporter::start(usage_report::ReporterInputs {
+            url: url.clone(),
+            interval: config.usage_report_interval,
+            store: Arc::clone(&object_store),
+            data_path: config.data_path.clone(),
+            process_started_unix_ms: u64::try_from(started_at.timestamp_millis()).unwrap_or_default(),
+            service: service.clone(),
+            node: Arc::clone(&node),
+            placement: placement.clone(),
+            cells: config.cells.len(),
+        })?),
+        None => None,
+    };
     let (heartbeat_stop, heartbeat_task) = start_heartbeat_publisher(
         Arc::clone(&object_store),
         Path::from(config.data_path.as_str()),
@@ -414,9 +444,12 @@ async fn run_node(
     );
     tracing::info!(
         node_id = %config.node_id,
-        bolt_addr = %bolt.local_addr(),
-        http_addr = %http.local_addr(),
+        bolt_addr = %listeners.bolt_addr(),
+        http_addr = %listeners.http_addr(),
         admin_addr = %admin.local_addr(),
+        // Absent from the line when unset.
+        internal_bolt_addr = listeners.internal_bolt_addr().map(tracing::field::display),
+        internal_http_addr = listeners.internal_http_addr().map(tracing::field::display),
         "graph node listeners started"
     );
 
@@ -446,8 +479,14 @@ async fn run_node(
     // the listeners drain.
     placement_refresh.abort();
     admin.stop().await?;
-    http.stop().await?;
-    bolt.stop().await?;
+    listeners.stop().await?;
+    if let Some(followers) = buddy_wal_followers {
+        followers.stop().await;
+    }
+    #[cfg(feature = "query-telemetry")]
+    if let Some(reporter) = &failure_reporter {
+        reporter.shutdown(Duration::from_secs(5)).await;
+    }
     if let Some(tls_reloader) = tls_reloader {
         tls_reloader.stop().await;
     }
@@ -461,13 +500,18 @@ async fn run_node(
         let _ = stop.send(true);
         task.await??;
     }
+    // After the listeners have drained, so the final usage report counts every
+    // query this process served; before `drop(service)` and the `try_unwrap`
+    // below, for the same reason as the metric collection.
+    if let Some(usage_reporter) = usage_reporter {
+        usage_reporter.stop().await;
+    }
     // Before `drop(service)` and before the `try_unwrap` below: the task holds
     // a clone of both, so a collection still in flight would turn a clean
     // shutdown into "graph node still has active runtime references".
     metric_collection.stop().await;
     drop(service);
-    let node =
-        Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
+    let node = Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
     node.close().await?;
     tracing::info!(node_id = %config.node_id, "graph node stopped");
     Ok(())
@@ -477,17 +521,12 @@ fn start_indexer_change_notifier(
     url: String,
     wake: Arc<tokio::sync::Notify>,
     bearer_token: String,
-) -> RuntimeResult<(
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<RuntimeResult<()>>,
-)> {
+) -> RuntimeResult<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<RuntimeResult<()>>)> {
     let url = reqwest::Url::parse(&url)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("GRAPH_INDEXER_NOTIFY_URL must use http or https".into());
     }
-    let client = reqwest::Client::builder()
-        .timeout(INDEXER_NOTIFY_TIMEOUT)
-        .build()?;
+    let client = reqwest::Client::builder().timeout(INDEXER_NOTIFY_TIMEOUT).build()?;
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
@@ -524,10 +563,7 @@ fn start_indexer_change_notifier(
 fn start_writer_lease_reconciler(
     node: Arc<ScopedRoutedGraphCluster>,
     interval: Duration,
-) -> (
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<RuntimeResult<()>>,
-) {
+) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<RuntimeResult<()>>) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -570,8 +606,8 @@ fn start_writer_lease_reconciler(
 /// up but unready must leave *no* object behind. That is why the unready branch
 /// DELETEs instead of skipping the PUT — a stale object would keep advertising a
 /// node that is not serving until it aged out. This is the one place the loop
-/// diverges from sleet's publisher (`../sleet/src/daemon.rs:213-310`), which
-/// publishes unconditionally.
+/// diverges from the heartbeat publisher it was adapted from, which publishes
+/// unconditionally.
 ///
 /// "Ready" is [`NodeReadiness`], the same value `/readyz` reports, so the two
 /// answers cannot drift apart — and it folds in decision 7's obligation: a node
@@ -590,10 +626,7 @@ fn start_heartbeat_publisher(
     ready: NodeReadiness,
     started_at: DateTime<Utc>,
     interval: Duration,
-) -> (
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
@@ -667,10 +700,7 @@ fn start_index_discovery(
     node: Arc<ScopedRoutedGraphCluster>,
     cells: Vec<String>,
     interval: Duration,
-) -> (
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<RuntimeResult<()>>,
-) {
+) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<RuntimeResult<()>>) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
@@ -692,9 +722,7 @@ fn start_index_discovery(
                     match shard.dirty_graph_index_edge_types(cell_id).await {
                         Ok(edge_types) => {
                             for (edge_type, _) in edge_types {
-                                if let Err(error) =
-                                    shard.discover_graph_index(cell_id, &edge_type).await
-                                {
+                                if let Err(error) = shard.discover_graph_index(cell_id, &edge_type).await {
                                     tracing::warn!(
                                         scope = %cluster.scope(),
                                         cell_id,
@@ -730,10 +758,7 @@ fn start_index_discovery(
 fn start_writer_ownership_reconciler(
     node: Arc<ScopedRoutedGraphCluster>,
     interval: Duration,
-) -> (
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<RuntimeResult<()>>,
-) {
+) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<RuntimeResult<()>>) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(100)));
@@ -767,8 +792,7 @@ fn start_writer_ownership_reconciler(
 async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(unix)]
     {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
             _ = terminate.recv() => {},

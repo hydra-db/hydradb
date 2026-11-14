@@ -39,6 +39,16 @@ pub enum QueryFailureReason {
     /// A supported query that failed while evaluating a value: overflow,
     /// division by zero, an operand of the wrong type.
     Evaluation,
+    /// A supported iterative algorithm that did not reach its tolerance
+    /// within its iteration limit, so it has no answer to return.
+    NotConverged,
+    /// A supported read over an index generation whose changes since cannot
+    /// be read back, so its answer would be unchecked.
+    IndexBehind,
+    /// A supported read or write of a property a write-back has started and
+    /// not completed, whose values and index disagree until a run of it
+    /// completes.
+    WriteBackInProgress,
     /// Anything not yet placed in a bucket. A non-zero rate means a failure
     /// site needs one.
     Other,
@@ -46,7 +56,7 @@ pub enum QueryFailureReason {
 
 impl QueryFailureReason {
     /// Every reason, in [`Self::index`] order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::ParseError,
         Self::UntypedStatement,
         Self::Pattern,
@@ -60,6 +70,9 @@ impl QueryFailureReason {
         Self::Procedure,
         Self::InvalidRequest,
         Self::Evaluation,
+        Self::NotConverged,
+        Self::IndexBehind,
+        Self::WriteBackInProgress,
         Self::Other,
     ];
 
@@ -82,6 +95,9 @@ impl QueryFailureReason {
             Self::Procedure => "unsupported_procedure",
             Self::InvalidRequest => "invalid_request",
             Self::Evaluation => "evaluation_error",
+            Self::NotConverged => "not_converged",
+            Self::IndexBehind => "index_behind",
+            Self::WriteBackInProgress => "write_back_in_progress",
             Self::Other => "unsupported_other",
         }
     }
@@ -102,9 +118,7 @@ impl QueryFailureReason {
             "ORDER" | "SKIP" | "LIMIT" => Self::OrderWindow,
             "UNION" => Self::Union,
             "UNWIND" => Self::Unwind,
-            "CREATE" | "MERGE" | "SET" | "DELETE" | "DETACH" | "REMOVE" | "FOREACH" => {
-                Self::Mutation
-            }
+            "CREATE" | "MERGE" | "SET" | "DELETE" | "DETACH" | "REMOVE" | "FOREACH" => Self::Mutation,
             "CALL" => Self::Procedure,
             _ => return None,
         })

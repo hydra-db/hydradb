@@ -44,8 +44,8 @@
 //! Likewise a stray object under the prefix is skipped, not fatal. One
 //! unparseable name must not poison the live set for the whole fleet.
 //!
-//! Ported from `sleet/src/heartbeat.rs` and `sleet/src/root.rs:129-220`, minus
-//! sleet's service-letter suffix, which has no analogue here. The suffix is
+//! Adapted from a proven heartbeat implementation, minus its service-letter
+//! suffix, which has no analogue here. The suffix is
 //! where per-node cell subsets would go if nodes ever stop serving every cell —
 //! in the *name*, so placement still needs no GETs. [`object_name`] and
 //! [`parse_object_name`] are the seam that change lands on, which is why they
@@ -290,10 +290,7 @@ pub(crate) fn name_rule_violation(value: &str) -> Option<&'static str> {
         Some("must not be empty")
     } else if value == "." || value == ".." {
         Some("must not be a relative path segment")
-    } else if !value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-    {
+    } else if !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
         Some("must be ASCII alphanumeric, '_', '-' or '.'")
     } else {
         None
@@ -339,9 +336,7 @@ pub fn heartbeat_prefix(base: &Path) -> Path {
 /// constant produces the single segment `_graph_nodes%2Fv1`, and re-parsing
 /// `format!("{base}/{prefix}")` encodes any `%` already in `base` a second time.
 pub(crate) fn versioned_prefix(base: &Path, prefix: &str) -> Path {
-    prefix
-        .split('/')
-        .fold(base.clone(), |path, segment| path.join(segment))
+    prefix.split('/').fold(base.clone(), |path, segment| path.join(segment))
 }
 
 /// The full path of one node's heartbeat object.
@@ -354,11 +349,7 @@ pub fn heartbeat_path(base: &Path, node_id: &str) -> Result<Path, PlacementError
 ///
 /// The path comes from `body.node_id`, so the name and the body cannot
 /// disagree — there is no second place to pass an id and get it wrong.
-pub async fn put_heartbeat(
-    store: &dyn ObjectStore,
-    base: &Path,
-    body: &Heartbeat,
-) -> Result<(), PlacementError> {
+pub async fn put_heartbeat(store: &dyn ObjectStore, base: &Path, body: &Heartbeat) -> Result<(), PlacementError> {
     let path = heartbeat_path(base, &body.node_id)?;
     let payload = serde_json::to_vec(body).map_err(|source| PlacementError::EncodeBody {
         node_id: body.node_id.clone(),
@@ -383,11 +374,7 @@ pub async fn put_heartbeat(
 /// already-absent object is the normal case and not a failure. Reporting it
 /// would make the caller's retry loop log an error every five seconds while
 /// behaving perfectly.
-pub async fn delete_heartbeat(
-    store: &dyn ObjectStore,
-    base: &Path,
-    node_id: &str,
-) -> Result<(), PlacementError> {
+pub async fn delete_heartbeat(store: &dyn ObjectStore, base: &Path, node_id: &str) -> Result<(), PlacementError> {
     let path = heartbeat_path(base, node_id)?;
     match store.delete(&path).await {
         Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
@@ -416,11 +403,7 @@ pub async fn delete_heartbeat(
 ///   one skipped entry, not the whole live set.
 /// - **A future `LastModified` saturates to [`Duration::ZERO`].** Reverse clock
 ///   skew makes a heartbeat maximally fresh, never dead.
-pub async fn list_heartbeats(
-    store: &dyn ObjectStore,
-    base: &Path,
-    now: DateTime<Utc>,
-) -> Result<Vec<HeartbeatEntry>, PlacementError> {
+pub async fn list_heartbeats(store: &dyn ObjectStore, base: &Path, now: DateTime<Utc>) -> Result<Vec<HeartbeatEntry>, PlacementError> {
     let prefix = heartbeat_prefix(base);
     let metas = match store.list(Some(&prefix)).try_collect::<Vec<_>>().await {
         Ok(metas) => metas,
@@ -461,7 +444,7 @@ pub async fn list_heartbeats(
 ///
 /// The depth check is the part worth keeping. LIST is recursive, so anything
 /// nested below the prefix comes back too, and taking the last path segment —
-/// which is what sleet does, over a flat prefix — would read
+/// which is what a flat-prefix layout can get away with — would read
 /// `…/v1/graph-node-0/scratch` as a heartbeat for a node called `scratch`.
 fn node_id_at(prefix: &Path, location: &Path) -> Option<String> {
     let mut parts = location.prefix_match(prefix)?;

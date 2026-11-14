@@ -39,6 +39,8 @@ struct ObjectSummary {
     reused_edge_id_cells: u64,
     relationship_pairs_without_adjacency: u64,
     adjacency_pairs_without_relationships: u64,
+    dangling_tensor_cells: u64,
+    empty_tensor_cells: u64,
     labeled_nodes: usize,
     adjacency_pairs: usize,
     elapsed_microseconds: u64,
@@ -60,6 +62,8 @@ struct ScanSummary {
     reused_edge_id_cells: u64,
     relationship_pairs_without_adjacency: u64,
     adjacency_pairs_without_relationships: u64,
+    dangling_tensor_cells: u64,
+    empty_tensor_cells: u64,
     labeled_nodes: u64,
     adjacency_pairs: u64,
     workers: usize,
@@ -115,10 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 };
                 match scan_object(root, object) {
-                    Ok(summary) => summaries
-                        .lock()
-                        .expect("summary mutex poisoned")
-                        .push(summary),
+                    Ok(summary) => summaries.lock().expect("summary mutex poisoned").push(summary),
                     Err(error) => {
                         failures
                             .lock()
@@ -135,12 +136,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "failure mutex poisoned")?;
     if !failures.is_empty() {
         failures.sort();
-        return Err(format!(
-            "{} object(s) failed validation:\n{}",
-            failures.len(),
-            failures.join("\n")
-        )
-        .into());
+        return Err(format!("{} object(s) failed validation:\n{}", failures.len(), failures.join("\n")).into());
     }
     let mut results = Arc::try_unwrap(summaries)
         .map_err(|_| "scan summary still shared")?
@@ -148,12 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "summary mutex poisoned")?;
     results.sort_by(|left, right| left.object.cmp(&right.object));
     if results.len() != objects.len() {
-        return Err(format!(
-            "decoded {} objects, expected {}",
-            results.len(),
-            objects.len()
-        )
-        .into());
+        return Err(format!("decoded {} objects, expected {}", results.len(), objects.len()).into());
     }
     let elapsed = started.elapsed();
     let summary = ScanSummary {
@@ -165,35 +156,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         nodes: results.iter().map(|item| item.nodes as u64).sum(),
         edge_records: results.iter().map(|item| item.edge_records as u64).sum(),
         relationships: results.iter().map(|item| item.relationships as u64).sum(),
-        relationships_with_missing_endpoints: results
-            .iter()
-            .map(|item| item.relationships_with_missing_endpoints)
-            .sum(),
-        relationship_cells_without_records: results
-            .iter()
-            .map(|item| item.relationship_cells_without_records)
-            .sum(),
-        edge_records_without_cells: results
-            .iter()
-            .map(|item| item.edge_records_without_cells)
-            .sum(),
+        relationships_with_missing_endpoints: results.iter().map(|item| item.relationships_with_missing_endpoints).sum(),
+        relationship_cells_without_records: results.iter().map(|item| item.relationship_cells_without_records).sum(),
+        edge_records_without_cells: results.iter().map(|item| item.edge_records_without_cells).sum(),
         reused_edge_id_cells: results.iter().map(|item| item.reused_edge_id_cells).sum(),
-        relationship_pairs_without_adjacency: results
-            .iter()
-            .map(|item| item.relationship_pairs_without_adjacency)
-            .sum(),
-        adjacency_pairs_without_relationships: results
-            .iter()
-            .map(|item| item.adjacency_pairs_without_relationships)
-            .sum(),
+        relationship_pairs_without_adjacency: results.iter().map(|item| item.relationship_pairs_without_adjacency).sum(),
+        adjacency_pairs_without_relationships: results.iter().map(|item| item.adjacency_pairs_without_relationships).sum(),
+        dangling_tensor_cells: results.iter().map(|item| item.dangling_tensor_cells).sum(),
+        empty_tensor_cells: results.iter().map(|item| item.empty_tensor_cells).sum(),
         labeled_nodes: results.iter().map(|item| item.labeled_nodes as u64).sum(),
         adjacency_pairs: results.iter().map(|item| item.adjacency_pairs as u64).sum(),
         workers,
         elapsed_milliseconds: elapsed.as_millis(),
         objects_per_second: results.len() as f64 / elapsed.as_secs_f64(),
-        mebibytes_per_second: manifest.dump_bytes as f64
-            / (1024.0 * 1024.0)
-            / elapsed.as_secs_f64(),
+        mebibytes_per_second: manifest.dump_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
         results,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -202,11 +178,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), Box<dyn std::error::Error>> {
     if manifest.format != SNAPSHOT_FORMAT {
-        return Err(format!(
-            "snapshot format is {}, expected {SNAPSHOT_FORMAT}",
-            manifest.format
-        )
-        .into());
+        return Err(format!("snapshot format is {}, expected {SNAPSHOT_FORMAT}", manifest.format).into());
     }
     if manifest.dumped_graphs != manifest.objects.len() {
         return Err(format!(
@@ -218,32 +190,16 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), Box<dyn std::error::Erro
     }
     let listed_bytes: u64 = manifest.objects.iter().map(|object| object.bytes).sum();
     if listed_bytes != manifest.dump_bytes {
-        return Err(format!(
-            "manifest says {} bytes but object list totals {listed_bytes}",
-            manifest.dump_bytes
-        )
-        .into());
+        return Err(format!("manifest says {} bytes but object list totals {listed_bytes}", manifest.dump_bytes).into());
     }
-    if let Some(object) = manifest
-        .objects
-        .iter()
-        .find(|object| object.status != "dumped")
-    {
+    if let Some(object) = manifest.objects.iter().find(|object| object.status != "dumped") {
         return Err(format!("{} has status {}", object.object, object.status).into());
     }
     let mut paths = BTreeSet::new();
     for object in &manifest.objects {
         let path = Path::new(&object.object);
-        if path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(format!(
-                "object path {:?} is not a safe relative path",
-                object.object
-            )
-            .into());
+        if path.as_os_str().is_empty() || path.components().any(|component| !matches!(component, Component::Normal(_))) {
+            return Err(format!("object path {:?} is not a safe relative path", object.object).into());
         }
         if !paths.insert(object.object.as_str()) {
             return Err(format!("object path {:?} is duplicated", object.object).into());
@@ -252,20 +208,12 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn scan_object(
-    root: &Path,
-    object: &ManifestObject,
-) -> Result<ObjectSummary, Box<dyn std::error::Error>> {
+fn scan_object(root: &Path, object: &ManifestObject) -> Result<ObjectSummary, Box<dyn std::error::Error>> {
     let started = Instant::now();
     let path = root.join(&object.object);
     let bytes = std::fs::read(&path)?;
     if bytes.len() as u64 != object.bytes {
-        return Err(format!(
-            "holds {} bytes, manifest says {}",
-            bytes.len(),
-            object.bytes
-        )
-        .into());
+        return Err(format!("holds {} bytes, manifest says {}", bytes.len(), object.bytes).into());
     }
     let digest = format!("{:x}", Sha256::digest(&bytes));
     if digest != object.sha256.to_ascii_lowercase() {
@@ -273,11 +221,7 @@ fn scan_object(
     }
     let graph = falkordb_rdb::decode_dump(&bytes)?;
     if graph.name != object.graph_utf8 {
-        return Err(format!(
-            "payload graph name {:?}, manifest says {:?}",
-            graph.name, object.graph_utf8
-        )
-        .into());
+        return Err(format!("payload graph name {:?}, manifest says {:?}", graph.name, object.graph_utf8).into());
     }
     graph.validate_reconciliation()?;
     let reconciliation = graph.reconciliation_diagnostics();
@@ -292,6 +236,8 @@ fn scan_object(
         reused_edge_id_cells: reconciliation.reused_edge_id_cells,
         relationship_pairs_without_adjacency: reconciliation.relationship_pairs_without_adjacency,
         adjacency_pairs_without_relationships: reconciliation.adjacency_pairs_without_relationships,
+        dangling_tensor_cells: reconciliation.dangling_tensor_cells,
+        empty_tensor_cells: reconciliation.empty_tensor_cells,
         labeled_nodes: graph.labels.len(),
         adjacency_pairs: graph.adjacency.len(),
         elapsed_microseconds: started.elapsed().as_micros().min(u64::MAX as u128) as u64,

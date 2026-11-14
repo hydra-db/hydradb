@@ -1,5 +1,8 @@
+use super::value_type::GqlType;
+use hydradb_cypher_ast::{NullOrdering, PathSearchKind, QueryConjunction};
+
 use crate::{
-    AggregateFunction, BoundValue, PatternDirection, ScalarFunction, ScalarValue, SortDirection,
+    AggregateFunction, BoundValue, ElementTestKind, PathPart, PathWord, PatternDirection, ScalarFunction, ScalarValue, SortDirection,
     Symbol,
 };
 
@@ -13,12 +16,18 @@ pub enum PhysicalBinaryOperator {
     GreaterThanOrEqual,
     And,
     Or,
+    Xor,
     Add,
     Subtract,
     Multiply,
     Divide,
     Modulo,
     StartsWith,
+    EndsWith,
+    Contains,
+    Concatenate,
+    /// Membership in a list computed per row; see `LogicalBinaryOperator::In`.
+    In,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -44,6 +53,9 @@ pub enum PhysicalExpression {
         function: AggregateFunction,
         distinct: bool,
         expression: Option<Box<PhysicalExpression>>,
+        /// See [`crate::LogicalExpression::Aggregate`].
+        fraction: Option<Box<PhysicalExpression>>,
+        group: Option<Symbol>,
     },
     Function {
         function: ScalarFunction,
@@ -71,6 +83,46 @@ pub enum PhysicalExpression {
         expression: Box<PhysicalExpression>,
         values: Vec<BoundValue>,
     },
+    /// See [`crate::LogicalExpression::ElementTest`].
+    ElementTest {
+        binding: Symbol,
+        test: ElementTestKind,
+    },
+    /// See [`crate::LogicalExpression::TypeTest`].
+    TypeTest {
+        expression: Box<PhysicalExpression>,
+        value_type: GqlType,
+        negated: bool,
+    },
+    /// See [`crate::LogicalExpression::Cast`].
+    Cast {
+        expression: Box<PhysicalExpression>,
+        value_type: GqlType,
+        request: Option<Box<PhysicalExpression>>,
+    },
+    /// See [`crate::LogicalExpression::Record`].
+    Record(Vec<(Symbol, PhysicalExpression)>),
+    /// See [`crate::LogicalExpression::Let`].
+    Let {
+        bindings: Vec<(Symbol, PhysicalExpression)>,
+        body: Box<PhysicalExpression>,
+    },
+    /// See [`crate::LogicalExpression::PathConstructor`].
+    PathConstructor(Vec<PhysicalExpression>),
+    /// See [`crate::LogicalExpression::Field`].
+    Field {
+        expression: Box<PhysicalExpression>,
+        field: Symbol,
+    },
+    /// GQL's SIMPLE and ACYCLIC path modes (§22.2 General Rule 16 d) ii)):
+    /// whether the path through `parts` repeats no node, the first and last
+    /// excepted when `simple`. Each part is a node name, or, flagged, the
+    /// name of a variable-length hop's relationship list, whose inner nodes
+    /// count too.
+    PathNodesDistinct {
+        simple: bool,
+        parts: Vec<PathPart>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,62 +140,119 @@ impl PhysicalProjection {
     }
 }
 
+/// [`expression_name`], except that a value bound from a parameter keeps the
+/// parameter's spelling. A column name must not depend on the values a query
+/// is run with, and binding has already replaced `$i` by its value.
+fn written_name(expression: &PhysicalExpression) -> String {
+    match expression {
+        PhysicalExpression::Value(crate::BoundValue {
+            origin: crate::ValueOrigin::Parameter(name),
+            ..
+        }) => {
+            let name = name.as_str();
+            if name.starts_with('$') {
+                name.to_string()
+            } else {
+                format!("${name}")
+            }
+        }
+        expression => expression_name(expression),
+    }
+}
+
 fn expression_name(expression: &PhysicalExpression) -> String {
     match expression {
         PhysicalExpression::Binding(binding) => binding.to_string(),
         PhysicalExpression::Identity(binding) => format!("{binding}.id"),
+        PhysicalExpression::ElementTest { binding, test } => test.expression_name(binding),
+        PhysicalExpression::TypeTest {
+            expression,
+            value_type,
+            negated,
+        } => format!(
+            "{} IS {}TYPED {value_type}",
+            expression_name(expression),
+            if *negated { "NOT " } else { "" }
+        ),
+        PhysicalExpression::Cast {
+            expression, value_type, ..
+        } => format!("CAST({} AS {value_type})", expression_name(expression)),
+        PhysicalExpression::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", expression_name(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PhysicalExpression::Field { expression, field } => format!("{}.{field}", expression_name(expression)),
+        PhysicalExpression::Let { bindings, body } => format!(
+            "LET {} IN {} END",
+            bindings
+                .iter()
+                .map(|(name, value)| format!("{name} = {}", expression_name(value)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            expression_name(body)
+        ),
+        PhysicalExpression::PathConstructor(elements) => {
+            format!("PATH[{}]", elements.iter().map(expression_name).collect::<Vec<_>>().join(", "))
+        }
+        PhysicalExpression::PathNodesDistinct { simple, parts } => format!(
+            "{}({})",
+            if *simple { "simple" } else { "acyclic" },
+            parts.iter().map(|part| part.name().as_str()).collect::<Vec<_>>().join(", ")
+        ),
         PhysicalExpression::Property { binding, property } => format!("{binding}.{property}"),
         PhysicalExpression::Value(value) => match &value.value {
             ScalarValue::Null => "NULL".to_string(),
             ScalarValue::Boolean(value) => value.to_string(),
             ScalarValue::Integer(value) => value.to_string(),
             ScalarValue::Float(value) | ScalarValue::String(value) => value.to_string(),
+            ScalarValue::Decimal(value) => format!("{value}M"),
+            ScalarValue::Bytes(value) => format!("X'{}'", hydradb_cypher_ast::bytes::hex(value)),
+            ScalarValue::Date(value) => format!("DATE_EPOCH_DAY({value})"),
+            ScalarValue::List(values) => format!("{values:?}"),
         },
         PhysicalExpression::InList { expression, values } => {
-            format!(
-                "{} IN [{} values]",
-                expression_name(expression),
-                values.len()
-            )
+            format!("{} IN [{} values]", expression_name(expression), values.len())
         }
         PhysicalExpression::Aggregate {
             function,
             distinct,
             expression,
+            fraction,
+            ..
         } => format!(
-            "{}({}{})",
+            "{}({}{}{})",
             function.name(),
             if *distinct { "DISTINCT " } else { "" },
-            expression
+            expression.as_deref().map(expression_name).unwrap_or_else(|| "*".to_string()),
+            fraction
                 .as_deref()
-                .map(expression_name)
-                .unwrap_or_else(|| "*".to_string())
+                .map(|fraction| format!(", {}", expression_name(fraction)))
+                .unwrap_or_default()
         ),
         PhysicalExpression::Case { .. } => "CASE".to_string(),
-        PhysicalExpression::List(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(expression_name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        PhysicalExpression::List(items) => format!("[{}]", items.iter().map(expression_name).collect::<Vec<_>>().join(", ")),
+        // `list[index]` is written as a postfix, so its column keeps that form,
+        // with parameters named as written: `n.tags[$i]`, whatever `$i` holds.
         PhysicalExpression::Function {
-            function,
+            function: super::ScalarFunction::IdProperty,
             arguments,
-        } => format!(
+        } => {
+            format!("{}.id", expression_name(&arguments[0]))
+        }
+        PhysicalExpression::Function {
+            function: crate::ScalarFunction::ListElement,
+            arguments,
+        } if arguments.len() == 2 => format!("{}[{}]", written_name(&arguments[0]), written_name(&arguments[1])),
+        PhysicalExpression::Function { function, arguments } => format!(
             "{}({})",
             function.name(),
-            arguments
-                .iter()
-                .map(expression_name)
-                .collect::<Vec<_>>()
-                .join(", ")
+            arguments.iter().map(expression_name).collect::<Vec<_>>().join(", ")
         ),
-        PhysicalExpression::Unary {
-            operator,
-            expression,
-        } => {
+        PhysicalExpression::Unary { operator, expression } => {
             let operand = expression_name(expression);
             match operator {
                 PhysicalUnaryOperator::Not => format!("NOT {operand}"),
@@ -161,20 +270,8 @@ fn expression_name(expression: &PhysicalExpression) -> String {
 pub struct PhysicalSort {
     pub expression: PhysicalExpression,
     pub direction: SortDirection,
-}
-
-/// What a [`GraphPhysicalPlan::VertexGuardedAccess`] reads while its guard
-/// holds.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GuardedAccess {
-    /// Seek the vertices whose `property` equals any of `values`.
-    PropertySeek {
-        property: Symbol,
-        values: Vec<BoundValue>,
-    },
-    /// Scan every vertex carrying `label`; the node's `labels` are checked on
-    /// the rows.
-    LabelScan { label: Symbol },
+    /// See [`crate::LogicalSort::nulls`].
+    pub nulls: Option<NullOrdering>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,63 +283,20 @@ pub enum GraphPhysicalPlan {
         input: Box<GraphPhysicalPlan>,
         expression: PhysicalExpression,
         binding: Symbol,
+        requires_list: bool,
+        /// See [`crate::GraphLogicalPlan::Unwind`].
+        position: Option<(Symbol, i128)>,
     },
+    /// A composite query (GQL §14.2): the arms joined, left to right, by one
+    /// conjunction. `all` keeps duplicates; it means nothing to `OTHERWISE`.
     Union {
         arms: Vec<GraphPhysicalPlan>,
         all: bool,
+        conjunction: QueryConjunction,
     },
-    VertexIdSeek {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        value: BoundValue,
-    },
-    VertexPropertySeek {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        property: Symbol,
-        value: BoundValue,
-    },
-    VertexPropertyMultiSeek {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        property: Symbol,
-        values: Vec<BoundValue>,
-    },
-    VertexPropertyScan {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        property: Symbol,
-    },
-    /// Bounded ordered walk of one vertex property index. Replaces
-    /// `Sort(Filter(VertexPropertyScan))` beneath a constant window when the
-    /// index alone proves the whole predicate and the requested order, so the
-    /// executor reads only the leading `required` rows (plus the final tie)
-    /// instead of hydrating and sorting the complete property population.
-    OrderedVertexPropertyScan {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        property: Symbol,
-        direction: SortDirection,
-        /// `property STARTS WITH prefix`, when present.
-        prefix: Option<BoundValue>,
-        /// Exclusive or inclusive lower bound on the property, when present.
-        lower: Option<(BoundValue, bool)>,
-        /// Exclusive or inclusive upper bound on the property, when present.
-        upper: Option<(BoundValue, bool)>,
-        /// `SKIP + LIMIT` of the enclosing window: the number of leading rows
-        /// the scan must prove before it may stop.
-        required: usize,
-        /// The complete requested order, applied in memory to the bounded
-        /// window so tie-breakers such as `n.id` stay deterministic.
-        items: Vec<PhysicalSort>,
-        /// The conjuncts the index cannot prove, which the scan applies to
-        /// each row itself. This is the only thing standing in for the Filter
-        /// the scan replaced, so a row reaching the caller has passed it.
-        ///
-        /// Its presence is what makes the walk unbounded in index entries
-        /// while staying bounded in rows: rejected rows do not count against
-        /// `required`, so the scan must keep reading until that many survive.
-        residual: Option<PhysicalExpression>,
+    /// Provider-prepared vertex reads, including their output and ordering guarantees.
+    VertexScan {
+        scan: crate::PreparedVertexScan,
     },
     /// Bounded ordered walk of one relationship property index: the
     /// relationship counterpart of `OrderedVertexPropertyScan`. Replaces
@@ -270,19 +324,6 @@ pub enum GraphPhysicalPlan {
         required: usize,
         items: Vec<PhysicalSort>,
         residual: Option<PhysicalExpression>,
-    },
-    VertexLabelScan {
-        binding: Symbol,
-        /// Label used to seed the storage scan. The planner chooses the
-        /// smallest persisted marginal when more than one label is required.
-        label: Symbol,
-        /// Complete semantic label predicate. Keeping this separate from the
-        /// scan label prevents a multi-label pattern from silently accepting
-        /// vertices that carry only the chosen anchor label.
-        labels: Vec<Symbol>,
-    },
-    AllVertexScan {
-        binding: Symbol,
     },
     RelationshipPropertySeek {
         from: Symbol,
@@ -324,51 +365,6 @@ pub enum GraphPhysicalPlan {
         direction: PatternDirection,
         to: Symbol,
         target_labels: Vec<Symbol>,
-        fallback: Box<GraphPhysicalPlan>,
-    },
-    /// Bounded read of one vertex property index between optional bounds,
-    /// chosen from stored statistics because the range looked narrower than
-    /// every equality and the label. Same shape as
-    /// `RelationshipPropertyRangeProbe`: the read is a candidate superset, the
-    /// `Filter` above it still applies the whole predicate, and once it has
-    /// read more than `read_limit` index entries it declines and `fallback`
-    /// -- the plan the planner picks without statistics -- runs, with the
-    /// enclosing `Filter`'s runtime probe allowed as it is on that plan
-    /// today. See [`GraphPhysicalPlan::VertexGuardedAccess`].
-    ///
-    /// `estimated_rows` and `read_limit` are derived from statistics, so they
-    /// render redacted in a plan shape and a refresh does not churn its hash.
-    VertexPropertyRangeSeek {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        property: Symbol,
-        /// Exclusive or inclusive lower bound, when present.
-        lower: Option<(BoundValue, bool)>,
-        /// Exclusive or inclusive upper bound, when present.
-        upper: Option<(BoundValue, bool)>,
-        estimated_rows: u64,
-        read_limit: usize,
-        fallback: Box<GraphPhysicalPlan>,
-    },
-    /// An equality seek or a label scan chosen from stored statistics. The
-    /// planner is confident in it, so it runs without the runtime equality
-    /// probe; its read limit is the guard instead. Once it has read more than
-    /// `read_limit` index entries it declines and `fallback` -- the plan the
-    /// planner picks without statistics -- runs, under the enclosing `Filter`
-    /// with the probe allowed exactly as before statistics existed. A wrong
-    /// estimate therefore costs the entries read before the decline, and
-    /// after it no more than today's plan.
-    ///
-    /// Like the range seek, the read is a candidate superset: the `Filter`
-    /// above it applies the whole predicate. `estimated_rows` and
-    /// `read_limit` are derived from statistics and render redacted in a plan
-    /// shape.
-    VertexGuardedAccess {
-        binding: Symbol,
-        labels: Vec<Symbol>,
-        access: GuardedAccess,
-        estimated_rows: u64,
-        read_limit: usize,
         fallback: Box<GraphPhysicalPlan>,
     },
     /// Enter the pattern through the relationship type instead of a vertex
@@ -414,13 +410,85 @@ pub enum GraphPhysicalPlan {
         /// `None` for an unbounded pattern (`*`, `*2..`): trail semantics end
         /// every walk, and the query's row budgets bound how far it gets.
         max_hops: Option<u8>,
+        /// See [`crate::GraphLogicalPlan::VariableExpand`].
+        trail: bool,
+        nodes: crate::WalkNodes,
+        iteration: Option<crate::IterationPlan<GraphPhysicalPlan>>,
     },
     NaturalJoin {
         left: Box<GraphPhysicalPlan>,
         right: Box<GraphPhysicalPlan>,
         optional: bool,
     },
+    /// `EXISTS { ... }` as a mark join (GQL §19.4): every input row once,
+    /// with `binding` holding whether `subquery`, run correlated with that
+    /// row, yields at least one row.
+    Exists {
+        input: Box<GraphPhysicalPlan>,
+        subquery: Box<GraphPhysicalPlan>,
+        binding: Symbol,
+    },
+    /// `VALUE { ... }` (GQL §20.6): every input row once, with `binding`
+    /// holding `column` of the one row `subquery`, run correlated with that
+    /// row, yields; null when it yields none.
+    ScalarSubquery {
+        input: Box<GraphPhysicalPlan>,
+        subquery: Box<GraphPhysicalPlan>,
+        column: Symbol,
+        binding: Symbol,
+    },
+    /// See [`crate::GraphLogicalPlan::CallProcedure`].
+    CallProcedure {
+        input: Box<GraphPhysicalPlan>,
+        subquery: Box<GraphPhysicalPlan>,
+        imports: Vec<Symbol>,
+        columns: Vec<Symbol>,
+        outputs_to_record: bool,
+        optional: bool,
+    },
+    /// GQL's `FINISH` (§14.10): `input` runs, and the result is omitted.
+    Next {
+        input: Box<GraphPhysicalPlan>,
+        next: Box<GraphPhysicalPlan>,
+    },
+    Finish {
+        input: Box<GraphPhysicalPlan>,
+    },
+    /// A path variable and its subpath variables (GQL §16.4, §16.7, G004,
+    /// G048): each of `names` bound to the path value `input`'s row binds
+    /// through `parts`.
+    BindPath {
+        input: Box<GraphPhysicalPlan>,
+        names: Vec<Symbol>,
+        parts: Vec<PathPart>,
+        /// See [`crate::GraphLogicalPlan::BindPath`].
+        node_groups: Vec<(Symbol, bool)>,
+    },
+    /// A selective path search (GQL §22.4): `input`'s rows, the matches of
+    /// one path pattern, partitioned by the nodes bound to `first` and
+    /// `last`, of which each partition keeps what `kind` and `count` select.
+    /// A path's length is `fixed_edges` plus the lengths of the relationship
+    /// lists named in `lists`.
+    SelectPaths {
+        input: Box<GraphPhysicalPlan>,
+        first: Symbol,
+        last: Symbol,
+        fixed_edges: usize,
+        lists: Vec<Symbol>,
+        kind: PathSearchKind,
+        count: PhysicalExpression,
+    },
+    /// A path pattern union or multiset alternation (GQL §16.7, G030 to
+    /// G033): the rows of each of `inputs`, an operand's matches, with the
+    /// names another operand binds null. For a union, `words` gives each
+    /// operand's word, and a reduced match (§16.4 General Rule 10) two
+    /// operands both find is kept once.
+    PathUnion {
+        inputs: Vec<GraphPhysicalPlan>,
+        words: Option<Vec<PathWord>>,
+    },
     Filter {
+        operation: hydradb_cypher_ast::operation::Operation,
         input: Box<GraphPhysicalPlan>,
         predicate: PhysicalExpression,
     },
@@ -438,6 +506,8 @@ pub enum GraphPhysicalPlan {
         count: BoundValue,
     },
     Project {
+        context: crate::plan::logical::ProjectionContext,
+        operation: hydradb_cypher_ast::operation::Operation,
         input: Box<GraphPhysicalPlan>,
         items: Vec<PhysicalProjection>,
         distinct: bool,
@@ -445,4 +515,42 @@ pub enum GraphPhysicalPlan {
         post_skip: Option<BoundValue>,
         post_limit: Option<BoundValue>,
     },
+}
+
+impl GraphPhysicalPlan {
+    pub(crate) fn result_omitted(&self) -> bool {
+        match self {
+            Self::Finish { .. } => true,
+            Self::Next { next, .. } => next.result_omitted(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn operation(&self) -> hydradb_cypher_ast::operation::Operation {
+        use hydradb_cypher_ast::operation;
+        match self {
+            Self::Filter { operation, .. } | Self::Project { operation, .. } => *operation,
+            Self::Sort { .. } | Self::Skip { .. } | Self::Limit { .. } => operation::ORDER_BY_AND_PAGE,
+            Self::SingleRow
+            | Self::Union { .. }
+            | Self::Exists { .. }
+            | Self::ScalarSubquery { .. }
+            | Self::Finish { .. }
+            | Self::Next { .. } => operation::UNRECOGNIZED,
+            Self::Unwind { .. } => operation::FOR,
+            Self::CallProcedure { .. } => operation::CALL_PROCEDURE,
+            Self::VertexScan { .. }
+            | Self::OrderedRelationshipPropertyScan { .. }
+            | Self::RelationshipPropertySeek { .. }
+            | Self::RelationshipPropertyMultiSeek { .. }
+            | Self::RelationshipPropertyRangeProbe { .. }
+            | Self::RelationshipTypeProbe { .. }
+            | Self::Expand { .. }
+            | Self::VariableExpand { .. }
+            | Self::SelectPaths { .. }
+            | Self::BindPath { .. }
+            | Self::PathUnion { .. }
+            | Self::NaturalJoin { .. } => operation::MATCH,
+        }
+    }
 }

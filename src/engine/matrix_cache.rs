@@ -9,16 +9,12 @@ impl GraphShard {
     ) -> Result<Arc<MatrixAdjacency>> {
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.matrix_cache.lock().await.get(&cache_key) {
-            self.cache_metrics
-                .record_hit(GraphCacheKind::MatrixAdjacency);
+            self.cache_metrics.record_hit(GraphCacheKind::MatrixAdjacency);
             return Ok(cached);
         }
 
-        self.cache_metrics
-            .record_miss(GraphCacheKind::MatrixAdjacency);
-        let _permit = self
-            .acquire_hydration_permit("cached_matrix_adjacency")
-            .await?;
+        self.cache_metrics.record_miss(GraphCacheKind::MatrixAdjacency);
+        let _permit = self.acquire_hydration_permit("cached_matrix_adjacency").await?;
         let artifact = self
             .latest_matrix_artifact(cell_id, edge_type, base_epoch)
             .await?
@@ -57,12 +53,7 @@ impl GraphShard {
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
             self.cache_metrics.record_hit(GraphCacheKind::GraphBlas);
-            record_matrix_profile(
-                matrix_profile_enabled(),
-                "graphblas_cache_hit",
-                Duration::ZERO,
-                base_epoch,
-            );
+            record_matrix_profile(matrix_profile_enabled(), "graphblas_cache_hit", Duration::ZERO, base_epoch);
             return Ok(Some(cached));
         }
 
@@ -81,56 +72,32 @@ impl GraphShard {
             return Ok(Some(cached));
         }
         let started = Instant::now();
-        let external = self
-            .graph_index_generation_at(cell_id, edge_type, base_epoch)
-            .await?;
+        let external = self.graph_index_generation_at(cell_id, edge_type, base_epoch).await?;
         let (compiled, compile_units) = if let Some(generation) = external {
             let Some(csc) = self.graph_index_csc(&generation).await? else {
                 self.forget_graph_index_generation(&generation).await;
                 return Ok(None);
             };
             let edge_count = csc.indices.len() as u64;
-            (
-                Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
-                edge_count,
-            )
+            (Arc::new(compile_graphblas_csc_owned(csc, kernel)?), edge_count)
         } else if kernel == SparseKernelBackend::CompactCsc {
-            if let Some((compiled, edge_count)) = self
-                .compact_graphblas_csc_matrix(cell_id, edge_type, base_epoch, kernel)
-                .await?
-            {
+            if let Some((compiled, edge_count)) = self.compact_graphblas_csc_matrix(cell_id, edge_type, base_epoch, kernel).await? {
                 (Arc::new(compiled), edge_count)
             } else if let Some(csc) = self.graphblas_csc(cell_id, edge_type, base_epoch).await? {
                 let edge_count = csc.indices.len() as u64;
-                (
-                    Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
-                    edge_count,
-                )
+                (Arc::new(compile_graphblas_csc_owned(csc, kernel)?), edge_count)
             } else {
-                let adjacency = self
-                    .cached_matrix_adjacency(cell_id, edge_type, base_epoch)
-                    .await?;
+                let adjacency = self.cached_matrix_adjacency(cell_id, edge_type, base_epoch).await?;
                 let edge_count = adjacency.values().map(|dsts| dsts.len() as u64).sum();
-                (
-                    Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?),
-                    edge_count,
-                )
+                (Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?), edge_count)
             }
         } else if let Some(csc) = self.graphblas_csc(cell_id, edge_type, base_epoch).await? {
             let edge_count = csc.indices.len() as u64;
-            (
-                Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
-                edge_count,
-            )
+            (Arc::new(compile_graphblas_csc_owned(csc, kernel)?), edge_count)
         } else {
-            let adjacency = self
-                .cached_matrix_adjacency(cell_id, edge_type, base_epoch)
-                .await?;
+            let adjacency = self.cached_matrix_adjacency(cell_id, edge_type, base_epoch).await?;
             let edge_count = adjacency.values().map(|dsts| dsts.len() as u64).sum();
-            (
-                Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?),
-                edge_count,
-            )
+            (Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?), edge_count)
         };
         trim_process_memory_after_hydration();
         record_matrix_profile(
@@ -162,9 +129,7 @@ impl GraphShard {
         kernel: SparseKernelBackend,
     ) -> Result<Option<(CompiledGraphBlasMatrix, u64)>> {
         let key = graphblas_csc_key(cell_id, edge_type, base_epoch);
-        let _permit = self
-            .acquire_hydration_permit("compact_graphblas_csc_matrix")
-            .await?;
+        let _permit = self.acquire_hydration_permit("compact_graphblas_csc_matrix").await?;
         let Some(value) = self.read_remote(&key).await? else {
             self.record_hydration_complete();
             return Ok(None);
@@ -175,10 +140,7 @@ impl GraphShard {
         }
 
         let manifest = decode_graphblas_csc_manifest(&key, &value)?;
-        if manifest.cell_id != cell_id
-            || manifest.edge_type != edge_type
-            || manifest.base_epoch != base_epoch
-        {
+        if manifest.cell_id != cell_id || manifest.edge_type != edge_type || manifest.base_epoch != base_epoch {
             return corrupt(&key, "GraphBLAS CSC manifest identity does not match key");
         }
 
@@ -221,12 +183,7 @@ impl GraphShard {
         Ok(Some((compiled, edge_count)))
     }
 
-    pub(crate) async fn graphblas_csc(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: StorageSequence,
-    ) -> Result<Option<GraphBlasCsc>> {
+    pub(crate) async fn graphblas_csc(&self, cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> Result<Option<GraphBlasCsc>> {
         let key = graphblas_csc_key(cell_id, edge_type, base_epoch);
         let _permit = self.acquire_hydration_permit("graphblas_csc").await?;
         let Some(value) = self.read_remote(&key).await? else {
@@ -240,10 +197,7 @@ impl GraphShard {
         }
 
         let manifest = decode_graphblas_csc_manifest(&key, &value)?;
-        if manifest.cell_id != cell_id
-            || manifest.edge_type != edge_type
-            || manifest.base_epoch != base_epoch
-        {
+        if manifest.cell_id != cell_id || manifest.edge_type != edge_type || manifest.base_epoch != base_epoch {
             return corrupt(&key, "GraphBLAS CSC manifest identity does not match key");
         }
 
@@ -334,9 +288,7 @@ impl GraphShard {
             let Some(value) = self.read_remote(&key).await? else {
                 return corrupt(&key, "missing GraphBLAS CSC chunk");
             };
-            values.extend(decode_graphblas_csc_chunk_u32(
-                &key, &value, field, chunk_id,
-            )?);
+            values.extend(decode_graphblas_csc_chunk_u32(&key, &value, field, chunk_id)?);
         }
         if values.len() as u64 != expected_len {
             return corrupt(
@@ -353,11 +305,7 @@ impl GraphShard {
     async fn load_matrix_adjacency(&self, artifact: &MatrixArtifact) -> Result<MatrixAdjacency> {
         if artifact.out_tiles == 0 {
             if let Some(generation) = self
-                .graph_index_generation_at(
-                    &artifact.cell_id,
-                    &artifact.edge_type,
-                    artifact.base_epoch,
-                )
+                .graph_index_generation_at(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch)
                 .await?
             {
                 if let Some(canonical) = self.graph_index_csc(&generation).await? {
@@ -394,12 +342,7 @@ impl GraphShard {
             }
         }
         let mut adjacency: MatrixAdjacency = BTreeMap::new();
-        let prefix = matrix_tile_prefix(
-            &artifact.cell_id,
-            &artifact.edge_type,
-            artifact.base_epoch,
-            MatrixDirection::Out,
-        );
+        let prefix = matrix_tile_prefix(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch, MatrixDirection::Out);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut tile_count = 0_u64;
         while let Some(kv) = iter.next().await? {
@@ -421,20 +364,14 @@ impl GraphShard {
         if tile_count != artifact.out_tiles {
             return corrupt(
                 &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
-                format!(
-                    "matrix tile count {tile_count} does not match manifest {}",
-                    artifact.out_tiles
-                ),
+                format!("matrix tile count {tile_count} does not match manifest {}", artifact.out_tiles),
             );
         }
         let edge_count = adjacency_edge_count(&adjacency);
         if edge_count != artifact.edge_count {
             return corrupt(
                 &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
-                format!(
-                    "matrix edge count {edge_count} does not match manifest {}",
-                    artifact.edge_count
-                ),
+                format!("matrix edge count {edge_count} does not match manifest {}", artifact.edge_count),
             );
         }
         Ok(adjacency)

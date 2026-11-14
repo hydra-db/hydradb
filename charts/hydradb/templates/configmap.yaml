@@ -5,6 +5,7 @@ metadata:
   labels:
     {{- include "hydradb.labels" . | nindent 4 }}
 data:
+  GRAPH_USAGE_REPORT_ENABLED: {{ .Values.usageReport.enabled | quote }}
   CLOUD_PROVIDER: {{ .Values.objectStore.cloudProvider | quote }}
   AWS_BUCKET_NAME: {{ required "objectStore.aws.bucketName is required" .Values.objectStore.aws.bucketName | quote }}
   AWS_DEFAULT_REGION: {{ .Values.objectStore.aws.region | quote }}
@@ -34,12 +35,15 @@ data:
   GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxRelationshipRowsBytes | quote }}
   GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxSourceRelationshipRowsBytes | quote }}
   GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxRelationshipPropertyRowsBytes | quote }}
+  GRAPH_MAX_GDS_PROJECTED_GRAPH_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxGdsProjectedGraphBytes | quote }}
   GRAPH_MAX_CONCURRENT_HYDRATIONS: {{ include "hydradb.decimalInteger" .Values.runtime.maxConcurrentHydrations | quote }}
   GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS: {{ include "hydradb.decimalInteger" .Values.runtime.maxConcurrentMatrixCompilations | quote }}
   GRAPH_INDEX_DISCOVERY_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.runtime.indexDiscoveryIntervalMs | quote }}
   GRAPH_WRITER_LEASE_MS: {{ include "hydradb.decimalInteger" .Values.runtime.writerLeaseMs | quote }}
   GRAPH_INDEXER_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.indexer.intervalMs | quote }}
+  GRAPH_INDEXER_FULL_SWEEP_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.indexer.fullSweepIntervalMs | quote }}
   GRAPH_INDEXER_DIRTY_POLL_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.indexer.dirtyPollIntervalMs | quote }}
+  GRAPH_INDEXER_CHANGE_MIN_INTERVAL_MS: {{ include "hydradb.decimalInteger" .Values.indexer.changeMinIntervalMs | quote }}
   GRAPH_INDEXER_RETAIN_PREVIOUS: {{ include "hydradb.decimalInteger" .Values.indexer.retainPreviousGenerations | quote }}
   GRAPH_INDEXER_BUILD_MODE: {{ .Values.indexer.buildMode | quote }}
   GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: {{ include "hydradb.decimalInteger" .Values.indexer.incrementalMinEdges | quote }}
@@ -48,6 +52,7 @@ data:
   GRAPH_INDEXER_MAX_OPEN_SCOPES: {{ include "hydradb.decimalInteger" .Values.indexer.maxOpenScopes | quote }}
   GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD: {{ include "hydradb.decimalInteger" .Values.indexer.readinessFailureThreshold | quote }}
   GRAPH_INDEXER_MAX_TAIL_FILES: {{ include "hydradb.decimalInteger" .Values.indexer.maxWalTailFiles | quote }}
+  GRAPH_INDEXER_MAX_ARTIFACT_BUILD_EDGES: {{ include "hydradb.decimalInteger" .Values.indexer.maxArtifactBuildEdges | quote }}
   GRAPH_WAL_TAIL_FETCH_CONCURRENCY: {{ include "hydradb.decimalInteger" .Values.indexer.walTailFetchConcurrency | quote }}
   GRAPH_INDEXER_ADMIN_ADDR: "0.0.0.0:9091"
   {{- if .Values.indexer.enabled }}
@@ -64,10 +69,20 @@ data:
   GRAPH_TLS_CERTIFICATE: /var/run/secrets/hydradb/public/tls.crt
   GRAPH_TLS_PRIVATE_KEY: /var/run/secrets/hydradb/public/tls.key
   GRAPH_ALLOW_PLAINTEXT: {{ not .Values.tls.public.enabled | quote }}
+  {{- if .Values.runtime.buddyWal }}
+  {{- if and .Values.tls.public.enabled (not .Values.tls.certManager.enabled) (not .Values.tls.public.peerCaSecretName) }}
+  {{- fail "runtime.buddyWal with TLS needs the peers' CA: set tls.public.peerCaSecretName to a Secret holding ca.crt, or issue the public certificate with tls.certManager (whose CA issuer writes ca.crt)" }}
+  {{- end }}
+  GRAPH_BUDDY_WAL: "true"
+  {{- if include "hydradb.peerCaSecretName" . }}
+  GRAPH_TLS_CA_CERTIFICATE: /var/run/secrets/hydradb/peer-ca/ca.crt
+  {{- end }}
+  {{- end }}
   GRAPH_MAX_OPEN_SCOPES: {{ include "hydradb.decimalInteger" .Values.runtime.maxOpenScopes | quote }}
-  GRAPH_READER_WAL_REPLAY_CONCURRENCY: {{ include "hydradb.decimalInteger" .Values.runtime.readerWalReplayConcurrency | quote }}
   GRAPH_MAX_CONCURRENT_QUERIES: {{ include "hydradb.decimalInteger" .Values.runtime.maxConcurrentQueries | quote }}
   GRAPH_MAX_QUERY_SCAN_EDGES: {{ include "hydradb.decimalInteger" .Values.runtime.maxQueryScanEdges | quote }}
+  GRAPH_MAX_ARTIFACT_BUILD_EDGES: {{ include "hydradb.decimalInteger" .Values.runtime.maxArtifactBuildEdges | quote }}
+  GRAPH_MAX_QUERY_RESULT_VERTICES: {{ include "hydradb.decimalInteger" .Values.runtime.maxQueryResultVertices | quote }}
   GRAPH_MAX_QUERY_RUNTIME_MS: {{ include "hydradb.decimalInteger" .Values.runtime.maxQueryRuntimeMs | quote }}
   GRAPH_MAX_SERVER_CURSORS: {{ include "hydradb.decimalInteger" .Values.runtime.maxServerCursors | quote }}
   GRAPH_MAX_CURSOR_BUFFER_BYTES: {{ include "hydradb.decimalInteger" .Values.runtime.maxCursorBufferBytes | quote }}

@@ -1,0 +1,15 @@
+# `hydradb-graph-datafusion`
+
+DataFusion logical extension nodes and physical planning/execution boundaries for graph operators. The logical payloads are plan-safe: they keep graph semantics and bound mutation IR, but do not retain query values, provider views, or transaction handles.
+
+## Integration contract
+
+- The workspace integration needs to add `crates/graph-datafusion` to the root Cargo workspace and add `hydradb-graph-types`, `hydradb-graph-provider`, and `hydradb-graph-plan` path dependencies to the relevant engine crates. This crate has a temporary standalone `[workspace]` stanza, matching the in-progress `graph-types` and `graph-provider` crates; remove the stanza when adding it to the root workspace.
+- DataFusion 55.2 is selected to match the proven extension-node prototype. It uses Arrow 59.2, matching `graph-provider` and `graph-types`.
+- Before opening a read view or a mutation session, the query engine should call `validate_plan_capabilities` with the prepared logical plan, provider capabilities, and request templates. It should then create `GraphExecutionContext::for_read` or `for_mutation` and install that context into the per-query `SessionConfig`.
+- Configure DataFusion's default planner with `graph_extension_planners()` (plus any other extension planners). Logical graph scans, seeks, expansions, hydration, existence, and correlated/optional apply dispatch through `GraphOperatorRuntime`. Its input plans are passed unstarted so a correlated apply implementation can set `CorrelationScopes` per outer row and run the inner branch for each binding.
+- Parameterized index seeks should use `GraphOperator::GraphSeekParameter` with a parameter name, then resolve the value from `GraphExecutionContext::parameter`; do not capture request values in reusable logical plans. `GraphSeek` remains available for expression-backed seek values.
+- The provider-specific mutation adapter implements `MutationProgramRuntime`, translating the full `hydradb-graph-plan::MutationProgram` and ordered input batches into `GraphMutationSession` actions. It returns staged RETURN batches plus a `MutationExecutionFinalizer`; the enclosing `MutationSink` commits only after it drains and validates the complete bounded result. The finalizer aborts on errors, cancellation, or early stream drop. The logical helper `graph_mutation_program` automatically wraps the effect node in a `MutationSink`; the sink drains the complete child result before returning rows, so an outer LIMIT cannot stop a write midway. A query-scoped atomic lease rejects a second execution of the same mutation program.
+- Provider Arrow streams can be converted with `provider_batches`; `bounded_batches` splits oversized DataFusion batches. Provider streams should enforce both row and byte budgets before conversion.
+
+The adapter traits are intentional integration seams, not storage-specific code. A concrete DataFusion runtime still needs to map each graph operator to `GraphReadView` requests and canonical graph Arrow layouts, and translate the provider mutation protocol to the graph-types action schema.

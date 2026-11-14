@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/opencypher/openCypher.git",
+  "commit": "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23",
+  "corpus_subdirectory": "tck/features",
+  "digest_algorithm": "sha256-length-prefixed-path-and-content-v1",
+  "corpus_sha256": "72fcf8105857e6803f6f6772afd7bbbf876adb40724074b02cab5061995fa20c",
+  "feature_files": 220,
+  "scenario_definitions": 1615,
+  "corpus_bytes": 1471138,
+  "license": "Apache-2.0",
+  "license_path": "LICENSE",
+  "source": "https://github.com/opencypher/openCypher/tree/677cbafabb8c3c5eed458fd3b1ec0daec8d67d23/tck/features"
+}

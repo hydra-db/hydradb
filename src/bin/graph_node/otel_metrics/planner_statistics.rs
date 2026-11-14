@@ -18,7 +18,7 @@
 //! not outlive it.
 
 use std::collections::BTreeMap;
-#[cfg(any(feature = "otlp", test))]
+#[cfg(feature = "otlp")]
 use std::collections::BTreeSet;
 
 use hydradb::{PlannerStatisticsLoadedSnapshot, ScopedGraphShardRuntimeMetrics};
@@ -43,9 +43,7 @@ pub(crate) struct CellPlannerStatistics {
 }
 
 /// Every cell on the node, including cells with nothing loaded, by `cell_id`.
-pub(crate) fn by_cell(
-    shards: &[ScopedGraphShardRuntimeMetrics],
-) -> BTreeMap<&str, CellPlannerStatistics> {
+pub(crate) fn by_cell(shards: &[ScopedGraphShardRuntimeMetrics]) -> BTreeMap<&str, CellPlannerStatistics> {
     let mut cells: BTreeMap<&str, CellPlannerStatistics> = BTreeMap::new();
     for shard in shards {
         let cell = cells.entry(shard.shard.cell_id.as_str()).or_default();
@@ -53,10 +51,7 @@ pub(crate) fn by_cell(
             continue;
         };
         cell.loaded += 1;
-        if cell
-            .oldest
-            .is_none_or(|oldest| statistics.age_ms > oldest.age_ms)
-        {
+        if cell.oldest.is_none_or(|oldest| statistics.age_ms > oldest.age_ms) {
             cell.oldest = Some(statistics);
         }
     }
@@ -66,7 +61,7 @@ pub(crate) fn by_cell(
 /// The cells to record this collection: every cell on the node, plus each cell
 /// reported last time that has since left it, as nothing loaded. `reported`
 /// becomes the cells on the node now, so a departed cell is zeroed once.
-#[cfg(any(feature = "otlp", test))]
+#[cfg(feature = "otlp")]
 pub(crate) fn cells_to_record(
     reported: &mut BTreeSet<String>,
     shards: &[ScopedGraphShardRuntimeMetrics],
@@ -91,25 +86,10 @@ pub(crate) fn append(output: &mut String, shards: &[ScopedGraphShardRuntimeMetri
         writeln!(output, "# TYPE {name} gauge").unwrap();
     }
     for (cell_id, cell) in by_cell(shards) {
-        writeln!(
-            output,
-            "{PROMETHEUS_LOADED}{{cell_id=\"{cell_id}\"}} {}",
-            cell.loaded
-        )
-        .unwrap();
+        writeln!(output, "{PROMETHEUS_LOADED}{{cell_id=\"{cell_id}\"}} {}", cell.loaded).unwrap();
         if let Some(oldest) = cell.oldest {
-            writeln!(
-                output,
-                "{PROMETHEUS_AGE}{{cell_id=\"{cell_id}\"}} {}",
-                oldest.age_ms
-            )
-            .unwrap();
-            writeln!(
-                output,
-                "{PROMETHEUS_SEQUENCE}{{cell_id=\"{cell_id}\"}} {}",
-                oldest.storage_sequence
-            )
-            .unwrap();
+            writeln!(output, "{PROMETHEUS_AGE}{{cell_id=\"{cell_id}\"}} {}", oldest.age_ms).unwrap();
+            writeln!(output, "{PROMETHEUS_SEQUENCE}{{cell_id=\"{cell_id}\"}} {}", oldest.storage_sequence).unwrap();
         }
     }
 }
@@ -156,10 +136,7 @@ impl Gauges {
     pub(super) fn record(&self, shards: &[ScopedGraphShardRuntimeMetrics]) {
         use hydradb_telemetry::semconv::L_CELL_ID;
         let cells = {
-            let mut reported = self
-                .reported
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reported = self.reported.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             cells_to_record(&mut reported, shards)
         };
         for (cell_id, cell) in &cells {
@@ -168,8 +145,7 @@ impl Gauges {
             for result in [
                 self.loaded.record(&labels, cell.loaded as f64),
                 self.age.record(&labels, oldest.age_ms as f64),
-                self.sequence
-                    .record(&labels, oldest.storage_sequence as f64),
+                self.sequence.record(&labels, oldest.storage_sequence as f64),
             ] {
                 if let Err(error) = result {
                     tracing::warn!(%error, "planner statistics gauge was not published");

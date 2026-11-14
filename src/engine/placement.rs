@@ -269,11 +269,7 @@ impl PlacementView {
     /// therefore own everything" — the latter has a starting node claim every
     /// cell. It is bounded regardless: if the LIST keeps failing, grace expires
     /// one `heartbeat_timeout` after start and the node sheds.
-    pub fn new<I, S>(
-        local_node_id: impl Into<String>,
-        members: I,
-        config: PlacementConfig,
-    ) -> Result<Self>
+    pub fn new<I, S>(local_node_id: impl Into<String>, members: I, config: PlacementConfig) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -313,11 +309,7 @@ impl PlacementView {
     /// performs no object-store I/O despite the name. This constructor exists so
     /// the runtime cannot accidentally build a live set over a different node
     /// list than the cluster was opened with.
-    pub fn from_directory(
-        local_node_id: impl Into<String>,
-        directory: &ObjectStoreNodeDirectory,
-        config: PlacementConfig,
-    ) -> Result<Self> {
+    pub fn from_directory(local_node_id: impl Into<String>, directory: &ObjectStoreNodeDirectory, config: PlacementConfig) -> Result<Self> {
         Self::new(local_node_id, directory.node_ids(), config)
     }
 
@@ -480,10 +472,7 @@ impl PlacementView {
     /// decision are separable, and because both elapsed durations must be read
     /// under the same lock that mutates the set — otherwise a concurrent refresh
     /// could stamp `last_success` between the measurement and its use.
-    fn install(
-        &self,
-        listed: std::result::Result<Vec<HeartbeatEntry>, PlacementError>,
-    ) -> Arc<LiveView> {
+    fn install(&self, listed: std::result::Result<Vec<HeartbeatEntry>, PlacementError>) -> Arc<LiveView> {
         let (view, previous, current, since_last_success) = {
             let mut state = lock(&self.shared.refresh);
             let since_last_success = state.since_last_success();

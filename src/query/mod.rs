@@ -6,6 +6,8 @@ pub(crate) mod corpus;
 #[cfg(feature = "experimental-cypher-engine")]
 pub(crate) mod experimental_cypher;
 #[cfg(feature = "opencypher")]
+pub(crate) mod gds_procedure;
+#[cfg(feature = "opencypher")]
 pub(crate) mod opencypher;
 #[cfg(feature = "opencypher")]
 pub(crate) mod path_procedure;

@@ -54,13 +54,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::object_store::path::Path;
-use slatedb::object_store::{
-    Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion,
-};
+use slatedb::object_store::{Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 use slatedb_txn_obj::{
-    DirtyObject, ObjectCodec, SimpleTransactionalObject, TransactionalObject,
-    TransactionalObjectError, TransactionalStorageProtocol,
+    DirtyObject, ObjectCodec, SimpleTransactionalObject, TransactionalObject, TransactionalObjectError, TransactionalStorageProtocol,
 };
 
 /// Durable format identifier of the control record. The version is part of
@@ -95,9 +92,7 @@ impl From<TransactionalObjectError> for PublicationError {
         match error {
             TransactionalObjectError::ObjectStoreError(error) => Self::ObjectStore(error),
             TransactionalObjectError::Fenced => Self::Fenced,
-            TransactionalObjectError::CallbackError(error) => {
-                Self::InvalidRecord(error.to_string())
-            }
+            TransactionalObjectError::CallbackError(error) => Self::InvalidRecord(error.to_string()),
             other => Self::InvalidRecord(other.to_string()),
         }
     }
@@ -150,9 +145,7 @@ pub struct ControlRecord {
 impl ControlRecord {
     fn owned_by_other(&self, owner: &str, now_ms: u64) -> Option<(String, u64)> {
         match &self.owner {
-            Some(holder) if holder != owner && self.lease_expires_at_ms > now_ms => {
-                Some((holder.clone(), self.lease_expires_at_ms))
-            }
+            Some(holder) if holder != owner && self.lease_expires_at_ms > now_ms => Some((holder.clone(), self.lease_expires_at_ms)),
             _ => None,
         }
     }
@@ -170,10 +163,7 @@ impl ObjectCodec<ControlRecord> for RecordCodec {
         if let Some(owner) = &value.owner {
             out.push_str(&format!("owner\t{owner}\n"));
         }
-        out.push_str(&format!(
-            "lease_expires_at_ms\t{}\n",
-            value.lease_expires_at_ms
-        ));
+        out.push_str(&format!("lease_expires_at_ms\t{}\n", value.lease_expires_at_ms));
         if let Some(sequence) = value.published_sequence {
             out.push_str(&format!("published_sequence\t{sequence}\n"));
         }
@@ -189,10 +179,7 @@ impl ObjectCodec<ControlRecord> for RecordCodec {
         Bytes::from(out)
     }
 
-    fn decode(
-        &self,
-        bytes: &Bytes,
-    ) -> Result<ControlRecord, Box<dyn std::error::Error + Send + Sync>> {
+    fn decode(&self, bytes: &Bytes) -> Result<ControlRecord, Box<dyn std::error::Error + Send + Sync>> {
         let legacy = || ControlRecord {
             legacy: Some(bytes.clone()),
             ..ControlRecord::default()
@@ -216,11 +203,7 @@ impl ObjectCodec<ControlRecord> for RecordCodec {
             let Some((field, value)) = line.split_once('\t') else {
                 return Err(format!("invalid publication record line {line:?}").into());
             };
-            let number = || {
-                value
-                    .parse::<u64>()
-                    .map_err(|error| format!("invalid {field}: {error}"))
-            };
+            let number = || value.parse::<u64>().map_err(|error| format!("invalid {field}: {error}"));
             match field {
                 "epoch" => record.epoch = number()?,
                 "owner" => record.owner = Some(value.to_string()),
@@ -251,40 +234,22 @@ pub struct SingleObjectProtocol<T> {
 }
 
 impl<T> SingleObjectProtocol<T> {
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        path: Path,
-        codec: Box<dyn ObjectCodec<T>>,
-    ) -> Self {
-        Self {
-            object_store,
-            path,
-            codec,
-        }
+    pub fn new(object_store: Arc<dyn ObjectStore>, path: Path, codec: Box<dyn ObjectCodec<T>>) -> Self {
+        Self { object_store, path, codec }
     }
 }
 
 #[async_trait]
 impl<T: Send + Sync> TransactionalStorageProtocol<T, ObjectVersion> for SingleObjectProtocol<T> {
-    async fn write(
-        &self,
-        current_id: Option<ObjectVersion>,
-        new_value: &T,
-    ) -> Result<ObjectVersion, TransactionalObjectError> {
+    async fn write(&self, current_id: Option<ObjectVersion>, new_value: &T) -> Result<ObjectVersion, TransactionalObjectError> {
         let mode = match current_id {
             None => PutMode::Create,
             Some(version) => PutMode::Update(version.update()),
         };
         let payload = self.codec.encode(new_value);
-        let result = match self
-            .object_store
-            .put_opts(&self.path, payload.into(), mode.into())
-            .await
-        {
+        let result = match self.object_store.put_opts(&self.path, payload.into(), mode.into()).await {
             Ok(result) => result,
-            Err(StoreError::AlreadyExists { .. })
-            | Err(StoreError::Precondition { .. })
-            | Err(StoreError::NotFound { .. }) => {
+            Err(StoreError::AlreadyExists { .. }) | Err(StoreError::Precondition { .. }) | Err(StoreError::NotFound { .. }) => {
                 return Err(TransactionalObjectError::ObjectVersionExists);
             }
             Err(error) => return Err(error.into()),
@@ -305,9 +270,7 @@ impl<T: Send + Sync> TransactionalStorageProtocol<T, ObjectVersion> for SingleOb
         Ok(version)
     }
 
-    async fn try_read_latest(
-        &self,
-    ) -> Result<Option<(ObjectVersion, T)>, TransactionalObjectError> {
+    async fn try_read_latest(&self) -> Result<Option<(ObjectVersion, T)>, TransactionalObjectError> {
         let result = match self.object_store.get(&self.path).await {
             Ok(result) => result,
             Err(StoreError::NotFound { .. }) => return Ok(None),
@@ -318,10 +281,7 @@ impl<T: Send + Sync> TransactionalStorageProtocol<T, ObjectVersion> for SingleOb
             version: result.meta.version.clone(),
         };
         let bytes = result.bytes().await?;
-        let value = self
-            .codec
-            .decode(&bytes)
-            .map_err(TransactionalObjectError::CallbackError)?;
+        let value = self.codec.decode(&bytes).map_err(TransactionalObjectError::CallbackError)?;
         Ok(Some((version, value)))
     }
 }
@@ -330,10 +290,7 @@ impl<T: Send + Sync> TransactionalStorageProtocol<T, ObjectVersion> for SingleOb
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Current {
     /// A record with a publication, and that publication's payload.
-    Published {
-        record: ControlRecord,
-        payload: Bytes,
-    },
+    Published { record: ControlRecord, payload: Bytes },
     /// A record with nothing published yet (an owner that has not finished).
     Unpublished(ControlRecord),
     /// `current` is not a control record: the layout before this crate. The
@@ -382,9 +339,7 @@ pub type LegacySequence = Arc<dyn Fn(&Bytes) -> Option<u64> + Send + Sync>;
 
 impl std::fmt::Debug for PublicationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PublicationStore")
-            .field("root", &self.root)
-            .finish()
+        f.debug_struct("PublicationStore").field("root", &self.root).finish()
     }
 }
 
@@ -428,11 +383,7 @@ impl PublicationStore {
     /// Write a payload once; a repeat of the same id is the same bytes.
     async fn upload_payload(&self, relative: &str, payload: Bytes) -> Result<(), PublicationError> {
         let path = self.payload_path(relative);
-        match self
-            .object_store
-            .put_opts(&path, payload.into(), PutMode::Create.into())
-            .await
-        {
+        match self.object_store.put_opts(&path, payload.into(), PutMode::Create.into()).await {
             Ok(_) | Err(StoreError::AlreadyExists { .. }) => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -444,10 +395,7 @@ impl PublicationStore {
     /// publication costs readers their statistics. Best effort throughout.
     async fn delete_payload_if_unreferenced(&self, relative: &str) {
         let referenced = match self.protocol().try_read_latest().await {
-            Ok(Some((_, record))) => {
-                record.payload.as_deref() == Some(relative)
-                    || record.previous_payload.as_deref() == Some(relative)
-            }
+            Ok(Some((_, record))) => record.payload.as_deref() == Some(relative) || record.previous_payload.as_deref() == Some(relative),
             Ok(None) => false,
             Err(_) => return,
         };
@@ -521,11 +469,10 @@ impl PublicationStore {
         // The legacy object, once uploaded as a payload: done at most once
         // per acquisition, and removed again if the takeover loses the race.
         let mut retained: Option<(String, Option<u64>)> = None;
-        let outcome = self
-            .acquire_inner(&protocol, owner, lease_ms, &mut retained)
-            .await;
+        let outcome = self.acquire_inner(&protocol, owner, lease_ms, &mut retained).await;
         if let Some((relative, _)) = retained {
-            let referenced = matches!(&outcome, Ok(Acquire::Acquired(ownership)) if ownership.record().payload.as_deref() == Some(relative.as_str()));
+            let referenced =
+                matches!(&outcome, Ok(Acquire::Acquired(ownership)) if ownership.record().payload.as_deref() == Some(relative.as_str()));
             if !referenced {
                 self.delete_payload_if_unreferenced(&relative).await;
             }
@@ -543,27 +490,22 @@ impl PublicationStore {
         let protocol = Arc::clone(protocol);
         for attempt in 1..=MAX_ATTEMPTS {
             let now = self.now_ms();
-            let Some(mut object) =
-                SimpleTransactionalObject::try_load(Arc::clone(&protocol)).await?
-            else {
+            let Some(mut object) = SimpleTransactionalObject::try_load(Arc::clone(&protocol)).await? else {
                 let record = ControlRecord {
                     epoch: 1,
                     owner: Some(owner.to_string()),
                     lease_expires_at_ms: now.saturating_add(lease_ms),
                     ..ControlRecord::default()
                 };
-                let object =
-                    match SimpleTransactionalObject::init(Arc::clone(&protocol), record).await {
-                        Ok(object) => object,
-                        Err(error) if error.is_sequenced_write_conflict() => continue,
-                        Err(TransactionalObjectError::ObjectStoreError(error)) => {
-                            match self.landed_acquisition(&protocol, owner, 1).await {
-                                Some(object) => object,
-                                None => return Err(error.into()),
-                            }
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
+                let object = match SimpleTransactionalObject::init(Arc::clone(&protocol), record).await {
+                    Ok(object) => object,
+                    Err(error) if error.is_sequenced_write_conflict() => continue,
+                    Err(TransactionalObjectError::ObjectStoreError(error)) => match self.landed_acquisition(&protocol, owner, 1).await {
+                        Some(object) => object,
+                        None => return Err(error.into()),
+                    },
+                    Err(error) => return Err(error.into()),
+                };
                 return Ok(Acquire::Acquired(Box::new(Ownership {
                     store: self.clone(),
                     object,
@@ -597,15 +539,11 @@ impl PublicationStore {
                     }
                 };
                 value.published_sequence = sequence;
-                value.publication_id =
-                    Some(relative.rsplit('/').next().unwrap_or(&relative).to_string());
+                value.publication_id = Some(relative.rsplit('/').next().unwrap_or(&relative).to_string());
                 value.payload = Some(relative);
                 value.previous_payload = None;
             }
-            let dirty = DirtyObject {
-                id: object.id(),
-                value,
-            };
+            let dirty = DirtyObject { id: object.id(), value };
             let object = match object.update(dirty).await {
                 Ok(()) => object,
                 Err(error) if error.is_sequenced_write_conflict() => {
@@ -614,12 +552,10 @@ impl PublicationStore {
                     }
                     continue;
                 }
-                Err(TransactionalObjectError::ObjectStoreError(error)) => {
-                    match self.landed_acquisition(&protocol, owner, epoch).await {
-                        Some(object) => object,
-                        None => return Err(error.into()),
-                    }
-                }
+                Err(TransactionalObjectError::ObjectStoreError(error)) => match self.landed_acquisition(&protocol, owner, epoch).await {
+                    Some(object) => object,
+                    None => return Err(error.into()),
+                },
                 Err(error) => return Err(error.into()),
             };
             return Ok(Acquire::Acquired(Box::new(Ownership {
@@ -629,9 +565,7 @@ impl PublicationStore {
                 owner: owner.to_string(),
             })));
         }
-        Err(PublicationError::Conflict {
-            attempts: MAX_ATTEMPTS,
-        })
+        Err(PublicationError::Conflict { attempts: MAX_ATTEMPTS })
     }
 
     /// Whether an acquisition write that reported an error landed all the
@@ -646,12 +580,7 @@ impl PublicationStore {
         epoch: u64,
     ) -> Option<SimpleTransactionalObject<ControlRecord, ObjectVersion>> {
         match SimpleTransactionalObject::try_load(Arc::clone(protocol)).await {
-            Ok(Some(object))
-                if object.object().owner.as_deref() == Some(owner)
-                    && object.object().epoch == epoch =>
-            {
-                Some(object)
-            }
+            Ok(Some(object)) if object.object().owner.as_deref() == Some(owner) && object.object().epoch == epoch => Some(object),
             _ => None,
         }
     }
@@ -705,10 +634,7 @@ impl Ownership {
     /// object landed) is told apart from a write that failed by re-reading
     /// once: `decide` sees the record as it is now, and answers `Done` if
     /// its write is there. The second such error in one update is returned.
-    async fn update_with<R>(
-        &mut self,
-        mut decide: impl FnMut(&ControlRecord) -> Step<R>,
-    ) -> Result<R, PublicationError> {
+    async fn update_with<R>(&mut self, mut decide: impl FnMut(&ControlRecord) -> Step<R>) -> Result<R, PublicationError> {
         let mut recovered = false;
         for attempt in 1..=MAX_ATTEMPTS {
             self.object.refresh().await?;
@@ -741,9 +667,7 @@ impl Ownership {
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(PublicationError::Conflict {
-            attempts: MAX_ATTEMPTS,
-        })
+        Err(PublicationError::Conflict { attempts: MAX_ATTEMPTS })
     }
 
     /// Extend the lease by `lease` from now.
@@ -773,11 +697,7 @@ impl Ownership {
     /// continue if the epoch moved. The payload two publications old is
     /// removed on success; the one before this is kept for readers holding
     /// the previous record.
-    pub async fn publish(
-        &mut self,
-        sequence: u64,
-        payload: Bytes,
-    ) -> Result<Publish, PublicationError> {
+    pub async fn publish(&mut self, sequence: u64, payload: Bytes) -> Result<Publish, PublicationError> {
         self.publish_with(sequence, payload, false).await
     }
 
@@ -786,20 +706,11 @@ impl Ownership {
     /// publication readers cannot use (one that does not decode), which a
     /// rebuild of the same snapshot could otherwise never repair. A newer
     /// sequence still wins over it.
-    pub async fn republish(
-        &mut self,
-        sequence: u64,
-        payload: Bytes,
-    ) -> Result<Publish, PublicationError> {
+    pub async fn republish(&mut self, sequence: u64, payload: Bytes) -> Result<Publish, PublicationError> {
         self.publish_with(sequence, payload, true).await
     }
 
-    async fn publish_with(
-        &mut self,
-        sequence: u64,
-        payload: Bytes,
-        replace_same: bool,
-    ) -> Result<Publish, PublicationError> {
+    async fn publish_with(&mut self, sequence: u64, payload: Bytes, replace_same: bool) -> Result<Publish, PublicationError> {
         let publication_id = ulid::Ulid::new().to_string();
         let relative = format!("{PAYLOADS_DIR}/{publication_id}");
         self.store.upload_payload(&relative, payload).await?;
@@ -812,12 +723,9 @@ impl Ownership {
                         publication_id: publication_id.clone(),
                     });
                 }
-                let superseded =
-                    |current: &u64| *current > sequence || (*current == sequence && !replace_same);
+                let superseded = |current: &u64| *current > sequence || (*current == sequence && !replace_same);
                 if let Some(current) = record.published_sequence.filter(superseded) {
-                    return Step::Done(Publish::Superseded {
-                        current_sequence: current,
-                    });
+                    return Step::Done(Publish::Superseded { current_sequence: current });
                 }
                 retired = record.previous_payload.clone();
                 Step::Write(
@@ -845,9 +753,7 @@ impl Ownership {
             // landed, the response was lost, and the recovery read failed
             // too), so the payload goes only once the record says it is
             // not the publication.
-            Ok(Publish::Superseded { .. }) | Err(_) => {
-                self.store.delete_payload_if_unreferenced(&relative).await
-            }
+            Ok(Publish::Superseded { .. }) | Err(_) => self.store.delete_payload_if_unreferenced(&relative).await,
         }
         outcome
     }

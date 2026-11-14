@@ -1,0 +1,24 @@
+[package]
+name = "turbolay-proxy-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The turbolay proxy's decisions: placement, routing, the owner cache, admission and metrics. No protocol or pingora types"
+publish = false
+
+# Both adapters call into this crate for every decision, so it must not know
+# Bolt, HTTP or pingora. Placement without `store`: `hash::rank` only, no
+# slatedb.
+[dependencies]
+arc-swap = { workspace = true }
+hydradb-placement = { path = "../../placement", default-features = false }
+moka = { workspace = true }
+prometheus = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turbolay-proxy-types = { path = "../types" }
+
+[dev-dependencies]
+hydradb-scope = { path = "../../scope" }
+tokio = { workspace = true, features = ["test-util"] }

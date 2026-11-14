@@ -1,11 +1,11 @@
 objectStore:
   aws:
-    bucketName: graph-benchmark
+    bucketName: my-hydradb-bucket
     region: us-east-1
 
 image:
-  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/hydradb
-  tag: "0.1.0"
+  repository: ghcr.io/hydra-db/hydradb
+  tag: ""
 
 auth:
   create: false

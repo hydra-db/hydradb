@@ -1,6 +1,6 @@
 //! Bounds-checked decoder for FalkorDB per-key Redis `DUMP` payloads.
 //!
-//! The crate deliberately has no dependency on HydraDB. It validates every
+//! The crate deliberately has no dependency on Turbolay. It validates every
 //! envelope and matrix layer before exposing graph records, allowing import
 //! code to parallelize decoding without granting malformed input access to the
 //! destination object store.
@@ -8,10 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+mod properties;
+pub use properties::{intern, Properties};
 
 const REDIS_MODULE_2: u8 = 7;
 const MODULE_OPCODE_STRING: u64 = 5;
@@ -81,11 +85,16 @@ pub enum PropertyValue {
     Null,
     Bool(bool),
     Integer(i64),
-    Float(f64),
+    Float(#[serde(with = "lossless_float")] f64),
     String(String),
     Array(Vec<PropertyValue>),
-    Point { latitude: f64, longitude: f64 },
-    VectorF32(Vec<f32>),
+    Point {
+        #[serde(with = "lossless_float")]
+        latitude: f64,
+        #[serde(with = "lossless_float")]
+        longitude: f64,
+    },
+    VectorF32(#[serde(with = "lossless_float::vector")] Vec<f32>),
     DateTime(i64),
     Date(i64),
     Time(i64),
@@ -93,16 +102,118 @@ pub enum PropertyValue {
     Map(BTreeMap<String, PropertyValue>),
 }
 
+/// JSON has no NaN or infinity, and serde_json writes them as null. Floats keep
+/// their value in every format: finite ones as numbers, the rest as the strings
+/// "NaN", "Infinity" and "-Infinity", which deserialize back to the same value.
+mod lossless_float {
+    use std::fmt;
+
+    use serde::de::{self, Deserializer, Visitor};
+    use serde::ser::{SerializeSeq, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        match non_finite_name(*value) {
+            Some(name) => serializer.serialize_str(name),
+            None => serializer.serialize_f64(*value),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        deserializer.deserialize_any(FloatVisitor)
+    }
+
+    fn non_finite_name(value: f64) -> Option<&'static str> {
+        if value.is_nan() {
+            Some("NaN")
+        } else if value == f64::INFINITY {
+            Some("Infinity")
+        } else if value == f64::NEG_INFINITY {
+            Some("-Infinity")
+        } else {
+            None
+        }
+    }
+
+    struct FloatVisitor;
+
+    impl Visitor<'_> for FloatVisitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a number, \"NaN\", \"Infinity\" or \"-Infinity\"")
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<f64, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<f64, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<f64, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<f64, E> {
+            match value {
+                "NaN" => Ok(f64::NAN),
+                "Infinity" => Ok(f64::INFINITY),
+                "-Infinity" => Ok(f64::NEG_INFINITY),
+                other => Err(E::invalid_value(de::Unexpected::Str(other), &self)),
+            }
+        }
+    }
+
+    pub mod vector {
+        use super::*;
+
+        struct Element(f32);
+
+        impl serde::Serialize for Element {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                match non_finite_name(f64::from(self.0)) {
+                    Some(name) => serializer.serialize_str(name),
+                    None => serializer.serialize_f32(self.0),
+                }
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for Element {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_any(FloatVisitor).map(|value| Element(value as f32))
+            }
+        }
+
+        pub fn serialize<S: Serializer>(values: &[f32], serializer: S) -> Result<S::Ok, S::Error> {
+            let mut seq = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                seq.serialize_element(&Element(*value))?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<f32>, D::Error> {
+            let elements: Vec<Element> = serde::Deserialize::deserialize(deserializer)?;
+            Ok(elements.into_iter().map(|element| element.0).collect())
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub id: u64,
     pub name: String,
+    #[serde(default)]
+    pub index_count: usize,
+    #[serde(default)]
+    pub constraint_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     pub id: u64,
-    pub properties: BTreeMap<String, PropertyValue>,
+    pub properties: Properties,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -131,6 +242,14 @@ pub struct ReconciliationDiagnostics {
     pub reused_edge_id_cells: u64,
     pub relationship_pairs_without_adjacency: u64,
     pub adjacency_pairs_without_relationships: u64,
+    /// Multi-edge cells whose edge lists the dump does not hold; each
+    /// explains its adjacency pair.
+    #[serde(default)]
+    pub dangling_tensor_cells: u64,
+    /// Multi-edge cells whose edge lists FalkorDB wrote empty; each explains
+    /// its adjacency pair.
+    #[serde(default)]
+    pub empty_tensor_cells: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,7 +269,41 @@ pub struct GraphDump {
     pub labels: BTreeMap<u64, BTreeSet<String>>,
     pub relationships: Vec<RelationshipCell>,
     pub adjacency: BTreeSet<(u64, u64)>,
+    /// Multi-edge cells whose edge-id lists the dump does not hold.
+    #[serde(default)]
+    pub dangling_tensor_cells: Vec<DanglingTensorCell>,
+    /// Multi-edge cells whose edge-id lists FalkorDB wrote empty.
+    #[serde(default)]
+    pub empty_tensor_cells: Vec<EmptyTensorCell>,
     pub diagnostics: DecodeDiagnostics,
+}
+
+/// A relationship matrix cell marked as holding several edges whose edge-id
+/// list FalkorDB did not write. FalkorDB 4.18 writes a relationship type's
+/// lists only when the type's edge counter differs from its matrix's cell
+/// count, so a drifted counter leaves every multi-edge cell of the type
+/// pointing at memory the dump does not contain. The cell's type and
+/// endpoints are known; its edges are not.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DanglingTensorCell {
+    pub edge_type: String,
+    pub src: u64,
+    pub dst: u64,
+    /// The cell's raw value: the multi-edge flag and FalkorDB's in-memory
+    /// address of the list.
+    pub value: u64,
+}
+
+/// A relationship matrix cell marked as holding several edges whose edge-id
+/// list FalkorDB wrote with no ids. FalkorDB keeps such a cell after the
+/// edges it held are deleted (seen in production on 2026-11-03), and reads
+/// through it find no edges, so it decodes to none: only its pair, which the
+/// adjacency matrix still holds, is reported.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct EmptyTensorCell {
+    pub edge_type: String,
+    pub src: u64,
+    pub dst: u64,
 }
 
 impl GraphDump {
@@ -161,42 +314,47 @@ impl GraphDump {
             .iter()
             .map(|relationship| relationship.edge_id)
             .collect::<BTreeSet<_>>();
-        let relationship_pairs = self
-            .relationships
-            .iter()
-            .map(|relationship| (relationship.src, relationship.dst))
-            .collect::<BTreeSet<_>>();
+        let relationship_pairs = self.typed_pairs();
         ReconciliationDiagnostics {
             relationship_cells: self.relationships.len() as u64,
             live_edge_records: self.edges.len() as u64,
             relationships_with_missing_endpoints: self
                 .relationships
                 .iter()
-                .filter(|relationship| {
-                    !self.nodes.contains_key(&relationship.src)
-                        || !self.nodes.contains_key(&relationship.dst)
-                })
+                .filter(|relationship| !self.nodes.contains_key(&relationship.src) || !self.nodes.contains_key(&relationship.dst))
                 .count() as u64,
             cells_without_edge_records: self
                 .relationships
                 .iter()
                 .filter(|relationship| !live_edge_ids.contains(&relationship.edge_id))
                 .count() as u64,
-            edge_records_without_cells: live_edge_ids.difference(&relationship_edge_ids).count()
-                as u64,
-            reused_edge_id_cells: self
-                .relationships
-                .len()
-                .saturating_sub(relationship_edge_ids.len())
-                as u64,
-            relationship_pairs_without_adjacency: relationship_pairs
-                .difference(&self.adjacency)
-                .count() as u64,
-            adjacency_pairs_without_relationships: self
-                .adjacency
-                .difference(&relationship_pairs)
-                .count() as u64,
+            edge_records_without_cells: live_edge_ids.difference(&relationship_edge_ids).count() as u64,
+            reused_edge_id_cells: self.relationships.len().saturating_sub(relationship_edge_ids.len()) as u64,
+            relationship_pairs_without_adjacency: relationship_pairs.difference(&self.adjacency).count() as u64,
+            adjacency_pairs_without_relationships: self.adjacency.difference(&relationship_pairs).count() as u64,
+            dangling_tensor_cells: self.dangling_tensor_cells.len() as u64,
+            empty_tensor_cells: self.empty_tensor_cells.len() as u64,
         }
+    }
+
+    /// Adjacency pairs no typed relationship explains: pairs FalkorDB kept
+    /// after their last edge was deleted. Counted alone, without the rest of
+    /// reconciliation_diagnostics, for a check on every graph.
+    pub fn adjacency_pairs_without_relationships(&self) -> u64 {
+        self.adjacency.difference(&self.typed_pairs()).count() as u64
+    }
+
+    /// The node pairs a typed relationship joins: every decoded relationship,
+    /// every dangling multi-edge cell, whose edges exist though the dump holds
+    /// no list of them, and every empty one, whose pair the adjacency matrix
+    /// keeps after its edges were deleted.
+    fn typed_pairs(&self) -> BTreeSet<(u64, u64)> {
+        self.relationships
+            .iter()
+            .map(|relationship| (relationship.src, relationship.dst))
+            .chain(self.dangling_tensor_cells.iter().map(|cell| (cell.src, cell.dst)))
+            .chain(self.empty_tensor_cells.iter().map(|cell| (cell.src, cell.dst)))
+            .collect()
     }
 
     pub fn validate_reconciliation(&self) -> Result<()> {
@@ -204,11 +362,7 @@ impl GraphDump {
             return invalid(
                 "graph",
                 0,
-                format!(
-                    "decoded {} live nodes, header declares {}",
-                    self.nodes.len(),
-                    self.declared_nodes
-                ),
+                format!("decoded {} live nodes, header declares {}", self.nodes.len(), self.declared_nodes),
             );
         }
         if self.edges.len() as u64 != self.declared_edges {
@@ -222,40 +376,14 @@ impl GraphDump {
                 ),
             );
         }
-        if let Some(node_id) = self
-            .labels
-            .keys()
-            .find(|node_id| !self.nodes.contains_key(node_id))
-        {
-            return invalid(
-                "graph",
-                0,
-                format!("label matrix references missing node {node_id}"),
-            );
+        if let Some(node_id) = self.labels.keys().find(|node_id| !self.nodes.contains_key(node_id)) {
+            return invalid("graph", 0, format!("label matrix references missing node {node_id}"));
         }
-        let relationship_pairs = self
-            .relationships
-            .iter()
-            .map(|relationship| (relationship.src, relationship.dst))
-            .collect::<BTreeSet<_>>();
-        let extra_adjacency_count = self.adjacency.difference(&relationship_pairs).count();
-        let extra_adjacency = self
-            .adjacency
-            .difference(&relationship_pairs)
-            .take(8)
-            .copied()
-            .collect::<Vec<_>>();
-        if extra_adjacency_count > 0 {
-            return invalid(
-                "graph",
-                0,
-                format!(
-                    "adjacency contains {extra_adjacency_count} pair(s) without typed relationships: {} relationship pairs, {} adjacency pairs; extra adjacency sample {extra_adjacency:?}",
-                    relationship_pairs.len(),
-                    self.adjacency.len(),
-                ),
-            );
-        }
+        // An adjacency pair no typed relationship explains is FalkorDB keeping
+        // the pair after its last edge was deleted (1 of 2,060,706 pairs in a
+        // 2026-11-03 production graph), as a relationship pair missing from
+        // the adjacency is it dropping one. Neither has an edge to import, so
+        // both are counted in reconciliation_diagnostics, not refused.
         Ok(())
     }
 }
@@ -271,18 +399,13 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
     let declared_deleted_edges = stream.unsigned()?;
     let label_count = stream.unsigned()?;
     let relation_count_declared = stream.unsigned()?;
-    let relation_count =
-        stream.metadata_count(relation_count_declared, 9, "relationship type count")?;
+    let relation_count = stream.metadata_count(relation_count_declared, 9, "relationship type count")?;
     for _ in 0..relation_count {
         let _ = stream.unsigned()?;
     }
     let key_count = stream.unsigned()?;
     if key_count != 1 {
-        return invalid(
-            "graph-header",
-            stream.offset(),
-            format!("key_count is {key_count}, expected 1"),
-        );
+        return invalid("graph-header", stream.offset(), format!("key_count is {key_count}, expected 1"));
     }
     let declared = stream.unsigned()?;
     let attribute_count = stream.metadata_count(declared, 10, "attribute count")?;
@@ -290,26 +413,21 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
     for _ in 0..attribute_count {
         attributes.push(stream.c_string()?);
     }
+    let attribute_names = attributes.iter().map(|name| intern(name)).collect::<Vec<_>>();
     let node_schemas = read_schema(&mut stream)?;
     let edge_schemas = read_schema(&mut stream)?;
     if node_schemas.len() as u64 != label_count {
         return invalid(
             "schema",
             stream.offset(),
-            format!(
-                "{} node schemas, header declares {label_count}",
-                node_schemas.len()
-            ),
+            format!("{} node schemas, header declares {label_count}", node_schemas.len()),
         );
     }
     if edge_schemas.len() != relation_count {
         return invalid(
             "schema",
             stream.offset(),
-            format!(
-                "{} edge schemas, header declares {relation_count}",
-                edge_schemas.len()
-            ),
+            format!("{} edge schemas, header declares {relation_count}", edge_schemas.len()),
         );
     }
 
@@ -320,30 +438,26 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
         payloads.push((stream.unsigned()?, stream.unsigned()?));
     }
 
-    let node_names: BTreeMap<u64, String> = node_schemas
-        .iter()
-        .map(|s| (s.id, s.name.clone()))
-        .collect();
-    let edge_names: BTreeMap<u64, String> = edge_schemas
-        .iter()
-        .map(|s| (s.id, s.name.clone()))
-        .collect();
+    let node_names: BTreeMap<u64, String> = node_schemas.iter().map(|s| (s.id, s.name.clone())).collect();
+    let edge_names: BTreeMap<u64, String> = edge_schemas.iter().map(|s| (s.id, s.name.clone())).collect();
     let mut nodes = BTreeMap::new();
     let mut edges = BTreeMap::new();
     let mut labels: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
     let mut relationships = Vec::new();
     let mut adjacency = BTreeSet::new();
     let mut diagnostics = DecodeDiagnostics::default();
+    let mut dangling_tensor_cells = Vec::new();
+    let mut empty_tensor_cells = Vec::new();
     let mut covered = BTreeMap::<u64, u64>::new();
 
     for (state, count) in payloads {
         *covered.entry(state).or_default() += count;
         match state {
-            1 => read_entities(&mut stream, count, &attributes, &mut nodes)?,
+            1 => read_entities(&mut stream, count, &attribute_names, &mut nodes)?,
             2 | 4 => {
                 let _ = stream.bytes()?;
             }
-            3 => read_entities(&mut stream, count, &attributes, &mut edges)?,
+            3 => read_entities(&mut stream, count, &attribute_names, &mut edges)?,
             6 => {
                 let declared = stream.unsigned()?;
                 let matrix_count = stream.metadata_count(declared, 9, "label matrix count")?;
@@ -364,18 +478,17 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
                     }
                     let matrices = read_delta(&mut stream, true, &mut diagnostics)?;
                     let tensors = read_tensors(&mut stream)?;
-                    let edge_type =
-                        edge_names
-                            .get(&actual)
-                            .ok_or_else(|| DecodeError::Invalid {
-                                layer: "relation-matrix",
-                                offset: stream.offset(),
-                                message: format!("relation id {actual} has no schema"),
-                            })?;
+                    let edge_type = edge_names.get(&actual).ok_or_else(|| DecodeError::Invalid {
+                        layer: "relation-matrix",
+                        offset: stream.offset(),
+                        message: format!("relation id {actual} has no schema"),
+                    })?;
                     relationships.extend(relation_cells(
                         edge_type,
                         matrices,
                         tensors,
+                        &mut dangling_tensor_cells,
+                        &mut empty_tensor_cells,
                         &mut diagnostics,
                     )?);
                 }
@@ -387,31 +500,19 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
             }
             9 => {
                 for entry in read_delta(&mut stream, false, &mut diagnostics)? {
-                    let label = node_names
-                        .get(&entry.col)
-                        .ok_or_else(|| DecodeError::Invalid {
-                            layer: "label-matrix",
-                            offset: stream.offset(),
-                            message: format!("label id {} has no schema", entry.col),
-                        })?;
+                    let label = node_names.get(&entry.col).ok_or_else(|| DecodeError::Invalid {
+                        layer: "label-matrix",
+                        offset: stream.offset(),
+                        message: format!("label id {} has no schema", entry.col),
+                    })?;
                     labels.entry(entry.row).or_default().insert(label.clone());
                 }
             }
-            other => {
-                return invalid(
-                    "payload",
-                    stream.offset(),
-                    format!("unknown payload state {other}"),
-                )
-            }
+            other => return invalid("payload", stream.offset(), format!("unknown payload state {other}")),
         }
     }
     if !stream.at_end()? {
-        return invalid(
-            "typed-stream",
-            stream.offset(),
-            "bytes remain after final payload",
-        );
+        return invalid("typed-stream", stream.offset(), "bytes remain after final payload");
     }
     for (state, expected) in [
         (1, declared_nodes),
@@ -432,11 +533,7 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
     }
     for state in [6, 7, 8, 9] {
         if covered.get(&state).copied().unwrap_or(0) != 1 {
-            return invalid(
-                "payload",
-                0,
-                format!("state {state} must appear exactly once"),
-            );
+            return invalid("payload", 0, format!("state {state} must appear exactly once"));
         }
     }
     relationships.sort();
@@ -456,6 +553,8 @@ pub fn decode_dump(data: &[u8]) -> Result<GraphDump> {
         labels,
         relationships,
         adjacency,
+        dangling_tensor_cells,
+        empty_tensor_cells,
         diagnostics,
     };
     graph.validate_reconciliation()?;
@@ -481,10 +580,7 @@ where
 
     reader
         .seek(SeekFrom::End(-10))
-        .map_err(|source| DecodeError::Io {
-            offset: bytes,
-            source,
-        })?;
+        .map_err(|source| DecodeError::Io { offset: bytes, source })?;
     let mut footer = [0u8; 10];
     read_exact_at(reader, &mut footer, bytes - 10)?;
     let rdb_version = u16::from_le_bytes(footer[..2].try_into().unwrap());
@@ -509,8 +605,7 @@ where
         let wanted = usize::try_from((bytes - offset).min(buffer.len() as u64)).unwrap();
         read_exact_at(reader, &mut buffer[..wanted], offset)?;
         sha256.update(&buffer[..wanted]);
-        let crc_count =
-            usize::try_from(crc_bytes.saturating_sub(offset).min(wanted as u64)).unwrap();
+        let crc_count = usize::try_from(crc_bytes.saturating_sub(offset).min(wanted as u64)).unwrap();
         crc = crc64_jones_update(crc, &buffer[..crc_count]);
         offset += wanted as u64;
     }
@@ -540,11 +635,7 @@ fn read_dump_name<R: Read>(reader: &mut R) -> Result<String> {
     }
     let (module_id, encoding) = stream.length()?;
     if encoding.is_some() {
-        return invalid(
-            "rdb-envelope",
-            stream.offset_usize(),
-            "module id uses a special string encoding",
-        );
+        return invalid("rdb-envelope", stream.offset_usize(), "module id uses a special string encoding");
     }
     let name_bits = module_id >> 10;
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -635,30 +726,16 @@ impl<'a, R: Read> StreamCursor<'a, R> {
         let (length, special) = self.length()?;
         match special {
             None => self.take_limited(length, limit, "RDB string length"),
-            Some(0) => Ok(i8::from_le_bytes(self.bytes::<1>()?)
-                .to_string()
-                .into_bytes()),
-            Some(1) => Ok(i16::from_le_bytes(self.bytes::<2>()?)
-                .to_string()
-                .into_bytes()),
-            Some(2) => Ok(i32::from_le_bytes(self.bytes::<4>()?)
-                .to_string()
-                .into_bytes()),
+            Some(0) => Ok(i8::from_le_bytes(self.bytes::<1>()?).to_string().into_bytes()),
+            Some(1) => Ok(i16::from_le_bytes(self.bytes::<2>()?).to_string().into_bytes()),
+            Some(2) => Ok(i32::from_le_bytes(self.bytes::<4>()?).to_string().into_bytes()),
             Some(3) => {
                 let (compressed, c_special) = self.length()?;
                 let (uncompressed, u_special) = self.length()?;
                 if c_special.is_some() || u_special.is_some() {
-                    return invalid(
-                        "rdb-envelope",
-                        self.offset_usize(),
-                        "LZF lengths use special encoding",
-                    );
+                    return invalid("rdb-envelope", self.offset_usize(), "LZF lengths use special encoding");
                 }
-                let uncompressed = usize_from(
-                    uncompressed,
-                    "LZF identity output length",
-                    self.offset_usize(),
-                )?;
+                let uncompressed = usize_from(uncompressed, "LZF identity output length", self.offset_usize())?;
                 if uncompressed > limit {
                     return invalid(
                         "resource-limit",
@@ -666,18 +743,10 @@ impl<'a, R: Read> StreamCursor<'a, R> {
                         format!("identity chunk requests {uncompressed} bytes, limit is {limit}"),
                     );
                 }
-                let compressed = self.take_limited(
-                    compressed,
-                    MAX_IDENTITY_CHUNK_BYTES,
-                    "LZF identity input length",
-                )?;
+                let compressed = self.take_limited(compressed, MAX_IDENTITY_CHUNK_BYTES, "LZF identity input length")?;
                 lzf_decompress(&compressed, uncompressed)
             }
-            Some(other) => invalid(
-                "rdb-envelope",
-                self.offset_usize(),
-                format!("unknown RDB string encoding {other}"),
-            ),
+            Some(other) => invalid("rdb-envelope", self.offset_usize(), format!("unknown RDB string encoding {other}")),
         }
     }
 
@@ -698,9 +767,7 @@ impl<'a, R: Read> StreamCursor<'a, R> {
 }
 
 fn read_exact_at<R: Read>(reader: &mut R, bytes: &mut [u8], offset: u64) -> Result<()> {
-    reader
-        .read_exact(bytes)
-        .map_err(|source| DecodeError::Io { offset, source })
+    reader.read_exact(bytes).map_err(|source| DecodeError::Io { offset, source })
 }
 
 struct Envelope {
@@ -737,11 +804,7 @@ fn decode_envelope(data: &[u8]) -> Result<Envelope> {
     }
     let (module_id, encoding) = cursor.length()?;
     if encoding.is_some() {
-        return invalid(
-            "rdb-envelope",
-            cursor.position(),
-            "module id uses a special string encoding",
-        );
+        return invalid("rdb-envelope", cursor.position(), "module id uses a special string encoding");
     }
     let name_bits = module_id >> 10;
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -761,22 +824,12 @@ fn decode_envelope(data: &[u8]) -> Result<Envelope> {
     loop {
         let (opcode, special) = cursor.length()?;
         if special.is_some() {
-            return invalid(
-                "rdb-envelope",
-                cursor.position(),
-                "module opcode uses a special encoding",
-            );
+            return invalid("rdb-envelope", cursor.position(), "module opcode uses a special encoding");
         }
         match opcode {
             MODULE_OPCODE_EOF => break,
             MODULE_OPCODE_STRING => chunks.push(cursor.string()?),
-            other => {
-                return invalid(
-                    "rdb-envelope",
-                    cursor.position(),
-                    format!("unsupported module opcode {other}"),
-                )
-            }
+            other => return invalid("rdb-envelope", cursor.position(), format!("unsupported module opcode {other}")),
         }
     }
     if cursor.remaining() != 0 {
@@ -801,11 +854,7 @@ struct ByteCursor<'a> {
 
 impl<'a> ByteCursor<'a> {
     fn new(data: &'a [u8], layer: &'static str) -> Self {
-        Self {
-            data,
-            position: 0,
-            layer,
-        }
+        Self { data, position: 0, layer }
     }
     fn position(&self) -> usize {
         self.position
@@ -830,16 +879,9 @@ impl<'a> ByteCursor<'a> {
             0 => Ok(((first & 0x3f) as u64, None)),
             1 => Ok(((((first & 0x3f) as u64) << 8) | self.byte()? as u64, None)),
             2 => match first {
-                0x80 => Ok((
-                    u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64,
-                    None,
-                )),
+                0x80 => Ok((u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64, None)),
                 0x81 => Ok((u64::from_be_bytes(self.take(8)?.try_into().unwrap()), None)),
-                _ => invalid(
-                    self.layer,
-                    self.position - 1,
-                    format!("invalid length marker {first:#x}"),
-                ),
+                _ => invalid(self.layer, self.position - 1, format!("invalid length marker {first:#x}")),
             },
             _ => Ok((0, Some(first & 0x3f))),
         }
@@ -847,43 +889,20 @@ impl<'a> ByteCursor<'a> {
     fn string(&mut self) -> Result<Vec<u8>> {
         let (length, special) = self.length()?;
         match special {
-            None => Ok(self
-                .take(usize_from(length, "RDB string length", self.position)?)?
-                .to_vec()),
-            Some(0) => Ok(i8::from_le_bytes(self.take(1)?.try_into().unwrap())
-                .to_string()
-                .into_bytes()),
-            Some(1) => Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap())
-                .to_string()
-                .into_bytes()),
-            Some(2) => Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap())
-                .to_string()
-                .into_bytes()),
+            None => Ok(self.take(usize_from(length, "RDB string length", self.position)?)?.to_vec()),
+            Some(0) => Ok(i8::from_le_bytes(self.take(1)?.try_into().unwrap()).to_string().into_bytes()),
+            Some(1) => Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()).to_string().into_bytes()),
+            Some(2) => Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()).to_string().into_bytes()),
             Some(3) => {
                 let (compressed, c_special) = self.length()?;
                 let (uncompressed, u_special) = self.length()?;
                 if c_special.is_some() || u_special.is_some() {
-                    return invalid(
-                        self.layer,
-                        self.position,
-                        "LZF lengths use special encoding",
-                    );
+                    return invalid(self.layer, self.position, "LZF lengths use special encoding");
                 }
-                let compressed = self.take(usize_from(
-                    compressed,
-                    "LZF compressed length",
-                    self.position,
-                )?)?;
-                lzf_decompress(
-                    compressed,
-                    usize_from(uncompressed, "LZF output length", self.position)?,
-                )
+                let compressed = self.take(usize_from(compressed, "LZF compressed length", self.position)?)?;
+                lzf_decompress(compressed, usize_from(uncompressed, "LZF output length", self.position)?)
             }
-            Some(other) => invalid(
-                self.layer,
-                self.position,
-                format!("unknown RDB string encoding {other}"),
-            ),
+            Some(other) => invalid(self.layer, self.position, format!("unknown RDB string encoding {other}")),
         }
     }
 }
@@ -892,60 +911,35 @@ struct TaggedStream {
     chunks: Vec<Vec<u8>>,
     chunk: usize,
     position: usize,
+    /// The bytes of every chunk before `chunk`, a taken blob's included.
     absolute: usize,
+    /// The bytes of every chunk, so the bytes left are known without
+    /// rescanning the chunks on each of the millions of count checks.
+    total: usize,
 }
 
 impl TaggedStream {
     fn new(chunks: Vec<Vec<u8>>) -> Self {
+        let total = chunks.iter().map(Vec::len).sum();
         Self {
             chunks,
             chunk: 0,
             position: 0,
             absolute: 0,
+            total,
         }
     }
     fn offset(&self) -> usize {
         self.absolute
     }
     fn remaining_bytes(&self) -> usize {
-        self.chunks
-            .iter()
-            .enumerate()
-            .skip(self.chunk)
-            .fold(0usize, |total, (index, chunk)| {
-                let bytes = if index == self.chunk {
-                    chunk.len().saturating_sub(self.position)
-                } else {
-                    chunk.len()
-                };
-                total.saturating_add(bytes)
-            })
+        self.total.saturating_sub(self.absolute + self.position)
     }
-    fn collection_count(
-        &self,
-        declared: u64,
-        minimum_encoded_bytes: usize,
-        purpose: &'static str,
-    ) -> Result<usize> {
-        self.collection_count_with_limit(
-            declared,
-            minimum_encoded_bytes,
-            purpose,
-            MAX_COLLECTION_ITEMS,
-        )
+    fn collection_count(&self, declared: u64, minimum_encoded_bytes: usize, purpose: &'static str) -> Result<usize> {
+        self.collection_count_with_limit(declared, minimum_encoded_bytes, purpose, MAX_COLLECTION_ITEMS)
     }
-    fn metadata_count(
-        &self,
-        declared: u64,
-        minimum_encoded_bytes: usize,
-        purpose: &'static str,
-    ) -> Result<usize> {
-        self.collection_count_with_limit(
-            declared,
-            minimum_encoded_bytes,
-            purpose,
-            MAX_METADATA_ITEMS,
-        )
+    fn metadata_count(&self, declared: u64, minimum_encoded_bytes: usize, purpose: &'static str) -> Result<usize> {
+        self.collection_count_with_limit(declared, minimum_encoded_bytes, purpose, MAX_METADATA_ITEMS)
     }
     fn collection_count_with_limit(
         &self,
@@ -982,11 +976,7 @@ impl TaggedStream {
         let actual = self.chunks[self.chunk][self.position];
         self.position += 1;
         if actual != expected {
-            return invalid(
-                "typed-stream",
-                offset,
-                format!("tag {actual}, expected {expected}"),
-            );
+            return invalid("typed-stream", offset, format!("tag {actual}, expected {expected}"));
         }
         Ok(())
     }
@@ -996,9 +986,7 @@ impl TaggedStream {
         if remaining < N {
             return truncated("typed-stream", self.offset() + self.position, N, remaining);
         }
-        let value = self.chunks[self.chunk][self.position..self.position + N]
-            .try_into()
-            .unwrap();
+        let value = self.chunks[self.chunk][self.position..self.position + N].try_into().unwrap();
         self.position += N;
         Ok(value)
     }
@@ -1035,41 +1023,24 @@ impl TaggedStream {
             if remaining < 8 {
                 return truncated("typed-stream", self.offset() + self.position, 8, remaining);
             }
-            let length = u64::from_le_bytes(
-                self.chunks[self.chunk][self.position..self.position + 8]
-                    .try_into()
-                    .unwrap(),
-            );
+            let length = u64::from_le_bytes(self.chunks[self.chunk][self.position..self.position + 8].try_into().unwrap());
             self.position += 8;
             let length = usize_from(length, "typed byte length", offset)?;
             let remaining = self.chunks[self.chunk].len() - self.position;
             if remaining < length {
-                return truncated(
-                    "typed-stream",
-                    self.offset() + self.position,
-                    length,
-                    remaining,
-                );
+                return truncated("typed-stream", self.offset() + self.position, length, remaining);
             }
             let result = self.chunks[self.chunk][self.position..self.position + length].to_vec();
             self.position += length;
             Ok(result)
         } else {
-            invalid(
-                "typed-stream",
-                offset,
-                format!("tag {tag}, expected bytes tag 0 or blob tag 6"),
-            )
+            invalid("typed-stream", offset, format!("tag {tag}, expected bytes tag 0 or blob tag 6"))
         }
     }
     fn c_string(&mut self) -> Result<String> {
         let mut bytes = self.bytes()?;
         if bytes.pop() != Some(0) {
-            return invalid(
-                "typed-stream",
-                self.offset(),
-                "string is not NUL terminated",
-            );
+            return invalid("typed-stream", self.offset(), "string is not NUL terminated");
         }
         String::from_utf8(bytes).map_err(|error| DecodeError::Invalid {
             layer: "typed-stream",
@@ -1126,58 +1097,43 @@ fn read_schema(stream: &mut TaggedStream) -> Result<Vec<Schema>> {
         for _ in 0..constraint_count {
             let _constraint_type = stream.unsigned()?;
             let declared = stream.unsigned()?;
-            let attribute_count =
-                stream.metadata_count(declared, 9, "constraint attribute count")?;
+            let attribute_count = stream.metadata_count(declared, 9, "constraint attribute count")?;
             for _ in 0..attribute_count {
                 let _ = stream.unsigned()?;
             }
         }
-        schemas.push(Schema { id, name });
+        schemas.push(Schema {
+            id,
+            name,
+            index_count,
+            constraint_count,
+        });
     }
     Ok(schemas)
 }
 
-fn read_entities(
-    stream: &mut TaggedStream,
-    count: u64,
-    attributes: &[String],
-    output: &mut BTreeMap<u64, Entity>,
-) -> Result<()> {
+fn read_entities(stream: &mut TaggedStream, count: u64, attributes: &[Arc<str>], output: &mut BTreeMap<u64, Entity>) -> Result<()> {
     let count = stream.collection_count(count, 18, "entity count")?;
     for _ in 0..count {
         let id = stream.unsigned()?;
         let declared = stream.unsigned()?;
         let property_count = stream.metadata_count(declared, 18, "property count")?;
-        let mut properties = BTreeMap::new();
+        let mut properties = Vec::with_capacity(property_count);
         for _ in 0..property_count {
             let attribute = usize_from(stream.unsigned()?, "attribute id", stream.offset())?;
-            let name = attributes
-                .get(attribute)
-                .ok_or_else(|| DecodeError::Invalid {
-                    layer: "entity",
-                    offset: stream.offset(),
-                    message: format!(
-                        "attribute id {attribute} outside table of {}",
-                        attributes.len()
-                    ),
-                })?;
-            if properties
-                .insert(name.clone(), read_value(stream)?)
-                .is_some()
-            {
-                return invalid(
-                    "entity",
-                    stream.offset(),
-                    format!("entity {id} repeats property {name}"),
-                );
-            }
+            let name = attributes.get(attribute).ok_or_else(|| DecodeError::Invalid {
+                layer: "entity",
+                offset: stream.offset(),
+                message: format!("attribute id {attribute} outside table of {}", attributes.len()),
+            })?;
+            properties.push((Arc::clone(name), read_value(stream)?));
         }
+        let properties = match Properties::from_entries(properties) {
+            Ok(properties) => properties,
+            Err(name) => return invalid("entity", stream.offset(), format!("entity {id} repeats property {name}")),
+        };
         if output.insert(id, Entity { id, properties }).is_some() {
-            return invalid(
-                "entity",
-                stream.offset(),
-                format!("entity id {id} appears twice"),
-            );
+            return invalid("entity", stream.offset(), format!("entity id {id} appears twice"));
         }
     }
     Ok(())
@@ -1192,19 +1148,15 @@ fn read_value(stream: &mut TaggedStream) -> Result<PropertyValue> {
         SI_STRING | SI_INTERN_STRING => {
             let mut value = stream.bytes()?;
             if value.pop() != Some(0) {
-                return invalid(
-                    "property",
-                    stream.offset(),
-                    "string property is not NUL terminated",
-                );
+                return invalid("property", stream.offset(), "string property is not NUL terminated");
             }
-            Ok(PropertyValue::String(String::from_utf8(value).map_err(
-                |error| DecodeError::Invalid {
+            Ok(PropertyValue::String(String::from_utf8(value).map_err(|error| {
+                DecodeError::Invalid {
                     layer: "property",
                     offset: stream.offset(),
                     message: format!("string property is not UTF-8: {error}"),
-                },
-            )?))
+                }
+            })?))
         }
         SI_ARRAY => {
             let declared = stream.unsigned()?;
@@ -1222,11 +1174,7 @@ fn read_value(stream: &mut TaggedStream) -> Result<PropertyValue> {
         SI_VECTOR_F32 => {
             let bytes = stream.bytes()?;
             if bytes.len() < 4 {
-                return invalid(
-                    "property",
-                    stream.offset(),
-                    "vector payload is shorter than dimension",
-                );
+                return invalid("property", stream.offset(), "vector payload is shorter than dimension");
             }
             let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
             if bytes.len() != 4 + count * 4 {
@@ -1238,10 +1186,7 @@ fn read_value(stream: &mut TaggedStream) -> Result<PropertyValue> {
             }
             let (chunks, remainder) = bytes[4..].as_chunks::<4>();
             debug_assert!(remainder.is_empty());
-            let values = chunks
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect();
+            let values = chunks.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect();
             Ok(PropertyValue::VectorF32(values))
         }
         SI_DATETIME => Ok(PropertyValue::DateTime(stream.signed()?)),
@@ -1258,11 +1203,7 @@ fn read_value(stream: &mut TaggedStream) -> Result<PropertyValue> {
             }
             Ok(PropertyValue::Map(values))
         }
-        other => invalid(
-            "property",
-            stream.offset(),
-            format!("unsupported SIValue type {other}"),
-        ),
+        other => invalid("property", stream.offset(), format!("unsupported SIValue type {other}")),
     }
 }
 
@@ -1302,11 +1243,7 @@ fn read_vector(stream: &mut TaggedStream) -> Result<Vector> {
             format!("{} bytes, declares {declared_bytes}", bytes.len()),
         );
     }
-    Ok(Vector {
-        bytes,
-        kind,
-        entries,
-    })
+    Ok(Vector { bytes, kind, entries })
 }
 
 fn read_matrix(stream: &mut TaggedStream) -> Result<Matrix> {
@@ -1354,11 +1291,7 @@ fn read_matrix(stream: &mut TaggedStream) -> Result<Matrix> {
     })
 }
 
-fn read_delta(
-    stream: &mut TaggedStream,
-    with_values: bool,
-    diagnostics: &mut DecodeDiagnostics,
-) -> Result<DeltaEntries> {
+fn read_delta(stream: &mut TaggedStream, with_values: bool, diagnostics: &mut DecodeDiagnostics) -> Result<DeltaEntries> {
     let base = matrix_entries(&read_matrix(stream)?, with_values)?;
     let inserts = matrix_entries(&read_matrix(stream)?, with_values)?;
     let deletes = matrix_entries(&read_matrix(stream)?, false)?;
@@ -1367,8 +1300,7 @@ fn read_delta(
     let base_keys: BTreeSet<_> = base.iter().map(|e| (e.row, e.col)).collect();
     diagnostics.delta_delete_missing_from_base += delete_keys.difference(&base_keys).count() as u64;
     diagnostics.delta_insert_overlaps_base += insert_keys.intersection(&base_keys).count() as u64;
-    diagnostics.delta_insert_overlaps_delete +=
-        insert_keys.intersection(&delete_keys).count() as u64;
+    diagnostics.delta_insert_overlaps_delete += insert_keys.intersection(&delete_keys).count() as u64;
     let mut effective: BTreeMap<(u64, u64), MatrixEntry> = base
         .into_iter()
         .filter(|e| !delete_keys.contains(&(e.row, e.col)))
@@ -1401,15 +1333,11 @@ fn matrix_entries(matrix: &Matrix, with_values: bool) -> Result<Vec<MatrixEntry>
         } else {
             dense_position
         };
-        values
-            .get(index)
-            .copied()
-            .map(Some)
-            .ok_or_else(|| DecodeError::Invalid {
-                layer: "graphblas-matrix",
-                offset: 0,
-                message: format!("value index {index} outside {} entries", values.len()),
-            })
+        values.get(index).copied().map(Some).ok_or_else(|| DecodeError::Invalid {
+            layer: "graphblas-matrix",
+            offset: 0,
+            message: format!("value index {index} outside {} entries", values.len()),
+        })
     };
     let value_count = usize_from(matrix.values, "matrix values", 0)?;
     let mut output = allocated_vec(value_count, "matrix entries", 0)?;
@@ -1426,18 +1354,12 @@ fn matrix_entries(matrix: &Matrix, with_values: bool) -> Result<Vec<MatrixEntry>
                 Some(hypers) => hypers.len(),
                 None => usize_from(matrix.rows, "matrix rows", 0)?,
             };
-            let required_pointers =
-                vector_count
-                    .checked_add(1)
-                    .ok_or_else(|| DecodeError::Invalid {
-                        layer: "graphblas-matrix",
-                        offset: 0,
-                        message: "matrix vector count overflows".into(),
-                    })?;
-            if pointers.len() < required_pointers
-                || pointers[vector_count] != matrix.values
-                || indices.len() < value_count
-            {
+            let required_pointers = vector_count.checked_add(1).ok_or_else(|| DecodeError::Invalid {
+                layer: "graphblas-matrix",
+                offset: 0,
+                message: "matrix vector count overflows".into(),
+            })?;
+            if pointers.len() < required_pointers || pointers[vector_count] != matrix.values || indices.len() < value_count {
                 return invalid("graphblas-matrix", 0, "sparse arrays disagree with nvals");
             }
             let used_pointers = &pointers[..=vector_count];
@@ -1445,24 +1367,12 @@ fn matrix_entries(matrix: &Matrix, with_values: bool) -> Result<Vec<MatrixEntry>
                 || used_pointers.iter().any(|pointer| *pointer > matrix.values)
                 || used_pointers.windows(2).any(|pair| pair[0] > pair[1])
             {
-                return invalid(
-                    "graphblas-matrix",
-                    0,
-                    "sparse pointers are not ordered within nvals",
-                );
+                return invalid("graphblas-matrix", 0, "sparse pointers are not ordered within nvals");
             }
-            if hypers
-                .as_ref()
-                .is_some_and(|rows| rows.iter().any(|row| *row >= matrix.rows))
-                || indices[..value_count]
-                    .iter()
-                    .any(|column| *column >= matrix.cols)
+            if hypers.as_ref().is_some_and(|rows| rows.iter().any(|row| *row >= matrix.rows))
+                || indices[..value_count].iter().any(|column| *column >= matrix.cols)
             {
-                return invalid(
-                    "graphblas-matrix",
-                    0,
-                    "sparse index is outside matrix dimensions",
-                );
+                return invalid("graphblas-matrix", 0, "sparse index is outside matrix dimensions");
             }
             for vector in 0..vector_count {
                 let row = hypers.as_ref().map_or(vector as u64, |h| h[vector]);
@@ -1479,19 +1389,14 @@ fn matrix_entries(matrix: &Matrix, with_values: bool) -> Result<Vec<MatrixEntry>
             }
         }
         4 | 8 => {
-            let cells =
-                matrix
-                    .rows
-                    .checked_mul(matrix.cols)
-                    .ok_or_else(|| DecodeError::Invalid {
-                        layer: "graphblas-matrix",
-                        offset: 0,
-                        message: "matrix dimensions overflow".into(),
-                    })?;
+            let cells = matrix.rows.checked_mul(matrix.cols).ok_or_else(|| DecodeError::Invalid {
+                layer: "graphblas-matrix",
+                offset: 0,
+                message: "matrix dimensions overflow".into(),
+            })?;
             let bitmap = matrix.vectors.get("b").unwrap();
             for dense in 0..usize_from(cells, "matrix cells", 0)? {
-                let present =
-                    matrix.format == 8 || bitmap.bytes.get(dense).copied().unwrap_or(0) != 0;
+                let present = matrix.format == 8 || bitmap.bytes.get(dense).copied().unwrap_or(0) != 0;
                 if present {
                     output.push(MatrixEntry {
                         row: dense as u64 / matrix.cols,
@@ -1504,11 +1409,7 @@ fn matrix_entries(matrix: &Matrix, with_values: bool) -> Result<Vec<MatrixEntry>
                 return invalid(
                     "graphblas-matrix",
                     0,
-                    format!(
-                        "dense/bitmap yielded {} entries, declares {}",
-                        output.len(),
-                        matrix.values
-                    ),
+                    format!("dense/bitmap yielded {} entries, declares {}", output.len(), matrix.values),
                 );
             }
         }
@@ -1525,31 +1426,19 @@ fn vector_indices(vector: &Vector) -> Result<Vec<u64>> {
         "GrB_INT32" => parse_chunks(&vector.bytes, vector.entries, 4, |b| {
             i32::from_le_bytes(b.try_into().unwrap()) as i64 as u64
         }),
-        "GrB_UINT64" => parse_chunks(&vector.bytes, vector.entries, 8, |b| {
-            u64::from_le_bytes(b.try_into().unwrap())
-        }),
+        "GrB_UINT64" => parse_chunks(&vector.bytes, vector.entries, 8, |b| u64::from_le_bytes(b.try_into().unwrap())),
         "GrB_INT64" => parse_chunks(&vector.bytes, vector.entries, 8, |b| {
             i64::from_le_bytes(b.try_into().unwrap()) as u64
         }),
-        other => invalid(
-            "graphblas-vector",
-            0,
-            format!("unsupported index type {other}"),
-        ),
+        other => invalid("graphblas-vector", 0, format!("unsupported index type {other}")),
     }
 }
 
 fn vector_u64(vector: &Vector, purpose: &str) -> Result<Vec<u64>> {
     match vector.kind.as_str() {
-        "GrB_UINT64" => parse_chunks(&vector.bytes, vector.entries, 8, |b| {
-            u64::from_le_bytes(b.try_into().unwrap())
-        }),
+        "GrB_UINT64" => parse_chunks(&vector.bytes, vector.entries, 8, |b| u64::from_le_bytes(b.try_into().unwrap())),
         "GrB_BOOL" => parse_chunks(&vector.bytes, vector.entries, 1, |b| b[0] as u64),
-        other => invalid(
-            "graphblas-vector",
-            0,
-            format!("unsupported {purpose} type {other}"),
-        ),
+        other => invalid("graphblas-vector", 0, format!("unsupported {purpose} type {other}")),
     }
 }
 
@@ -1558,13 +1447,11 @@ where
     F: Fn(&[u8]) -> u64,
 {
     let count = usize_from(entries, "vector entries", 0)?;
-    let need = count
-        .checked_mul(width)
-        .ok_or_else(|| DecodeError::Invalid {
-            layer: "graphblas-vector",
-            offset: 0,
-            message: "vector byte length overflow".into(),
-        })?;
+    let need = count.checked_mul(width).ok_or_else(|| DecodeError::Invalid {
+        layer: "graphblas-vector",
+        offset: 0,
+        message: "vector byte length overflow".into(),
+    })?;
     if bytes.len() < need {
         return truncated("graphblas-vector", 0, need, bytes.len());
     }
@@ -1594,20 +1481,12 @@ fn read_tensors(stream: &mut TaggedStream) -> Result<BTreeMap<(u64, u64), Vec<u6
             let col = stream.unsigned()?;
             let ids = tensor_ids(&stream.bytes()?)?;
             if tensors.insert((row, col), ids).is_some() {
-                return invalid(
-                    "tensor",
-                    stream.offset(),
-                    format!("duplicate tensor at ({row},{col})"),
-                );
+                return invalid("tensor", stream.offset(), format!("duplicate tensor at ({row},{col})"));
             }
         }
     }
     if tensors.len() as u64 != total {
-        return invalid(
-            "tensor",
-            stream.offset(),
-            format!("{} tensors, declares {total}", tensors.len()),
-        );
+        return invalid("tensor", stream.offset(), format!("{} tensors, declares {total}", tensors.len()));
     }
     Ok(tensors)
 }
@@ -1619,22 +1498,16 @@ fn tensor_ids(blob: &[u8]) -> Result<Vec<u64>> {
     }
     let declared = le_u64(blob, 0, "tensor")?;
     if declared != blob.len() as u64 {
-        return invalid(
-            "tensor",
-            0,
-            format!("declares {declared} bytes, holds {}", blob.len()),
-        );
+        return invalid("tensor", 0, format!("declares {declared} bytes, holds {}", blob.len()));
     }
     let encoding = le_u32(blob, 8, "tensor")?;
     let index_is_u32 = ((encoding >> 4) & 0xf) != 0;
     let nvals = usize_from(
-        le_i64(blob, 48, "tensor")?
-            .try_into()
-            .map_err(|_| DecodeError::Invalid {
-                layer: "tensor",
-                offset: 48,
-                message: "negative nvals".into(),
-            })?,
+        le_i64(blob, 48, "tensor")?.try_into().map_err(|_| DecodeError::Invalid {
+            layer: "tensor",
+            offset: 48,
+            message: "negative nvals".into(),
+        })?,
         "tensor nvals",
         48,
     )?;
@@ -1650,14 +1523,11 @@ fn tensor_ids(blob: &[u8]) -> Result<Vec<u64>> {
     let mut block_counts = [0usize; 5];
     let mut methods = [0i32; 5];
     for index in 0..5 {
-        block_counts[index] =
-            usize::try_from(le_i32(blob, 120 + index * 8, "tensor")?).map_err(|_| {
-                DecodeError::Invalid {
-                    layer: "tensor",
-                    offset: 120 + index * 8,
-                    message: "negative block count".into(),
-                }
-            })?;
+        block_counts[index] = usize::try_from(le_i32(blob, 120 + index * 8, "tensor")?).map_err(|_| DecodeError::Invalid {
+            layer: "tensor",
+            offset: 120 + index * 8,
+            message: "negative block count".into(),
+        })?;
         methods[index] = le_i32(blob, 124 + index * 8, "tensor")?;
     }
     let mut position = HEADER;
@@ -1680,16 +1550,8 @@ fn tensor_ids(blob: &[u8]) -> Result<Vec<u64>> {
     let mut ai = Vec::new();
     for index in 0..5 {
         let compressed_length = ends[index].last().copied().unwrap_or(0);
-        if position
-            .checked_add(compressed_length)
-            .is_none_or(|end| end > blob.len())
-        {
-            return truncated(
-                "tensor",
-                position,
-                compressed_length,
-                blob.len().saturating_sub(position),
-            );
+        if position.checked_add(compressed_length).is_none_or(|end| end > blob.len()) {
+            return truncated("tensor", position, compressed_length, blob.len().saturating_sub(position));
         }
         let raw = &blob[position..position + compressed_length];
         position += compressed_length;
@@ -1700,10 +1562,7 @@ fn tensor_ids(blob: &[u8]) -> Result<Vec<u64>> {
     }
     let trailer = &blob[position..];
     let parts: Vec<_> = trailer.split(|byte| *byte == 0).collect();
-    if parts.len() != 3
-        || !parts[2].is_empty()
-        || !matches!(parts[1], b"" | b"GrB_BOOL" | b"GrB_UINT64")
-    {
+    if parts.len() != 3 || !parts[2].is_empty() || !matches!(parts[1], b"" | b"GrB_BOOL" | b"GrB_UINT64") {
         return invalid("tensor", position, "unexpected tensor trailer");
     }
     let width = if index_is_u32 { 4 } else { 8 };
@@ -1724,28 +1583,18 @@ fn tensor_ids(blob: &[u8]) -> Result<Vec<u64>> {
             .collect::<Vec<_>>()
     };
     if ids.len() < nvals {
-        return invalid(
-            "tensor",
-            0,
-            format!("Ai has {} ids, nvals is {nvals}", ids.len()),
-        );
+        return invalid("tensor", 0, format!("Ai has {} ids, nvals is {nvals}", ids.len()));
     }
     ids.truncate(nvals);
-    if ids.is_empty() {
-        return invalid("tensor", 0, "empty tensor");
-    }
+    // An empty list is a multi-edge cell whose edges were all deleted
+    // (EmptyTensorCell); relation_cells reports it.
     if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return invalid("tensor", 0, "tensor ids are not strictly ascending");
     }
     Ok(ids)
 }
 
-fn decode_tensor_component(
-    raw: &[u8],
-    expected: usize,
-    ends: &[usize],
-    method: i32,
-) -> Result<Vec<u8>> {
+fn decode_tensor_component(raw: &[u8], expected: usize, ends: &[usize], method: i32) -> Result<Vec<u8>> {
     let output = if ends.is_empty() {
         Vec::new()
     } else if method == -1 {
@@ -1775,39 +1624,36 @@ fn decode_tensor_component(
                 return invalid(
                     "tensor",
                     start,
-                    format!(
-                        "zstd block decoded to {} bytes, expected {expected_block}",
-                        decoded.len()
-                    ),
+                    format!("zstd block decoded to {} bytes, expected {expected_block}", decoded.len()),
                 );
             }
             output.extend(decoded);
         }
         output
     } else {
-        return invalid(
-            "tensor",
-            0,
-            format!("unsupported compression method {method}"),
-        );
+        return invalid("tensor", 0, format!("unsupported compression method {method}"));
     };
     if output.len() != expected {
         return invalid(
             "tensor",
             0,
-            format!(
-                "component decoded to {} bytes, expected {expected}",
-                output.len()
-            ),
+            format!("component decoded to {} bytes, expected {expected}", output.len()),
         );
     }
     Ok(output)
 }
 
+/// A relationship type's cells as one relationship per edge. A multi-edge cell
+/// with no list is reported in `dangling` only when the type wrote no lists at
+/// all, FalkorDB's drifted-counter case; a list missing from a type that wrote
+/// lists is corruption. A multi-edge cell whose list is empty has no edges and
+/// is reported in `empty`.
 fn relation_cells(
     edge_type: &str,
     entries: DeltaEntries,
     tensors: BTreeMap<(u64, u64), Vec<u64>>,
+    dangling: &mut Vec<DanglingTensorCell>,
+    empty: &mut Vec<EmptyTensorCell>,
     diagnostics: &mut DecodeDiagnostics,
 ) -> Result<Vec<RelationshipCell>> {
     let mut output = Vec::new();
@@ -1822,15 +1668,30 @@ fn relation_cells(
             diagnostics.delete_markers += 1;
             continue;
         }
+        if value & MSB != 0 && tensors.is_empty() {
+            dangling.push(DanglingTensorCell {
+                edge_type: edge_type.to_string(),
+                src: entry.row,
+                dst: entry.col,
+                value,
+            });
+            continue;
+        }
         if value & MSB != 0 {
-            let ids = tensors
-                .get(&(entry.row, entry.col))
-                .ok_or_else(|| DecodeError::Invalid {
-                    layer: "relation-matrix",
-                    offset: 0,
-                    message: format!("tensor cell ({},{}) has no blob", entry.row, entry.col),
-                })?;
+            let ids = tensors.get(&(entry.row, entry.col)).ok_or_else(|| DecodeError::Invalid {
+                layer: "relation-matrix",
+                offset: 0,
+                message: format!("tensor cell ({},{}) has no blob", entry.row, entry.col),
+            })?;
             used.insert((entry.row, entry.col));
+            if ids.is_empty() {
+                empty.push(EmptyTensorCell {
+                    edge_type: edge_type.to_string(),
+                    src: entry.row,
+                    dst: entry.col,
+                });
+                continue;
+            }
             for &edge_id in ids {
                 output.push(RelationshipCell {
                     edge_type: edge_type.to_string(),
@@ -1852,10 +1713,7 @@ fn relation_cells(
         return invalid(
             "relation-matrix",
             0,
-            format!(
-                "{} tensor blobs are unreferenced",
-                tensors.len() - used.len()
-            ),
+            format!("{} tensor blobs are unreferenced", tensors.len() - used.len()),
         );
     }
     Ok(output)
@@ -1917,11 +1775,7 @@ fn lzf_decompress(input: &[u8], expected: usize) -> Result<Vec<u8>> {
         }
     }
     if output.len() != expected {
-        return invalid(
-            "lzf",
-            position,
-            format!("decoded {} bytes, expected {expected}", output.len()),
-        );
+        return invalid("lzf", position, format!("decoded {} bytes, expected {expected}", output.len()));
     }
     Ok(output)
 }
@@ -1970,14 +1824,11 @@ fn usize_from(value: u64, what: &str, offset: usize) -> Result<usize> {
     })
 }
 fn allocated_vec<T>(count: usize, purpose: &'static str, offset: usize) -> Result<Vec<T>> {
-    let allocation_bytes =
-        count
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| DecodeError::Invalid {
-                layer: "resource-limit",
-                offset,
-                message: format!("{purpose} allocation size overflows"),
-            })?;
+    let allocation_bytes = count.checked_mul(size_of::<T>()).ok_or_else(|| DecodeError::Invalid {
+        layer: "resource-limit",
+        offset,
+        message: format!("{purpose} allocation size overflows"),
+    })?;
     if count > MAX_COLLECTION_ITEMS || allocation_bytes > MAX_SINGLE_ALLOCATION_BYTES {
         return invalid(
             "resource-limit",
@@ -1988,13 +1839,11 @@ fn allocated_vec<T>(count: usize, purpose: &'static str, offset: usize) -> Resul
         );
     }
     let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|error| DecodeError::Invalid {
-            layer: "resource-limit",
-            offset,
-            message: format!("cannot reserve {count} items for {purpose}: {error}"),
-        })?;
+    values.try_reserve_exact(count).map_err(|error| DecodeError::Invalid {
+        layer: "resource-limit",
+        offset,
+        message: format!("cannot reserve {count} items for {purpose}: {error}"),
+    })?;
     Ok(values)
 }
 
@@ -2003,19 +1852,15 @@ fn allocated_byte_vec(count: usize, purpose: &'static str, offset: usize) -> Res
         return invalid(
             "resource-limit",
             offset,
-            format!(
-                "{purpose} requests {count} bytes, limit is {MAX_SINGLE_ALLOCATION_BYTES} bytes"
-            ),
+            format!("{purpose} requests {count} bytes, limit is {MAX_SINGLE_ALLOCATION_BYTES} bytes"),
         );
     }
     let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|error| DecodeError::Invalid {
-            layer: "resource-limit",
-            offset,
-            message: format!("cannot reserve {count} bytes for {purpose}: {error}"),
-        })?;
+    values.try_reserve_exact(count).map_err(|error| DecodeError::Invalid {
+        layer: "resource-limit",
+        offset,
+        message: format!("cannot reserve {count} bytes for {purpose}: {error}"),
+    })?;
     Ok(values)
 }
 
@@ -2027,10 +1872,5 @@ fn invalid<T>(layer: &'static str, offset: usize, message: impl Into<String>) ->
     })
 }
 fn truncated<T>(layer: &'static str, offset: usize, need: usize, have: usize) -> Result<T> {
-    Err(DecodeError::Truncated {
-        layer,
-        offset,
-        need,
-        have,
-    })
+    Err(DecodeError::Truncated { layer, offset, need, have })
 }

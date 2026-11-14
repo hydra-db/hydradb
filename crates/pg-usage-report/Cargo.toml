@@ -1,0 +1,12 @@
+[package]
+name = "hydradb-pg-usage-report"
+version = "0.1.0"
+edition = "2021"
+description = "The anonymous usage report pg_hydradb sends, and the receiver's check of it"
+license = "Elastic-2.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
