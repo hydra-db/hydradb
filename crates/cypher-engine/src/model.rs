@@ -17,16 +17,21 @@ pub type ListParameterMap = BTreeMap<String, Vec<ScalarValue>>;
 /// `1.0`; `NULL` remains unknown and is handled by expression evaluation.
 pub fn scalar_values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
     match (left, right) {
-        (ScalarValue::Integer(left), ScalarValue::Float(right))
-        | (ScalarValue::Float(right), ScalarValue::Integer(left)) => right
-            .parse::<f64>()
-            .ok()
-            .is_some_and(|right| integer_float_equal(*left, right)),
-        (ScalarValue::Float(left), ScalarValue::Float(right)) => {
-            match (left.parse::<f64>(), right.parse::<f64>()) {
-                (Ok(left), Ok(right)) => left == right,
-                _ => false,
-            }
+        (ScalarValue::Integer(left), ScalarValue::Float(right)) | (ScalarValue::Float(right), ScalarValue::Integer(left)) => {
+            right.parse::<f64>().ok().is_some_and(|right| integer_float_equal(*left, right))
+        }
+        (ScalarValue::Float(left), ScalarValue::Float(right)) => match (left.parse::<f64>(), right.parse::<f64>()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        },
+        // Numbers by their algebraic values (§19.3): a decimal against an
+        // integer, or against a float's exact binary value, so 0.5 equals
+        // 0.5M but 0.1, a little more than a tenth, does not equal 0.1M.
+        (ScalarValue::Integer(left), ScalarValue::Decimal(right)) | (ScalarValue::Decimal(right), ScalarValue::Integer(left)) => {
+            right.cmp_integer(*left) == Ordering::Equal
+        }
+        (ScalarValue::Float(left), ScalarValue::Decimal(right)) | (ScalarValue::Decimal(right), ScalarValue::Float(left)) => {
+            left.parse::<f64>().is_ok_and(|left| right.cmp_f64(left) == Some(Ordering::Equal))
         }
         _ => left == right,
     }
@@ -35,17 +40,17 @@ pub fn scalar_values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
 fn integer_float_equal(integer: i128, float: f64) -> bool {
     const I128_INCLUSIVE_LOWER: f64 = -170141183460469231731687303715884105728.0;
     const I128_EXCLUSIVE_UPPER: f64 = 170141183460469231731687303715884105728.0;
-    float.is_finite()
-        && float.fract() == 0.0
-        && (I128_INCLUSIVE_LOWER..I128_EXCLUSIVE_UPPER).contains(&float)
-        && (float as i128) == integer
+    float.is_finite() && float.fract() == 0.0 && (I128_INCLUSIVE_LOWER..I128_EXCLUSIVE_UPPER).contains(&float) && (float as i128) == integer
 }
 
 pub(crate) fn scalar_value_rank(value: &ScalarValue) -> u8 {
     match value {
         ScalarValue::Boolean(_) => 0,
-        ScalarValue::Integer(_) | ScalarValue::Float(_) => 1,
+        ScalarValue::Integer(_) | ScalarValue::Float(_) | ScalarValue::Decimal(_) => 1,
         ScalarValue::String(_) => 2,
+        ScalarValue::Bytes(_) => 3,
+        ScalarValue::Date(_) => 4,
+        ScalarValue::List(_) => 5,
         ScalarValue::Null => u8::MAX,
     }
 }
@@ -63,9 +68,7 @@ pub fn compare_property_values(left: &ScalarValue, right: &ScalarValue) -> Order
         (_, ScalarValue::Null) => Ordering::Less,
         (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left.cmp(right),
         (ScalarValue::Integer(left), ScalarValue::Integer(right)) => left.cmp(right),
-        (ScalarValue::Float(left), ScalarValue::Float(right)) => {
-            compare_float_spellings(left, right)
-        }
+        (ScalarValue::Float(left), ScalarValue::Float(right)) => compare_float_spellings(left, right),
         (ScalarValue::Integer(left), ScalarValue::Float(right)) => right
             .parse::<f64>()
             .ok()
@@ -77,15 +80,43 @@ pub fn compare_property_values(left: &ScalarValue, right: &ScalarValue) -> Order
             .map(|left| compare_integer_float(*right, left).reverse())
             .unwrap_or_else(|| left.to_string().cmp(&right.to_string())),
         (ScalarValue::String(left), ScalarValue::String(right)) => left.cmp(right),
+        (ScalarValue::Decimal(left), ScalarValue::Decimal(right)) => left.cmp(right),
+        (ScalarValue::Integer(left), ScalarValue::Decimal(right)) => compare_integer_decimal(*left, *right),
+        (ScalarValue::Decimal(left), ScalarValue::Integer(right)) => compare_integer_decimal(*right, *left).reverse(),
+        (ScalarValue::Float(left), ScalarValue::Decimal(right)) => compare_float_decimal(left, *right).reverse(),
+        (ScalarValue::Decimal(left), ScalarValue::Float(right)) => compare_float_decimal(right, *left),
+        // Byte strings byte by byte, a prefix first.
+        (ScalarValue::Bytes(left), ScalarValue::Bytes(right)) => left.cmp(right),
+        (ScalarValue::Date(left), ScalarValue::Date(right)) => left.cmp(right),
+        (ScalarValue::List(left), ScalarValue::List(right)) => {
+            for (left, right) in left.iter().zip(right) {
+                let ordering = compare_property_values(left, right);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            left.len().cmp(&right.len())
+        }
         _ => scalar_value_rank(left).cmp(&scalar_value_rank(right)),
+    }
+}
+
+fn compare_integer_decimal(integer: i128, decimal: crate::Decimal) -> Ordering {
+    decimal.cmp_integer(integer).reverse()
+}
+
+/// How `decimal` orders against the float `float` spells, exactly; a NaN
+/// sorts as it does against any number.
+fn compare_float_decimal(float: &str, decimal: crate::Decimal) -> Ordering {
+    match float.parse::<f64>().ok().and_then(|float| decimal.cmp_f64(float)) {
+        Some(order) => order,
+        None => compare_float_spellings(&format!("{:?}", decimal.to_f64()), float),
     }
 }
 
 fn compare_float_spellings(left: &str, right: &str) -> Ordering {
     match (left.parse::<f64>(), right.parse::<f64>()) {
-        (Ok(left), Ok(right)) => left
-            .partial_cmp(&right)
-            .unwrap_or_else(|| left.total_cmp(&right)),
+        (Ok(left), Ok(right)) => left.partial_cmp(&right).unwrap_or_else(|| left.total_cmp(&right)),
         _ => left.cmp(right),
     }
 }
@@ -111,12 +142,8 @@ fn compare_integer_float(integer: i128, float: f64) -> Ordering {
     }
     let truncated = float as i128;
     match integer.cmp(&truncated) {
-        Ordering::Equal if float.fract().is_sign_positive() && float.fract() > 0.0 => {
-            Ordering::Less
-        }
-        Ordering::Equal if float.fract().is_sign_negative() && float.fract() < 0.0 => {
-            Ordering::Greater
-        }
+        Ordering::Equal if float.fract().is_sign_positive() && float.fract() > 0.0 => Ordering::Less,
+        Ordering::Equal if float.fract().is_sign_negative() && float.fract() < 0.0 => Ordering::Greater,
         ordering => ordering,
     }
 }
@@ -206,10 +233,7 @@ pub struct BoundedVertexIds {
 impl BoundedVertexIds {
     /// A decline after reading `index_entries` entries.
     pub fn declined(index_entries: u64) -> Self {
-        Self {
-            ids: None,
-            index_entries,
-        }
+        Self { ids: None, index_entries }
     }
 
     /// `ids` read one index entry each, or a decline once there are more than
@@ -261,6 +285,24 @@ pub struct OrderedPropertyScanPage {
     /// labels and outside the restrictions included, when the backend counts
     /// them. A bounded read declines on this, not on the rows returned: a
     /// property shared by many labels can cost far more than it yields.
+    pub index_entries: Option<u64>,
+}
+
+/// One page of the same walk as [`OrderedPropertyScanPage`], as index
+/// entries instead of records: each qualifying vertex's id with the value
+/// its index entry holds, which is the property's stored value.
+///
+/// For a caller that reads nothing of the vertex beyond its id, the walk's
+/// labels and the walked property, the record is pure cost, and on a backend
+/// whose record read is a point get plus an overlay it is most of the walk.
+/// The backend still proves each entry names an existing vertex carrying
+/// the labels; what it skips is reading the record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrderedPropertyEntryPage {
+    /// `(vertex id, value)` per qualifying entry, in the page's order.
+    pub entries: Vec<(VertexId, ScalarValue)>,
+    pub last: Option<OrderedScanPosition>,
+    pub exhausted: bool,
     pub index_entries: Option<u64>,
 }
 
@@ -329,21 +371,66 @@ impl OrderedPropertyScanRequest {
     /// by this request, under [`compare_property_values`]. A prefix admits
     /// only strings. Backends without a native seek can filter with it.
     pub fn accepts(&self, value: &ScalarValue) -> bool {
-        restrictions_accept(
-            self.prefix.as_deref(),
-            self.lower.as_ref(),
-            self.upper.as_ref(),
-            value,
-        )
+        restrictions_accept(self.prefix.as_deref(), self.lower.as_ref(), self.upper.as_ref(), value)
     }
 }
 
-fn restrictions_accept(
-    prefix: Option<&str>,
-    lower: Option<&PropertyBound>,
-    upper: Option<&PropertyBound>,
-    value: &ScalarValue,
-) -> bool {
+/// One or more property-index point spans. `Multiple` stays distinct even when
+/// it contains one value because operation attribution and backend batching are
+/// properties of the planned access, not of its bound cardinality.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PropertyPointSet<T> {
+    Single(T),
+    Multiple(Vec<T>),
+}
+
+impl<T> PropertyPointSet<T> {
+    pub fn values(&self) -> &[T] {
+        match self {
+            Self::Single(value) => std::slice::from_ref(value),
+            Self::Multiple(values) => values,
+        }
+    }
+}
+
+/// One runtime vertex-storage request produced by a provider-prepared `VertexScan`.
+///
+/// The variants are typed rather than optional fields: every request names one
+/// storage family and only the span, projection and paging data that family
+/// accepts. Ordered property pages retain their established cursor contract.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VertexStorageScanRequest {
+    /// Vertex-record point spans. The executor hydrates these IDs through its
+    /// request-local identity map.
+    IdPoints { ids: Vec<VertexId> },
+    /// One or more equality spans over a property index.
+    PropertyPoints {
+        property: String,
+        points: PropertyPointSet<ScalarValue>,
+    },
+    /// The complete prefix for one property index.
+    PropertyPresence { property: String },
+    /// A cursor-based page from an ordered property index.
+    OrderedProperty(Box<OrderedPropertyScanRequest>),
+    /// One label-index prefix, optionally under a proven semantic result cap.
+    LabelPrefix { label: String, max_results: Option<usize> },
+    /// The complete vertex inventory.
+    AllVertices,
+}
+
+/// The typed output of one [`VertexStorageScanRequest`]. Ordinary point and
+/// prefix scans return IDs for identity-map hydration. Ordered scans retain
+/// hydrated records and their cursor because pagination depends on both.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VertexStorageScanPage {
+    Ids(Vec<VertexId>),
+    /// Hydrated point records returned by providers that can combine the
+    /// identity lookup and metadata read in one storage operation.
+    Records(Vec<VertexRecord>),
+    Ordered(OrderedPropertyScanPage),
+}
+
+fn restrictions_accept(prefix: Option<&str>, lower: Option<&PropertyBound>, upper: Option<&PropertyBound>, value: &ScalarValue) -> bool {
     if matches!(value, ScalarValue::Null) {
         return false;
     }
@@ -405,12 +492,7 @@ impl OrderedRelationshipPropertyScanRequest {
     /// Whether a stored, non-null value satisfies every restriction carried
     /// by this request; see [`OrderedPropertyScanRequest::accepts`].
     pub fn accepts(&self, value: &ScalarValue) -> bool {
-        restrictions_accept(
-            self.prefix.as_deref(),
-            self.lower.as_ref(),
-            self.upper.as_ref(),
-            value,
-        )
+        restrictions_accept(self.prefix.as_deref(), self.lower.as_ref(), self.upper.as_ref(), value)
     }
 }
 
@@ -475,12 +557,7 @@ pub struct RelationshipRecord {
 }
 
 impl RelationshipRecord {
-    pub fn new(
-        id: RelationshipId,
-        source: VertexId,
-        target: VertexId,
-        relationship_type: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: RelationshipId, source: VertexId, target: VertexId, relationship_type: impl Into<String>) -> Self {
         Self {
             id,
             source,
@@ -514,6 +591,30 @@ pub enum QueryValue {
     Count(u64),
     Scalar(ScalarValue),
     List(Vec<QueryValue>),
+    /// A path (GQL §4.15.2), bound to a path or subpath variable (G004,
+    /// G048).
+    Path(Box<PathValue>),
+    /// A record (GQL §4.15.4, GV45): its fields, ordered by name, each name
+    /// once.
+    Record(Vec<(Box<str>, QueryValue)>),
+    /// A temporal instant or duration (GQL §4.16.6, GV39 to GV41).
+    Temporal(crate::TemporalValue),
+}
+
+/// A path value: nodes and edges alternating, from its first node to its
+/// last. `relationships[i]` connects `nodes[i]` and `nodes[i + 1]`, in either
+/// direction.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PathValue {
+    pub nodes: Vec<VertexRecord>,
+    pub relationships: Vec<RelationshipRecord>,
+}
+
+impl QueryValue {
+    /// Both public null representations denote the same absent value.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null | Self::Scalar(ScalarValue::Null))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

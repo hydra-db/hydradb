@@ -160,7 +160,7 @@ pub const PLACEMENT_LIVE_NODES: &str = "hydradb.placement.live_nodes";
 /// ambiguous — the same three-node fleet produces a one-address `READ` list
 /// under `owner` and a three-address one under `fleet`, and nothing on the span
 /// said which mode had produced the one in front of you. See
-/// the cell-affine read-routing design.
+/// the cell-affine read routing design.
 ///
 /// Span-only despite a closed two-value domain: it is a *deployment* fact, so
 /// as a metric dimension it would be a column with one value per process for

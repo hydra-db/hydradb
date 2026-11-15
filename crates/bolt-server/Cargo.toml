@@ -1,0 +1,17 @@
+[package]
+name = "hydradb-bolt-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The Bolt connection session shared by graph-node and the turbolay proxy: limits, connection gate, handshake under a deadline, and the per-connection message loop"
+publish = false
+
+# No dependency on `hydradb` and no TLS. graph-node runs this session behind
+# its own listener and rustls; the proxy runs it inside a pingora `ServerApp`
+# behind pingora's TLS. What a backend does with RUN, PULL, DISCARD and ROUTE
+# stays with the backend, behind `SessionHandler`.
+[dependencies]
+boltr = { workspace = true }
+hydradb-protocol = { path = "../protocol" }
+tokio = { workspace = true, features = ["io-util", "rt"] }
+tracing = { workspace = true }

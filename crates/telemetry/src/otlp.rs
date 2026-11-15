@@ -122,9 +122,7 @@ pub type OtlpLayers<S> = Vec<Box<dyn Layer<S> + Send + Sync>>;
 /// Returns an empty layer set and `None` when no endpoint is configured, which
 /// is the case in tests and local runs. That path allocates nothing and opens
 /// no socket.
-pub fn build<S>(
-    config: &TelemetryConfig,
-) -> Result<(OtlpLayers<S>, Option<Providers>), TelemetryError>
+pub fn build<S>(config: &TelemetryConfig) -> Result<(OtlpLayers<S>, Option<Providers>), TelemetryError>
 where
     S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
 {
@@ -169,9 +167,7 @@ where
         // Redaction wraps the batch processor rather than replacing it, so the
         // last thing that touches a span before it is queued for the network is
         // the denylist.
-        .with_span_processor(RedactingSpanProcessor::new(
-            BatchSpanProcessor::builder(span_exporter).build(),
-        ))
+        .with_span_processor(RedactingSpanProcessor::new(BatchSpanProcessor::builder(span_exporter).build()))
         .build();
 
     // The one conditional pipeline. Building the exporter inside the branch
@@ -242,10 +238,7 @@ fn build_resource(config: &TelemetryConfig) -> Resource {
         KeyValue::new("hydradb.binary", config.identity.binary()),
     ];
     if let Some(environment) = &config.deployment_environment {
-        attributes.push(KeyValue::new(
-            "deployment.environment.name",
-            environment.clone(),
-        ));
+        attributes.push(KeyValue::new("deployment.environment.name", environment.clone()));
     }
 
     Resource::builder()

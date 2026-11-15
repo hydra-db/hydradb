@@ -210,10 +210,7 @@ impl TelemetryConfig {
             config.otlp_headers = parse_headers(&raw);
         }
 
-        if let Some(protocol) = get("OTEL_EXPORTER_OTLP_PROTOCOL")
-            .as_deref()
-            .and_then(OtlpProtocol::parse)
-        {
+        if let Some(protocol) = get("OTEL_EXPORTER_OTLP_PROTOCOL").as_deref().and_then(OtlpProtocol::parse) {
             config.otlp_protocol = protocol;
         }
 
@@ -264,12 +261,9 @@ impl TelemetryConfig {
             config.service_version = version;
         }
 
-        config.instance_id = get("POD_NAME")
-            .or_else(|| get("HOSTNAME"))
-            .unwrap_or_else(|| "unknown".to_string());
+        config.instance_id = get("POD_NAME").or_else(|| get("HOSTNAME")).unwrap_or_else(|| "unknown".to_string());
 
-        config.deployment_environment =
-            get("DEPLOYMENT_ENVIRONMENT").or_else(|| get("ENVIRONMENT"));
+        config.deployment_environment = get("DEPLOYMENT_ENVIRONMENT").or_else(|| get("ENVIRONMENT"));
 
         config
     }

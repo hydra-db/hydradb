@@ -43,17 +43,8 @@ impl GraphShard {
         Ok(neighbors)
     }
 
-    pub async fn out_degree_at(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        read_epoch: StorageSequence,
-    ) -> Result<u64> {
-        Ok(self
-            .out_neighbors_at(cell_id, edge_type, src, read_epoch)
-            .await?
-            .len() as u64)
+    pub async fn out_degree_at(&self, cell_id: &str, edge_type: &str, src: VertexId, read_epoch: StorageSequence) -> Result<u64> {
+        Ok(self.out_neighbors_at(cell_id, edge_type, src, read_epoch).await?.len() as u64)
     }
 
     pub async fn compact_out_adjacency_segments(
@@ -70,13 +61,9 @@ impl GraphShard {
         self.ensure_write_authority(cell_id, "compact_out_adjacency_segments")?;
 
         let started = std::time::Instant::now();
-        let _permit = self
-            .acquire_gc_permit("compact_out_adjacency_segments")
-            .await?;
+        let _permit = self.acquire_gc_permit("compact_out_adjacency_segments").await?;
         let _writer = self.writer_lane(cell_id).lock().await;
-        let lock = self
-            .acquire_local_write_guard(cell_id, "compact_out_adjacency_segments")
-            .await?;
+        let lock = self.acquire_local_write_guard(cell_id, "compact_out_adjacency_segments").await?;
         let result = self
             .compact_out_adjacency_segments_locked(SegmentCompactionRequest {
                 cell_id,
@@ -91,10 +78,7 @@ impl GraphShard {
         finish_local_write(lock, result).await
     }
 
-    async fn compact_out_adjacency_segments_locked(
-        &self,
-        request: SegmentCompactionRequest<'_>,
-    ) -> Result<SegmentCompactionResult> {
+    async fn compact_out_adjacency_segments_locked(&self, request: SegmentCompactionRequest<'_>) -> Result<SegmentCompactionResult> {
         let SegmentCompactionRequest {
             cell_id,
             edge_type,
@@ -107,12 +91,7 @@ impl GraphShard {
         let idempotency_operation = segment_compaction_idempotency_operation(edge_type, src);
         let idem_key = keys::idempotency(cell_id, &idempotency_operation, idempotency_key);
         if let Some(value) = self.read_remote(&idem_key).await? {
-            return decode_segment_compaction_idempotency(
-                &idem_key,
-                idempotency_key,
-                compacted_through_epoch,
-                &value,
-            );
+            return decode_segment_compaction_idempotency(&idem_key, idempotency_key, compacted_through_epoch, &value);
         }
 
         let current_epoch = self.current_epoch(cell_id).await?;
@@ -123,10 +102,7 @@ impl GraphShard {
                 current_epoch,
             });
         }
-        let Some(artifact) = self
-            .latest_matrix_artifact(cell_id, edge_type, compacted_through_epoch)
-            .await?
-        else {
+        let Some(artifact) = self.latest_matrix_artifact(cell_id, edge_type, compacted_through_epoch).await? else {
             return Err(GraphError::CorruptValue {
                 key: keys::out_segment_src_prefix(cell_id, edge_type, src),
                 reason: "cannot compact adjacency segments without a matrix artifact".to_string(),
@@ -162,9 +138,7 @@ impl GraphShard {
         }
 
         let mut tombstone_iter = self
-            .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(
-                cell_id, edge_type, src,
-            ))
+            .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src))
             .await?;
         let mut tombstones = BTreeMap::<VertexId, (StorageSequence, String)>::new();
         while let Some(kv) = tombstone_iter.next().await? {
@@ -172,8 +146,7 @@ impl GraphShard {
                 lock.renew().await?;
             }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, key_src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
+            let (key_cell_id, key_edge_type, key_src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
             if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
                 return Err(GraphError::CorruptValue {
                     key,
@@ -195,9 +168,7 @@ impl GraphShard {
                     .filter(|epoch| *epoch <= compacted_through_epoch);
                 if segment_edge_visible(segment.storage_sequence, tombstone_epoch) {
                     live.entry(*dst)
-                        .and_modify(|existing| {
-                            *existing = (*existing).max(segment.storage_sequence)
-                        })
+                        .and_modify(|existing| *existing = (*existing).max(segment.storage_sequence))
                         .or_insert(segment.storage_sequence);
                 }
             }
@@ -227,10 +198,7 @@ impl GraphShard {
                 encode_out_edge_segment_records(&compacted_destinations),
             );
         }
-        batch.put(
-            keys::degree_out(cell_id, edge_type, src),
-            encode_u64(current_degree),
-        );
+        batch.put(keys::degree_out(cell_id, edge_type, src), encode_u64(current_degree));
         let result = SegmentCompactionResult {
             compacted_through_epoch,
             source_segments: source_segments.len() as u64,
@@ -239,17 +207,12 @@ impl GraphShard {
             input_edges,
             output_edges: compacted_destinations.len() as u64,
         };
-        batch.put(
-            idem_key.as_bytes(),
-            encode_segment_compaction_idempotency(idempotency_key, &result),
-        );
+        batch.put(idem_key.as_bytes(), encode_segment_compaction_idempotency(idempotency_key, &result));
         lock.renew().await?;
         self.write_graph_batch_strict(cell_id, "compact_out_adjacency_segments", batch)
             .await?;
         self.record_gc_completed(
-            result
-                .deleted_segment_keys
-                .saturating_add(result.deleted_tombstone_keys),
+            result.deleted_segment_keys.saturating_add(result.deleted_tombstone_keys),
             started.elapsed(),
         );
         Ok(result)
@@ -263,16 +226,13 @@ impl GraphShard {
     }
 
     pub(crate) async fn read_remote(&self, key: &str) -> Result<Option<Bytes>> {
-        let value = self
-            .db
-            .get_with_options(key.as_bytes(), &remote_read_options())
-            .await?;
+        let value = self.storage.get_with_options(key.as_bytes(), &remote_read_options()).await?;
         Ok(value)
     }
 
     pub(crate) async fn scan_remote_prefix(&self, prefix: &str) -> Result<slatedb::DbIterator> {
         let iter = self
-            .db
+            .storage
             .scan_prefix_with_options(prefix.as_bytes(), None, &remote_scan_options())
             .await?;
         Ok(iter)
@@ -286,41 +246,25 @@ impl GraphShard {
     /// them made every relationship hydration of a path or expansion re-read
     /// the same block from object storage, warm or cold.
     #[cfg(feature = "opencypher")]
-    pub(crate) async fn scan_remote_point_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<slatedb::DbIterator> {
+    pub(crate) async fn scan_remote_point_prefix(&self, prefix: &str) -> Result<slatedb::DbIterator> {
         let iter = self
-            .db
-            .scan_prefix_with_options(
-                prefix.as_bytes(),
-                None,
-                &remote_scan_options_for_expected_items(1),
-            )
+            .storage
+            .scan_prefix_with_options(prefix.as_bytes(), None, &remote_scan_options_for_expected_items(1))
             .await?;
         Ok(iter)
     }
 
     /// [`Self::scan_remote_prefix`] starting at `start_suffix` (inclusive,
     /// relative to `prefix`) instead of the first key under the prefix.
-    pub(crate) async fn scan_remote_prefix_from(
-        &self,
-        prefix: &str,
-        start_suffix: Option<Vec<u8>>,
-    ) -> Result<slatedb::DbIterator> {
+    pub(crate) async fn scan_remote_prefix_from(&self, prefix: &str, start_suffix: Option<Vec<u8>>) -> Result<slatedb::DbIterator> {
         let iter = self
-            .db
+            .storage
             .scan_prefix_with_options(prefix.as_bytes(), start_suffix, &remote_scan_options())
             .await?;
         Ok(iter)
     }
 
-    pub(crate) async fn write_graph_batch_strict(
-        &self,
-        cell_id: &str,
-        operation: &'static str,
-        batch: GraphWriteBatch,
-    ) -> Result<()> {
+    pub(crate) async fn write_graph_batch_strict(&self, cell_id: &str, operation: &'static str, batch: GraphWriteBatch) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         if batch.is_empty() {
             return Ok(());
@@ -328,16 +272,9 @@ impl GraphShard {
         let record_count = batch.len();
         let started = std::time::Instant::now();
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .write_graph_batch_txn(cell_id, operation, batch.clone())
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+            match self.write_graph_batch_txn(cell_id, operation, batch.clone()).await {
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(()) => {
@@ -367,16 +304,9 @@ impl GraphShard {
         let record_count = batch.len();
         let started = std::time::Instant::now();
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .write_graph_batch_guarded_txn(cell_id, operation, &guards, batch.clone())
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
+            match self.write_graph_batch_guarded_txn(cell_id, operation, &guards, batch.clone()).await {
+                Err(err) if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES => {
+                    self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
                 Ok(()) => {
@@ -402,25 +332,17 @@ impl GraphShard {
             return Ok(());
         }
         let lock = self.acquire_local_write_guard(cell_id, operation).await?;
-        let result = self
-            .write_graph_batch_strict(cell_id, operation, batch)
-            .await;
+        let result = self.write_graph_batch_strict(cell_id, operation, batch).await;
         finish_local_write(lock, result).await
     }
 
-    async fn write_graph_batch_txn(
-        &self,
-        cell_id: &str,
-        operation: &'static str,
-        batch: GraphWriteBatch,
-    ) -> Result<()> {
-        let writer = self.db.writer()?;
-        let txn = writer.begin(IsolationLevel::SerializableSnapshot).await?;
+    async fn write_graph_batch_txn(&self, cell_id: &str, operation: &'static str, batch: GraphWriteBatch) -> Result<()> {
+        let writer = self.storage.writer()?;
+        let txn = writer.begin(IsolationLevel::SerializableSnapshot)?;
         if self.await_durable_writes {
             super::write_pipeline::wait_durable(&writer, txn.seqnum()).await?;
         }
-        self.validate_write_fence_txn(&txn, cell_id, operation)
-            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation).await?;
         for op in batch.ops {
             match op {
                 GraphWriteOp::Put(key, value) => txn.put(key.as_ref(), value.as_ref())?,
@@ -437,15 +359,14 @@ impl GraphShard {
         guards: &[GraphWriteGuard],
         batch: GraphWriteBatch,
     ) -> Result<()> {
-        let writer = self.db.writer()?;
-        let txn = writer.begin(IsolationLevel::SerializableSnapshot).await?;
+        let writer = self.storage.writer()?;
+        let txn = writer.begin(IsolationLevel::SerializableSnapshot)?;
         // Artifact work can bypass the foreground mutex. Make its fixed
         // transaction snapshot durable before testing guards with Remote reads.
         if self.await_durable_writes {
             super::write_pipeline::wait_durable(&writer, txn.seqnum()).await?;
         }
-        self.validate_write_fence_txn(&txn, cell_id, operation)
-            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation).await?;
         for guard in guards {
             let (key, matches) = match guard {
                 GraphWriteGuard::Absent(key) => {
@@ -477,7 +398,5 @@ impl GraphShard {
 }
 
 fn should_renew_cell_lock_after_items(items: usize) -> bool {
-    items == 0
-        || (items >= GRAPH_MAINTENANCE_BATCH_KEYS
-            && items / GRAPH_MAINTENANCE_BATCH_KEYS * GRAPH_MAINTENANCE_BATCH_KEYS == items)
+    items == 0 || (items >= GRAPH_MAINTENANCE_BATCH_KEYS && items / GRAPH_MAINTENANCE_BATCH_KEYS * GRAPH_MAINTENANCE_BATCH_KEYS == items)
 }

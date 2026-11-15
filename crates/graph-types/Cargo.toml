@@ -1,0 +1,17 @@
+[package]
+name = "hydradb-graph-types"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Backend-neutral Cypher graph values, semantics, and Arrow codecs"
+publish = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+chrono = { workspace = true }
+hydradb-cypher-date = { path = "../cypher-date" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

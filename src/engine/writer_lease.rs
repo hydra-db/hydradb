@@ -1,14 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use futures::{stream, StreamExt};
+use prometheus::{core::Collector, proto::MetricFamily, IntCounterVec, IntGaugeVec, Opts};
 use slatedb::object_store::path::Path;
-use slatedb::object_store::{
-    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
-    UpdateVersion,
-};
+use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
@@ -68,6 +66,9 @@ pub struct ObjectStoreWriterLeaseDirectory {
     scope_users: Arc<StdMutex<BTreeMap<ScopeLeaseUserKey, usize>>>,
     observed: Arc<Mutex<BTreeMap<String, ObservedWriterLease>>>,
     clock_probe: Arc<AtomicU64>,
+    /// Successful holder-changing writes by `cell_id`, summed over scopes.
+    /// The counter vector shares its storage across directory clones.
+    holder_changes: IntCounterVec,
 }
 
 #[derive(Clone)]
@@ -103,11 +104,7 @@ impl ObjectStoreWriterLeaseDirectory {
         Self::with_duration(base_path, object_store, DEFAULT_WRITER_LEASE_DURATION)
     }
 
-    pub fn with_duration(
-        base_path: impl Into<String>,
-        object_store: Arc<dyn ObjectStore>,
-        lease_duration: Duration,
-    ) -> Self {
+    pub fn with_duration(base_path: impl Into<String>, object_store: Arc<dyn ObjectStore>, lease_duration: Duration) -> Self {
         Self::with_duration_and_holder(base_path, object_store, lease_duration, process_holder_id())
     }
 
@@ -127,7 +124,38 @@ impl ObjectStoreWriterLeaseDirectory {
             scope_users: Arc::new(StdMutex::new(BTreeMap::new())),
             observed: Arc::new(Mutex::new(BTreeMap::new())),
             clock_probe: Arc::new(AtomicU64::new(0)),
+            holder_changes: IntCounterVec::new(
+                Opts::new("graph_writer_lease_changes", "Successful writer lease holder changes"),
+                &["cell_id"],
+            )
+            .expect("writer lease counter has a valid static descriptor"),
         }
+    }
+
+    /// Prometheus families labelled by `cell_id` alone, never by tenant scope.
+    /// Counter samples pass through unchanged. The held gauge is derived from
+    /// valid local leases on each scrape, so expiry needs no update event.
+    pub fn collect_metrics(&self) -> Vec<MetricFamily> {
+        let mut families = self.holder_changes.collect();
+        let held = IntGaugeVec::new(
+            Opts::new("graph_writer_lease_held", "Whether this process holds a valid writer lease"),
+            &["cell_id"],
+        )
+        .expect("writer lease gauge has a valid static descriptor");
+        // Keep a zero gauge for previously observed cells after release.
+        // Copy label sets by name rather than assuming a positional schema.
+        for metric in families.iter().flat_map(|family| family.get_metric()) {
+            let labels: HashMap<_, _> = metric.get_label().iter().map(|label| (label.name(), label.value())).collect();
+            held.with(&labels).set(0);
+        }
+        let now = Instant::now();
+        for lease in self.local().values().filter(|lease| now < lease.valid_until) {
+            held.with_label_values(&[&lease.cell_id]).set(1);
+        }
+        families.extend(held.collect());
+        // Empty vectors have no samples and are omitted by Prometheus registries.
+        families.retain(|family| !family.get_metric().is_empty());
+        families
     }
 
     pub fn lease_duration(&self) -> Duration {
@@ -142,11 +170,7 @@ impl ObjectStoreWriterLeaseDirectory {
         *self.scope_users().entry(key).or_default() += 1;
     }
 
-    pub async fn current_owner(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<WriterLeaseOwner>> {
+    pub async fn current_owner(&self, scope: &GraphScope, cell_id: &str) -> Result<Option<WriterLeaseOwner>> {
         validate_component("cell_id", cell_id)?;
         let path = self.lease_path(scope, cell_id);
         let Some(stored) = self.read_stored(&path).await? else {
@@ -163,12 +187,7 @@ impl ObjectStoreWriterLeaseDirectory {
         }))
     }
 
-    pub(crate) fn holds_abandoned_local(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-    ) -> bool {
+    pub(crate) fn holds_abandoned_local(&self, scope: &GraphScope, cell_id: &str, node_id: &str) -> bool {
         let path = self.lease_path(scope, cell_id);
         let key = path.to_string();
         let mut abandoned = self.abandoned();
@@ -182,23 +201,11 @@ impl ObjectStoreWriterLeaseDirectory {
         false
     }
 
-    pub async fn acquire_or_renew(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-    ) -> Result<u64> {
-        self.acquire_or_renew_inner(scope, cell_id, node_id, false)
-            .await
+    pub async fn acquire_or_renew(&self, scope: &GraphScope, cell_id: &str, node_id: &str) -> Result<u64> {
+        self.acquire_or_renew_inner(scope, cell_id, node_id, false).await
     }
 
-    async fn acquire_or_renew_inner(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-        force_renew: bool,
-    ) -> Result<u64> {
+    async fn acquire_or_renew_inner(&self, scope: &GraphScope, cell_id: &str, node_id: &str, force_renew: bool) -> Result<u64> {
         validate_component("cell_id", cell_id)?;
         validate_component("node_id", node_id)?;
         validate_component("writer_lease_holder", &self.holder_id)?;
@@ -206,9 +213,10 @@ impl ObjectStoreWriterLeaseDirectory {
         let cache_key = path.to_string();
         let renew_margin = self.lease_duration / 3;
         if force_renew {
-            let local_is_valid = self.local().get(&cache_key).is_some_and(|lease| {
-                lease.node_id == node_id && Instant::now() < lease.valid_until
-            });
+            let local_is_valid = self
+                .local()
+                .get(&cache_key)
+                .is_some_and(|lease| lease.node_id == node_id && Instant::now() < lease.valid_until);
             if !local_is_valid {
                 self.local().remove(&cache_key);
                 return Err(GraphError::NotCellWriter {
@@ -229,8 +237,7 @@ impl ObjectStoreWriterLeaseDirectory {
             let current = self.read_stored(&path).await?;
             if let Some(stored) = current.as_ref().filter(|stored| !stored.released) {
                 let remaining_ms = self.shared_remaining_ms(&path, stored).await?;
-                let owned_by_this_process =
-                    stored.node_id == node_id && stored.holder_id == self.holder_id;
+                let owned_by_this_process = stored.node_id == node_id && stored.holder_id == self.holder_id;
                 if remaining_ms > 0 && !owned_by_this_process {
                     self.local().remove(&cache_key);
                     self.abandoned().remove(&cache_key);
@@ -241,9 +248,9 @@ impl ObjectStoreWriterLeaseDirectory {
                 }
             }
 
-            let same_holder = current.as_ref().is_some_and(|stored| {
-                !stored.released && stored.node_id == node_id && stored.holder_id == self.holder_id
-            });
+            let same_holder = current
+                .as_ref()
+                .is_some_and(|stored| !stored.released && stored.node_id == node_id && stored.holder_id == self.holder_id);
             let generation = current
                 .as_ref()
                 .map(|stored| {
@@ -254,18 +261,8 @@ impl ObjectStoreWriterLeaseDirectory {
                     }
                 })
                 .unwrap_or(1);
-            let heartbeat = current
-                .as_ref()
-                .map(|stored| stored.heartbeat.saturating_add(1))
-                .unwrap_or(1);
-            let payload = encode_writer_lease(
-                node_id,
-                &self.holder_id,
-                generation,
-                heartbeat,
-                self.lease_duration,
-                false,
-            )?;
+            let heartbeat = current.as_ref().map(|stored| stored.heartbeat.saturating_add(1)).unwrap_or(1);
+            let payload = encode_writer_lease(node_id, &self.holder_id, generation, heartbeat, self.lease_duration, false)?;
             let mode = current
                 .as_ref()
                 .map(|stored| PutMode::Update(stored.version.clone()))
@@ -273,25 +270,26 @@ impl ObjectStoreWriterLeaseDirectory {
             let write_started = Instant::now();
             let write_result = self
                 .object_store
-                .put_opts(
-                    &path,
-                    PutPayload::from(payload.clone()),
-                    PutOptions::from(mode),
-                )
+                .put_opts(&path, PutPayload::from(payload.clone()), PutOptions::from(mode))
                 .await;
             let write_result = match write_result {
                 Err(ObjectStoreError::NotImplemented { .. }) if same_holder => {
                     // LocalFileSystem lacks conditional update. Overwrite is safe
                     // only for the still-valid incumbent; stale takeovers remain
                     // fail-closed because they require real compare-and-swap.
-                    self.object_store
-                        .put(&path, PutPayload::from(payload))
-                        .await
+                    self.object_store.put(&path, PutPayload::from(payload)).await
                 }
                 result => result,
             };
             match write_result {
                 Ok(_) => {
+                    let holder_changes = self.holder_changes.with_label_values(&[cell_id]);
+                    if !same_holder {
+                        // Count the durable holder change even if the response
+                        // outlives our local validity window or bookkeeping is
+                        // cancelled before the lease is cached.
+                        holder_changes.inc();
+                    }
                     let valid_until = write_started + self.lease_duration;
                     if Instant::now() >= valid_until {
                         continue;
@@ -340,9 +338,7 @@ impl ObjectStoreWriterLeaseDirectory {
                     }
                     return Ok(generation);
                 }
-                Err(
-                    ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. },
-                ) => continue,
+                Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -361,9 +357,7 @@ impl ObjectStoreWriterLeaseDirectory {
             .collect::<Vec<_>>();
         stream::iter(leases)
             .map(|lease| async move {
-                let result = self
-                    .acquire_or_renew_inner(&lease.scope, &lease.cell_id, node_id, true)
-                    .await;
+                let result = self.acquire_or_renew_inner(&lease.scope, &lease.cell_id, node_id, true).await;
                 (lease, result)
             })
             .buffer_unordered(MAX_CONCURRENT_WRITER_LEASE_RENEWALS)
@@ -373,8 +367,7 @@ impl ObjectStoreWriterLeaseDirectory {
                 };
                 let ownership_lost = !self.holds_valid_local(&lease.scope, &lease.cell_id, node_id);
                 if ownership_lost {
-                    self.local()
-                        .remove(self.lease_path(&lease.scope, &lease.cell_id).as_ref());
+                    self.local().remove(self.lease_path(&lease.scope, &lease.cell_id).as_ref());
                 }
                 Some(WriterLeaseRenewalFailure {
                     scope: lease.scope,
@@ -387,11 +380,7 @@ impl ObjectStoreWriterLeaseDirectory {
             .await
     }
 
-    pub async fn release_scope(
-        &self,
-        scope: &GraphScope,
-        node_id: &str,
-    ) -> Vec<(String, GraphError)> {
+    pub async fn release_scope(&self, scope: &GraphScope, node_id: &str) -> Vec<(String, GraphError)> {
         let key = ScopeLeaseUserKey {
             scope: scope.clone(),
             node_id: node_id.to_string(),
@@ -420,9 +409,7 @@ impl ObjectStoreWriterLeaseDirectory {
                 .filter(|(_, lease)| lease.scope == *scope && lease.node_id == node_id)
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| local.remove(&key))
-                .collect::<Vec<_>>()
+            keys.into_iter().filter_map(|key| local.remove(&key)).collect::<Vec<_>>()
         };
         let abandoned_leases = {
             let mut abandoned = self.abandoned();
@@ -431,16 +418,11 @@ impl ObjectStoreWriterLeaseDirectory {
                 .filter(|(_, lease)| lease.scope == *scope && lease.node_id == node_id)
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| abandoned.remove(&key))
-                .collect::<Vec<_>>()
+            keys.into_iter().filter_map(|key| abandoned.remove(&key)).collect::<Vec<_>>()
         };
         let mut failures = Vec::new();
         for lease in leases.into_iter().chain(abandoned_leases) {
-            if let Err(error) = self
-                .release_stored(scope, &lease.cell_id, node_id, lease.generation)
-                .await
-            {
+            if let Err(error) = self.release_stored(scope, &lease.cell_id, node_id, lease.generation).await {
                 failures.push((lease.cell_id, error));
             }
         }
@@ -493,12 +475,7 @@ impl ObjectStoreWriterLeaseDirectory {
         abandoned.extend(leases);
     }
 
-    pub async fn release_cell(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-    ) -> Result<()> {
+    pub async fn release_cell(&self, scope: &GraphScope, cell_id: &str, node_id: &str) -> Result<()> {
         let path = self.lease_path(scope, cell_id);
         let lease = self
             .local()
@@ -507,44 +484,29 @@ impl ObjectStoreWriterLeaseDirectory {
         let Some(lease) = lease else {
             return Ok(());
         };
-        self.release_stored(scope, cell_id, node_id, lease.generation)
-            .await
+        self.release_stored(scope, cell_id, node_id, lease.generation).await
     }
 
-    pub(crate) fn holds_valid_local(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-    ) -> bool {
+    pub(crate) fn holds_valid_local(&self, scope: &GraphScope, cell_id: &str, node_id: &str) -> bool {
         self.local()
             .get(self.lease_path(scope, cell_id).as_ref())
             .is_some_and(|lease| lease.node_id == node_id && Instant::now() < lease.valid_until)
     }
 
     fn local(&self) -> StdMutexGuard<'_, BTreeMap<String, LocalWriterLease>> {
-        self.local
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.local.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn abandoned(&self) -> StdMutexGuard<'_, BTreeMap<String, LocalWriterLease>> {
-        self.abandoned
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.abandoned.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn scope_users(&self) -> StdMutexGuard<'_, BTreeMap<ScopeLeaseUserKey, usize>> {
-        self.scope_users
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.scope_users.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn lease_path(&self, scope: &GraphScope, cell_id: &str) -> Path {
-        Path::from(format!(
-            "{}/_writer_leases/v2/{cell_id}",
-            scope.scoped_store_path(&self.base_path)
-        ))
+        Path::from(format!("{}/_writer_leases/v2/{cell_id}", scope.scoped_store_path(&self.base_path)))
     }
 
     async fn read_stored(&self, path: &Path) -> Result<Option<StoredWriterLease>> {
@@ -592,9 +554,7 @@ impl ObjectStoreWriterLeaseDirectory {
         drop(observed);
 
         let server_now = self.probe_server_time().await?;
-        let durable_age = Duration::from_millis(
-            u64::try_from(server_now.saturating_sub(stored.last_modified_ms)).unwrap_or(0),
-        );
+        let durable_age = Duration::from_millis(u64::try_from(server_now.saturating_sub(stored.last_modified_ms)).unwrap_or(0));
         let remaining = stored
             .duration
             .saturating_add(SERVER_TIMESTAMP_RESOLUTION_GUARD)
@@ -620,23 +580,11 @@ impl ObjectStoreWriterLeaseDirectory {
     async fn probe_server_time(&self) -> Result<i64> {
         let path = Path::from(format!("{}/_coordination/v1/server-clock", self.base_path));
         let probe = self.clock_probe.fetch_add(1, Ordering::Relaxed);
-        self.object_store
-            .put(&path, PutPayload::from(probe.to_string()))
-            .await?;
-        Ok(self
-            .object_store
-            .head(&path)
-            .await?
-            .last_modified
-            .timestamp_millis())
+        self.object_store.put(&path, PutPayload::from(probe.to_string())).await?;
+        Ok(self.object_store.head(&path).await?.last_modified.timestamp_millis())
     }
 
-    async fn observe_successful_write(
-        &self,
-        path: &Path,
-        fingerprint: WriterLeaseFingerprint,
-        observed_at: Instant,
-    ) {
+    async fn observe_successful_write(&self, path: &Path, fingerprint: WriterLeaseFingerprint, observed_at: Instant) {
         let released = fingerprint.5;
         let duration = Duration::from_millis(fingerprint.4);
         self.observed.lock().await.insert(
@@ -653,42 +601,22 @@ impl ObjectStoreWriterLeaseDirectory {
         );
     }
 
-    async fn release_stored(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-        node_id: &str,
-        generation: u64,
-    ) -> Result<()> {
+    async fn release_stored(&self, scope: &GraphScope, cell_id: &str, node_id: &str, generation: u64) -> Result<()> {
         let path = self.lease_path(scope, cell_id);
         for _ in 0..MAX_WRITER_LEASE_CAS_ATTEMPTS {
             let Some(current) = self.read_stored(&path).await? else {
                 return Ok(());
             };
-            if current.node_id != node_id
-                || current.holder_id != self.holder_id
-                || current.generation != generation
-            {
+            if current.node_id != node_id || current.holder_id != self.holder_id || current.generation != generation {
                 return Ok(());
             }
             let heartbeat = current.heartbeat.saturating_add(1);
             let duration = current.duration;
-            let payload = encode_writer_lease(
-                node_id,
-                &self.holder_id,
-                generation,
-                heartbeat,
-                duration,
-                true,
-            )?;
+            let payload = encode_writer_lease(node_id, &self.holder_id, generation, heartbeat, duration, true)?;
             let write_started = Instant::now();
             let release_result = self
                 .object_store
-                .put_opts(
-                    &path,
-                    PutPayload::from(payload),
-                    PutOptions::from(PutMode::Update(current.version)),
-                )
+                .put_opts(&path, PutPayload::from(payload), PutOptions::from(PutMode::Update(current.version)))
                 .await;
             let release_result = match release_result {
                 Err(ObjectStoreError::NotImplemented { .. }) => {
@@ -717,9 +645,7 @@ impl ObjectStoreWriterLeaseDirectory {
                     .await;
                     return Ok(());
                 }
-                Err(
-                    ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. },
-                ) => continue,
+                Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -742,11 +668,8 @@ pub(crate) fn process_writer_lease_directory(
         base_path: base_path.clone(),
         lease_duration_ms: u64::try_from(lease_duration.as_millis()).unwrap_or(u64::MAX),
     };
-    let directories =
-        PROCESS_WRITER_LEASE_DIRECTORIES.get_or_init(|| StdMutex::new(BTreeMap::new()));
-    let mut directories = directories
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directories = PROCESS_WRITER_LEASE_DIRECTORIES.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    let mut directories = directories.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     directories.retain(|_, directory| directory.strong_count() > 0);
     if let Some(directory) = directories.get(&key).and_then(Weak::upgrade) {
         return directory;
@@ -761,9 +684,7 @@ pub(crate) fn process_writer_lease_directory(
 }
 
 fn process_holder_id() -> String {
-    PROCESS_HOLDER_ID
-        .get_or_init(|| Ulid::new().to_string())
-        .clone()
+    PROCESS_HOLDER_ID.get_or_init(|| Ulid::new().to_string()).clone()
 }
 
 fn remaining_after_elapsed(entry: &ObservedWriterLease, now: Instant) -> u64 {
@@ -783,11 +704,10 @@ fn encode_writer_lease(
 ) -> Result<String> {
     validate_component("node_id", node_id)?;
     validate_component("writer_lease_holder", holder_id)?;
-    let duration_ms =
-        u64::try_from(duration.as_millis()).map_err(|_| GraphError::CorruptValue {
-            key: "writer-lease/duration".to_string(),
-            reason: "writer lease duration exceeds u64 milliseconds".to_string(),
-        })?;
+    let duration_ms = u64::try_from(duration.as_millis()).map_err(|_| GraphError::CorruptValue {
+        key: "writer-lease/duration".to_string(),
+        reason: "writer lease duration exceeds u64 milliseconds".to_string(),
+    })?;
     let state = if released { "released" } else { "active" };
     Ok(format!(
         "{WRITER_LEASE_FORMAT}\n{node_id}\n{holder_id}\n{generation}\n{heartbeat}\n{duration_ms}\n{state}\n"
@@ -849,11 +769,8 @@ fn decode_writer_lease(path: &Path, bytes: &[u8]) -> Result<DecodedWriterLease> 
 }
 
 fn parse_lease_u64(path: &Path, field: &str, value: Option<&str>) -> Result<u64> {
-    value
-        .unwrap_or_default()
-        .parse::<u64>()
-        .map_err(|error| GraphError::CorruptValue {
-            key: path.to_string(),
-            reason: format!("invalid writer lease {field}: {error}"),
-        })
+    value.unwrap_or_default().parse::<u64>().map_err(|error| GraphError::CorruptValue {
+        key: path.to_string(),
+        reason: format!("invalid writer lease {field}: {error}"),
+    })
 }

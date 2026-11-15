@@ -1,0 +1,21 @@
+[package]
+name = "turbolay-proxy-topology"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Who the turbolay proxy routes to: backend membership and the proxy replica set, published as one snapshot"
+publish = false
+
+# Knows nothing of routing or protocols. It publishes a `RouteSnapshot` on a
+# watch channel; the core applies it. Kubernetes sources belong in a crate of
+# their own, so nothing here, and nothing that depends on this, compiles kube.
+[dependencies]
+async-trait = { workspace = true }
+hydradb-placement = { path = "../../placement", default-features = false }
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
+turbolay-proxy-types = { path = "../types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

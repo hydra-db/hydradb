@@ -32,11 +32,7 @@ impl GraphShard {
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        ensure_limit(
-            "matrix_reachable",
-            u64::from(hops),
-            u64::from(self.limits.max_traversal_hops),
-        )?;
+        ensure_limit("matrix_reachable", u64::from(hops), u64::from(self.limits.max_traversal_hops))?;
         // An `Adjacency` policy is a hard ceiling, not a default: it means this
         // shard does no matrix compilation at all. Without this clamp a caller
         // asking for a compiled rung would fall through to `expand_sparse` with
@@ -50,9 +46,7 @@ impl GraphShard {
         let total_started = Instant::now();
 
         let started = Instant::now();
-        let artifact = self
-            .latest_matrix_artifact(cell_id, edge_type, read_epoch)
-            .await?;
+        let artifact = self.latest_matrix_artifact(cell_id, edge_type, read_epoch).await?;
         record_matrix_profile(
             profile,
             "latest_matrix_artifact",
@@ -87,9 +81,7 @@ impl GraphShard {
                     )
                     .await?
                 } else {
-                    let adjacency = self
-                        .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-                        .await?;
+                    let adjacency = self.canonical_adjacency_at(cell_id, edge_type, read_epoch).await?;
                     expand_sparse(&adjacency, starts, hops, sparse_kernel)?
                 };
                 return Ok(MatrixTraversalResult {
@@ -106,9 +98,7 @@ impl GraphShard {
             let started = Instant::now();
             let empty_adjacency = BTreeMap::new();
             let mut traversal = if let Some(overlay) = overlay {
-                crate::shard::topology_tail::expand_range_with_overlay(
-                    &compiled, &overlay, starts, 1, hops,
-                )?
+                crate::shard::topology_tail::expand_range_with_overlay(&compiled, &overlay, starts, 1, hops)?
             } else {
                 expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?
             };
@@ -118,21 +108,14 @@ impl GraphShard {
             // may rediscover a seed through a cycle, so normalize that one
             // semantic difference at this API boundary.
             let start_set = starts.iter().copied().collect::<BTreeSet<_>>();
-            traversal
-                .vertices
-                .retain(|vertex| !start_set.contains(vertex));
+            traversal.vertices.retain(|vertex| !start_set.contains(vertex));
             record_matrix_profile(
                 profile,
                 "expand_compiled_graphblas",
                 started.elapsed(),
                 traversal.vertices.len() as u64,
             );
-            record_matrix_profile(
-                profile,
-                "matrix_reachable_total",
-                total_started.elapsed(),
-                0,
-            );
+            record_matrix_profile(profile, "matrix_reachable_total", total_started.elapsed(), 0);
             return Ok(MatrixTraversalResult {
                 backend: TraversalBackend::MatrixSnapshot,
                 vertices: traversal.vertices,
@@ -144,23 +127,11 @@ impl GraphShard {
         }
 
         let started = Instant::now();
-        let adjacency = self
-            .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-            .await?;
-        record_matrix_profile(
-            profile,
-            "canonical_adjacency",
-            started.elapsed(),
-            adjacency.len() as u64,
-        );
+        let adjacency = self.canonical_adjacency_at(cell_id, edge_type, read_epoch).await?;
+        record_matrix_profile(profile, "canonical_adjacency", started.elapsed(), adjacency.len() as u64);
 
         let traversal = expand_sparse(&adjacency, starts, hops, sparse_kernel)?;
-        record_matrix_profile(
-            profile,
-            "matrix_reachable_total",
-            total_started.elapsed(),
-            0,
-        );
+        record_matrix_profile(profile, "matrix_reachable_total", total_started.elapsed(), 0);
         Ok(MatrixTraversalResult {
             backend: TraversalBackend::MatrixSnapshot,
             vertices: traversal.vertices,
@@ -186,9 +157,7 @@ impl GraphShard {
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
-        let adjacency = self
-            .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-            .await?;
+        let adjacency = self.canonical_adjacency_at(cell_id, edge_type, read_epoch).await?;
         let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::Adjacency)?;
         Ok(MatrixTraversalResult {
             backend: TraversalBackend::DirectSnapshot,
@@ -208,15 +177,10 @@ impl GraphShard {
         hops: u8,
         read_epoch: StorageSequence,
     ) -> Result<BenchmarkResult> {
-        let direct = self
-            .direct_snapshot_reachable(cell_id, edge_type, starts, hops, read_epoch)
-            .await?;
-        let matrix = self
-            .matrix_reachable(cell_id, edge_type, starts, hops, read_epoch)
-            .await?;
+        let direct = self.direct_snapshot_reachable(cell_id, edge_type, starts, hops, read_epoch).await?;
+        let matrix = self.matrix_reachable(cell_id, edge_type, starts, hops, read_epoch).await?;
         Ok(BenchmarkResult {
-            matrix_wins: matrix.vertices == direct.vertices
-                && matrix.edge_visits < direct.edge_visits,
+            matrix_wins: matrix.vertices == direct.vertices && matrix.edge_visits < direct.edge_visits,
             direct,
             matrix,
         })

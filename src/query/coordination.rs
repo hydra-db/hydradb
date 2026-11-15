@@ -32,9 +32,7 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "query-transport")]
 use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "query-transport-tls")]
-use tokio_rustls::rustls::{
-    pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig,
-};
+use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 #[cfg(feature = "query-transport")]
@@ -44,13 +42,11 @@ use tracing::Instrument as _;
 use crate::QueryCancellationToken;
 use crate::QueryFailureReason;
 use crate::{
-    validate_component, GraphError, ObjectStoreNodeDirectory, QueryContext, QueryCursorToken,
-    QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster,
+    validate_component, GraphError, ObjectStoreNodeDirectory, QueryColumn, QueryContext, QueryCursorToken, QueryResultPage, QueryResultSet,
+    QueryRow, QueryValue, Result, RoutedGraphCluster,
 };
 #[cfg(feature = "query-transport")]
-use crate::{
-    AtomicDurationHistogram, DurationHistogramSnapshot, GraphId, GraphScope, NamespacePath,
-};
+use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
 // Guarded writes use distinct batch-operation variants. An older peer can
@@ -113,9 +109,7 @@ impl Default for QueryTransportClientConfig {
             max_idle_connections: DEFAULT_QUERY_TRANSPORT_MAX_IDLE_CONNECTIONS,
             max_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONNECTIONS,
             max_control_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONTROL_CONNECTIONS,
-            max_connection_age: Duration::from_millis(
-                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
-            ),
+            max_connection_age: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS),
             allow_plaintext: false,
             #[cfg(feature = "query-transport-tls")]
             tls_server_name: None,
@@ -237,11 +231,7 @@ impl QueryTransportClientConfig {
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_tls(
-        mut self,
-        server_name: impl Into<String>,
-        config: Arc<RustlsClientConfig>,
-    ) -> Self {
+    pub fn with_tls(mut self, server_name: impl Into<String>, config: Arc<RustlsClientConfig>) -> Self {
         self.tls_server_name = Some(server_name.into());
         self.tls_config = Some(config);
         self.tls_config_provider = None;
@@ -249,11 +239,7 @@ impl QueryTransportClientConfig {
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_tls_provider(
-        mut self,
-        server_name: impl Into<String>,
-        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
-    ) -> Self {
+    pub fn with_tls_provider(mut self, server_name: impl Into<String>, provider: Arc<dyn QueryTransportTlsClientConfigProvider>) -> Self {
         self.tls_server_name = Some(server_name.into());
         self.tls_config = None;
         self.tls_config_provider = Some(provider);
@@ -271,9 +257,7 @@ impl QueryTransportClientConfig {
             return transport_config_error("max_connection_age must be greater than zero");
         }
         if self.max_connections == 0 || self.max_control_connections == 0 {
-            return transport_config_error(
-                "client connection and control-connection limits must be greater than zero",
-            );
+            return transport_config_error("client connection and control-connection limits must be greater than zero");
         }
         if let Some(secret) = &self.bearer_token {
             if !secret.is_valid() {
@@ -283,9 +267,7 @@ impl QueryTransportClientConfig {
         #[cfg(feature = "query-transport-tls")]
         {
             if self.tls_config.is_some() && self.tls_config_provider.is_some() {
-                return transport_config_error(
-                    "set either a static TLS config or a TLS provider, not both",
-                );
+                return transport_config_error("set either a static TLS config or a TLS provider, not both");
             }
             let has_tls = self.tls_config.is_some() || self.tls_config_provider.is_some();
             let missing_server_name = match self.tls_server_name.as_deref() {
@@ -299,16 +281,12 @@ impl QueryTransportClientConfig {
                 return transport_config_error("TLS server name was set without a TLS config");
             }
             if self.bearer_token.is_some() && !has_tls && !self.allow_plaintext {
-                return transport_config_error(
-                    "bearer authentication requires TLS unless plaintext is explicitly allowed",
-                );
+                return transport_config_error("bearer authentication requires TLS unless plaintext is explicitly allowed");
             }
         }
         #[cfg(not(feature = "query-transport-tls"))]
         if self.bearer_token.is_some() && !self.allow_plaintext {
-            return transport_config_error(
-                "bearer authentication requires TLS unless plaintext is explicitly allowed",
-            );
+            return transport_config_error("bearer authentication requires TLS unless plaintext is explicitly allowed");
         }
         Ok(())
     }
@@ -330,11 +308,7 @@ pub enum QueryTransportAuthPolicy {
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportAuthPolicy {
-    fn authenticate(
-        &self,
-        auth: &QueryTransportAuth,
-        _identity: &QueryTransportConnectionIdentity,
-    ) -> Option<QueryTransportPrincipal> {
+    fn authenticate(&self, auth: &QueryTransportAuth, _identity: &QueryTransportConnectionIdentity) -> Option<QueryTransportPrincipal> {
         match self {
             Self::RejectAll => None,
             Self::BearerToken(required) => {
@@ -346,9 +320,7 @@ impl QueryTransportAuthPolicy {
                 let supplied = auth.bearer_token.as_deref()?;
                 let mut matched = None;
                 for required in required_tokens {
-                    if required.is_valid()
-                        && constant_time_secret_eq(supplied, required.expose_secret())
-                    {
+                    if required.is_valid() && constant_time_secret_eq(supplied, required.expose_secret()) {
                         matched = Some(QueryTransportPrincipal::bearer(required.expose_secret()));
                     }
                 }
@@ -361,10 +333,7 @@ impl QueryTransportAuthPolicy {
             } => {
                 let bearer_ok = match bearer_token {
                     Some(required) => match auth.bearer_token.as_deref() {
-                        Some(supplied) => {
-                            required.is_valid()
-                                && constant_time_secret_eq(supplied, required.expose_secret())
-                        }
+                        Some(supplied) => required.is_valid() && constant_time_secret_eq(supplied, required.expose_secret()),
                         None => false,
                     },
                     None => true,
@@ -407,10 +376,7 @@ pub struct QueryTransportPrincipal(String);
 #[cfg(feature = "query-transport")]
 impl QueryTransportPrincipal {
     fn bearer(token: &str) -> Self {
-        Self(format!(
-            "bearer:sha256:{}",
-            lowercase_hex(&Sha256::digest(token.as_bytes()))
-        ))
+        Self(format!("bearer:sha256:{}", lowercase_hex(&Sha256::digest(token.as_bytes()))))
     }
 
     #[cfg(feature = "query-transport-tls")]
@@ -429,23 +395,16 @@ impl QueryTransportPrincipal {
 
     #[cfg(feature = "query-transport-tls")]
     pub fn from_mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
-        let fingerprints =
-            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
-                GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::InvalidRequest,
-                    dialect: "QueryTransport",
-                    feature: "mTLS principal requires a canonical sha256 fingerprint".to_string(),
-                }
-            })?;
-        let fingerprint =
-            fingerprints
-                .into_iter()
-                .next()
-                .ok_or_else(|| GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::InvalidRequest,
-                    dialect: "QueryTransport",
-                    feature: "mTLS principal requires a fingerprint".to_string(),
-                })?;
+        let fingerprints = normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
+            dialect: "QueryTransport",
+            feature: "mTLS principal requires a canonical sha256 fingerprint".to_string(),
+        })?;
+        let fingerprint = fingerprints.into_iter().next().ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
+            dialect: "QueryTransport",
+            feature: "mTLS principal requires a fingerprint".to_string(),
+        })?;
         Ok(Self::mtls(&fingerprint))
     }
 
@@ -477,6 +436,18 @@ pub enum QueryTransportAction {
     Admin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedCypherEffect {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedCypherQuery {
+    pub effect: PreparedCypherEffect,
+    pub columns: Vec<QueryColumn>,
+}
+
 #[cfg(feature = "query-transport")]
 impl QueryTransportAction {
     pub(crate) fn as_str(self) -> &'static str {
@@ -500,10 +471,7 @@ pub struct QueryTransportScopeGrant {
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportScopeGrant {
-    pub fn graph(
-        scope: GraphScope,
-        actions: impl IntoIterator<Item = QueryTransportAction>,
-    ) -> Self {
+    pub fn graph(scope: GraphScope, actions: impl IntoIterator<Item = QueryTransportAction>) -> Self {
         Self {
             namespace: scope.namespace,
             graph_id: Some(scope.graph_id),
@@ -512,11 +480,7 @@ impl QueryTransportScopeGrant {
         }
     }
 
-    pub fn namespace(
-        namespace: NamespacePath,
-        include_descendants: bool,
-        actions: impl IntoIterator<Item = QueryTransportAction>,
-    ) -> Self {
+    pub fn namespace(namespace: NamespacePath, include_descendants: bool, actions: impl IntoIterator<Item = QueryTransportAction>) -> Self {
         Self {
             namespace,
             graph_id: None,
@@ -540,10 +504,7 @@ impl QueryTransportScopeGrant {
     }
 
     pub fn read_graph(scope: GraphScope) -> Self {
-        Self::graph(
-            scope,
-            [QueryTransportAction::Read, QueryTransportAction::Cancel],
-        )
+        Self::graph(scope, [QueryTransportAction::Read, QueryTransportAction::Cancel])
     }
 
     pub fn read_namespace(namespace: NamespacePath, include_descendants: bool) -> Self {
@@ -570,12 +531,7 @@ impl QueryTransportScopeGrant {
 
 #[cfg(feature = "query-transport")]
 pub trait QueryTransportScopeAuthorizer: Send + Sync {
-    fn authorize(
-        &self,
-        principal: &QueryTransportPrincipal,
-        scope: &GraphScope,
-        action: QueryTransportAction,
-    ) -> bool;
+    fn authorize(&self, principal: &QueryTransportPrincipal, scope: &GraphScope, action: QueryTransportAction) -> bool;
 }
 
 #[cfg(feature = "query-transport")]
@@ -594,44 +550,24 @@ impl StaticQueryTransportScopeAuthorizer {
         self.grants.entry(principal).or_default().push(grant);
     }
 
-    pub fn with_grant(
-        mut self,
-        principal: QueryTransportPrincipal,
-        grant: QueryTransportScopeGrant,
-    ) -> Self {
+    pub fn with_grant(mut self, principal: QueryTransportPrincipal, grant: QueryTransportScopeGrant) -> Self {
         self.grant(principal, grant);
         self
     }
 
-    pub fn with_bearer_grant(
-        self,
-        token: impl Into<String>,
-        grant: QueryTransportScopeGrant,
-    ) -> Result<Self> {
+    pub fn with_bearer_grant(self, token: impl Into<String>, grant: QueryTransportScopeGrant) -> Result<Self> {
         Ok(self.with_grant(QueryTransportPrincipal::from_bearer_token(token)?, grant))
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_mtls_grant(
-        self,
-        fingerprint: impl Into<String>,
-        grant: QueryTransportScopeGrant,
-    ) -> Result<Self> {
-        Ok(self.with_grant(
-            QueryTransportPrincipal::from_mtls_peer_fingerprint(fingerprint)?,
-            grant,
-        ))
+    pub fn with_mtls_grant(self, fingerprint: impl Into<String>, grant: QueryTransportScopeGrant) -> Result<Self> {
+        Ok(self.with_grant(QueryTransportPrincipal::from_mtls_peer_fingerprint(fingerprint)?, grant))
     }
 }
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportScopeAuthorizer for StaticQueryTransportScopeAuthorizer {
-    fn authorize(
-        &self,
-        principal: &QueryTransportPrincipal,
-        scope: &GraphScope,
-        action: QueryTransportAction,
-    ) -> bool {
+    fn authorize(&self, principal: &QueryTransportPrincipal, scope: &GraphScope, action: QueryTransportAction) -> bool {
         self.grants
             .get(principal)
             .is_some_and(|grants| grants.iter().any(|grant| grant.allows(scope, action)))
@@ -643,12 +579,7 @@ struct DefaultQueryTransportScopeAuthorizer;
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportScopeAuthorizer for DefaultQueryTransportScopeAuthorizer {
-    fn authorize(
-        &self,
-        _principal: &QueryTransportPrincipal,
-        scope: &GraphScope,
-        _action: QueryTransportAction,
-    ) -> bool {
+    fn authorize(&self, _principal: &QueryTransportPrincipal, scope: &GraphScope, _action: QueryTransportAction) -> bool {
         scope.is_default()
     }
 }
@@ -666,8 +597,7 @@ impl QueryTransportNamespaceQuotas {
     }
 
     pub fn with_query_limit(mut self, namespace: NamespacePath, max_concurrent: usize) -> Self {
-        self.max_concurrent_queries
-            .insert(namespace, max_concurrent);
+        self.max_concurrent_queries.insert(namespace, max_concurrent);
         self
     }
 
@@ -676,14 +606,8 @@ impl QueryTransportNamespaceQuotas {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self
-            .max_concurrent_queries
-            .values()
-            .any(|limit| *limit == 0)
-        {
-            return transport_config_error(
-                "namespace query concurrency limits must be greater than zero",
-            );
+        if self.max_concurrent_queries.values().any(|limit| *limit == 0) {
+            return transport_config_error("namespace query concurrency limits must be greater than zero");
         }
         Ok(())
     }
@@ -704,31 +628,21 @@ pub struct QueryTransportCancellationPrincipal(QueryTransportPrincipal);
 impl QueryTransportCancellationPrincipal {
     pub fn bearer_token(token: impl Into<String>) -> Result<Self> {
         let secret = QueryTransportSecret::try_new(token)?;
-        Ok(Self(QueryTransportPrincipal::bearer(
-            secret.expose_secret(),
-        )))
+        Ok(Self(QueryTransportPrincipal::bearer(secret.expose_secret())))
     }
 
     #[cfg(feature = "query-transport-tls")]
     pub fn mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
-        let fingerprints =
-            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
-                GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::InvalidRequest,
-                    dialect: "QueryTransport",
-                    feature: "mTLS cancellation principal requires a canonical sha256 fingerprint"
-                        .to_string(),
-                }
-            })?;
-        let fingerprint =
-            fingerprints
-                .into_iter()
-                .next()
-                .ok_or_else(|| GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::InvalidRequest,
-                    dialect: "QueryTransport",
-                    feature: "mTLS cancellation principal requires a fingerprint".to_string(),
-                })?;
+        let fingerprints = normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
+            dialect: "QueryTransport",
+            feature: "mTLS cancellation principal requires a canonical sha256 fingerprint".to_string(),
+        })?;
+        let fingerprint = fingerprints.into_iter().next().ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
+            dialect: "QueryTransport",
+            feature: "mTLS cancellation principal requires a fingerprint".to_string(),
+        })?;
         Ok(Self(QueryTransportPrincipal::mtls(&fingerprint)))
     }
 
@@ -927,15 +841,11 @@ impl Default for QueryTransportServerConfig {
             max_connections: DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS,
             reserved_control_connections: DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS,
             max_requests_per_connection: DEFAULT_QUERY_TRANSPORT_MAX_REQUESTS_PER_CONNECTION,
-            max_connection_age: Duration::from_millis(
-                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
-            ),
+            max_connection_age: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS),
             handshake_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_HANDSHAKE_TIMEOUT_MS),
             idle_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_IDLE_TIMEOUT_MS),
             write_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS),
-            graceful_shutdown_timeout: Duration::from_millis(
-                DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS,
-            ),
+            graceful_shutdown_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS),
             allow_plaintext: false,
             slow_query_log_threshold: Some(Duration::from_millis(500)),
             #[cfg(feature = "query-transport-tls")]
@@ -957,10 +867,7 @@ impl QueryTransportServerConfig {
     }
 
     pub fn with_required_bearer_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
-        let tokens: Result<Vec<_>> = tokens
-            .into_iter()
-            .map(QueryTransportSecret::try_new)
-            .collect();
+        let tokens: Result<Vec<_>> = tokens.into_iter().map(QueryTransportSecret::try_new).collect();
         self.auth_policy = match tokens {
             Ok(tokens) if !tokens.is_empty() => QueryTransportAuthPolicy::BearerTokens(tokens),
             _ => QueryTransportAuthPolicy::RejectAll,
@@ -979,10 +886,7 @@ impl QueryTransportServerConfig {
         self
     }
 
-    pub fn with_scope_authorizer(
-        mut self,
-        authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
-    ) -> Self {
+    pub fn with_scope_authorizer(mut self, authorizer: Arc<dyn QueryTransportScopeAuthorizer>) -> Self {
         self.scope_authorizer = authorizer;
         self
     }
@@ -1007,10 +911,7 @@ impl QueryTransportServerConfig {
         self
     }
 
-    pub fn with_reserved_control_connections(
-        mut self,
-        reserved_control_connections: usize,
-    ) -> Self {
+    pub fn with_reserved_control_connections(mut self, reserved_control_connections: usize) -> Self {
         self.reserved_control_connections = reserved_control_connections.max(1);
         self
     }
@@ -1058,27 +959,21 @@ impl QueryTransportServerConfig {
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_tls_provider(
-        mut self,
-        provider: Arc<dyn QueryTransportTlsServerConfigProvider>,
-    ) -> Self {
+    pub fn with_tls_provider(mut self, provider: Arc<dyn QueryTransportTlsServerConfigProvider>) -> Self {
         self.tls_config = None;
         self.tls_config_provider = Some(provider);
         self
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_required_mtls_fingerprints(
-        mut self,
-        allowed_fingerprints: impl IntoIterator<Item = String>,
-    ) -> Self {
-        self.auth_policy = normalized_sha256_fingerprints(allowed_fingerprints).map_or(
-            QueryTransportAuthPolicy::RejectAll,
-            |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
-                allowed_fingerprints,
-                bearer_token: None,
-            },
-        );
+    pub fn with_required_mtls_fingerprints(mut self, allowed_fingerprints: impl IntoIterator<Item = String>) -> Self {
+        self.auth_policy =
+            normalized_sha256_fingerprints(allowed_fingerprints).map_or(QueryTransportAuthPolicy::RejectAll, |allowed_fingerprints| {
+                QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                    allowed_fingerprints,
+                    bearer_token: None,
+                }
+            });
         self
     }
 
@@ -1089,13 +984,14 @@ impl QueryTransportServerConfig {
         token: impl Into<String>,
     ) -> Self {
         self.auth_policy = match QueryTransportSecret::try_new(token) {
-            Ok(secret) => normalized_sha256_fingerprints(allowed_fingerprints).map_or(
-                QueryTransportAuthPolicy::RejectAll,
-                |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
-                    allowed_fingerprints,
-                    bearer_token: Some(secret),
-                },
-            ),
+            Ok(secret) => {
+                normalized_sha256_fingerprints(allowed_fingerprints).map_or(QueryTransportAuthPolicy::RejectAll, |allowed_fingerprints| {
+                    QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                        allowed_fingerprints,
+                        bearer_token: Some(secret),
+                    }
+                })
+            }
             Err(_) => QueryTransportAuthPolicy::RejectAll,
         };
         self
@@ -1106,10 +1002,7 @@ impl QueryTransportServerConfig {
         if self.max_frame_bytes < 2 {
             return transport_config_error("max_frame_bytes must be at least 2");
         }
-        if self.max_connections == 0
-            || self.reserved_control_connections == 0
-            || self.max_concurrent_requests == 0
-        {
+        if self.max_connections == 0 || self.reserved_control_connections == 0 || self.max_concurrent_requests == 0 {
             return transport_config_error("connection, reserved control-connection, and request limits must be greater than zero");
         }
         if self.max_requests_per_connection == 0 {
@@ -1130,58 +1023,37 @@ impl QueryTransportServerConfig {
 
         #[cfg(feature = "query-transport-tls")]
         if self.tls_config.is_some() && self.tls_config_provider.is_some() {
-            return transport_config_error(
-                "set either a static TLS config or a TLS provider, not both",
-            );
+            return transport_config_error("set either a static TLS config or a TLS provider, not both");
         }
 
         match &self.auth_policy {
             QueryTransportAuthPolicy::BearerToken(secret) if !secret.is_valid() => {
                 return transport_config_error("bearer token cannot be empty");
             }
-            QueryTransportAuthPolicy::BearerTokens(tokens)
-                if tokens.is_empty() || tokens.iter().any(|secret| !secret.is_valid()) =>
-            {
-                return transport_config_error(
-                    "bearer token list must be non-empty and cannot contain empty tokens",
-                );
+            QueryTransportAuthPolicy::BearerTokens(tokens) if tokens.is_empty() || tokens.iter().any(|secret| !secret.is_valid()) => {
+                return transport_config_error("bearer token list must be non-empty and cannot contain empty tokens");
             }
             #[cfg(feature = "query-transport-tls")]
             QueryTransportAuthPolicy::MtlsPeerFingerprint {
                 allowed_fingerprints,
                 bearer_token,
             } => {
-                let normalized =
-                    normalized_sha256_fingerprints(allowed_fingerprints.iter().cloned());
+                let normalized = normalized_sha256_fingerprints(allowed_fingerprints.iter().cloned());
                 if normalized.as_ref() != Some(allowed_fingerprints) {
-                    return transport_config_error(
-                        "mTLS fingerprints must be canonical sha256 values",
-                    );
+                    return transport_config_error("mTLS fingerprints must be canonical sha256 values");
                 }
-                if bearer_token
-                    .as_ref()
-                    .is_some_and(|secret| !secret.is_valid())
-                {
+                if bearer_token.as_ref().is_some_and(|secret| !secret.is_valid()) {
                     return transport_config_error("bearer token cannot be empty");
                 }
             }
             _ => {}
         }
 
-        if !tls_configured
-            && !self.allow_plaintext
-            && !matches!(self.auth_policy, QueryTransportAuthPolicy::RejectAll)
-        {
-            return transport_config_error(
-                "authenticated query transport requires TLS unless plaintext is explicitly allowed",
-            );
+        if !tls_configured && !self.allow_plaintext && !matches!(self.auth_policy, QueryTransportAuthPolicy::RejectAll) {
+            return transport_config_error("authenticated query transport requires TLS unless plaintext is explicitly allowed");
         }
         #[cfg(feature = "query-transport-tls")]
-        if matches!(
-            self.auth_policy,
-            QueryTransportAuthPolicy::MtlsPeerFingerprint { .. }
-        ) && !tls_configured
-        {
+        if matches!(self.auth_policy, QueryTransportAuthPolicy::MtlsPeerFingerprint { .. }) && !tls_configured {
             return transport_config_error("mTLS authentication requires a TLS server config");
         }
         Ok(())
@@ -1189,9 +1061,7 @@ impl QueryTransportServerConfig {
 }
 
 #[cfg(feature = "query-transport-tls")]
-fn normalized_sha256_fingerprints(
-    fingerprints: impl IntoIterator<Item = String>,
-) -> Option<BTreeSet<String>> {
+fn normalized_sha256_fingerprints(fingerprints: impl IntoIterator<Item = String>) -> Option<BTreeSet<String>> {
     let mut normalized = BTreeSet::new();
     for fingerprint in fingerprints {
         let fingerprint = fingerprint.trim().to_ascii_lowercase();
@@ -1406,10 +1276,7 @@ impl QueryServiceDirectory {
 
 #[cfg(feature = "query-transport")]
 // async_trait adds #[must_use] to boxed futures; Rust 1.99 already marks Future must_use.
-#[allow(
-    clippy::double_must_use,
-    reason = "redundant attribute is generated by async_trait"
-)]
+#[allow(clippy::double_must_use, reason = "redundant attribute is generated by async_trait")]
 #[async_trait]
 pub trait QueryServiceDiscovery: Send + Sync {
     async fn resolve_query_services(&self) -> Result<QueryServiceDirectory>;
@@ -1450,11 +1317,7 @@ pub struct KubernetesQueryServiceDiscovery {
 
 #[cfg(feature = "query-service-discovery")]
 impl KubernetesQueryServiceDiscovery {
-    pub fn new(
-        api_server: impl Into<String>,
-        namespace: impl Into<String>,
-        label_selector: impl Into<String>,
-    ) -> Self {
+    pub fn new(api_server: impl Into<String>, namespace: impl Into<String>, label_selector: impl Into<String>) -> Self {
         Self {
             api_server: api_server.into().trim_end_matches('/').to_string(),
             namespace: namespace.into(),
@@ -1498,10 +1361,7 @@ impl QueryServiceDiscovery for KubernetesQueryServiceDiscovery {
             "{}/apis/discovery.k8s.io/v1/namespaces/{}/endpointslices",
             self.api_server, self.namespace
         );
-        let mut request = self
-            .http
-            .get(url)
-            .query(&[("labelSelector", self.label_selector.as_str())]);
+        let mut request = self.http.get(url).query(&[("labelSelector", self.label_selector.as_str())]);
         if let Some(token) = &self.bearer_token {
             request = request.bearer_auth(token.expose_secret());
         }
@@ -1514,11 +1374,7 @@ impl QueryServiceDiscovery for KubernetesQueryServiceDiscovery {
             .json::<serde_json::Value>()
             .await
             .map_err(|err| service_discovery_error("kubernetes/decode", err))?;
-        parse_kubernetes_endpointslices(
-            &value,
-            self.port_name.as_deref(),
-            self.client_config.clone(),
-        )
+        parse_kubernetes_endpointslices(&value, self.port_name.as_deref(), self.client_config.clone())
     }
 }
 
@@ -1629,13 +1485,9 @@ impl EtcdQueryServiceDiscovery {
 impl QueryServiceDiscovery for EtcdQueryServiceDiscovery {
     async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
         let key = base64::engine::general_purpose::STANDARD.encode(self.prefix.as_bytes());
-        let range_end =
-            base64::engine::general_purpose::STANDARD.encode(etcd_prefix_end(&self.prefix));
+        let range_end = base64::engine::general_purpose::STANDARD.encode(etcd_prefix_end(&self.prefix));
         let body = serde_json::json!({ "key": key, "range_end": range_end });
-        let mut request = self
-            .http
-            .post(format!("{}/v3/kv/range", self.endpoint))
-            .json(&body);
+        let mut request = self.http.post(format!("{}/v3/kv/range", self.endpoint)).json(&body);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token.expose_secret());
         }
@@ -1653,17 +1505,23 @@ impl QueryServiceDiscovery for EtcdQueryServiceDiscovery {
 }
 
 // async_trait adds #[must_use] to boxed futures; Rust 1.99 already marks Future must_use.
-#[allow(
-    clippy::double_must_use,
-    reason = "redundant attribute is generated by async_trait"
-)]
+#[allow(clippy::double_must_use, reason = "redundant attribute is generated by async_trait")]
 #[async_trait]
 pub trait QueryCellClient: Send + Sync {
-    async fn execute_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet>;
+    #[cfg(feature = "datafusion-cypher-engine")]
+    async fn resolve_datafusion_statement_receipt(&self, _context: QueryContext, _query: &str) -> Result<Option<QueryResultSet>> {
+        Ok(None)
+    }
+
+    async fn prepare_datafusion_cypher(&self, _context: QueryContext, _query: &str) -> Result<PreparedCypherQuery> {
+        Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Other,
+            dialect: "QueryCellClient",
+            feature: "DataFusion Cypher preparation is not implemented by this query client".to_string(),
+        })
+    }
+
+    async fn execute_cypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet>;
 
     async fn execute_cypher_rows_page(
         &self,
@@ -1673,11 +1531,7 @@ pub trait QueryCellClient: Send + Sync {
         page_size: usize,
     ) -> Result<QueryResultPage>;
 
-    async fn execute_batch(
-        &self,
-        _context: QueryContext,
-        _operation: crate::QueryBatchOperation,
-    ) -> Result<QueryResultSet> {
+    async fn execute_batch(&self, _context: QueryContext, _operation: crate::QueryBatchOperation) -> Result<QueryResultSet> {
         Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Other,
             dialect: "QueryCellClient",
@@ -1692,18 +1546,10 @@ pub trait QueryCellClient: Send + Sync {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
-        paginate_query_batch_result(
-            self.execute_batch(context, operation).await?,
-            cursor,
-            page_size,
-        )
+        paginate_query_batch_result(self.execute_batch(context, operation).await?, cursor, page_size)
     }
 
-    async fn current_storage_sequence(
-        &self,
-        _scope: &crate::GraphScope,
-        _cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn current_storage_sequence(&self, _scope: &crate::GraphScope, _cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         Ok(None)
     }
 
@@ -1726,7 +1572,7 @@ pub trait QueryCellClient: Send + Sync {
     /// for everyone who cannot — `None`, meaning "no observation", which the
     /// client records as neither owner nor non-owner rather than guessing.
     ///
-    /// Change 4 of the cell-affine read-routing design. See
+    /// Change 4 of the cell-affine read routing design. See
     /// [`crate::BookmarkWait`] for what the two facts are worth.
     async fn wait_for_storage_sequence_observed(
         &self,
@@ -1734,27 +1580,15 @@ pub trait QueryCellClient: Send + Sync {
         cell_id: &str,
         minimum: crate::StorageSequence,
     ) -> Result<(Option<crate::StorageSequence>, Option<crate::BookmarkWait>)> {
-        Ok((
-            self.wait_for_storage_sequence(scope, cell_id, minimum)
-                .await?,
-            None,
-        ))
+        Ok((self.wait_for_storage_sequence(scope, cell_id, minimum).await?, None))
     }
 
-    async fn refresh_storage_sequence(
-        &self,
-        scope: &crate::GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn refresh_storage_sequence(&self, scope: &crate::GraphScope, cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         self.current_storage_sequence(scope, cell_id).await
     }
 }
 
-fn paginate_query_batch_result(
-    result: QueryResultSet,
-    cursor: Option<QueryCursorToken>,
-    page_size: usize,
-) -> Result<QueryResultPage> {
+fn paginate_query_batch_result(result: QueryResultSet, cursor: Option<QueryCursorToken>, page_size: usize) -> Result<QueryResultPage> {
     if page_size == 0 {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::InvalidRequest,
@@ -1777,11 +1611,7 @@ fn paginate_query_batch_result(
     }
     let end = offset.saturating_add(page_size).min(result.rows.len());
     let next_cursor = (end < result.rows.len()).then(|| QueryCursorToken::new(end as u64));
-    Ok(QueryResultPage::new(
-        result.columns,
-        result.rows[offset..end].to_vec(),
-        next_cursor,
-    ))
+    Ok(QueryResultPage::new(result.columns, result.rows[offset..end].to_vec(), next_cursor).with_statuses(result.statuses))
 }
 
 #[cfg(feature = "query-transport")]
@@ -1860,8 +1690,7 @@ impl TcpQueryCellClient {
 
     pub fn with_max_control_connections(mut self, max_control_connections: usize) -> Self {
         self.config.max_control_connections = max_control_connections.max(1);
-        self.control_connection_gate =
-            Arc::new(Semaphore::new(self.config.max_control_connections));
+        self.control_connection_gate = Arc::new(Semaphore::new(self.config.max_control_connections));
         self
     }
 
@@ -1876,11 +1705,7 @@ impl TcpQueryCellClient {
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_tls(
-        mut self,
-        server_name: impl Into<String>,
-        config: Arc<RustlsClientConfig>,
-    ) -> Self {
+    pub fn with_tls(mut self, server_name: impl Into<String>, config: Arc<RustlsClientConfig>) -> Self {
         self.config.tls_server_name = Some(server_name.into());
         self.config.tls_config = Some(config);
         self.config.tls_config_provider = None;
@@ -1889,11 +1714,7 @@ impl TcpQueryCellClient {
     }
 
     #[cfg(feature = "query-transport-tls")]
-    pub fn with_tls_provider(
-        mut self,
-        server_name: impl Into<String>,
-        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
-    ) -> Self {
+    pub fn with_tls_provider(mut self, server_name: impl Into<String>, provider: Arc<dyn QueryTransportTlsClientConfigProvider>) -> Self {
         self.config.tls_server_name = Some(server_name.into());
         self.config.tls_config = None;
         self.config.tls_config_provider = Some(provider);
@@ -1957,11 +1778,7 @@ struct QueryLifecycleKey {
 
 #[cfg(feature = "query-transport")]
 impl QueryLifecycleKey {
-    fn new(
-        principal: QueryTransportPrincipal,
-        scope: GraphScope,
-        query_id: impl Into<String>,
-    ) -> Self {
+    fn new(principal: QueryTransportPrincipal, scope: GraphScope, query_id: impl Into<String>) -> Self {
         Self {
             principal,
             scope,
@@ -1996,9 +1813,7 @@ impl ActiveQueryTransportConnection {
 #[cfg(feature = "query-transport")]
 impl Drop for ActiveQueryTransportConnection {
     fn drop(&mut self) {
-        self.metrics
-            .connections_active
-            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2016,11 +1831,7 @@ impl TcpQueryServer {
         Self::bind_with_config(addr, client, QueryTransportServerConfig::default()).await
     }
 
-    pub async fn bind_with_max_frame_bytes(
-        addr: SocketAddr,
-        client: Arc<dyn QueryCellClient>,
-        max_frame_bytes: usize,
-    ) -> Result<Self> {
+    pub async fn bind_with_max_frame_bytes(addr: SocketAddr, client: Arc<dyn QueryCellClient>, max_frame_bytes: usize) -> Result<Self> {
         Self::bind_with_config(
             addr,
             client,
@@ -2029,18 +1840,10 @@ impl TcpQueryServer {
         .await
     }
 
-    pub async fn bind_with_config(
-        addr: SocketAddr,
-        client: Arc<dyn QueryCellClient>,
-        config: QueryTransportServerConfig,
-    ) -> Result<Self> {
+    pub async fn bind_with_config(addr: SocketAddr, client: Arc<dyn QueryCellClient>, config: QueryTransportServerConfig) -> Result<Self> {
         config.validate()?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|err| transport_error("bind", err))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|err| transport_error("local_addr", err))?;
+        let listener = TcpListener::bind(addr).await.map_err(|err| transport_error("bind", err))?;
+        let local_addr = listener.local_addr().map_err(|err| transport_error("local_addr", err))?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let metrics = Arc::new(QueryTransportMetrics::default());
         let lifecycle = Arc::new(Mutex::new(QueryTransportLifecycle::default()));
@@ -2145,14 +1948,8 @@ impl TcpQueryServer {
                     }
                 }
             };
-            if tokio::time::timeout(graceful_shutdown_timeout, graceful_drain)
-                .await
-                .is_err()
-            {
-                runtime
-                    .metrics
-                    .forced_shutdowns
-                    .fetch_add(1, Ordering::Relaxed);
+            if tokio::time::timeout(graceful_shutdown_timeout, graceful_drain).await.is_err() {
+                runtime.metrics.forced_shutdowns.fetch_add(1, Ordering::Relaxed);
                 connections.abort_all();
                 while let Some(joined) = connections.join_next().await {
                     if let Err(err) = joined {
@@ -2186,21 +1983,12 @@ impl TcpQueryServer {
     }
 
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
-        self.cancel_query_in_scope(GraphScope::default(), query_id)
-            .await
+        self.cancel_query_in_scope(GraphScope::default(), query_id).await
     }
 
-    pub async fn cancel_query_in_scope(
-        &self,
-        scope: GraphScope,
-        query_id: impl Into<String>,
-    ) -> Result<()> {
-        self.cancel_query_for_principal_in_scope(
-            QueryTransportCancellationPrincipal::insecure(),
-            scope,
-            query_id,
-        )
-        .await
+    pub async fn cancel_query_in_scope(&self, scope: GraphScope, query_id: impl Into<String>) -> Result<()> {
+        self.cancel_query_for_principal_in_scope(QueryTransportCancellationPrincipal::insecure(), scope, query_id)
+            .await
     }
 
     pub async fn cancel_query_for_principal(
@@ -2240,11 +2028,7 @@ impl TcpQueryServer {
 #[cfg(feature = "query-transport")]
 #[async_trait]
 impl QueryCellClient for TcpQueryCellClient {
-    async fn execute_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet> {
+    async fn execute_cypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
         let request = QueryTransportRequest::Rows {
             version: QUERY_TRANSPORT_VERSION,
             auth: self.auth(),
@@ -2268,6 +2052,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             } => Err(transport_remote_error(
                 "query/transport/rows",
                 message,
@@ -2275,6 +2060,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             )),
         }
     }
@@ -2311,6 +2097,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             } => Err(transport_remote_error(
                 "query/transport/page",
                 message,
@@ -2318,15 +2105,12 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             )),
         }
     }
 
-    async fn execute_batch(
-        &self,
-        context: QueryContext,
-        operation: crate::QueryBatchOperation,
-    ) -> Result<QueryResultSet> {
+    async fn execute_batch(&self, context: QueryContext, operation: crate::QueryBatchOperation) -> Result<QueryResultSet> {
         let request = QueryTransportRequest::Batch {
             version: QUERY_TRANSPORT_VERSION,
             auth: self.auth(),
@@ -2350,6 +2134,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             } => Err(transport_remote_error(
                 "query/transport/batch",
                 message,
@@ -2357,6 +2142,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             )),
         }
     }
@@ -2393,6 +2179,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             } => Err(transport_remote_error(
                 "query/transport/batch_page",
                 message,
@@ -2400,6 +2187,7 @@ impl QueryCellClient for TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             )),
         }
     }
@@ -2407,12 +2195,7 @@ impl QueryCellClient for TcpQueryCellClient {
 
 #[cfg(feature = "query-transport")]
 impl TcpQueryCellClient {
-    pub fn stream_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: impl Into<String>,
-        page_size: usize,
-    ) -> TcpQueryRowStream {
+    pub fn stream_cypher_rows(&self, context: QueryContext, query: impl Into<String>, page_size: usize) -> TcpQueryRowStream {
         TcpQueryRowStream {
             client: self.clone(),
             context,
@@ -2426,15 +2209,10 @@ impl TcpQueryCellClient {
     }
 
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
-        self.cancel_query_in_scope(GraphScope::default(), query_id)
-            .await
+        self.cancel_query_in_scope(GraphScope::default(), query_id).await
     }
 
-    pub async fn cancel_query_in_scope(
-        &self,
-        scope: GraphScope,
-        query_id: impl Into<String>,
-    ) -> Result<()> {
+    pub async fn cancel_query_in_scope(&self, scope: GraphScope, query_id: impl Into<String>) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
         let request = QueryTransportRequest::Cancel {
@@ -2446,18 +2224,17 @@ impl TcpQueryCellClient {
         };
         match self.send_control(request).await? {
             QueryTransportResponse::Cancelled => Ok(()),
-            QueryTransportResponse::Rows { .. } | QueryTransportResponse::Page { .. } => {
-                Err(transport_protocol_error(
-                    "query/transport/cancel",
-                    "server returned query data for cancel request",
-                ))
-            }
+            QueryTransportResponse::Rows { .. } | QueryTransportResponse::Page { .. } => Err(transport_protocol_error(
+                "query/transport/cancel",
+                "server returned query data for cancel request",
+            )),
             QueryTransportResponse::Error {
                 message,
                 reason,
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             } => Err(transport_remote_error(
                 "query/transport/cancel",
                 message,
@@ -2465,6 +2242,7 @@ impl TcpQueryCellClient {
                 batch_conflict,
                 snapshot_unavailable,
                 typed_failure,
+                gql,
             )),
         }
     }
@@ -2482,8 +2260,7 @@ impl TcpQueryCellClient {
 
     async fn send(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
         let started = std::time::Instant::now();
-        let result = match tokio::time::timeout(self.config.timeout, self.send_once(&request)).await
-        {
+        let result = match tokio::time::timeout(self.config.timeout, self.send_once(&request)).await {
             Ok(result) => result,
             Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
         };
@@ -2494,12 +2271,10 @@ impl TcpQueryCellClient {
 
     async fn send_control(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
         let started = std::time::Instant::now();
-        let result =
-            match tokio::time::timeout(self.config.timeout, self.send_control_once(&request)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
-            };
+        let result = match tokio::time::timeout(self.config.timeout, self.send_control_once(&request)).await {
+            Ok(result) => result,
+            Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
+        };
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.metrics.rpc_latency.record_micros(elapsed_us);
         result
@@ -2510,9 +2285,7 @@ impl TcpQueryCellClient {
         let _connection_permit = match Arc::clone(&self.connection_gate).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                self.metrics
-                    .client_connection_waits
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.client_connection_waits.fetch_add(1, Ordering::Relaxed);
                 Arc::clone(&self.connection_gate)
                     .acquire_owned()
                     .await
@@ -2524,9 +2297,7 @@ impl TcpQueryCellClient {
         };
         let mut connection = match self.take_idle_connection().await {
             Some(connection) => {
-                self.metrics
-                    .connections_reused
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.connections_reused.fetch_add(1, Ordering::Relaxed);
                 connection
             }
             None => self.open_connection_with_retries().await?,
@@ -2538,10 +2309,7 @@ impl TcpQueryCellClient {
         Ok(decoded.response)
     }
 
-    async fn send_control_once(
-        &self,
-        request: &QueryTransportRequest,
-    ) -> Result<QueryTransportResponse> {
+    async fn send_control_once(&self, request: &QueryTransportRequest) -> Result<QueryTransportResponse> {
         self.config.validate()?;
         let _control_permit = Arc::clone(&self.control_connection_gate)
             .acquire_owned()
@@ -2568,21 +2336,13 @@ impl TcpQueryCellClient {
                 Err(err) => last_err = Some(err),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            transport_protocol_error("query/transport/connect", "no connection attempts")
-        }))
+        Err(last_err.unwrap_or_else(|| transport_protocol_error("query/transport/connect", "no connection attempts")))
     }
 
     async fn open_connection(&self) -> Result<PooledQueryTransportConnection> {
-        let stream = TcpStream::connect(self.addr)
-            .await
-            .map_err(|err| transport_error("connect", err))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|err| transport_error("set_nodelay", err))?;
-        self.metrics
-            .connections_created
-            .fetch_add(1, Ordering::Relaxed);
+        let stream = TcpStream::connect(self.addr).await.map_err(|err| transport_error("connect", err))?;
+        stream.set_nodelay(true).map_err(|err| transport_error("set_nodelay", err))?;
+        self.metrics.connections_created.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "query-transport-tls")]
         {
             let tls_config = if let Some(provider) = &self.config.tls_config_provider {
@@ -2591,14 +2351,15 @@ impl TcpQueryCellClient {
                 self.config.tls_config.clone()
             };
             if let Some(tls_config) = tls_config {
-                let server_name = self.config.tls_server_name.clone().ok_or_else(|| {
-                    transport_protocol_error("query/transport/tls", "missing TLS server name")
+                let server_name = self
+                    .config
+                    .tls_server_name
+                    .clone()
+                    .ok_or_else(|| transport_protocol_error("query/transport/tls", "missing TLS server name"))?;
+                let server_name = ServerName::try_from(server_name).map_err(|err| GraphError::CorruptValue {
+                    key: "query/transport/tls/server_name".to_string(),
+                    reason: err.to_string(),
                 })?;
-                let server_name =
-                    ServerName::try_from(server_name).map_err(|err| GraphError::CorruptValue {
-                        key: "query/transport/tls/server_name".to_string(),
-                        reason: err.to_string(),
-                    })?;
                 let stream = TlsConnector::from(tls_config)
                     .connect(server_name, stream)
                     .await
@@ -2651,20 +2412,13 @@ impl TcpQueryCellClient {
         0
     }
 
-    async fn send_on_io<S>(
-        &self,
-        stream: &mut S,
-        request: &QueryTransportRequest,
-    ) -> Result<DecodedQueryTransportResponse>
+    async fn send_on_io<S>(&self, stream: &mut S, request: &QueryTransportRequest) -> Result<DecodedQueryTransportResponse>
     where
         S: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
-        write_query_transport_frame(stream, request, self.config.max_frame_bytes, &self.metrics)
-            .await?;
-        let frame =
-            read_query_transport_frame(stream, self.config.max_frame_bytes, &self.metrics).await?;
-        let frame: QueryTransportResponseFrame =
-            serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))?;
+        write_query_transport_frame(stream, request, self.config.max_frame_bytes, &self.metrics).await?;
+        let frame = read_query_transport_frame(stream, self.config.max_frame_bytes, &self.metrics).await?;
+        let frame: QueryTransportResponseFrame = serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))?;
         Ok(DecodedQueryTransportResponse {
             response: frame.response,
             close_connection: frame.close_connection,
@@ -2703,12 +2457,7 @@ impl TcpQueryRowStream {
         }
         let page = self
             .client
-            .execute_cypher_rows_page(
-                self.context.clone(),
-                &self.query,
-                self.cursor,
-                self.page_size,
-            )
+            .execute_cypher_rows_page(self.context.clone(), &self.query, self.cursor, self.page_size)
             .await?;
         self.cursor = page.next_cursor;
         self.done = self.cursor.is_none();
@@ -2757,11 +2506,7 @@ pub struct DistributedQueryLeg {
 }
 
 impl DistributedQueryLeg {
-    pub fn new(
-        name: impl Into<String>,
-        context: QueryContext,
-        query: impl Into<String>,
-    ) -> Result<Self> {
+    pub fn new(name: impl Into<String>, context: QueryContext, query: impl Into<String>) -> Result<Self> {
         let name = name.into();
         validate_component("query_leg", &name)?;
         Ok(Self {
@@ -2863,55 +2608,36 @@ impl DistributedQueryCoordinator {
         }
     }
 
-    pub fn register_client(
-        &mut self,
-        node_id: impl Into<String>,
-        client: Arc<dyn QueryCellClient>,
-    ) -> Result<()> {
+    pub fn register_client(&mut self, node_id: impl Into<String>, client: Arc<dyn QueryCellClient>) -> Result<()> {
         let node_id = node_id.into();
         validate_component("node_id", &node_id)?;
         self.clients.insert(node_id, client);
         Ok(())
     }
 
-    pub fn with_client(
-        mut self,
-        node_id: impl Into<String>,
-        client: Arc<dyn QueryCellClient>,
-    ) -> Result<Self> {
+    pub fn with_client(mut self, node_id: impl Into<String>, client: Arc<dyn QueryCellClient>) -> Result<Self> {
         self.register_client(node_id, client)?;
         Ok(self)
     }
 
     #[cfg(feature = "query-transport")]
-    pub fn from_service_directory(
-        nodes: ObjectStoreNodeDirectory,
-        services: &QueryServiceDirectory,
-    ) -> Result<Self> {
+    pub fn from_service_directory(nodes: ObjectStoreNodeDirectory, services: &QueryServiceDirectory) -> Result<Self> {
         let mut coordinator = Self::new(nodes.clone());
         for node_id in nodes.node_ids() {
-            let endpoint = services
-                .endpoint(node_id)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: format!("query/service/{node_id}"),
-                    reason: format!("missing service-discovery endpoint for node {node_id}"),
-                })?;
+            let endpoint = services.endpoint(node_id).ok_or_else(|| GraphError::CorruptValue {
+                key: format!("query/service/{node_id}"),
+                reason: format!("missing service-discovery endpoint for node {node_id}"),
+            })?;
             coordinator.register_client(
                 node_id.to_string(),
-                Arc::new(TcpQueryCellClient::with_config(
-                    endpoint.addr,
-                    endpoint.client_config.clone(),
-                )),
+                Arc::new(TcpQueryCellClient::with_config(endpoint.addr, endpoint.client_config.clone())),
             )?;
         }
         Ok(coordinator)
     }
 
     #[cfg(feature = "query-transport")]
-    pub async fn from_service_discovery(
-        nodes: ObjectStoreNodeDirectory,
-        discovery: &dyn QueryServiceDiscovery,
-    ) -> Result<Self> {
+    pub async fn from_service_discovery(nodes: ObjectStoreNodeDirectory, discovery: &dyn QueryServiceDiscovery) -> Result<Self> {
         let services = discovery.resolve_query_services().await?;
         Self::from_service_directory(nodes, &services)
     }
@@ -2956,12 +2682,7 @@ impl DistributedQueryCoordinator {
             let query = Arc::clone(&query);
             jobs.push(async move {
                 let result = client
-                    .execute_cypher_rows_page(
-                        request.context,
-                        query.as_str(),
-                        request.cursor,
-                        page_size,
-                    )
+                    .execute_cypher_rows_page(request.context, query.as_str(), request.cursor, page_size)
                     .await;
                 (cell_id, result)
             });
@@ -2974,10 +2695,7 @@ impl DistributedQueryCoordinator {
         Ok(pages)
     }
 
-    pub async fn execute_distributed_query_plan(
-        &self,
-        plan: DistributedQueryPlan,
-    ) -> Result<DistributedQueryPlanResult> {
+    pub async fn execute_distributed_query_plan(&self, plan: DistributedQueryPlan) -> Result<DistributedQueryPlanResult> {
         let plan = if matches!(&plan.merge, DistributedQueryMerge::InnerJoin(_)) {
             plan.optimized_for_costs()
         } else {
@@ -2990,11 +2708,7 @@ impl DistributedQueryCoordinator {
                 feature: "distributed query plan requires at least one leg".to_string(),
             });
         }
-        let leg_order = plan
-            .legs
-            .iter()
-            .map(|leg| leg.name.clone())
-            .collect::<Vec<_>>();
+        let leg_order = plan.legs.iter().map(|leg| leg.name.clone()).collect::<Vec<_>>();
         let mut seen_leg_names = BTreeSet::new();
         let mut jobs = Vec::new();
         for leg in plan.legs {
@@ -3007,9 +2721,7 @@ impl DistributedQueryCoordinator {
             let cell_id = leg.context.cell_id.clone();
             let client = self.client_for_cell(&cell_id)?;
             jobs.push(async move {
-                let result = client
-                    .execute_cypher_rows(leg.context, leg.query.as_str())
-                    .await;
+                let result = client.execute_cypher_rows(leg.context, leg.query.as_str()).await;
                 (leg.name, result)
             });
         }
@@ -3019,17 +2731,10 @@ impl DistributedQueryCoordinator {
             leg_results.insert(leg_name, result?);
         }
         let merged = match plan.merge {
-            DistributedQueryMerge::UnionAll => {
-                merge_distributed_union_all(&leg_results, &leg_order)?
-            }
-            DistributedQueryMerge::InnerJoin(join) => {
-                merge_distributed_inner_join(&leg_results, &join)?
-            }
+            DistributedQueryMerge::UnionAll => merge_distributed_union_all(&leg_results, &leg_order)?,
+            DistributedQueryMerge::InnerJoin(join) => merge_distributed_inner_join(&leg_results, &join)?,
         };
-        Ok(DistributedQueryPlanResult {
-            leg_results,
-            merged,
-        })
+        Ok(DistributedQueryPlanResult { leg_results, merged })
     }
 
     fn client_for_cell(&self, cell_id: &str) -> Result<Arc<dyn QueryCellClient>> {
@@ -3044,21 +2749,14 @@ impl DistributedQueryCoordinator {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         let index = usize::try_from(hash % self.clients.len().max(1) as u64).unwrap_or(0);
-        self.clients
-            .values()
-            .nth(index)
-            .cloned()
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: format!("query/cell/{cell_id}"),
-                reason: "no query nodes are registered".to_string(),
-            })
+        self.clients.values().nth(index).cloned().ok_or_else(|| GraphError::CorruptValue {
+            key: format!("query/cell/{cell_id}"),
+            reason: "no query nodes are registered".to_string(),
+        })
     }
 }
 
-fn merge_distributed_union_all(
-    leg_results: &BTreeMap<String, QueryResultSet>,
-    leg_order: &[String],
-) -> Result<QueryResultSet> {
+fn merge_distributed_union_all(leg_results: &BTreeMap<String, QueryResultSet>, leg_order: &[String]) -> Result<QueryResultSet> {
     let Some(first_leg) = leg_order.first() else {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Union,
@@ -3066,15 +2764,11 @@ fn merge_distributed_union_all(
             feature: "cannot merge an empty distributed result".to_string(),
         });
     };
-    let first = leg_results
-        .get(first_leg)
-        .ok_or_else(|| missing_distributed_leg(first_leg))?;
+    let first = leg_results.get(first_leg).ok_or_else(|| missing_distributed_leg(first_leg))?;
     let columns = first.columns.clone();
     let mut rows = first.rows.clone();
     for leg_name in leg_order.iter().skip(1) {
-        let result = leg_results
-            .get(leg_name)
-            .ok_or_else(|| missing_distributed_leg(leg_name))?;
+        let result = leg_results.get(leg_name).ok_or_else(|| missing_distributed_leg(leg_name))?;
         if result.columns != columns {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::Union,
@@ -3087,10 +2781,7 @@ fn merge_distributed_union_all(
     Ok(QueryResultSet::new(columns, rows))
 }
 
-fn merge_distributed_inner_join(
-    leg_results: &BTreeMap<String, QueryResultSet>,
-    join: &DistributedQueryJoin,
-) -> Result<QueryResultSet> {
+fn merge_distributed_inner_join(leg_results: &BTreeMap<String, QueryResultSet>, join: &DistributedQueryJoin) -> Result<QueryResultSet> {
     let left = leg_results
         .get(&join.left_leg)
         .ok_or_else(|| missing_distributed_leg(&join.left_leg))?;
@@ -3204,14 +2895,51 @@ fn column_index(result: &QueryResultSet, column: &str) -> Result<usize> {
         })
 }
 
+// Only the three native single-batch statement arms may promote this shard error.
+pub(crate) fn atomic_vertex_delete_error(error: GraphError) -> GraphError {
+    match error {
+        GraphError::ConditionalWriteConflict {
+            operation: "validate_vertex_delete_preparation",
+            ..
+        } => GraphError::AtomicVertexDeleteConflict,
+        other => other,
+    }
+}
+
 #[async_trait]
 impl QueryCellClient for RoutedGraphCluster {
-    async fn execute_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet> {
-        if routed_client_query_is_mutation(&context, query)? {
+    #[cfg(feature = "datafusion-cypher-engine")]
+    async fn resolve_datafusion_statement_receipt(&self, context: QueryContext, query: &str) -> Result<Option<QueryResultSet>> {
+        self.ensure_query_scope(&context.scope)?;
+        self.shard(&context.cell_id)?
+            .resolve_datafusion_statement_receipt(&context, query)
+            .await
+    }
+
+    async fn prepare_datafusion_cypher(&self, context: QueryContext, query: &str) -> Result<PreparedCypherQuery> {
+        #[cfg(feature = "datafusion-cypher-engine")]
+        {
+            self.ensure_query_scope(&context.scope)?;
+            self.shard(&context.cell_id)?.prepare_datafusion_cypher(&context, query).await
+        }
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        {
+            let _ = (context, query);
+            Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Other,
+                dialect: "QueryCellClient",
+                feature: "DataFusion Cypher support is not enabled in this build".to_string(),
+            })
+        }
+    }
+
+    async fn execute_cypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
+        let is_mutation = if uses_datafusion_engine(&context) {
+            self.prepare_datafusion_cypher(context.clone(), query).await?.effect == PreparedCypherEffect::Write
+        } else {
+            routed_client_query_is_mutation(&context, query)?
+        };
+        if is_mutation {
             return match RoutedGraphCluster::execute_cypher(self, context, query).await? {
                 crate::QueryOutput::Mutation(mutation) => Ok(mutation.into_result_set()),
                 crate::QueryOutput::Write(commit) => Ok(if commit.already_existed {
@@ -3219,6 +2947,9 @@ impl QueryCellClient for RoutedGraphCluster {
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(commit.epoch)
                 }),
+                // A native catalog write, `gds.graph.project` or drop, which
+                // answers with rows and changes no topology.
+                crate::QueryOutput::Rows(rows) => Ok(rows),
                 output => Err(GraphError::CorruptValue {
                     key: "query/client/mutation_output".to_string(),
                     reason: format!("mutation query returned non-mutation output {output:?}"),
@@ -3235,7 +2966,12 @@ impl QueryCellClient for RoutedGraphCluster {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
-        if routed_client_query_is_mutation(&context, query)? {
+        let is_mutation = if uses_datafusion_engine(&context) {
+            self.prepare_datafusion_cypher(context.clone(), query).await?.effect == PreparedCypherEffect::Write
+        } else {
+            routed_client_query_is_mutation(&context, query)?
+        };
+        if is_mutation {
             if cursor.is_some() {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::InvalidRequest,
@@ -3248,9 +2984,9 @@ impl QueryCellClient for RoutedGraphCluster {
                     let rows = mutation.into_result_set();
                     Ok(QueryResultPage::new(rows.columns, rows.rows, None))
                 }
-                crate::QueryOutput::Write(_) => {
-                    Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
-                }
+                crate::QueryOutput::Write(_) => Ok(QueryResultPage::new(Vec::new(), Vec::new(), None)),
+                // A native catalog write: rows, and no topology change.
+                crate::QueryOutput::Rows(rows) => Ok(QueryResultPage::new(rows.columns, rows.rows, None)),
                 output => Err(GraphError::CorruptValue {
                     key: "query/client/mutation_page_output".to_string(),
                     reason: format!("mutation query returned non-mutation output {output:?}"),
@@ -3260,11 +2996,7 @@ impl QueryCellClient for RoutedGraphCluster {
         RoutedGraphCluster::execute_cypher_rows_page(self, context, query, cursor, page_size).await
     }
 
-    async fn execute_batch(
-        &self,
-        context: QueryContext,
-        operation: crate::QueryBatchOperation,
-    ) -> Result<QueryResultSet> {
+    async fn execute_batch(&self, context: QueryContext, operation: crate::QueryBatchOperation) -> Result<QueryResultSet> {
         if &context.scope != self.scope() {
             return Err(GraphError::GraphScopeMismatch {
                 expected: self.scope().to_string(),
@@ -3272,7 +3004,44 @@ impl QueryCellClient for RoutedGraphCluster {
             });
         }
         let shard = self.shard(&context.cell_id)?;
+        // These batches lower managed Cypher's `n.id` to internal IDs before
+        // reaching the shard. Guard the entire dispatch, including read batches,
+        // before any writer promotion or storage operation. Explicit internal-ID
+        // storage APIs do not pass through this Cypher batch interface.
+        shard.ensure_managed_cypher_layout().await?;
         match operation {
+            crate::QueryBatchOperation::MatchMutation {
+                query,
+                alias,
+                rows,
+                parameters,
+                list_parameters,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                #[cfg(all(feature = "opencypher", feature = "client-api"))]
+                {
+                    let lowered =
+                        crate::query::opencypher::lower_unwind_match_mutation_rows(&query, &alias, &rows, &parameters, &list_parameters)?;
+                    let shard = self.shard_arc(&context.cell_id)?;
+                    let result = crate::engine::run_write_to_completion(async move {
+                        shard.execute_parsed_opencypher_mutation_rows(context, lowered).await
+                    })
+                    .await?;
+                    Ok(result.topology_sequence.map_or_else(
+                        || QueryResultSet::new(Vec::new(), Vec::new()),
+                        |sequence| QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(sequence),
+                    ))
+                }
+                #[cfg(not(all(feature = "opencypher", feature = "client-api")))]
+                {
+                    let _ = (query, alias, rows, parameters, list_parameters, shard);
+                    Err(GraphError::UnsupportedQuery {
+                        reason: crate::QueryFailureReason::Unwind,
+                        dialect: "OpenCypher",
+                        feature: "UNWIND MATCH SET requires the opencypher feature".to_string(),
+                    })
+                }
+            }
             crate::QueryBatchOperation::OutNeighbors {
                 edge_type,
                 sources,
@@ -3281,17 +3050,11 @@ impl QueryCellClient for RoutedGraphCluster {
             } => {
                 let snapshot = match context.read_epoch {
                     Some(read_epoch) => shard.snapshot_at(&context.cell_id, read_epoch).await?,
-                    None => {
-                        shard
-                            .snapshot_for_query(&context.cell_id, context.uses_refreshed_reader())
-                            .await?
-                    }
+                    None => shard.snapshot_for_query(&context.cell_id, context.uses_refreshed_reader()).await?,
                 };
                 let read_epoch = snapshot.read_epoch();
-                let storage_sequence = snapshot
-                    .storage_sequence()
-                    .expect("all graph snapshots pin a SlateDB sequence");
-                let entries = crate::GraphStore::scope_snapshot(
+                let storage_sequence = snapshot.storage_sequence().expect("all graph snapshots pin a SlateDB sequence");
+                let entries = crate::SlateGraphStore::scope_snapshot(
                     Arc::clone(&snapshot.storage_snapshot),
                     shard.out_neighbors_batch_at_with_cancellation(
                         &context.cell_id,
@@ -3302,10 +3065,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     ),
                 )
                 .await?;
-                let row_count = entries
-                    .iter()
-                    .map(|entry| entry.neighbors.len())
-                    .sum::<usize>();
+                let row_count = entries.iter().map(|entry| entry.neighbors.len()).sum::<usize>();
                 crate::codec::ensure_limit(
                     "query_batch_result_rows",
                     row_count as u64,
@@ -3326,49 +3086,30 @@ impl QueryCellClient for RoutedGraphCluster {
                         });
                     }
                     for destination in entry.neighbors {
-                        let row = QueryRow::new(vec![
-                            QueryValue::VertexId(entry.vertex),
-                            QueryValue::VertexId(destination),
-                        ]);
+                        let row = QueryRow::new(vec![QueryValue::VertexId(entry.vertex), QueryValue::VertexId(destination)]);
                         result_bytes = result_bytes.saturating_add(row.estimated_resident_bytes());
                         if let Some(limit) = context.max_result_bytes {
-                            crate::codec::ensure_limit(
-                                "client_cursor_buffer_bytes",
-                                result_bytes,
-                                limit,
-                            )?;
+                            crate::codec::ensure_limit("client_cursor_buffer_bytes", result_bytes, limit)?;
                         }
                         rows.push(row);
                     }
                 }
-                Ok(
-                    QueryResultSet::new(vec![source_column, destination_column], rows)
-                        .with_read_epoch(read_epoch)
-                        .with_storage_sequence(storage_sequence),
-                )
+                Ok(QueryResultSet::new(vec![source_column, destination_column], rows)
+                    .with_read_epoch(read_epoch)
+                    .with_storage_sequence(storage_sequence))
             }
             crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
                 self.ensure_local_writer(&context.cell_id).await?;
-                let mutations =
-                    edges
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, edge)| crate::EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: edge.src,
-                            dst: edge.dst,
-                            idempotency_key: format!(
-                                "{}.unwind-create.{index:020}",
-                                context.idempotency_key
-                            ),
-                        });
-                let result = shard
-                    .write_edge_mutations_batch(&context.cell_id, mutations)
-                    .await?;
+                let mutations = edges.into_iter().enumerate().map(|(index, edge)| crate::EdgeMutation {
+                    cell_id: context.cell_id.clone(),
+                    edge_type: edge_type.clone(),
+                    src: edge.src,
+                    dst: edge.dst,
+                    idempotency_key: format!("{}.unwind-create.{index:020}", context.idempotency_key),
+                });
+                let result = shard.write_edge_mutations_batch(&context.cell_id, mutations).await?;
                 Ok(if result.inserted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
@@ -3380,31 +3121,18 @@ impl QueryCellClient for RoutedGraphCluster {
                 destination_label,
             } => {
                 self.ensure_local_writer(&context.cell_id).await?;
-                let mutations =
-                    edges
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, edge)| crate::EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: edge.src,
-                            dst: edge.dst,
-                            idempotency_key: format!(
-                                "{}.unwind-create-matched.{index:020}",
-                                context.idempotency_key
-                            ),
-                        });
+                let mutations = edges.into_iter().enumerate().map(|(index, edge)| crate::EdgeMutation {
+                    cell_id: context.cell_id.clone(),
+                    edge_type: edge_type.clone(),
+                    src: edge.src,
+                    dst: edge.dst,
+                    idempotency_key: format!("{}.unwind-create-matched.{index:020}", context.idempotency_key),
+                });
                 let result = shard
-                    .write_edge_mutations_batch_between_labeled_vertices(
-                        &context.cell_id,
-                        mutations,
-                        &source_label,
-                        &destination_label,
-                    )
+                    .write_edge_mutations_batch_between_labeled_vertices(&context.cell_id, mutations, &source_label, &destination_label)
                     .await?;
                 Ok(if result.inserted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
@@ -3414,25 +3142,18 @@ impl QueryCellClient for RoutedGraphCluster {
                 shard
                     .merge_vertex_metadata_batch(
                         &context.cell_id,
-                        vertices
-                            .into_iter()
-                            .map(|vertex| (vertex.vertex, vertex.metadata)),
+                        vertices.into_iter().map(|vertex| (vertex.vertex, vertex.metadata)),
                         None,
                     )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
-            crate::QueryBatchOperation::GuardedUpsertVertices {
-                vertices,
-                merge_policy,
-            } => {
+            crate::QueryBatchOperation::GuardedUpsertVertices { vertices, merge_policy } => {
                 self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .merge_vertex_metadata_batch(
                         &context.cell_id,
-                        vertices
-                            .into_iter()
-                            .map(|vertex| (vertex.vertex, vertex.metadata)),
+                        vertices.into_iter().map(|vertex| (vertex.vertex, vertex.metadata)),
                         Some(&merge_policy),
                     )
                     .await?;
@@ -3449,24 +3170,21 @@ impl QueryCellClient for RoutedGraphCluster {
                     .create_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
                         &edge_type,
-                        relationships
-                            .into_iter()
-                            .map(|relationship| crate::RelationshipMutation {
-                                cell_id: context.cell_id.clone(),
-                                edge_type: edge_type.clone(),
-                                src: relationship.src,
-                                dst: relationship.dst,
-                                relationship_id: 0,
-                                metadata: relationship.metadata,
-                            }),
+                        relationships.into_iter().map(|relationship| crate::RelationshipMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: relationship.src,
+                            dst: relationship.dst,
+                            relationship_id: 0,
+                            metadata: relationship.metadata,
+                        }),
                         &format!("{}.unwind-relationship-create", context.idempotency_key),
                         &source_label,
                         &destination_label,
                     )
                     .await?;
                 Ok(if result.structural_edges_inserted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
@@ -3484,10 +3202,9 @@ impl QueryCellClient for RoutedGraphCluster {
                         &edge_type,
                         relationships.into_iter().map(|relationship| {
                             let mut metadata = relationship.metadata;
-                            metadata.properties.insert(
-                                "id".to_string(),
-                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
-                            );
+                            metadata
+                                .properties
+                                .insert("id".to_string(), crate::VertexPropertyValue::Integer(relationship.relationship_id));
                             crate::RelationshipMutation {
                                 cell_id: context.cell_id.clone(),
                                 edge_type: edge_type.clone(),
@@ -3503,8 +3220,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     )
                     .await?;
                 Ok(if result.structural_edges_inserted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
@@ -3523,10 +3239,9 @@ impl QueryCellClient for RoutedGraphCluster {
                         &edge_type,
                         relationships.into_iter().map(|relationship| {
                             let mut metadata = relationship.metadata;
-                            metadata.properties.insert(
-                                "id".to_string(),
-                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
-                            );
+                            metadata
+                                .properties
+                                .insert("id".to_string(), crate::VertexPropertyValue::Integer(relationship.relationship_id));
                             crate::RelationshipMutation {
                                 cell_id: context.cell_id.clone(),
                                 edge_type: edge_type.clone(),
@@ -3542,34 +3257,23 @@ impl QueryCellClient for RoutedGraphCluster {
                     )
                     .await?;
                 Ok(if result.structural_edges_inserted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
             }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
                 self.ensure_local_writer(&context.cell_id).await?;
-                let mutations =
-                    edges
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, edge)| crate::EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: edge.src,
-                            dst: edge.dst,
-                            idempotency_key: format!(
-                                "{}.unwind-delete.{index:020}",
-                                context.idempotency_key
-                            ),
-                        });
-                let result = shard
-                    .delete_edge_mutations_batch(&context.cell_id, mutations)
-                    .await?;
+                let mutations = edges.into_iter().enumerate().map(|(index, edge)| crate::EdgeMutation {
+                    cell_id: context.cell_id.clone(),
+                    edge_type: edge_type.clone(),
+                    src: edge.src,
+                    dst: edge.dst,
+                    idempotency_key: format!("{}.unwind-delete.{index:020}", context.idempotency_key),
+                });
+                let result = shard.delete_edge_mutations_batch(&context.cell_id, mutations).await?;
                 Ok(if result.deleted > 0 {
-                    QueryResultSet::new(Vec::new(), Vec::new())
-                        .with_storage_sequence(result.end_epoch)
+                    QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(result.end_epoch)
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
@@ -3593,16 +3297,14 @@ impl QueryCellClient for RoutedGraphCluster {
                     .map(|(index, vertex)| {
                         (
                             vertex,
-                            format!(
-                                "{}.unwind-delete-vertex.{index:020}.{vertex}",
-                                context.idempotency_key
-                            ),
+                            format!("{}.unwind-delete-vertex.{index:020}.{vertex}", context.idempotency_key),
                         )
                     })
                     .collect();
                 let results = shard
                     .delete_vertex_mutations_batch(&context.cell_id, deletions, detach)
-                    .await?;
+                    .await
+                    .map_err(atomic_vertex_delete_error)?;
                 let topology_sequence = results
                     .iter()
                     .filter(|result| result.incident_edges_deleted > 0)
@@ -3610,9 +3312,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     .max();
                 Ok(topology_sequence.map_or_else(
                     || QueryResultSet::new(Vec::new(), Vec::new()),
-                    |sequence| {
-                        QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(sequence)
-                    },
+                    |sequence| QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(sequence),
                 ))
             }
             crate::QueryBatchOperation::DeleteIsolatedVertices {
@@ -3648,16 +3348,12 @@ impl QueryCellClient for RoutedGraphCluster {
                     .collect();
                 let results = shard
                     .delete_isolated_vertex_mutations_batch(&context.cell_id, deletions)
-                    .await?;
-                let deleted = results
-                    .iter()
-                    .filter(|result| result.vertex_deleted)
-                    .count() as u64;
+                    .await
+                    .map_err(atomic_vertex_delete_error)?;
+                let deleted = results.iter().filter(|result| result.vertex_deleted).count() as u64;
                 Ok(QueryResultSet::new(
                     vec![deleted_column],
-                    vec![crate::QueryRow::new(vec![crate::QueryValue::Count(
-                        deleted,
-                    )])],
+                    vec![crate::QueryRow::new(vec![crate::QueryValue::Count(deleted)])],
                 ))
             }
             crate::QueryBatchOperation::DeleteVerticesAndIsolatedCandidates {
@@ -3681,17 +3377,16 @@ impl QueryCellClient for RoutedGraphCluster {
                 let deletions = detach_vertices
                     .into_iter()
                     .map(|vertex| (vertex, true, crate::VertexMetadata::default()))
-                    .chain(isolated_candidates.into_iter().map(|candidate| {
-                        (candidate.vertex, false, candidate.path_node_constraints)
-                    }))
+                    .chain(
+                        isolated_candidates
+                            .into_iter()
+                            .map(|candidate| (candidate.vertex, false, candidate.path_node_constraints)),
+                    )
                     .enumerate()
                     .map(|(index, (vertex, detach, constraints))| {
                         (
                             vertex,
-                            format!(
-                                "{}.unwind-source-cleanup-vertex.{index:020}.{vertex}",
-                                context.idempotency_key
-                            ),
+                            format!("{}.unwind-source-cleanup-vertex.{index:020}.{vertex}", context.idempotency_key),
                             detach,
                             constraints,
                         )
@@ -3699,12 +3394,9 @@ impl QueryCellClient for RoutedGraphCluster {
                     .collect();
                 let results = shard
                     .delete_vertices_and_isolated_candidates_batch(&context.cell_id, deletions)
-                    .await?;
-                let deleted = results
-                    .iter()
-                    .skip(detach_count)
-                    .filter(|result| result.vertex_deleted)
-                    .count() as u64;
+                    .await
+                    .map_err(atomic_vertex_delete_error)?;
+                let deleted = results.iter().skip(detach_count).filter(|result| result.vertex_deleted).count() as u64;
                 let topology_sequence = results
                     .iter()
                     .filter(|result| result.incident_edges_deleted > 0)
@@ -3712,9 +3404,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     .max();
                 let result = QueryResultSet::new(
                     vec![deleted_column],
-                    vec![crate::QueryRow::new(vec![crate::QueryValue::Count(
-                        deleted,
-                    )])],
+                    vec![crate::QueryRow::new(vec![crate::QueryValue::Count(deleted)])],
                 );
                 Ok(match topology_sequence {
                     Some(sequence) => result.with_storage_sequence(sequence),
@@ -3728,36 +3418,24 @@ impl QueryCellClient for RoutedGraphCluster {
             } => {
                 self.ensure_local_writer(&context.cell_id).await?;
                 let result = shard
-                    .delete_relationships_by_property_values_batch(
-                        &context, &edge_type, &property, values,
-                    )
+                    .delete_relationships_by_property_values_batch(&context, &edge_type, &property, values)
                     .await?;
                 Ok(result.topology_sequence.map_or_else(
                     || QueryResultSet::new(Vec::new(), Vec::new()),
-                    |sequence| {
-                        QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(sequence)
-                    },
+                    |sequence| QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(sequence),
                 ))
             }
         }
     }
 
-    async fn current_storage_sequence(
-        &self,
-        scope: &crate::GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn current_storage_sequence(&self, scope: &crate::GraphScope, cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         if scope != self.scope() {
             return Err(GraphError::GraphScopeMismatch {
                 expected: self.scope().to_string(),
                 actual: scope.to_string(),
             });
         }
-        Ok(Some(
-            self.shard(cell_id)?
-                .current_storage_sequence(cell_id)
-                .await?,
-        ))
+        Ok(Some(self.shard(cell_id)?.current_storage_sequence(cell_id).await?))
     }
 
     async fn wait_for_storage_sequence(
@@ -3766,10 +3444,7 @@ impl QueryCellClient for RoutedGraphCluster {
         cell_id: &str,
         minimum: crate::StorageSequence,
     ) -> Result<Option<crate::StorageSequence>> {
-        Ok(self
-            .wait_for_storage_sequence_observed(scope, cell_id, minimum)
-            .await?
-            .0)
+        Ok(self.wait_for_storage_sequence_observed(scope, cell_id, minimum).await?.0)
     }
 
     /// The observing half of the pair, and the one that carries the fact.
@@ -3791,51 +3466,73 @@ impl QueryCellClient for RoutedGraphCluster {
                 actual: scope.to_string(),
             });
         }
-        let (sequence, wait) = self
-            .shard(cell_id)?
-            .wait_for_storage_sequence_observed(cell_id, minimum)
-            .await?;
+        let (sequence, wait) = self.shard(cell_id)?.wait_for_storage_sequence_observed(cell_id, minimum).await?;
         Ok((Some(sequence), Some(wait)))
     }
 
-    async fn refresh_storage_sequence(
-        &self,
-        scope: &crate::GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn refresh_storage_sequence(&self, scope: &crate::GraphScope, cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         if scope != self.scope() {
             return Err(GraphError::GraphScopeMismatch {
                 expected: self.scope().to_string(),
                 actual: scope.to_string(),
             });
         }
-        Ok(Some(
-            self.shard(cell_id)?
-                .refresh_storage_sequence(cell_id)
-                .await?,
-        ))
+        Ok(Some(self.shard(cell_id)?.refresh_storage_sequence(cell_id).await?))
     }
 }
 
 #[cfg(feature = "query-transport")]
 #[async_trait]
 impl QueryCellClient for crate::ScopedRoutedGraphCluster {
-    async fn execute_cypher_rows(
-        &self,
-        context: QueryContext,
-        query: &str,
-    ) -> Result<QueryResultSet> {
+    #[cfg(feature = "datafusion-cypher-engine")]
+    async fn resolve_datafusion_statement_receipt(&self, context: QueryContext, query: &str) -> Result<Option<QueryResultSet>> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
-        let is_mutation = routed_client_query_is_mutation(&context, query)?;
+        let cluster = self.cluster_for_scope_wait(&context.scope).await?;
+        QueryCellClient::resolve_datafusion_statement_receipt(cluster.as_ref(), context, query).await
+    }
+
+    async fn prepare_datafusion_cypher(&self, context: QueryContext, query: &str) -> Result<PreparedCypherQuery> {
+        let _scope_capacity_release = self.scope_capacity_release_guard();
+        let cluster = self.cluster_for_scope_wait(&context.scope).await?;
+        QueryCellClient::prepare_datafusion_cypher(cluster.as_ref(), context, query).await
+    }
+
+    async fn execute_cypher_rows(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
+        let _scope_capacity_release = self.scope_capacity_release_guard();
+        let is_mutation = if uses_datafusion_engine(&context) {
+            let cluster = self.cluster_for_scope_wait(&context.scope).await?;
+            QueryCellClient::prepare_datafusion_cypher(cluster.as_ref(), context.clone(), query)
+                .await?
+                .effect
+                == PreparedCypherEffect::Write
+        } else {
+            routed_client_query_is_mutation(&context, query)?
+        };
         let changed_scope = context.scope.clone();
         let changed_cell = context.cell_id.clone();
         let cluster = if is_mutation {
-            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id)
-                .await?
+            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id).await?
         } else {
             self.cluster_for_scope_wait(&context.scope).await?
         };
-        let result = QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, query).await;
+        let result = if is_mutation {
+            // The task owns a handle to the cluster, so the scope cannot look
+            // idle to eviction while the write it started is still running.
+            let cluster = Arc::clone(&cluster);
+            let query = query.to_string();
+            // The caller's release guard can drop while this task is still
+            // writing. Notify again only after the task's scope handle drops.
+            let release = self.scope_capacity_release_guard();
+            crate::engine::run_write_to_completion(async move {
+                let _release = release;
+                let result = QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, &query).await;
+                drop(cluster);
+                result
+            })
+            .await
+        } else {
+            QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, query).await
+        };
         if is_mutation {
             if let Ok(result) = &result {
                 if let Some(sequence) = result.storage_sequence {
@@ -3854,12 +3551,19 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
         page_size: usize,
     ) -> Result<QueryResultPage> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
-        let is_mutation = routed_client_query_is_mutation(&context, query)?;
+        let is_mutation = if uses_datafusion_engine(&context) {
+            let cluster = self.cluster_for_scope_wait(&context.scope).await?;
+            QueryCellClient::prepare_datafusion_cypher(cluster.as_ref(), context.clone(), query)
+                .await?
+                .effect
+                == PreparedCypherEffect::Write
+        } else {
+            routed_client_query_is_mutation(&context, query)?
+        };
         let changed_scope = context.scope.clone();
         let changed_cell = context.cell_id.clone();
         let cluster = if is_mutation {
-            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id)
-                .await?
+            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id).await?
         } else {
             self.cluster_for_scope_wait(&context.scope).await?
         };
@@ -3871,8 +3575,20 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
                     feature: "mutation queries cannot continue from a result cursor".to_string(),
                 });
             }
-            let output =
-                RoutedGraphCluster::execute_cypher(cluster.as_ref(), context, query).await?;
+            // The task owns a handle to the cluster, so the scope cannot look
+            // idle to eviction while the write it started is still running.
+            let output = {
+                let cluster = Arc::clone(&cluster);
+                let query = query.to_string();
+                let release = self.scope_capacity_release_guard();
+                crate::engine::run_write_to_completion(async move {
+                    let _release = release;
+                    let result = RoutedGraphCluster::execute_cypher(cluster.as_ref(), context, &query).await;
+                    drop(cluster);
+                    result
+                })
+                .await?
+            };
             let (sequence, rows) = match output {
                 crate::QueryOutput::Mutation(mutation) => {
                     // A mutation that ends in `RETURN count(...)` carries a
@@ -3887,6 +3603,9 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
                     (!commit.already_existed).then_some(commit.epoch),
                     QueryResultSet::new(Vec::new(), Vec::new()),
                 ),
+                // A native catalog write, which changes no topology for the
+                // index to pick up.
+                crate::QueryOutput::Rows(rows) => (None, rows),
                 output => {
                     return Err(GraphError::CorruptValue {
                         key: "query/client/mutation_page_output".to_string(),
@@ -3899,32 +3618,34 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
             }
             return Ok(QueryResultPage::new(rows.columns, rows.rows, None));
         }
-        QueryCellClient::execute_cypher_rows_page(
-            cluster.as_ref(),
-            context,
-            query,
-            cursor,
-            page_size,
-        )
-        .await
+        QueryCellClient::execute_cypher_rows_page(cluster.as_ref(), context, query, cursor, page_size).await
     }
 
-    async fn execute_batch(
-        &self,
-        context: QueryContext,
-        operation: crate::QueryBatchOperation,
-    ) -> Result<QueryResultSet> {
+    async fn execute_batch(&self, context: QueryContext, operation: crate::QueryBatchOperation) -> Result<QueryResultSet> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
         let is_mutation = operation.is_write();
         let changed_scope = context.scope.clone();
         let changed_cell = context.cell_id.clone();
         let cluster = if is_mutation {
-            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id)
-                .await?
+            self.cluster_for_scope_write_wait(&context.scope, &context.cell_id).await?
         } else {
             self.cluster_for_scope_wait(&context.scope).await?
         };
-        let result = QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await;
+        let result = if is_mutation {
+            // The task owns a handle to the cluster, so the scope cannot look
+            // idle to eviction while the write it started is still running.
+            let cluster = Arc::clone(&cluster);
+            let release = self.scope_capacity_release_guard();
+            crate::engine::run_write_to_completion(async move {
+                let _release = release;
+                let result = QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await;
+                drop(cluster);
+                result
+            })
+            .await
+        } else {
+            QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await
+        };
         if is_mutation {
             if let Ok(result) = &result {
                 if let Some(sequence) = result.storage_sequence {
@@ -3935,11 +3656,7 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
         result
     }
 
-    async fn current_storage_sequence(
-        &self,
-        scope: &crate::GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn current_storage_sequence(&self, scope: &crate::GraphScope, cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
         let cluster = self.cluster_for_scope_wait(scope).await?;
         QueryCellClient::current_storage_sequence(cluster.as_ref(), scope, cell_id).await
@@ -3967,20 +3684,10 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
     ) -> Result<(Option<crate::StorageSequence>, Option<crate::BookmarkWait>)> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
         let cluster = self.cluster_for_scope_wait(scope).await?;
-        QueryCellClient::wait_for_storage_sequence_observed(
-            cluster.as_ref(),
-            scope,
-            cell_id,
-            minimum,
-        )
-        .await
+        QueryCellClient::wait_for_storage_sequence_observed(cluster.as_ref(), scope, cell_id, minimum).await
     }
 
-    async fn refresh_storage_sequence(
-        &self,
-        scope: &crate::GraphScope,
-        cell_id: &str,
-    ) -> Result<Option<crate::StorageSequence>> {
+    async fn refresh_storage_sequence(&self, scope: &crate::GraphScope, cell_id: &str) -> Result<Option<crate::StorageSequence>> {
         let _scope_capacity_release = self.scope_capacity_release_guard();
         let cluster = self.cluster_for_scope_wait(scope).await?;
         QueryCellClient::refresh_storage_sequence(cluster.as_ref(), scope, cell_id).await
@@ -3993,6 +3700,18 @@ fn routed_client_query_is_mutation(context: &QueryContext, query: &str) -> Resul
         crate::query::opencypher::classify_opencypher_query_access(query)?,
         crate::query::opencypher::OpenCypherQueryAccess::Write
     ))
+}
+
+fn uses_datafusion_engine(context: &QueryContext) -> bool {
+    #[cfg(feature = "datafusion-cypher-engine")]
+    {
+        context.cypher_engine == crate::CypherEngineMode::DataFusion
+    }
+    #[cfg(not(feature = "datafusion-cypher-engine"))]
+    {
+        let _ = context;
+        false
+    }
 }
 
 fn checked_unique_cell(seen: &mut BTreeSet<String>, cell_id: &str) -> Result<String> {
@@ -4023,11 +3742,7 @@ fn parse_kubernetes_endpointslices(
             continue;
         };
         for endpoint in endpoints {
-            if endpoint
-                .pointer("/conditions/ready")
-                .and_then(serde_json::Value::as_bool)
-                == Some(false)
-            {
+            if endpoint.pointer("/conditions/ready").and_then(serde_json::Value::as_bool) == Some(false) {
                 continue;
             }
             let Some(address) = endpoint
@@ -4041,18 +3756,11 @@ fn parse_kubernetes_endpointslices(
             let node_id = endpoint
                 .get("hostname")
                 .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    endpoint
-                        .pointer("/targetRef/name")
-                        .and_then(serde_json::Value::as_str)
-                })
+                .or_else(|| endpoint.pointer("/targetRef/name").and_then(serde_json::Value::as_str))
                 .unwrap_or(address);
             directory.insert(
-                QueryServiceEndpoint::new(
-                    discovery_node_id(node_id),
-                    socket_addr_from_host_port("kubernetes", address, port)?,
-                )
-                .with_client_config(client_config.clone()),
+                QueryServiceEndpoint::new(discovery_node_id(node_id), socket_addr_from_host_port("kubernetes", address, port)?)
+                    .with_client_config(client_config.clone()),
             )?;
         }
     }
@@ -4076,14 +3784,11 @@ fn select_kubernetes_port(item: &serde_json::Value, port_name: Option<&str>) -> 
 }
 
 #[cfg(feature = "query-service-discovery")]
-fn parse_consul_health_service(
-    value: &serde_json::Value,
-    client_config: QueryTransportClientConfig,
-) -> Result<QueryServiceDirectory> {
+fn parse_consul_health_service(value: &serde_json::Value, client_config: QueryTransportClientConfig) -> Result<QueryServiceDirectory> {
     let mut directory = QueryServiceDirectory::new();
-    let services = value.as_array().ok_or_else(|| {
-        service_discovery_format_error("consul", "health service array is missing")
-    })?;
+    let services = value
+        .as_array()
+        .ok_or_else(|| service_discovery_format_error("consul", "health service array is missing"))?;
     for item in services {
         let service = item
             .get("Service")
@@ -4098,20 +3803,12 @@ fn parse_consul_health_service(
             .get("Address")
             .and_then(serde_json::Value::as_str)
             .filter(|address| !address.is_empty())
-            .or_else(|| {
-                node.and_then(|node| node.get("Address"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .ok_or_else(|| {
-                service_discovery_format_error("consul", "service address is missing")
-            })?;
+            .or_else(|| node.and_then(|node| node.get("Address")).and_then(serde_json::Value::as_str))
+            .ok_or_else(|| service_discovery_format_error("consul", "service address is missing"))?;
         let port = u16_from_json_field("consul", service, "Port")?;
         directory.insert(
-            QueryServiceEndpoint::new(
-                discovery_node_id(node_id),
-                socket_addr_from_host_port("consul", address, port)?,
-            )
-            .with_client_config(client_config.clone()),
+            QueryServiceEndpoint::new(discovery_node_id(node_id), socket_addr_from_host_port("consul", address, port)?)
+                .with_client_config(client_config.clone()),
         )?;
     }
     Ok(directory)
@@ -4126,10 +3823,7 @@ struct EtcdQueryServiceRecord {
 }
 
 #[cfg(feature = "query-service-discovery")]
-fn parse_etcd_query_services(
-    value: &serde_json::Value,
-    client_config: QueryTransportClientConfig,
-) -> Result<QueryServiceDirectory> {
+fn parse_etcd_query_services(value: &serde_json::Value, client_config: QueryTransportClientConfig) -> Result<QueryServiceDirectory> {
     let mut directory = QueryServiceDirectory::new();
     let Some(kvs) = value.get("kvs").and_then(serde_json::Value::as_array) else {
         return Ok(directory);
@@ -4142,8 +3836,7 @@ fn parse_etcd_query_services(
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|err| service_discovery_error("etcd/base64", err))?;
-        let record: EtcdQueryServiceRecord = serde_json::from_slice(&bytes)
-            .map_err(|err| service_discovery_error("etcd/record", err))?;
+        let record: EtcdQueryServiceRecord = serde_json::from_slice(&bytes).map_err(|err| service_discovery_error("etcd/record", err))?;
         directory.insert(
             QueryServiceEndpoint::new(
                 discovery_node_id(&record.node_id),
@@ -4182,17 +3875,12 @@ fn socket_addr_from_host_port(provider: &'static str, host: &str, port: u16) -> 
 }
 
 #[cfg(feature = "query-service-discovery")]
-fn u16_from_json_field(
-    provider: &'static str,
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<u16> {
+fn u16_from_json_field(provider: &'static str, value: &serde_json::Value, field: &str) -> Result<u16> {
     let raw = value
         .get(field)
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| service_discovery_format_error(provider, &format!("{field} is missing")))?;
-    u16::try_from(raw)
-        .map_err(|_| service_discovery_format_error(provider, &format!("{field} is out of range")))
+    u16::try_from(raw).map_err(|_| service_discovery_format_error(provider, &format!("{field} is out of range")))
 }
 
 #[cfg(feature = "query-service-discovery")]
@@ -4341,6 +4029,11 @@ enum QueryTransportResponse {
         /// arrive unclassified.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         typed_failure: Option<RemoteFailureDetails>,
+        /// The GQL-status object of a [`GraphError::GqlQuery`], so the
+        /// caller's client reports the GQLSTATUS the owner's engine raised.
+        /// Optional on the wire both ways; an older peer ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gql: Option<crate::GqlStatusReport>,
     },
 }
 
@@ -4349,26 +4042,15 @@ enum QueryTransportResponse {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RemoteFailureDetails {
     /// [`GraphError::QueryTimeout`], including cancellation.
-    Timeout {
-        operation: String,
-        elapsed_ms: u64,
-        limit_ms: u64,
-    },
+    Timeout { operation: String, elapsed_ms: u64, limit_ms: u64 },
     /// [`GraphError::AdmissionRejected`]: a scan, row, byte or batch budget.
-    Admission {
-        operation: String,
-        actual: u64,
-        limit: u64,
-    },
+    Admission { operation: String, actual: u64, limit: u64 },
     /// [`GraphError::QueryAllocation`]. Its reason is not sent, as no
     /// internal detail is.
     Allocation { operation: String },
     /// [`GraphError::NotCellWriter`]: the owner hint is what lets a driver
     /// re-route (`Neo.ClientError.Cluster.NotALeader`).
-    NotCellWriter {
-        cell_id: String,
-        owner: Option<String>,
-    },
+    NotCellWriter { cell_id: String, owner: Option<String> },
     /// [`GraphError::RoutingUnavailable`]: transient, ask another router.
     RoutingUnavailable { reason: String },
     /// [`GraphError::SnapshotAhead`]: the bookmark is ahead of this replica,
@@ -4379,7 +4061,13 @@ enum RemoteFailureDetails {
         current_epoch: crate::StorageSequence,
     },
     /// Any error the owner suppressed as internal, with its class.
-    Internal { class: String },
+    Internal {
+        class: String,
+        // Optional on the existing wire variant so older callers still decode it.
+        // Some(false) means earlier clauses may have written; None is unrelated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        atomic_vertex_delete: Option<bool>,
+    },
 }
 
 #[cfg(feature = "query-transport")]
@@ -4395,11 +4083,7 @@ impl RemoteFailureDetails {
                 elapsed_ms: *elapsed_ms,
                 limit_ms: *limit_ms,
             },
-            GraphError::AdmissionRejected {
-                operation,
-                actual,
-                limit,
-            } => Self::Admission {
+            GraphError::AdmissionRejected { operation, actual, limit } => Self::Admission {
                 operation: (*operation).to_string(),
                 actual: *actual,
                 limit: *limit,
@@ -4411,9 +4095,7 @@ impl RemoteFailureDetails {
                 cell_id: cell_id.clone(),
                 owner: owner.clone(),
             },
-            GraphError::RoutingUnavailable { reason } => Self::RoutingUnavailable {
-                reason: reason.clone(),
-            },
+            GraphError::RoutingUnavailable { reason } => Self::RoutingUnavailable { reason: reason.clone() },
             GraphError::SnapshotAhead {
                 cell_id,
                 read_epoch,
@@ -4425,6 +4107,14 @@ impl RemoteFailureDetails {
             },
             error if !transport_error_message_is_public(error) => Self::Internal {
                 class: error.class().to_string(),
+                atomic_vertex_delete: match error {
+                    GraphError::AtomicVertexDeleteConflict => Some(true),
+                    GraphError::ConditionalWriteConflict {
+                        operation: "validate_vertex_delete_preparation",
+                        ..
+                    } => Some(false),
+                    _ => None,
+                },
             },
             _ => return None,
         })
@@ -4441,11 +4131,7 @@ impl RemoteFailureDetails {
                 elapsed_ms,
                 limit_ms,
             },
-            Self::Admission {
-                operation,
-                actual,
-                limit,
-            } => GraphError::AdmissionRejected {
+            Self::Admission { operation, actual, limit } => GraphError::AdmissionRejected {
                 operation: remote_operation_label(&operation),
                 actual,
                 limit,
@@ -4465,7 +4151,21 @@ impl RemoteFailureDetails {
                 read_epoch,
                 current_epoch,
             },
-            Self::Internal { class } => GraphError::RemoteInternal {
+            Self::Internal {
+                atomic_vertex_delete: Some(true),
+                ..
+            } => GraphError::AtomicVertexDeleteConflict,
+            Self::Internal {
+                atomic_vertex_delete: Some(false),
+                ..
+            } => GraphError::ConditionalWriteConflict {
+                operation: "validate_vertex_delete_preparation",
+                key: key.to_string(),
+            },
+            Self::Internal {
+                class,
+                atomic_vertex_delete: None,
+            } => GraphError::RemoteInternal {
                 key: key.to_string(),
                 class: GraphError::CLASSES
                     .into_iter()
@@ -4485,8 +4185,7 @@ impl RemoteFailureDetails {
 fn remote_operation_label(operation: &str) -> &'static str {
     const FALLBACK: &str = "query_transport_remote";
     const MAX_LABELS: usize = 512;
-    static LABELS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
-        std::sync::OnceLock::new();
+    static LABELS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> = std::sync::OnceLock::new();
     let well_formed = !operation.is_empty()
         && operation.len() <= 96
         && operation
@@ -4548,8 +4247,7 @@ async fn serve_query_transport_stream(
         };
         if let Some(tls_config) = tls_config {
             let acceptor = TlsAcceptor::from(tls_config);
-            let handshake =
-                tokio::time::timeout(runtime.config.handshake_timeout, acceptor.accept(stream));
+            let handshake = tokio::time::timeout(runtime.config.handshake_timeout, acceptor.accept(stream));
             let mut handshake_shutdown = shutdown.clone();
             let handshake = tokio::select! {
                 changed = handshake_shutdown.changed() => {
@@ -4561,33 +4259,16 @@ async fn serve_query_transport_stream(
             let mut stream = match handshake {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(err)) => {
-                    runtime
-                        .metrics
-                        .handshake_failures
-                        .fetch_add(1, Ordering::Relaxed);
+                    runtime.metrics.handshake_failures.fetch_add(1, Ordering::Relaxed);
                     return Err(transport_error("tls_accept", err));
                 }
                 Err(_) => {
-                    runtime
-                        .metrics
-                        .handshake_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(transport_timeout_error(
-                        "tls_handshake",
-                        runtime.config.handshake_timeout,
-                    ));
+                    runtime.metrics.handshake_failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(transport_timeout_error("tls_handshake", runtime.config.handshake_timeout));
                 }
             };
             let identity = query_transport_tls_identity(&stream);
-            return serve_query_transport_io(
-                &mut stream,
-                client,
-                runtime,
-                identity,
-                shutdown,
-                control_only,
-            )
-            .await;
+            return serve_query_transport_io(&mut stream, client, runtime, identity, shutdown, control_only).await;
         }
     }
 
@@ -4604,9 +4285,7 @@ async fn serve_query_transport_stream(
 }
 
 #[cfg(feature = "query-transport-tls")]
-fn query_transport_tls_identity<S>(
-    stream: &tokio_rustls::server::TlsStream<S>,
-) -> QueryTransportConnectionIdentity {
+fn query_transport_tls_identity<S>(stream: &tokio_rustls::server::TlsStream<S>) -> QueryTransportConnectionIdentity {
     let mut identity = QueryTransportConnectionIdentity::default();
     let (_, connection) = stream.get_ref();
     if let Some(certs) = connection.peer_certificates() {
@@ -4651,12 +4330,7 @@ where
         if *shutdown.borrow() {
             return Ok(());
         }
-        let read = read_optional_query_transport_frame(
-            stream,
-            runtime.config.max_frame_bytes,
-            &runtime.metrics,
-            &mut read_buffer,
-        );
+        let read = read_optional_query_transport_frame(stream, runtime.config.max_frame_bytes, &runtime.metrics, &mut read_buffer);
         let frame = tokio::select! {
             changed = shutdown.changed() => {
                 let _ = changed;
@@ -4684,15 +4358,10 @@ where
                         batch_conflict: None,
                         snapshot_unavailable: None,
                         typed_failure: None,
+                        gql: None,
                     }
                 } else {
-                    execute_query_transport_request(
-                        Arc::clone(&client),
-                        request,
-                        Arc::clone(&runtime),
-                        identity.clone(),
-                    )
-                    .await
+                    execute_query_transport_request(Arc::clone(&client), request, Arc::clone(&runtime), identity.clone()).await
                 }
             }
             Err(err) => QueryTransportResponse::Error {
@@ -4701,6 +4370,7 @@ where
                 batch_conflict: None,
                 snapshot_unavailable: None,
                 typed_failure: None,
+                gql: None,
             },
         };
         let close_connection = control_only
@@ -4712,21 +4382,13 @@ where
         };
         match tokio::time::timeout(
             runtime.config.write_timeout,
-            write_query_transport_frame(
-                stream,
-                &wire_response,
-                runtime.config.max_frame_bytes,
-                &runtime.metrics,
-            ),
+            write_query_transport_frame(stream, &wire_response, runtime.config.max_frame_bytes, &runtime.metrics),
         )
         .await
         {
             Ok(result) => result?,
             Err(_) => {
-                return Err(transport_timeout_error(
-                    "frame_write",
-                    runtime.config.write_timeout,
-                ));
+                return Err(transport_timeout_error("frame_write", runtime.config.write_timeout));
             }
         }
         if close_connection {
@@ -4785,18 +4447,13 @@ async fn execute_query_transport_request_inner(
                 Ok(action) => action,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            if let Err(err) =
-                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
-            {
+            if let Err(err) = authorize_query_transport_scope(&runtime, &principal, &context.scope, action) {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
             let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
             match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
-                client.execute_cypher_rows(
-                    context.with_cancellation_token(cancellation_token),
-                    &query,
-                )
+                client.execute_cypher_rows(context.with_cancellation_token(cancellation_token), &query)
             })
             .await
             {
@@ -4824,9 +4481,7 @@ async fn execute_query_transport_request_inner(
                 Ok(action) => action,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            if let Err(err) =
-                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
-            {
+            if let Err(err) = authorize_query_transport_scope(&runtime, &principal, &context.scope, action) {
                 return transport_error_response(&runtime, err);
             }
             if action == QueryTransportAction::Write {
@@ -4842,12 +4497,7 @@ async fn execute_query_transport_request_inner(
             let query_id = context.idempotency_key.clone();
             let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
             match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
-                client.execute_cypher_rows_page(
-                    context.with_cancellation_token(cancellation_token),
-                    &query,
-                    cursor,
-                    page_size,
-                )
+                client.execute_cypher_rows_page(context.with_cancellation_token(cancellation_token), &query, cursor, page_size)
             })
             .await
             {
@@ -4874,18 +4524,13 @@ async fn execute_query_transport_request_inner(
             } else {
                 QueryTransportAction::Read
             };
-            if let Err(err) =
-                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
-            {
+            if let Err(err) = authorize_query_transport_scope(&runtime, &principal, &context.scope, action) {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
             let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
             match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
-                client.execute_batch(
-                    context.with_cancellation_token(cancellation_token),
-                    operation,
-                )
+                client.execute_batch(context.with_cancellation_token(cancellation_token), operation)
             })
             .await
             {
@@ -4915,8 +4560,7 @@ async fn execute_query_transport_request_inner(
                     GraphError::UnsupportedQuery {
                         reason: QueryFailureReason::InvalidRequest,
                         dialect: "QueryTransport",
-                        feature: "mutation batches cannot continue from a result cursor"
-                            .to_string(),
+                        feature: "mutation batches cannot continue from a result cursor".to_string(),
                     },
                 );
             }
@@ -4925,9 +4569,7 @@ async fn execute_query_transport_request_inner(
             } else {
                 QueryTransportAction::Read
             };
-            if let Err(err) =
-                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
-            {
+            if let Err(err) = authorize_query_transport_scope(&runtime, &principal, &context.scope, action) {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
@@ -4935,22 +4577,14 @@ async fn execute_query_transport_request_inner(
             let result = if action == QueryTransportAction::Write {
                 execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| async {
                     let result = client
-                        .execute_batch(
-                            context.with_cancellation_token(cancellation_token),
-                            operation,
-                        )
+                        .execute_batch(context.with_cancellation_token(cancellation_token), operation)
                         .await?;
                     paginate_query_batch_result(result, None, page_size)
                 })
                 .await
             } else {
                 execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
-                    client.execute_batch_page(
-                        context.with_cancellation_token(cancellation_token),
-                        operation,
-                        cursor,
-                        page_size,
-                    )
+                    client.execute_batch_page(context.with_cancellation_token(cancellation_token), operation, cursor, page_size)
                 })
                 .await
             };
@@ -4973,12 +4607,7 @@ async fn execute_query_transport_request_inner(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            if let Err(err) = authorize_query_transport_scope(
-                &runtime,
-                &principal,
-                &scope,
-                QueryTransportAction::Cancel,
-            ) {
+            if let Err(err) = authorize_query_transport_scope(&runtime, &principal, &scope, QueryTransportAction::Cancel) {
                 return transport_error_response(&runtime, err);
             }
             let lifecycle_key = QueryLifecycleKey::new(principal, scope, &query_id);
@@ -4993,13 +4622,12 @@ async fn execute_query_transport_request_inner(
 #[cfg(feature = "query-transport")]
 fn transport_version_error(version: u16) -> QueryTransportResponse {
     QueryTransportResponse::Error {
-        message: format!(
-            "unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"
-        ),
+        message: format!("unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"),
         reason: Some(QueryFailureReason::InvalidRequest.as_str().to_string()),
         batch_conflict: None,
         snapshot_unavailable: None,
         typed_failure: None,
+        gql: None,
     }
 }
 
@@ -5026,34 +4654,24 @@ where
     F: FnOnce(QueryCancellationToken) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let (lifecycle_token, cancellation_token) =
-        begin_query_lifecycle(runtime, lifecycle_key).await?;
+    let (lifecycle_token, cancellation_token) = begin_query_lifecycle(runtime, lifecycle_key).await?;
     let result = async {
-        let _namespace_permits = acquire_namespace_query_permits(
-            runtime,
-            &lifecycle_key.scope.namespace,
-            &cancellation_token,
-        )
-        .await?;
+        let _namespace_permits = acquire_namespace_query_permits(runtime, &lifecycle_key.scope.namespace, &cancellation_token).await?;
         let _permit = acquire_query_transport_permit(runtime, &cancellation_token).await?;
         activate_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await?;
         ensure_query_not_cancelled(runtime, lifecycle_key, lifecycle_token).await?;
-        runtime
-            .metrics
-            .requests_started
-            .fetch_add(1, Ordering::Relaxed);
+        runtime.metrics.requests_started.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let result =
-            match AssertUnwindSafe(cancellation_token.scope(execute(cancellation_token.clone())))
-                .catch_unwind()
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(GraphError::CorruptValue {
-                    key: "query/transport/executor".to_string(),
-                    reason: "query executor panicked".to_string(),
-                }),
-            };
+        let result = match AssertUnwindSafe(cancellation_token.scope(execute(cancellation_token.clone())))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(GraphError::CorruptValue {
+                key: "query/transport/executor".to_string(),
+                reason: "query executor panicked".to_string(),
+            }),
+        };
         let elapsed = started.elapsed();
         runtime.metrics.serve_latency.record(elapsed);
         let is_slow_query = match runtime.config.slow_query_log_threshold {
@@ -5077,14 +4695,8 @@ where
         QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
     };
     match &result {
-        Ok(_) => runtime
-            .metrics
-            .requests_completed
-            .fetch_add(1, Ordering::Relaxed),
-        Err(_) => runtime
-            .metrics
-            .requests_failed
-            .fetch_add(1, Ordering::Relaxed),
+        Ok(_) => runtime.metrics.requests_completed.fetch_add(1, Ordering::Relaxed),
+        Err(_) => runtime.metrics.requests_failed.fetch_add(1, Ordering::Relaxed),
     };
     result
 }
@@ -5153,15 +4765,10 @@ async fn finish_query_lifecycle(
     lifecycle.queries.remove(lifecycle_key);
     match state {
         QueryLifecycleState::Cancelled => {
-            runtime
-                .metrics
-                .cancelled_rejections
-                .fetch_add(1, Ordering::Relaxed);
+            runtime.metrics.cancelled_rejections.fetch_add(1, Ordering::Relaxed);
             QueryLifecycleFinish::Cancelled
         }
-        QueryLifecycleState::Queued | QueryLifecycleState::Running => {
-            QueryLifecycleFinish::NotCancelled
-        }
+        QueryLifecycleState::Queued | QueryLifecycleState::Running => QueryLifecycleFinish::NotCancelled,
     }
 }
 
@@ -5173,10 +4780,7 @@ enum QueryLifecycleFinish {
 }
 
 #[cfg(feature = "query-transport")]
-async fn cancel_active_query(
-    runtime: &QueryTransportServerRuntime,
-    lifecycle_key: &QueryLifecycleKey,
-) -> Result<()> {
+async fn cancel_active_query(runtime: &QueryTransportServerRuntime, lifecycle_key: &QueryLifecycleKey) -> Result<()> {
     validate_component("query_id", &lifecycle_key.query_id)?;
     let mut lifecycle = runtime.lifecycle.lock().await;
     cancel_query_lifecycle_entry(&mut lifecycle, &runtime.metrics, lifecycle_key)
@@ -5213,10 +4817,7 @@ async fn acquire_query_transport_permit(
     match Arc::clone(&runtime.request_gate).try_acquire_owned() {
         Ok(permit) => Ok(permit),
         Err(_) => {
-            runtime
-                .metrics
-                .backpressure_waits
-                .fetch_add(1, Ordering::Relaxed);
+            runtime.metrics.backpressure_waits.fetch_add(1, Ordering::Relaxed);
             tokio::select! {
                 permit = Arc::clone(&runtime.request_gate).acquire_owned() => {
                     permit.map_err(|err| GraphError::CorruptValue {
@@ -5244,10 +4845,7 @@ async fn acquire_namespace_query_permits(
         let permit = match Arc::clone(gate).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                runtime
-                    .metrics
-                    .namespace_quota_waits
-                    .fetch_add(1, Ordering::Relaxed);
+                runtime.metrics.namespace_quota_waits.fetch_add(1, Ordering::Relaxed);
                 tokio::select! {
                     permit = Arc::clone(gate).acquire_owned() => {
                         permit.map_err(|err| GraphError::CorruptValue {
@@ -5321,10 +4919,7 @@ fn authenticate_query_transport(
     if let Some(principal) = runtime.config.auth_policy.authenticate(auth, identity) {
         return Ok(principal);
     }
-    runtime
-        .metrics
-        .auth_failures
-        .fetch_add(1, Ordering::Relaxed);
+    runtime.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
     Err(transport_authentication_error())
 }
 
@@ -5335,23 +4930,16 @@ fn authorize_query_transport_scope(
     scope: &GraphScope,
     action: QueryTransportAction,
 ) -> Result<()> {
-    if runtime
-        .config
-        .scope_authorizer
-        .authorize(principal, scope, action)
+    if runtime.config.scope_authorizer.authorize(principal, scope, action)
         || (action != QueryTransportAction::Admin
-            && runtime.config.scope_authorizer.authorize(
-                principal,
-                scope,
-                QueryTransportAction::Admin,
-            ))
+            && runtime
+                .config
+                .scope_authorizer
+                .authorize(principal, scope, QueryTransportAction::Admin))
     {
         return Ok(());
     }
-    runtime
-        .metrics
-        .namespace_access_denials
-        .fetch_add(1, Ordering::Relaxed);
+    runtime.metrics.namespace_access_denials.fetch_add(1, Ordering::Relaxed);
     Err(GraphError::GraphScopeAccessDenied {
         principal: principal.error_label().to_string(),
         action: action.as_str(),
@@ -5371,6 +4959,7 @@ fn transport_error_message_is_public(error: &GraphError) -> bool {
             | GraphError::QueryParse { .. }
             | GraphError::QueryTimeout { .. }
             | GraphError::UnsupportedQuery { .. }
+            | GraphError::GqlQuery { .. }
             | GraphError::UnclassifiedQuery { .. }
             | GraphError::BatchValueConflict { .. }
             | GraphError::SnapshotUnavailable { .. }
@@ -5378,14 +4967,8 @@ fn transport_error_message_is_public(error: &GraphError) -> bool {
 }
 
 #[cfg(feature = "query-transport")]
-fn transport_error_response(
-    runtime: &QueryTransportServerRuntime,
-    err: GraphError,
-) -> QueryTransportResponse {
-    runtime
-        .metrics
-        .requests_failed
-        .fetch_add(1, Ordering::Relaxed);
+fn transport_error_response(runtime: &QueryTransportServerRuntime, err: GraphError) -> QueryTransportResponse {
+    runtime.metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
     let message = if transport_error_message_is_public(&err) {
         err.to_string()
     } else {
@@ -5398,9 +4981,7 @@ fn transport_error_response(
     };
     QueryTransportResponse::Error {
         message,
-        reason: err
-            .failure_reason()
-            .map(|reason| reason.as_str().to_string()),
+        reason: err.failure_reason().map(|reason| reason.as_str().to_string()),
         snapshot_unavailable: match &err {
             GraphError::SnapshotUnavailable {
                 cell_id,
@@ -5414,6 +4995,10 @@ fn transport_error_response(
             _ => None,
         },
         typed_failure: RemoteFailureDetails::of(&err),
+        gql: match &err {
+            GraphError::GqlQuery { status, .. } => Some((**status).clone()),
+            _ => None,
+        },
         batch_conflict: match err {
             GraphError::BatchValueConflict { target } => Some(target),
             _ => None,
@@ -5432,8 +5017,7 @@ where
     S: AsyncWrite + Unpin + ?Sized,
     T: serde::Serialize,
 {
-    let mut bytes =
-        serde_json::to_vec(message).map_err(|err| transport_json_error("encode", err))?;
+    let mut bytes = serde_json::to_vec(message).map_err(|err| transport_json_error("encode", err))?;
     if bytes.len() >= max_frame_bytes {
         return Err(GraphError::AdmissionRejected {
             operation: "query_transport_frame",
@@ -5442,33 +5026,19 @@ where
         });
     }
     bytes.push(b'\n');
-    metrics
-        .bytes_sent
-        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-    stream
-        .write_all(&bytes)
-        .await
-        .map_err(|err| transport_error("write", err))
+    metrics.bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    stream.write_all(&bytes).await.map_err(|err| transport_error("write", err))
 }
 
 #[cfg(feature = "query-transport")]
-async fn read_query_transport_frame<S>(
-    stream: &mut S,
-    max_frame_bytes: usize,
-    metrics: &QueryTransportMetrics,
-) -> Result<Vec<u8>>
+async fn read_query_transport_frame<S>(stream: &mut S, max_frame_bytes: usize, metrics: &QueryTransportMetrics) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin + ?Sized,
 {
     let mut read_buffer = Vec::new();
     read_optional_query_transport_frame(stream, max_frame_bytes, metrics, &mut read_buffer)
         .await?
-        .ok_or_else(|| {
-            transport_protocol_error(
-                "query/transport/frame",
-                "connection closed before a response frame",
-            )
-        })
+        .ok_or_else(|| transport_protocol_error("query/transport/frame", "connection closed before a response frame"))
 }
 
 #[cfg(feature = "query-transport")]
@@ -5494,14 +5064,9 @@ where
             let mut frame: Vec<u8> = read_buffer.drain(..=newline).collect();
             frame.pop();
             if frame.is_empty() {
-                return Err(transport_protocol_error(
-                    "query/transport/frame",
-                    "empty query transport frame",
-                ));
+                return Err(transport_protocol_error("query/transport/frame", "empty query transport frame"));
             }
-            metrics
-                .bytes_received
-                .fetch_add((frame.len() + 1) as u64, Ordering::Relaxed);
+            metrics.bytes_received.fetch_add((frame.len() + 1) as u64, Ordering::Relaxed);
             return Ok(Some(frame));
         }
         if read_buffer.len() >= max_frame_bytes {
@@ -5511,10 +5076,7 @@ where
                 limit: max_frame_bytes as u64,
             });
         }
-        let read = stream
-            .read(&mut buf)
-            .await
-            .map_err(|err| transport_error("read", err))?;
+        let read = stream.read(&mut buf).await.map_err(|err| transport_error("read", err))?;
         if read == 0 {
             if read_buffer.is_empty() {
                 return Ok(None);
@@ -5578,6 +5140,7 @@ fn transport_remote_error(
     batch_conflict: Option<String>,
     snapshot_unavailable: Option<SnapshotUnavailableDetails>,
     typed_failure: Option<RemoteFailureDetails>,
+    gql: Option<crate::GqlStatusReport>,
 ) -> GraphError {
     if let Some(failure) = typed_failure {
         tracing::debug!(
@@ -5607,14 +5170,27 @@ fn transport_remote_error(
     match reason {
         // The owner classified this as a query failure. A label this build
         // does not know (a newer peer) is kept as `Other` rather than guessed.
-        Some(label) => GraphError::UnsupportedQuery {
-            dialect: "QueryTransport",
-            feature,
-            reason: QueryFailureReason::ALL
+        Some(label) => {
+            let reason = QueryFailureReason::ALL
                 .into_iter()
                 .find(|reason| reason.as_str() == label)
-                .unwrap_or(QueryFailureReason::Other),
-        },
+                .unwrap_or(QueryFailureReason::Other);
+            match gql {
+                // The owner's engine reported a GQL-status object: rebuild
+                // the failure with it, so the client sees the same GQLSTATUS.
+                Some(status) => GraphError::GqlQuery {
+                    dialect: "QueryTransport",
+                    feature,
+                    reason,
+                    status: Box::new(status),
+                },
+                None => GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature,
+                    reason,
+                },
+            }
+        }
         None => GraphError::UnclassifiedQuery {
             dialect: "QueryTransport",
             feature,

@@ -14,21 +14,19 @@ use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
 #[cfg(feature = "opencypher")]
 use super::SparseTraversalCount;
-use super::{
-    graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend, SparseTraversal,
-};
+use super::{graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend, SparseTraversal};
 use crate::{GraphError, Result, VertexId};
 
-type GrBInfo = c_int;
+pub(super) type GrBInfo = c_int;
 type GrBFormat = c_int;
-type GrBIndex = u64;
-type GrBType = *mut c_void;
+pub(super) type GrBIndex = u64;
+pub(super) type GrBType = *mut c_void;
 type GrBMonoid = *mut c_void;
 type GrBSemiring = *mut c_void;
-type GrBMatrix = *mut c_void;
-type GrBVector = *mut c_void;
+pub(super) type GrBMatrix = *mut c_void;
+pub(super) type GrBVector = *mut c_void;
 type GrBDescriptor = *mut c_void;
-type GrBBinaryOp = *mut c_void;
+pub(super) type GrBBinaryOp = *mut c_void;
 
 const GRB_SUCCESS: GrBInfo = 0;
 const GRB_INVALID_VALUE: GrBInfo = -3;
@@ -46,8 +44,18 @@ const GRB_INDEX_MAX: u64 = (1_u64 << 60) - 1;
 // returns GrB_INVALID_VALUE for it regardless of the constant used, even though
 // the v10 header still lists it under GrB_Desc_Field. Thread count is now only
 // settable globally (or per GxB_Context), which is what `init` does below.
+//
+// LAGraph follows the same split. Ubuntu 24.04 packages no LAGraph, and
+// LAGraph 1.2 needs GraphBLAS 9 or newer, so Linux builds the 1.0.2 tag against
+// v7.4 with `scripts/install_lagraph.sh`; Homebrew's suite-sparse bundles
+// LAGraph 1.2.2 with v10. Every LAGraph entry point `lagraph.rs` calls has the
+// same signature in both, and it reads no LAGraph struct field, whose layout
+// changed between them.
 const GXB_NTHREADS: c_int = 7086;
 const GXB_NTHREADS_LEGACY: c_int = 5;
+// GxB_JIT_C_CONTROL and its GxB_JIT_OFF setting, both v8 and later.
+const GXB_JIT_C_CONTROL: c_int = 7029;
+const GXB_JIT_OFF: i32 = 0;
 
 #[link(name = "graphblas")]
 unsafe extern "C" {
@@ -61,13 +69,7 @@ unsafe extern "C" {
     static GrB_LOR_LAND_SEMIRING_BOOL: GrBSemiring;
     static GrB_PLUS_MONOID_UINT64: GrBMonoid;
 
-    fn GrB_init(mode: c_int) -> GrBInfo;
-    fn GrB_Matrix_new(
-        matrix: *mut GrBMatrix,
-        value_type: GrBType,
-        rows: GrBIndex,
-        cols: GrBIndex,
-    ) -> GrBInfo;
+    pub(super) fn GrB_Matrix_new(matrix: *mut GrBMatrix, value_type: GrBType, rows: GrBIndex, cols: GrBIndex) -> GrBInfo;
     fn GrB_Matrix_free(matrix: *mut GrBMatrix) -> GrBInfo;
     fn GrB_Matrix_import_BOOL(
         matrix: *mut GrBMatrix,
@@ -107,13 +109,8 @@ unsafe extern "C" {
         nvals: GrBIndex,
         dup: GrBBinaryOp,
     ) -> GrBInfo;
-    fn GrB_Vector_nvals(nvals: *mut GrBIndex, vector: GrBVector) -> GrBInfo;
-    fn GrB_Vector_extractTuples_BOOL(
-        indices: *mut GrBIndex,
-        values: *mut bool,
-        nvals: *mut GrBIndex,
-        vector: GrBVector,
-    ) -> GrBInfo;
+    pub(super) fn GrB_Vector_nvals(nvals: *mut GrBIndex, vector: GrBVector) -> GrBInfo;
+    fn GrB_Vector_extractTuples_BOOL(indices: *mut GrBIndex, values: *mut bool, nvals: *mut GrBIndex, vector: GrBVector) -> GrBInfo;
     fn GrB_Vector_wait(vector: GrBVector, waitmode: c_int) -> GrBInfo;
     fn GrB_Vector_eWiseAdd_BinaryOp(
         output: GrBVector,
@@ -156,8 +153,8 @@ static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 static INLINE_WORK_EDGES: OnceLock<usize> = OnceLock::new();
 
-struct Matrix(GrBMatrix);
-struct Vector(GrBVector);
+pub(super) struct Matrix(pub(super) GrBMatrix);
+pub(super) struct Vector(pub(super) GrBVector);
 struct Descriptor(GrBDescriptor);
 
 pub(crate) struct CompiledGraphBlasMatrix {
@@ -265,14 +262,12 @@ impl CompiledCompactCscMatrix {
     }
 
     fn degree(&self, ordinal: usize) -> u64 {
-        self.pointer(ordinal + 1)
-            .saturating_sub(self.pointer(ordinal)) as u64
+        self.pointer(ordinal + 1).saturating_sub(self.pointer(ordinal)) as u64
     }
 
     #[cfg(feature = "opencypher")]
     fn vertex_degree(&self, vertex: VertexId) -> u64 {
-        self.ordinal(vertex)
-            .map_or(0, |ordinal| self.degree(ordinal))
+        self.ordinal(vertex).map_or(0, |ordinal| self.degree(ordinal))
     }
 
     fn pointer(&self, ordinal: usize) -> usize {
@@ -291,8 +286,7 @@ impl CompiledCompactCscMatrix {
         let (Some(src_ordinal), Some(dst_ordinal)) = (self.ordinal(src), self.ordinal(dst)) else {
             return false;
         };
-        self.neighbor_range(src_ordinal)
-            .any(|index| self.neighbor(index) == dst_ordinal)
+        self.neighbor_range(src_ordinal).any(|index| self.neighbor(index) == dst_ordinal)
     }
 
     #[cfg(feature = "opencypher")]
@@ -306,11 +300,7 @@ impl CompiledCompactCscMatrix {
     }
 
     #[cfg(feature = "opencypher")]
-    fn neighbors_intersecting(
-        &self,
-        vertex: VertexId,
-        allowed: &BTreeSet<VertexId>,
-    ) -> Vec<VertexId> {
+    fn neighbors_intersecting(&self, vertex: VertexId, allowed: &BTreeSet<VertexId>) -> Vec<VertexId> {
         let Some(ordinal) = self.ordinal(vertex) else {
             return Vec::new();
         };
@@ -405,9 +395,7 @@ impl CompiledCompactCscMatrix {
         let vertices = seen
             .into_iter()
             .enumerate()
-            .filter_map(|(ordinal, reached)| {
-                (reached && !start_seen[ordinal]).then_some(self.vertices[ordinal])
-            })
+            .filter_map(|(ordinal, reached)| (reached && !start_seen[ordinal]).then_some(self.vertices[ordinal]))
             .collect();
         Ok(SparseTraversal {
             vertices,
@@ -416,30 +404,17 @@ impl CompiledCompactCscMatrix {
         })
     }
 
-    fn expand_range(
-        &self,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-    ) -> Result<SparseTraversal> {
+    fn expand_range(&self, starts: &[VertexId], min_hops: u8, max_hops: u8) -> Result<SparseTraversal> {
         let (vertices, edge_visits) = self.expand_range_ordinals(starts, min_hops, max_hops)?;
         Ok(SparseTraversal {
-            vertices: vertices
-                .into_iter()
-                .map(|ordinal| self.vertices[ordinal])
-                .collect(),
+            vertices: vertices.into_iter().map(|ordinal| self.vertices[ordinal]).collect(),
             edge_visits,
             backend: SparseKernelBackend::CompactCsc,
         })
     }
 
     #[cfg(feature = "opencypher")]
-    fn expand_range_count(
-        &self,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-    ) -> Result<SparseTraversalCount> {
+    fn expand_range_count(&self, starts: &[VertexId], min_hops: u8, max_hops: u8) -> Result<SparseTraversalCount> {
         let (result_seen, edge_visits) = self.expand_range_bitmap(starts, min_hops, max_hops)?;
         Ok(SparseTraversalCount {
             vertices: result_seen.into_iter().filter(|seen| *seen).count() as u64,
@@ -448,12 +423,7 @@ impl CompiledCompactCscMatrix {
         })
     }
 
-    fn expand_range_ordinals(
-        &self,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-    ) -> Result<(Vec<usize>, u64)> {
+    fn expand_range_ordinals(&self, starts: &[VertexId], min_hops: u8, max_hops: u8) -> Result<(Vec<usize>, u64)> {
         let (result_seen, edge_visits) = self.expand_range_bitmap(starts, min_hops, max_hops)?;
         Ok((
             result_seen
@@ -465,12 +435,7 @@ impl CompiledCompactCscMatrix {
         ))
     }
 
-    fn expand_range_bitmap(
-        &self,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-    ) -> Result<(Vec<bool>, u64)> {
+    fn expand_range_bitmap(&self, starts: &[VertexId], min_hops: u8, max_hops: u8) -> Result<(Vec<bool>, u64)> {
         if min_hops > max_hops || self.vertices.is_empty() || starts.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -558,9 +523,7 @@ impl Drop for Descriptor {
 fn compiled_kernel(requested: SparseKernelBackend) -> SparseKernelBackend {
     match requested {
         SparseKernelBackend::SuiteSparse => SparseKernelBackend::SuiteSparse,
-        SparseKernelBackend::Adjacency | SparseKernelBackend::CompactCsc => {
-            SparseKernelBackend::CompactCsc
-        }
+        _ => SparseKernelBackend::CompactCsc,
     }
 }
 
@@ -602,11 +565,7 @@ impl CompiledGraphBlasMatrix {
             });
         }
         init()?;
-        let replica_count = if csc.vertices.is_empty() {
-            1
-        } else {
-            graphblas_replica_count(csc)
-        };
+        let replica_count = if csc.vertices.is_empty() { 1 } else { graphblas_replica_count(csc) };
         let mut replicas = Vec::with_capacity(replica_count);
         for _ in 0..replica_count {
             replicas.push(Mutex::new(build_compiled_inner(csc)?));
@@ -624,10 +583,7 @@ impl CompiledGraphBlasMatrix {
         })
     }
 
-    pub(crate) fn new_from_csc_owned(
-        csc: GraphBlasCsc,
-        kernel: SparseKernelBackend,
-    ) -> Result<Self> {
+    pub(crate) fn new_from_csc_owned(csc: GraphBlasCsc, kernel: SparseKernelBackend) -> Result<Self> {
         validate_csc(&csc)?;
         let kernel = compiled_kernel(kernel);
         if kernel == SparseKernelBackend::CompactCsc {
@@ -660,18 +616,9 @@ impl CompiledGraphBlasMatrix {
             let one_orientation_bytes = vertices
                 .capacity()
                 .saturating_mul(std::mem::size_of::<VertexId>())
-                .saturating_add(
-                    pointers
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<u32>()),
-                )
-                .saturating_add(
-                    indices
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<u32>()),
-                );
-            let canonical_out =
-                CompiledCompactCscMatrix::from_u32_parts(vertices, pointers, indices);
+                .saturating_add(pointers.capacity().saturating_mul(std::mem::size_of::<u32>()))
+                .saturating_add(indices.capacity().saturating_mul(std::mem::size_of::<u32>()));
+            let canonical_out = CompiledCompactCscMatrix::from_u32_parts(vertices, pointers, indices);
             let edge_count = canonical_out.indices.len();
             return Ok(Self {
                 canonical_out,
@@ -698,12 +645,7 @@ impl CompiledGraphBlasMatrix {
         self.kernel
     }
 
-    pub(crate) fn expand(
-        &self,
-        adjacency: &Adjacency,
-        starts: &[VertexId],
-        hops: u8,
-    ) -> Result<SparseTraversal> {
+    pub(crate) fn expand(&self, adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> Result<SparseTraversal> {
         if self.kernel == SparseKernelBackend::CompactCsc {
             return self.canonical_out.expand(starts, hops);
         }
@@ -721,9 +663,7 @@ impl CompiledGraphBlasMatrix {
 
     #[cfg(feature = "opencypher")]
     pub(crate) fn in_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
-        self.canonical_in
-            .get_or_init(|| self.canonical_out.transpose())
-            .neighbors(vertex)
+        self.canonical_in.get_or_init(|| self.canonical_out.transpose()).neighbors(vertex)
     }
 
     #[cfg(feature = "opencypher")]
@@ -734,24 +674,17 @@ impl CompiledGraphBlasMatrix {
     /// Read a prepared reverse degree without allocating the reverse CSC.
     #[cfg(feature = "opencypher")]
     pub(crate) fn cached_in_degree(&self, vertex: VertexId) -> Option<u64> {
-        self.canonical_in
-            .get()
-            .map(|matrix| matrix.vertex_degree(vertex))
+        self.canonical_in.get().map(|matrix| matrix.vertex_degree(vertex))
     }
 
     /// Work required to find predecessors without building a reverse matrix.
     #[cfg(feature = "opencypher")]
     pub(crate) fn in_neighbor_scan_work(&self) -> u64 {
-        (self.canonical_out.vertices.len() as u64)
-            .saturating_add(self.canonical_out.indices.len() as u64)
+        (self.canonical_out.vertices.len() as u64).saturating_add(self.canonical_out.indices.len() as u64)
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn in_neighbors_without_reverse(
-        &self,
-        vertex: VertexId,
-        mut check: impl FnMut() -> Result<()>,
-    ) -> Result<Vec<VertexId>> {
+    pub(crate) fn in_neighbors_without_reverse(&self, vertex: VertexId, mut check: impl FnMut() -> Result<()>) -> Result<Vec<VertexId>> {
         let target = self.canonical_out.ordinal(vertex);
         let mut neighbors = Vec::new();
         for (ordinal, src) in self.canonical_out.vertices.iter().enumerate() {
@@ -775,21 +708,37 @@ impl CompiledGraphBlasMatrix {
     /// runs once per source vertex and once per edge, so a hub's edges cannot
     /// outrun cancellation; callers throttle it.
     #[cfg(feature = "opencypher")]
-    pub(crate) fn for_each_edge(
-        &self,
-        mut visit: impl FnMut(VertexId, VertexId),
-        mut check: impl FnMut() -> Result<()>,
-    ) -> Result<()> {
+    pub(crate) fn for_each_edge(&self, mut visit: impl FnMut(VertexId, VertexId), check: impl FnMut() -> Result<()>) -> Result<()> {
+        let vertices = &self.canonical_out.vertices;
+        self.for_each_edge_ordinals(|src, dst| visit(vertices[src], vertices[dst]), check)
+    }
+
+    /// `for_each_edge` in the forward CSC's own ordinal space: each endpoint
+    /// is its index into `vertex_ids`. A caller remapping every endpoint
+    /// indexes a table by it instead of hashing the id.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn for_each_edge_ordinals(&self, mut visit: impl FnMut(usize, usize), mut check: impl FnMut() -> Result<()>) -> Result<()> {
         let matrix = &self.canonical_out;
         for ordinal in 0..matrix.dimension() {
             check()?;
-            let src = matrix.vertices[ordinal];
             for index in matrix.neighbor_range(ordinal) {
                 check()?;
-                visit(src, matrix.vertices[matrix.neighbor(index)]);
+                visit(ordinal, matrix.neighbor(index));
             }
         }
         Ok(())
+    }
+
+    /// The forward CSC's vertices, ascending by id, at their ordinals.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn vertex_ids(&self) -> &[VertexId] {
+        &self.canonical_out.vertices
+    }
+
+    /// Structural edges in the forward CSC.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn edge_count(&self) -> usize {
+        self.edge_count
     }
 
     /// Visit every vertex's structural out- and/or in-degree in one pass over
@@ -833,32 +782,18 @@ impl CompiledGraphBlasMatrix {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn in_neighbors_intersecting(
-        &self,
-        vertex: VertexId,
-        allowed: &BTreeSet<VertexId>,
-    ) -> Vec<VertexId> {
+    pub(crate) fn in_neighbors_intersecting(&self, vertex: VertexId, allowed: &BTreeSet<VertexId>) -> Vec<VertexId> {
         self.canonical_in
             .get_or_init(|| self.canonical_out.transpose())
             .neighbors_intersecting(vertex, allowed)
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn out_neighbors_intersecting(
-        &self,
-        vertex: VertexId,
-        allowed: &BTreeSet<VertexId>,
-    ) -> Vec<VertexId> {
+    pub(crate) fn out_neighbors_intersecting(&self, vertex: VertexId, allowed: &BTreeSet<VertexId>) -> Vec<VertexId> {
         self.canonical_out.neighbors_intersecting(vertex, allowed)
     }
 
-    pub(crate) fn expand_range(
-        &self,
-        adjacency: &Adjacency,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-    ) -> Result<SparseTraversal> {
+    pub(crate) fn expand_range(&self, adjacency: &Adjacency, starts: &[VertexId], min_hops: u8, max_hops: u8) -> Result<SparseTraversal> {
         if self.kernel == SparseKernelBackend::CompactCsc {
             return self.canonical_out.expand_range(starts, min_hops, max_hops);
         }
@@ -875,9 +810,7 @@ impl CompiledGraphBlasMatrix {
         max_hops: u8,
     ) -> Result<SparseTraversalCount> {
         if self.kernel == SparseKernelBackend::CompactCsc {
-            return self
-                .canonical_out
-                .expand_range_count(starts, min_hops, max_hops);
+            return self.canonical_out.expand_range_count(starts, min_hops, max_hops);
         }
         let mut inner = self.lock_available_replica()?;
         expand_range_count_with_compiled(adjacency, starts, min_hops, max_hops, &mut inner)
@@ -905,9 +838,7 @@ impl CompiledGraphBlasMatrix {
                 Err(TryLockError::Poisoned(_)) => return Err(graphblas_replica_lock_error()),
             }
         }
-        self.replicas[start]
-            .lock()
-            .map_err(|_| graphblas_replica_lock_error())
+        self.replicas[start].lock().map_err(|_| graphblas_replica_lock_error())
     }
 }
 
@@ -919,20 +850,12 @@ fn graphblas_replica_lock_error() -> GraphError {
 }
 
 fn compact_csc_resident_bytes(csc: &GraphBlasCsc) -> usize {
-    let pointer_bytes = if csc
-        .pointers
-        .iter()
-        .all(|value| u32::try_from(*value).is_ok())
-    {
+    let pointer_bytes = if csc.pointers.iter().all(|value| u32::try_from(*value).is_ok()) {
         std::mem::size_of::<u32>()
     } else {
         std::mem::size_of::<u64>()
     };
-    let index_bytes = if csc
-        .indices
-        .iter()
-        .all(|value| u32::try_from(*value).is_ok())
-    {
+    let index_bytes = if csc.indices.iter().all(|value| u32::try_from(*value).is_ok()) {
         std::mem::size_of::<u32>()
     } else {
         std::mem::size_of::<u64>()
@@ -949,11 +872,7 @@ fn native_graphblas_resident_bytes(csc: &GraphBlasCsc, replicas: usize) -> usize
         .vertices
         .len()
         .saturating_mul(std::mem::size_of::<VertexId>().saturating_mul(2))
-        .saturating_add(
-            csc.pointers
-                .len()
-                .saturating_mul(std::mem::size_of::<u64>()),
-        )
+        .saturating_add(csc.pointers.len().saturating_mul(std::mem::size_of::<u64>()))
         .saturating_add(
             csc.indices
                 .len()
@@ -962,11 +881,7 @@ fn native_graphblas_resident_bytes(csc: &GraphBlasCsc, replicas: usize) -> usize
     per_replica.saturating_mul(replicas).saturating_mul(2)
 }
 
-pub(super) fn expand(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    hops: u8,
-) -> Result<SparseTraversal> {
+pub(super) fn expand(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> Result<SparseTraversal> {
     init()?;
 
     let csc = graphblas_csc_from_adjacency(adjacency)?;
@@ -1043,12 +958,7 @@ fn expand_with_compiled(
     let mut edge_visits = 0_u64;
 
     for _ in 0..hops {
-        edge_visits += frontier_edge_visits_graphblas(
-            degree_vector,
-            &frontier,
-            &mut degree_scratch,
-            unsafe { GrB_DESC_S },
-        )?;
+        edge_visits += frontier_edge_visits_graphblas(degree_vector, &frontier, &mut degree_scratch, unsafe { GrB_DESC_S })?;
         let next = masked_multiply(matrix, &frontier, &seen, compiled.ordinal_map.len())?;
         let next_count = vector_nvals(&next)?;
         if next_count == 0 {
@@ -1168,13 +1078,10 @@ fn exact_hop_count_with_compiled(
         });
     }
 
-    let scratch = compiled
-        .count_scratch
-        .as_mut()
-        .ok_or_else(|| GraphError::SparseKernel {
-            backend: "SuiteSparseGraphBlas",
-            reason: "compiled count scratch is missing".to_string(),
-        })?;
+    let scratch = compiled.count_scratch.as_mut().ok_or_else(|| GraphError::SparseKernel {
+        backend: "SuiteSparseGraphBlas",
+        reason: "compiled count scratch is missing".to_string(),
+    })?;
     reset_bool_vector(&mut scratch.frontier, &start_ordinals)?;
     clear_vector(&mut scratch.next)?;
     if hops == 0 {
@@ -1193,12 +1100,7 @@ fn exact_hop_count_with_compiled(
             &mut scratch.degree,
             scratch.descriptor.0,
         )?);
-        multiply_into(
-            matrix,
-            &scratch.frontier,
-            &mut scratch.next,
-            scratch.descriptor.0,
-        )?;
+        multiply_into(matrix, &scratch.frontier, &mut scratch.next, scratch.descriptor.0)?;
         let next_count = vector_nvals(&scratch.next)?;
         std::mem::swap(&mut scratch.frontier, &mut scratch.next);
         if next_count == 0 {
@@ -1222,12 +1124,7 @@ struct RangeVector {
     edge_visits: u64,
 }
 
-fn range_result_vector(
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-    compiled: &CompiledGraphBlasMatrixInner,
-) -> Result<RangeVector> {
+fn range_result_vector(starts: &[VertexId], min_hops: u8, max_hops: u8, compiled: &CompiledGraphBlasMatrixInner) -> Result<RangeVector> {
     let Some(matrix) = compiled.matrix.as_ref() else {
         return Ok(empty_range_vector());
     };
@@ -1302,12 +1199,20 @@ fn empty_traversal() -> SparseTraversal {
     }
 }
 
-fn init() -> Result<()> {
+pub(super) fn init() -> Result<()> {
     match INIT.get_or_init(|| unsafe {
-        let info = GrB_init(GRB_BLOCKING);
-        if info != GRB_SUCCESS {
-            return Err(format!("GrB_init returned GraphBLAS status {info}"));
-        }
+        // GraphBLAS initializes once per process, and LAGraph must be
+        // initialized too, so `LAGr_Init` does both.
+        super::lagraph::initialize(GRB_BLOCKING)?;
+        // From v8 on, GraphBLAS compiles a kernel at run time for an operator
+        // and type combination it has no built-in kernel for, as LAGraph's
+        // betweenness needs. When that compile fails, which it does wherever
+        // the compiler or SDK baked in at build time is absent, the call that
+        // asked fails, and only later calls fall back to the generic kernels.
+        // v7.4, which production links, has no JIT and always runs the generic
+        // ones, so turning the JIT off makes every build do the same. v7
+        // rejects the unknown field, which is the outcome wanted there.
+        let _ = GxB_Global_Option_set_INT32(GXB_JIT_C_CONTROL, GXB_JIT_OFF);
         // Only applied when explicitly requested; otherwise GraphBLAS keeps its
         // own default (one thread per core). This used to be a descriptor field
         // scoped to the exact-count path, which v9 no longer accepts.
@@ -1336,20 +1241,6 @@ fn init() -> Result<()> {
             reason: reason.clone(),
         }),
     }
-}
-
-/// The legacy `GRAPH_COMPILED_KERNEL` switch, retained as a fallback default.
-///
-/// Compilation no longer consults it — constructors take the kernel explicitly.
-/// It is read once, by `super::default_matrix_kernel`, and only when the policy
-/// has been left at its default, so benchmark scripts keep working.
-pub(crate) fn use_compact_csc_kernel() -> bool {
-    std::env::var("GRAPH_COMPILED_KERNEL").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "compact" | "csc" | "compact-csc" | "rust-csc"
-        )
-    })
 }
 
 fn graphblas_replica_count(csc: &GraphBlasCsc) -> usize {
@@ -1397,18 +1288,12 @@ fn build_transposed_matrix(csc: &GraphBlasCsc) -> Result<Matrix> {
                 "GrB_Matrix_import_BOOL",
             )?;
             let matrix = Matrix(raw);
-            check(
-                GrB_Matrix_wait(matrix.0, GRB_MATERIALIZE),
-                "GrB_Matrix_wait",
-            )?;
+            check(GrB_Matrix_wait(matrix.0, GRB_MATERIALIZE), "GrB_Matrix_wait")?;
             return Ok(matrix);
         }
     }
     unsafe {
-        check(
-            GrB_Matrix_new(&mut raw, GrB_BOOL, dimension, dimension),
-            "GrB_Matrix_new",
-        )?;
+        check(GrB_Matrix_new(&mut raw, GrB_BOOL, dimension, dimension), "GrB_Matrix_new")?;
     }
     Ok(Matrix(raw))
 }
@@ -1417,10 +1302,7 @@ fn build_degree_vector(csc: &GraphBlasCsc) -> Result<Vector> {
     let dimension = csc.vertices.len() as GrBIndex;
     let mut raw = null_mut();
     unsafe {
-        check(
-            GrB_Vector_new(&mut raw, GrB_UINT64, dimension),
-            "GrB_Vector_new",
-        )?;
+        check(GrB_Vector_new(&mut raw, GrB_UINT64, dimension), "GrB_Vector_new")?;
     }
     let vector = Vector(raw);
     let mut indices = Vec::new();
@@ -1445,10 +1327,7 @@ fn build_degree_vector(csc: &GraphBlasCsc) -> Result<Vector> {
                 ),
                 "GrB_Vector_build_UINT64",
             )?;
-            check(
-                GrB_Vector_wait(vector.0, GRB_MATERIALIZE),
-                "GrB_Vector_wait",
-            )?;
+            check(GrB_Vector_wait(vector.0, GRB_MATERIALIZE), "GrB_Vector_wait")?;
         }
     }
     Ok(vector)
@@ -1457,10 +1336,7 @@ fn build_degree_vector(csc: &GraphBlasCsc) -> Result<Vector> {
 fn vector_from_ordinals(dimension: GrBIndex, ordinals: &[GrBIndex]) -> Result<Vector> {
     let mut raw = null_mut();
     unsafe {
-        check(
-            GrB_Vector_new(&mut raw, GrB_BOOL, dimension),
-            "GrB_Vector_new",
-        )?;
+        check(GrB_Vector_new(&mut raw, GrB_BOOL, dimension), "GrB_Vector_new")?;
     }
     let vector = Vector(raw);
     if ordinals.is_empty() {
@@ -1469,13 +1345,7 @@ fn vector_from_ordinals(dimension: GrBIndex, ordinals: &[GrBIndex]) -> Result<Ve
     let values = vec![true; ordinals.len()];
     unsafe {
         check(
-            GrB_Vector_build_BOOL(
-                vector.0,
-                ordinals.as_ptr(),
-                values.as_ptr(),
-                ordinals.len() as GrBIndex,
-                GrB_LOR,
-            ),
+            GrB_Vector_build_BOOL(vector.0, ordinals.as_ptr(), values.as_ptr(), ordinals.len() as GrBIndex, GrB_LOR),
             "GrB_Vector_build_BOOL",
         )?;
     }
@@ -1499,13 +1369,7 @@ fn reset_bool_vector(vector: &mut Vector, ordinals: &[GrBIndex]) -> Result<()> {
     let values = vec![true; ordinals.len()];
     unsafe {
         check(
-            GrB_Vector_build_BOOL(
-                vector.0,
-                ordinals.as_ptr(),
-                values.as_ptr(),
-                ordinals.len() as GrBIndex,
-                GrB_LOR,
-            ),
+            GrB_Vector_build_BOOL(vector.0, ordinals.as_ptr(), values.as_ptr(), ordinals.len() as GrBIndex, GrB_LOR),
             "GrB_Vector_build_BOOL",
         )?;
     }
@@ -1515,36 +1379,17 @@ fn reset_bool_vector(vector: &mut Vector, ordinals: &[GrBIndex]) -> Result<()> {
 fn uint64_vector(dimension: GrBIndex) -> Result<Vector> {
     let mut raw = null_mut();
     unsafe {
-        check(
-            GrB_Vector_new(&mut raw, GrB_UINT64, dimension),
-            "GrB_Vector_new",
-        )?;
+        check(GrB_Vector_new(&mut raw, GrB_UINT64, dimension), "GrB_Vector_new")?;
     }
     Ok(Vector(raw))
 }
 
-fn masked_multiply(
-    matrix: &Matrix,
-    input: &Vector,
-    seen: &Vector,
-    dimension: GrBIndex,
-) -> Result<Vector> {
+fn masked_multiply(matrix: &Matrix, input: &Vector, seen: &Vector, dimension: GrBIndex) -> Result<Vector> {
     let mut raw = null_mut();
     unsafe {
+        check(GrB_Vector_new(&mut raw, GrB_BOOL, dimension), "GrB_Vector_new")?;
         check(
-            GrB_Vector_new(&mut raw, GrB_BOOL, dimension),
-            "GrB_Vector_new",
-        )?;
-        check(
-            GrB_mxv(
-                raw,
-                seen.0,
-                null_mut(),
-                GrB_LOR_LAND_SEMIRING_BOOL,
-                matrix.0,
-                input.0,
-                GrB_DESC_SC,
-            ),
+            GrB_mxv(raw, seen.0, null_mut(), GrB_LOR_LAND_SEMIRING_BOOL, matrix.0, input.0, GrB_DESC_SC),
             "GrB_mxv",
         )?;
     }
@@ -1554,10 +1399,7 @@ fn masked_multiply(
 fn multiply(matrix: &Matrix, input: &Vector, dimension: GrBIndex) -> Result<Vector> {
     let mut raw = null_mut();
     unsafe {
-        check(
-            GrB_Vector_new(&mut raw, GrB_BOOL, dimension),
-            "GrB_Vector_new",
-        )?;
+        check(GrB_Vector_new(&mut raw, GrB_BOOL, dimension), "GrB_Vector_new")?;
         check(
             GrB_mxv(
                 raw,
@@ -1575,12 +1417,7 @@ fn multiply(matrix: &Matrix, input: &Vector, dimension: GrBIndex) -> Result<Vect
 }
 
 #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
-fn multiply_into(
-    matrix: &Matrix,
-    input: &Vector,
-    output: &mut Vector,
-    descriptor: GrBDescriptor,
-) -> Result<()> {
+fn multiply_into(matrix: &Matrix, input: &Vector, output: &mut Vector, descriptor: GrBDescriptor) -> Result<()> {
     clear_vector(output)?;
     unsafe {
         check(
@@ -1602,15 +1439,7 @@ fn multiply_into(
 fn union_into(seen: &mut Vector, next: &Vector) -> Result<()> {
     unsafe {
         check(
-            GrB_Vector_eWiseAdd_BinaryOp(
-                seen.0,
-                null_mut(),
-                null_mut(),
-                GrB_LOR,
-                seen.0,
-                next.0,
-                null_mut(),
-            ),
+            GrB_Vector_eWiseAdd_BinaryOp(seen.0, null_mut(), null_mut(), GrB_LOR, seen.0, next.0, null_mut()),
             "GrB_Vector_eWiseAdd_BinaryOp",
         )?;
     }
@@ -1639,13 +1468,7 @@ fn frontier_edge_visits_graphblas(
         )?;
         let mut edge_visits = 0_u64;
         check(
-            GrB_Vector_reduce_UINT64(
-                &mut edge_visits,
-                null_mut(),
-                GrB_PLUS_MONOID_UINT64,
-                scratch.0,
-                descriptor,
-            ),
+            GrB_Vector_reduce_UINT64(&mut edge_visits, null_mut(), GrB_PLUS_MONOID_UINT64, scratch.0, descriptor),
             "GrB_Vector_reduce_UINT64",
         )?;
         Ok(edge_visits)
@@ -1677,12 +1500,7 @@ fn extract_ordinals(vector: &Vector) -> Result<Vec<GrBIndex>> {
     let mut capacity = nvals;
     unsafe {
         check(
-            GrB_Vector_extractTuples_BOOL(
-                indices.as_mut_ptr(),
-                null_mut(),
-                &mut capacity,
-                vector.0,
-            ),
+            GrB_Vector_extractTuples_BOOL(indices.as_mut_ptr(), null_mut(), &mut capacity, vector.0),
             "GrB_Vector_extractTuples_BOOL",
         )?;
     }
@@ -1690,7 +1508,7 @@ fn extract_ordinals(vector: &Vector) -> Result<Vec<GrBIndex>> {
     Ok(indices)
 }
 
-fn check(info: GrBInfo, operation: &'static str) -> Result<()> {
+pub(super) fn check(info: GrBInfo, operation: &'static str) -> Result<()> {
     if info == GRB_SUCCESS {
         return Ok(());
     }
@@ -1704,10 +1522,7 @@ fn validate_csc(csc: &GraphBlasCsc) -> Result<()> {
     if csc.vertices.len() as u64 > GRB_INDEX_MAX {
         return Err(GraphError::SparseKernel {
             backend: "SuiteSparseGraphBlas",
-            reason: format!(
-                "{} local vertices exceed GraphBLAS index limit",
-                csc.vertices.len()
-            ),
+            reason: format!("{} local vertices exceed GraphBLAS index limit", csc.vertices.len()),
         });
     }
     if csc.pointers.len() != csc.vertices.len() + 1 {
@@ -1745,12 +1560,7 @@ fn validate_csc(csc: &GraphBlasCsc) -> Result<()> {
         });
     }
     let dimension = csc.vertices.len() as u64;
-    if let Some(index) = csc
-        .indices
-        .iter()
-        .copied()
-        .find(|index| *index >= dimension)
-    {
+    if let Some(index) = csc.indices.iter().copied().find(|index| *index >= dimension) {
         return Err(GraphError::SparseKernel {
             backend: "SuiteSparseGraphBlas",
             reason: format!("CSC row index {index} exceeds dimension {dimension}"),
@@ -1767,11 +1577,7 @@ fn validate_csc(csc: &GraphBlasCsc) -> Result<()> {
     Ok(())
 }
 
-fn validate_compact_u32_csc(
-    vertices: &[VertexId],
-    pointers: &[u32],
-    indices: &[u32],
-) -> Result<()> {
+fn validate_compact_u32_csc(vertices: &[VertexId], pointers: &[u32], indices: &[u32]) -> Result<()> {
     if pointers.len() != vertices.len() + 1 {
         return Err(GraphError::SparseKernel {
             backend: "CompactCsc",
@@ -1806,11 +1612,7 @@ fn validate_compact_u32_csc(
             ),
         });
     }
-    if let Some(index) = indices
-        .iter()
-        .copied()
-        .find(|index| *index as usize >= vertices.len())
-    {
+    if let Some(index) = indices.iter().copied().find(|index| *index as usize >= vertices.len()) {
         return Err(GraphError::SparseKernel {
             backend: "CompactCsc",
             reason: format!("CSC row index {index} exceeds dimension {}", vertices.len()),
@@ -1836,10 +1638,7 @@ impl OrdinalMap {
         if vertices.len() as u64 > GRB_INDEX_MAX {
             return Err(GraphError::SparseKernel {
                 backend: "SuiteSparseGraphBlas",
-                reason: format!(
-                    "{} local vertices exceed GraphBLAS index limit",
-                    vertices.len()
-                ),
+                reason: format!("{} local vertices exceed GraphBLAS index limit", vertices.len()),
             });
         }
         for window in vertices.windows(2) {
@@ -1863,10 +1662,7 @@ impl OrdinalMap {
     }
 
     fn try_ordinal(&self, vertex: VertexId) -> Option<GrBIndex> {
-        self.by_ordinal
-            .binary_search(&vertex)
-            .ok()
-            .map(|idx| idx as GrBIndex)
+        self.by_ordinal.binary_search(&vertex).ok().map(|idx| idx as GrBIndex)
     }
 
     fn vertex(&self, ordinal: GrBIndex) -> Result<VertexId> {

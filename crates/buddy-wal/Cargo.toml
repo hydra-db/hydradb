@@ -1,0 +1,33 @@
+[package]
+name = "hydradb-buddy-wal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Buddy WAL: the owner's durable WAL frontier, streamed to replica graph-nodes"
+publish = false
+
+# No dependency on `hydradb`, `hydradb-graph-slate` or SlateDB: this crate owns
+# the feed's vocabulary (`Frontier`, `FeedEvent`) and its transport. The graph
+# side implements `WriterDirectory`; the binary decides where the route lives.
+
+[features]
+default = []
+# The owner's server-sent-events route.
+server = ["dep:axum"]
+# A replica following its peers' feeds.
+client = ["dep:reqwest", "dep:thiserror", "dep:tracing", "tokio/time", "tokio/macros"]
+
+[dependencies]
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+axum = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["net", "test-util"] }

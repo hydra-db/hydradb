@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hydradb::{
-    QueryTransportTlsServerConfigProvider, ReloadableQueryTransportTlsServerConfigProvider,
-};
+use hydradb::{QueryTransportTlsServerConfigProvider, ReloadableQueryTransportTlsServerConfigProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::ServerConfig;
@@ -31,18 +29,13 @@ fn load_certificate_material(
     let certificate_bytes = std::fs::read(certificate_path)?;
     let private_key_bytes = std::fs::read(private_key_path)?;
     let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let certificates = rustls_pemfile::certs(&mut certificate_reader).collect::<std::result::Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
     }
     let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
-        )
-    })?;
+    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "TLS private key file contains no key"))?;
     let mut fingerprint = DefaultHasher::new();
     certificate_bytes.hash(&mut fingerprint);
     private_key_bytes.hash(&mut fingerprint);
@@ -50,20 +43,14 @@ fn load_certificate_material(
 }
 
 impl FileTlsReloader {
-    pub fn start(
-        certificate_path: &Path,
-        private_key_path: &Path,
-        interval: Duration,
-    ) -> TlsResult<Self> {
+    pub fn start(certificate_path: &Path, private_key_path: &Path, interval: Duration) -> TlsResult<Self> {
         if interval.is_zero() {
             return Err(Error::new(ErrorKind::InvalidInput, "TLS reload interval is zero").into());
         }
         let certificate_path = certificate_path.to_path_buf();
         let private_key_path = private_key_path.to_path_buf();
         let (config, mut fingerprint) = load_server_config(&certificate_path, &private_key_path)?;
-        let provider = Arc::new(ReloadableQueryTransportTlsServerConfigProvider::new(
-            Arc::new(config),
-        ));
+        let provider = Arc::new(ReloadableQueryTransportTlsServerConfigProvider::new(Arc::new(config)));
         let task_provider = Arc::clone(&provider);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -94,11 +81,7 @@ impl FileTlsReloader {
                 }
             }
         });
-        Ok(Self {
-            provider,
-            stop_tx,
-            task,
-        })
+        Ok(Self { provider, stop_tx, task })
     }
 
     pub fn provider(&self) -> Arc<dyn QueryTransportTlsServerConfigProvider> {
@@ -111,25 +94,17 @@ impl FileTlsReloader {
     }
 }
 
-fn load_server_config(
-    certificate_path: &PathBuf,
-    private_key_path: &PathBuf,
-) -> TlsResult<(ServerConfig, u64)> {
+fn load_server_config(certificate_path: &PathBuf, private_key_path: &PathBuf) -> TlsResult<(ServerConfig, u64)> {
     let certificate_bytes = std::fs::read(certificate_path)?;
     let private_key_bytes = std::fs::read(private_key_path)?;
     let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let certificates = rustls_pemfile::certs(&mut certificate_reader).collect::<std::result::Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
     }
     let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
-        )
-    })?;
+    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "TLS private key file contains no key"))?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)?;

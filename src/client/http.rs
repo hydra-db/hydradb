@@ -19,22 +19,28 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::service::{
-    ClientBookmark, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest,
-    ClientQueryService, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
+    ClientBookmark, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
+    ClientReadConsistency,
 };
 use crate::QueryFailureReason;
 use crate::{
-    GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
-    QueryParameterValue, QueryPath, QueryTransportConnectionIdentity,
-    QueryTransportTlsServerConfigProvider, QueryValue, Result, VertexPropertyValue,
+    GqlStatusReport, GraphError, GraphScope, QueryCursorToken, QueryFloat, QueryParameterValue, QueryPath,
+    QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider, QueryValue, Result, VertexPropertyValue,
 };
+#[cfg(feature = "datafusion-cypher-engine")]
+use hydradb_graph_types::{decode_value, CypherValue, RelationshipIdentity, RelationshipRef};
 
-const GRAPH_NAMESPACE_HEADER: &str = "x-graph-namespace";
+use hydradb_scope::http::{HttpScopeError, GRAPH_NAMESPACE_HEADER};
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const DEFAULT_HTTP_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_HTTP_PAGE_SIZE: usize = 256;
 const DEFAULT_HTTP_GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(30);
 const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One sequence for every HTTP listener in the process. Active queries are
+/// keyed by id across the whole query service, so two listeners must never
+/// issue the same one.
+static NEXT_HTTP_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct HttpQueryServerConfig {
@@ -82,10 +88,7 @@ impl HttpQueryServerConfig {
         self
     }
 
-    pub fn with_tls_provider(
-        mut self,
-        provider: Arc<dyn QueryTransportTlsServerConfigProvider>,
-    ) -> Self {
+    pub fn with_tls_provider(mut self, provider: Arc<dyn QueryTransportTlsServerConfigProvider>) -> Self {
         self.tls_config_provider = Some(provider);
         self
     }
@@ -101,10 +104,7 @@ impl HttpQueryServerConfig {
     }
 
     fn validate(&self, service: &ClientQueryService) -> Result<()> {
-        if self.max_body_bytes == 0
-            || self.default_page_size == 0
-            || self.default_page_size > service.max_page_size()
-        {
+        if self.max_body_bytes == 0 || self.default_page_size == 0 || self.default_page_size > service.max_page_size() {
             return http_config_error("HTTP body and page limits are invalid");
         }
         if self.tls_reload_interval.is_zero() {
@@ -139,8 +139,7 @@ impl HttpQueryServerHandle {
     }
 
     pub async fn stop(mut self) -> Result<()> {
-        self.handle
-            .graceful_shutdown(Some(self.graceful_shutdown_timeout));
+        self.handle.graceful_shutdown(Some(self.graceful_shutdown_timeout));
         if let Some(task) = self.tls_reload_task.take() {
             task.abort();
             let _ = task.await;
@@ -171,41 +170,40 @@ impl Drop for HttpQueryServerHandle {
 pub struct ClientHttpServer;
 
 impl ClientHttpServer {
-    pub async fn bind(
+    pub async fn bind(addr: SocketAddr, service: ClientQueryService, config: HttpQueryServerConfig) -> Result<HttpQueryServerHandle> {
+        Self::bind_with_routes(addr, service, config, Router::new()).await
+    }
+
+    /// [`Self::bind`], also serving `extra`: routes owned elsewhere (the buddy
+    /// WAL feed) that need this listener's transport, TLS included, but
+    /// nothing from its state.
+    pub async fn bind_with_routes(
         addr: SocketAddr,
         service: ClientQueryService,
         config: HttpQueryServerConfig,
+        extra: Router,
     ) -> Result<HttpQueryServerHandle> {
         config.validate(&service)?;
-        let listener =
-            std::net::TcpListener::bind(addr).map_err(|err| http_io_error("bind", err))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|err| http_io_error("nonblocking", err))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|err| http_io_error("local_addr", err))?;
+        let listener = std::net::TcpListener::bind(addr).map_err(|err| http_io_error("bind", err))?;
+        listener.set_nonblocking(true).map_err(|err| http_io_error("nonblocking", err))?;
+        let local_addr = listener.local_addr().map_err(|err| http_io_error("local_addr", err))?;
         let state = Arc::new(HttpServerState {
             service,
             default_page_size: config.default_page_size,
             allow_default_namespace: config.allow_default_namespace,
-            next_query_id: AtomicU64::new(1),
         });
         let router = Router::new()
             .route("/healthz", get(health))
             .route("/v1/graphs/{graph_id}/query", post(execute_query))
-            .route(
-                "/v1/graphs/{graph_id}/queries/{query_id}/cancel",
-                post(cancel_query),
-            )
+            .route("/v1/graphs/{graph_id}/queries/{query_id}/cancel", post(cancel_query))
             .layer(DefaultBodyLimit::max(config.max_body_bytes))
-            .with_state(state);
+            .with_state(state)
+            .merge(extra);
         let handle = axum_server::Handle::new();
         let (task, tls_reload_task) = match config.tls_config_provider.clone() {
             Some(provider) => {
                 let generation = provider.generation();
-                let rustls_config =
-                    RustlsConfig::from_config(http_tls_config(provider.current_server_config()?));
+                let rustls_config = RustlsConfig::from_config(http_tls_config(provider.current_server_config()?));
                 let reload_config = rustls_config.clone();
                 let reload_interval = config.tls_reload_interval;
                 let tls_reload_task = tokio::spawn(async move {
@@ -264,9 +262,7 @@ impl ClientHttpServer {
     }
 }
 
-fn http_tls_config(
-    config: Arc<tokio_rustls::rustls::ServerConfig>,
-) -> Arc<tokio_rustls::rustls::ServerConfig> {
+fn http_tls_config(config: Arc<tokio_rustls::rustls::ServerConfig>) -> Arc<tokio_rustls::rustls::ServerConfig> {
     let mut config = (*config).clone();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(config)
@@ -276,7 +272,6 @@ struct HttpServerState {
     service: ClientQueryService,
     default_page_size: usize,
     allow_default_namespace: bool,
-    next_query_id: AtomicU64,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +282,8 @@ struct HttpQueryRequestBody {
     query_id: Option<String>,
     #[serde(default)]
     parameters: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    typed_parameters: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     bookmark: Option<String>,
     #[serde(default)]
@@ -309,9 +306,13 @@ struct HttpQueryResponseBody {
     read_epoch: Option<u64>,
     next_cursor: Option<u64>,
     bookmark: Option<String>,
+    /// The outcome's GQL-status objects (ISO/IEC 39075 §4.9), primary first,
+    /// when the engine reports them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    statuses: Vec<HttpGqlStatus>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 enum HttpQueryValue {
     Null,
@@ -322,7 +323,39 @@ enum HttpQueryValue {
     Boolean(bool),
     String(String),
     List(Vec<HttpQueryValue>),
+    #[cfg(feature = "datafusion-cypher-engine")]
+    Map(BTreeMap<String, HttpQueryValue>),
+    #[cfg(feature = "datafusion-cypher-engine")]
+    Node {
+        id: u64,
+        labels: Vec<String>,
+        properties: BTreeMap<String, HttpQueryValue>,
+    },
+    #[cfg(feature = "datafusion-cypher-engine")]
+    Relationship {
+        id: Option<u64>,
+        start_node_id: u64,
+        end_node_id: u64,
+        relationship_type: String,
+        properties: BTreeMap<String, HttpQueryValue>,
+    },
     Path(QueryPath),
+    /// A record (GQL §4.15.4) as a JSON object.
+    Record(std::collections::BTreeMap<String, HttpQueryValue>),
+    /// Temporal values (GQL §4.16.6) as their ISO 8601 strings.
+    Date(String),
+    LocalTime(String),
+    ZonedTime(String),
+    LocalDatetime(String),
+    ZonedDatetime(String),
+    Duration(String),
+    /// An exact decimal (GQL §4.16.5) as its literal.
+    Decimal(String),
+    /// A byte string (GQL §4.16.4) in hexadecimal.
+    Bytes(String),
+    #[cfg(feature = "datafusion-cypher-engine")]
+    BigInteger(String),
+    GraphValue(Vec<u8>),
 }
 
 #[derive(Serialize)]
@@ -339,6 +372,29 @@ struct HttpErrorBody {
     /// all, and an absent field says that where a `null` would not.
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
+    /// The GQL-status object of an engine error: `gql_status`,
+    /// `description` and `diagnostic_record`, beside `code` and `message`.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    gql: Option<HttpGqlStatus>,
+}
+
+/// A GQL-status object (ISO/IEC 39075 §4.9.2) in an HTTP body.
+#[derive(Clone, Serialize)]
+struct HttpGqlStatus {
+    gql_status: String,
+    description: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    diagnostic_record: BTreeMap<String, String>,
+}
+
+impl From<&GqlStatusReport> for HttpGqlStatus {
+    fn from(status: &GqlStatusReport) -> Self {
+        Self {
+            gql_status: status.gql_status.clone(),
+            description: status.description.clone(),
+            diagnostic_record: status.diagnostic.clone(),
+        }
+    }
 }
 
 struct HttpApiError {
@@ -347,6 +403,9 @@ struct HttpApiError {
     message: String,
     owner: Option<String>,
     authenticate: bool,
+    /// The GQL-status object of an engine error (ISO/IEC 39075 §4.9), boxed
+    /// to keep this error small.
+    gql: Option<Box<GqlStatusReport>>,
 }
 
 impl HttpApiError {
@@ -357,6 +416,7 @@ impl HttpApiError {
             message: "valid bearer authentication is required".to_string(),
             owner: None,
             authenticate: true,
+            gql: None,
         }
     }
 
@@ -365,6 +425,14 @@ impl HttpApiError {
     }
 
     fn from_graph_ref(error: &GraphError) -> Self {
+        let mut api_error = Self::from_graph_class(error);
+        if let GraphError::GqlQuery { status, .. } = error {
+            api_error.gql = Some(status.clone());
+        }
+        api_error
+    }
+
+    fn from_graph_class(error: &GraphError) -> Self {
         match error {
             GraphError::GraphScopeAccessDenied { .. } => Self {
                 status: StatusCode::FORBIDDEN,
@@ -372,6 +440,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
             },
             GraphError::AdmissionRejected { .. } => Self {
                 status: StatusCode::TOO_MANY_REQUESTS,
@@ -379,6 +448,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
             },
             GraphError::QueryTimeout { .. } => Self {
                 status: StatusCode::REQUEST_TIMEOUT,
@@ -386,6 +456,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
             },
             // Touch point (c) for HTTP. 421 Misdirected Request is the honest
             // status: the request reached a node that cannot serve it, and the
@@ -405,6 +476,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
             },
             GraphError::NotCellWriter { owner, .. } => Self {
                 status: StatusCode::MISDIRECTED_REQUEST,
@@ -412,6 +484,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: owner.clone(),
                 authenticate: false,
+                gql: None,
             },
             GraphError::SnapshotUnavailable { .. } => Self {
                 status: StatusCode::CONFLICT,
@@ -419,6 +492,120 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(
+                hydradb_graph_provider::GraphProviderError::Conflict { .. }
+                | hydradb_graph_provider::GraphProviderError::IdempotencyConflict,
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "mutation_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(
+                hydradb_graph_provider::GraphProviderError::DurabilityUnknown { .. }
+                | hydradb_graph_provider::GraphProviderError::DurabilityNotConfirmed,
+            ) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "mutation_outcome_unknown",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(hydradb_graph_provider::GraphProviderError::PartialCompletion { .. }) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "mutation_partial_completion",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(
+                hydradb_graph_provider::GraphProviderError::BudgetExceeded { .. }
+                | hydradb_graph_provider::GraphProviderError::BatchTooLarge { .. },
+            ) => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "resource_exhausted",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(
+                hydradb_graph_provider::GraphProviderError::Cancelled | hydradb_graph_provider::GraphProviderError::DeadlineExceeded,
+            ) => Self {
+                status: StatusCode::REQUEST_TIMEOUT,
+                code: "query_timeout",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(hydradb_graph_provider::GraphProviderError::InvalidRequest(_)) => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_request",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            #[cfg(feature = "datafusion-cypher-engine")]
+            GraphError::DataFusionProvider(
+                hydradb_graph_provider::GraphProviderError::UnsupportedCapability { .. }
+                | hydradb_graph_provider::GraphProviderError::UnsupportedReceiptVersion { .. },
+            ) => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "unsupported_query",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            // Supported, but a write-back of a property it touches has
+            // started and not completed: a retry succeeds once a run of the
+            // property completes, where a 400 says the request is wrong.
+            GraphError::UnsupportedQuery {
+                reason: crate::QueryFailureReason::WriteBackInProgress,
+                ..
+            }
+            | GraphError::GqlQuery {
+                reason: crate::QueryFailureReason::WriteBackInProgress,
+                ..
+            } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "write_back_in_progress",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
+            },
+            // Supported, but the index generation it reads is too far behind
+            // the WAL to check until the indexer publishes a newer one: a
+            // retry succeeds where a 400 says the request is wrong.
+            GraphError::UnsupportedQuery {
+                reason: crate::QueryFailureReason::IndexBehind,
+                ..
+            }
+            | GraphError::GqlQuery {
+                reason: crate::QueryFailureReason::IndexBehind,
+                ..
+            } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "index_behind",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+                gql: None,
             },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
@@ -426,6 +613,7 @@ impl HttpApiError {
             | GraphError::QueryParse { .. }
             | GraphError::SnapshotAhead { .. }
             | GraphError::UnsupportedQuery { .. }
+            | GraphError::GqlQuery { .. }
             | GraphError::UnclassifiedQuery { .. }
             | GraphError::BatchValueConflict { .. } => Self {
                 status: StatusCode::BAD_REQUEST,
@@ -433,6 +621,7 @@ impl HttpApiError {
                 message: error.to_string(),
                 owner: None,
                 authenticate: false,
+                gql: None,
             },
             _ => {
                 tracing::warn!(target: "hydradb", error = %error, "HTTP suppressed internal graph error");
@@ -442,6 +631,7 @@ impl HttpApiError {
                     message: "internal query execution error".to_string(),
                     owner: None,
                     authenticate: false,
+                    gql: None,
                 }
             }
         }
@@ -450,6 +640,11 @@ impl HttpApiError {
 
 impl IntoResponse for HttpApiError {
     fn into_response(self) -> Response {
+        // The owner also goes in a header on a 421, so the turbolay proxy can
+        // retry at the owner from the response head, before any body is read.
+        let owner_header = (self.status == StatusCode::MISDIRECTED_REQUEST)
+            .then(|| self.owner.as_deref().and_then(|owner| HeaderValue::from_str(owner).ok()))
+            .flatten();
         let mut response = (
             self.status,
             Json(HttpErrorEnvelope {
@@ -457,19 +652,20 @@ impl IntoResponse for HttpApiError {
                     code: self.code,
                     message: self.message,
                     owner: self.owner,
+                    gql: self.gql.as_deref().map(HttpGqlStatus::from),
                 },
             }),
         )
             .into_response();
-        if self.authenticate {
-            response.headers_mut().insert(
-                WWW_AUTHENTICATE,
-                HeaderValue::from_static("Bearer realm=\"slatedb-graph\""),
-            );
+        if let Some(owner) = owner_header {
+            response.headers_mut().insert(hydradb_protocol::http::GRAPH_OWNER_HEADER, owner);
         }
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if self.authenticate {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"slatedb-graph\""));
+        }
+        response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         response
     }
 }
@@ -499,19 +695,43 @@ async fn execute_query_inner(
     let session = authenticate_http(&state.service, headers)?;
     let scope = http_graph_scope(headers, graph_id, state.allow_default_namespace)?;
     let target = ClientQueryTarget::new(scope, body.cell_id).map_err(HttpApiError::from_graph)?;
-    let query_id = body.query_id.unwrap_or_else(|| {
-        format!(
-            "http-query-{}",
-            state.next_query_id.fetch_add(1, Ordering::Relaxed)
-        )
-    });
-    let parameters = body
+    let query_id = body
+        .query_id
+        .unwrap_or_else(|| format!("http-query-{}", NEXT_HTTP_QUERY_ID.fetch_add(1, Ordering::Relaxed)));
+    if let Some(name) = body.parameters.keys().find(|name| body.typed_parameters.contains_key(*name)) {
+        return Err(HttpApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "duplicate_parameter",
+            message: format!("parameter ${name} occurs in both parameters and typed_parameters"),
+            owner: None,
+            authenticate: false,
+            gql: None,
+        });
+    }
+    let mut parameters = body
         .parameters
         .iter()
         .map(|(name, value)| Ok((name.clone(), http_parameter_to_query_value(name, value)?)))
         .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?;
-    let mut request =
-        ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
+    parameters.extend(
+        body.typed_parameters
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), http_typed_parameter_to_query_value(name, value)?)))
+            .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?,
+    );
+    let mut request = ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
+    let page_size = body.page_size.unwrap_or(state.default_page_size);
+    let cursor = body.cursor.map(QueryCursorToken::new);
+    #[cfg(feature = "query-telemetry")]
+    {
+        request.protocol = "http";
+    }
+    if let Some(value) = headers.get("X-HydraDB-Correlation-Id").and_then(|value| value.to_str().ok()) {
+        request = request.with_correlation_id(value);
+    }
+    if let Some(value) = headers.get("X-HydraDB-Caller-Step").and_then(|value| value.to_str().ok()) {
+        request = request.with_caller_step(value);
+    }
     if let Some(consistency) = body.consistency {
         request = request.with_consistency(consistency);
     }
@@ -519,13 +739,17 @@ async fn execute_query_inner(
         let error = GraphError::UnsupportedQuery {
             reason: QueryFailureReason::InvalidRequest,
             dialect: "HTTP",
-            feature: "read_epoch is not a storage snapshot selector; use bookmark for causal reads"
-                .to_string(),
+            feature: "read_epoch is not a storage snapshot selector; use bookmark for causal reads".to_string(),
         };
-        state.service.record_request_failure(
+        state
+            .service
+            .record_request_failure(crate::QueryFailureStage::Prepare, &error, state.service.cypher_engine());
+        state.service.report_rejected_page(
+            &request,
             crate::QueryFailureStage::Prepare,
             &error,
-            state.service.cypher_engine(),
+            Some(page_size),
+            cursor.is_some(),
         );
         return Err(HttpApiError::from_graph(error));
     }
@@ -533,15 +757,28 @@ async fn execute_query_inner(
         request = request.with_timeout_ms(timeout_ms);
     }
     if let Some(bookmark) = body.bookmark {
-        request = request
-            .after_bookmark(ClientBookmark::parse(&bookmark).map_err(HttpApiError::from_graph)?);
+        let bookmark = ClientBookmark::parse(&bookmark).map_err(|error| {
+            state.service.report_rejected_page(
+                &request,
+                crate::QueryFailureStage::Prepare,
+                &error,
+                Some(page_size),
+                cursor.is_some(),
+            );
+            HttpApiError::from_graph(error)
+        })?;
+        request = request.after_bookmark(bookmark);
     }
-    let page_size = body.page_size.unwrap_or(state.default_page_size);
-    let cursor = body.cursor.map(QueryCursorToken::new);
-    let runtime_limit_ms = state
-        .service
-        .effective_runtime_limit_ms(request.max_runtime_ms)
-        .map_err(HttpApiError::from_graph)?;
+    let runtime_limit_ms = state.service.effective_runtime_limit_ms(request.max_runtime_ms).map_err(|error| {
+        state.service.report_rejected_page(
+            &request,
+            crate::QueryFailureStage::Prepare,
+            &error,
+            Some(page_size),
+            cursor.is_some(),
+        );
+        HttpApiError::from_graph(error)
+    })?;
     request.max_runtime_ms = Some(runtime_limit_ms);
     let query_deadline = Instant::now() + Duration::from_millis(runtime_limit_ms);
     let first_page = state
@@ -566,9 +803,7 @@ async fn execute_query_inner(
     let response = http_query_response(first_page).map_err(HttpApiError::from_graph)?;
     // `Json::into_response` serializes eagerly, so this is the whole encode.
     let response = with_no_store((StatusCode::OK, Json(response)).into_response());
-    state
-        .service
-        .record_serialization(serialize_started.elapsed(), rows);
+    state.service.record_serialization(serialize_started.elapsed(), rows);
     Ok(response)
 }
 
@@ -591,17 +826,12 @@ async fn cancel_query(
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-fn authenticate_http(
-    service: &ClientQueryService,
-    headers: &HeaderMap,
-) -> std::result::Result<ClientQuerySession, HttpApiError> {
+fn authenticate_http(service: &ClientQueryService, headers: &HeaderMap) -> std::result::Result<ClientQuerySession, HttpApiError> {
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(HttpApiError::unauthenticated)?;
-    let (scheme, token) = value
-        .split_once(' ')
-        .ok_or_else(HttpApiError::unauthenticated)?;
+    let (scheme, token) = value.split_once(' ').ok_or_else(HttpApiError::unauthenticated)?;
     if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
         return Err(HttpApiError::unauthenticated());
     }
@@ -613,56 +843,30 @@ fn authenticate_http(
         .map_err(|_| HttpApiError::unauthenticated())
 }
 
-fn http_graph_scope(
-    headers: &HeaderMap,
-    graph_id: String,
-    allow_default_namespace: bool,
-) -> std::result::Result<GraphScope, HttpApiError> {
-    let namespace = match headers
-        .get(GRAPH_NAMESPACE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(namespace) => NamespacePath::new(
-            namespace
-                .split('/')
-                .map(|segment| NamespaceId::new(segment.to_string()))
-                .collect::<Result<Vec<_>>>()
-                .map_err(HttpApiError::from_graph)?,
-        )
-        .map_err(HttpApiError::from_graph)?,
-        None if allow_default_namespace => NamespacePath::default(),
-        None => {
-            return Err(HttpApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "missing_namespace",
-                message: format!("{GRAPH_NAMESPACE_HEADER} header is required"),
-                owner: None,
-                authenticate: false,
-            })
-        }
-    };
-    Ok(GraphScope::new(
-        namespace,
-        GraphId::new(graph_id).map_err(HttpApiError::from_graph)?,
-    ))
+fn http_graph_scope(headers: &HeaderMap, graph_id: String, allow_default_namespace: bool) -> std::result::Result<GraphScope, HttpApiError> {
+    let namespace = headers.get(GRAPH_NAMESPACE_HEADER).and_then(|value| value.to_str().ok());
+    hydradb_scope::http::http_graph_scope(namespace, &graph_id, allow_default_namespace).map_err(|error| match error {
+        HttpScopeError::MissingNamespace => HttpApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "missing_namespace",
+            message: format!("{GRAPH_NAMESPACE_HEADER} header is required"),
+            owner: None,
+            authenticate: false,
+            gql: None,
+        },
+        HttpScopeError::Invalid(error) => HttpApiError::from_graph(error.into()),
+    })
 }
 
 fn accepts_ndjson(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|value| {
-            value
-                .split(',')
-                .any(|media_type| media_type.trim().starts_with(NDJSON_CONTENT_TYPE))
-        })
+    headers.get_all(ACCEPT).iter().filter_map(|value| value.to_str().ok()).any(|value| {
+        value
+            .split(',')
+            .any(|media_type| media_type.trim().starts_with(NDJSON_CONTENT_TYPE))
+    })
 }
 
-fn http_parameter_to_property(
-    name: &str,
-    value: &serde_json::Value,
-) -> std::result::Result<VertexPropertyValue, HttpApiError> {
+fn http_parameter_to_property(name: &str, value: &serde_json::Value) -> std::result::Result<VertexPropertyValue, HttpApiError> {
     match value {
         serde_json::Value::Bool(value) => Ok(VertexPropertyValue::Bool(*value)),
         serde_json::Value::Number(value) => {
@@ -684,10 +888,21 @@ fn http_parameter_to_property(
     }
 }
 
-fn http_parameter_to_query_value(
-    name: &str,
-    value: &serde_json::Value,
-) -> std::result::Result<QueryParameterValue, HttpApiError> {
+fn http_typed_parameter_to_property(name: &str, value: &serde_json::Value) -> std::result::Result<VertexPropertyValue, HttpApiError> {
+    VertexPropertyValue::from_typed_json_value(value).map_err(|_| invalid_http_parameter(name))
+}
+
+fn http_typed_parameter_to_query_value(name: &str, value: &serde_json::Value) -> std::result::Result<QueryParameterValue, HttpApiError> {
+    let property = http_typed_parameter_to_property(name, value)?;
+    Ok(match property {
+        VertexPropertyValue::List(values) => {
+            QueryParameterValue::List(values.into_property_values().into_iter().map(QueryParameterValue::Scalar).collect())
+        }
+        property => QueryParameterValue::Scalar(property),
+    })
+}
+
+fn http_parameter_to_query_value(name: &str, value: &serde_json::Value) -> std::result::Result<QueryParameterValue, HttpApiError> {
     http_parameter_to_query_value_at_depth(name, value, 0)
 }
 
@@ -707,12 +922,7 @@ fn http_parameter_to_query_value_at_depth(
             .map(QueryParameterValue::List),
         serde_json::Value::Object(values) => values
             .iter()
-            .map(|(key, value)| {
-                Ok((
-                    key.clone(),
-                    http_parameter_to_query_value_at_depth(name, value, depth + 1)?,
-                ))
-            })
+            .map(|(key, value)| Ok((key.clone(), http_parameter_to_query_value_at_depth(name, value, depth + 1)?)))
             .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()
             .map(QueryParameterValue::Map),
         _ => http_parameter_to_property(name, value).map(QueryParameterValue::Scalar),
@@ -728,32 +938,24 @@ fn invalid_http_parameter(name: &str) -> HttpApiError {
         ),
         owner: None,
         authenticate: false,
+        gql: None,
     }
 }
 
 fn http_query_response(page: ClientQueryPage) -> Result<HttpQueryResponseBody> {
     Ok(HttpQueryResponseBody {
         query_id: page.query_id,
-        columns: page
-            .page
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
+        columns: page.page.columns.iter().map(|column| column.name.clone()).collect(),
         rows: page
             .page
             .rows
             .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .map(http_query_value)
-                    .collect::<Result<Vec<_>>>()
-            })
+            .map(|row| row.values.iter().map(http_query_value).collect::<Result<Vec<_>>>())
             .collect::<Result<Vec<_>>>()?,
         read_epoch: page.read_epoch,
         next_cursor: page.page.next_cursor.map(|cursor| cursor.offset),
         bookmark: page.bookmark.map(|bookmark| bookmark.encode()),
+        statuses: page.page.statuses.iter().map(HttpGqlStatus::from).collect(),
     })
 }
 
@@ -765,23 +967,176 @@ fn http_query_value(value: &QueryValue) -> Result<HttpQueryValue> {
         QueryValue::Bool(value) => Ok(HttpQueryValue::Boolean(*value)),
         QueryValue::Float(value) if value.0.is_finite() => Ok(HttpQueryValue::Float(value.0)),
         QueryValue::Float(_) => Err(non_finite_json_error()),
-        QueryValue::Property(value) => match value {
-            VertexPropertyValue::Integer(value) => Ok(HttpQueryValue::Integer(*value)),
-            VertexPropertyValue::SignedInteger(value) => Ok(HttpQueryValue::SignedInteger(*value)),
-            VertexPropertyValue::Bool(value) => Ok(HttpQueryValue::Boolean(*value)),
-            VertexPropertyValue::Float(value) if value.0.is_finite() => {
-                Ok(HttpQueryValue::Float(value.0))
-            }
-            VertexPropertyValue::Float(_) => Err(non_finite_json_error()),
-            VertexPropertyValue::String(value) => Ok(HttpQueryValue::String(value.clone())),
-        },
+        QueryValue::Property(value) => http_property_value(value),
         QueryValue::List(values) => values
             .iter()
             .map(http_query_value)
             .collect::<Result<Vec<_>>>()
             .map(HttpQueryValue::List),
         QueryValue::Path(path) => Ok(HttpQueryValue::Path(path.as_ref().clone())),
+        QueryValue::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), http_query_value(value)?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()
+            .map(HttpQueryValue::Record),
+        QueryValue::Decimal(text) => Ok(HttpQueryValue::Decimal(text.clone())),
+        QueryValue::Bytes(bytes) => Ok(HttpQueryValue::Bytes(hydradb_cypher_ast::bytes::hex(bytes))),
+        QueryValue::Temporal(temporal) => {
+            use crate::query::algebra::QueryTemporalKind;
+            let text = temporal.text.clone();
+            Ok(match temporal.kind {
+                QueryTemporalKind::Date { .. } => HttpQueryValue::Date(text),
+                QueryTemporalKind::LocalTime { .. } => HttpQueryValue::LocalTime(text),
+                QueryTemporalKind::ZonedTime { .. } => HttpQueryValue::ZonedTime(text),
+                QueryTemporalKind::LocalDatetime { .. } => HttpQueryValue::LocalDatetime(text),
+                QueryTemporalKind::ZonedDatetime { .. } => HttpQueryValue::ZonedDatetime(text),
+                QueryTemporalKind::Duration { .. } => HttpQueryValue::Duration(text),
+            })
+        }
+        #[cfg(feature = "datafusion-cypher-engine")]
+        QueryValue::GraphValue(bytes) => {
+            let value = decode_value(bytes).map_err(|error| GraphError::CorruptValue {
+                key: "query/datafusion/http_value".to_string(),
+                reason: error.to_string(),
+            })?;
+            http_graph_value(value)
+        }
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        QueryValue::GraphValue(bytes) => Ok(HttpQueryValue::GraphValue(bytes.clone())),
     }
+}
+
+fn http_property_value(value: &VertexPropertyValue) -> Result<HttpQueryValue> {
+    Ok(match value {
+        VertexPropertyValue::Integer(value) => HttpQueryValue::Integer(*value),
+        VertexPropertyValue::SignedInteger(value) => HttpQueryValue::SignedInteger(*value),
+        VertexPropertyValue::Bool(value) => HttpQueryValue::Boolean(*value),
+        VertexPropertyValue::Float(value) if value.0.is_finite() => HttpQueryValue::Float(value.0),
+        VertexPropertyValue::Float(_) => return Err(non_finite_json_error()),
+        VertexPropertyValue::String(value) => HttpQueryValue::String(value.clone()),
+        VertexPropertyValue::Date(days) => http_date(*days)?,
+        VertexPropertyValue::List(values) => HttpQueryValue::List(match values {
+            crate::VertexPropertyList::Empty => Vec::new(),
+            crate::VertexPropertyList::Integer(values) => values
+                .iter()
+                .map(|value| match value {
+                    crate::VertexPropertyInteger::Unsigned(value) => HttpQueryValue::Integer(*value),
+                    crate::VertexPropertyInteger::Signed(value) => HttpQueryValue::SignedInteger(*value),
+                })
+                .collect(),
+            crate::VertexPropertyList::Bool(values) => values.iter().copied().map(HttpQueryValue::Boolean).collect(),
+            crate::VertexPropertyList::Float(values) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .0
+                        .is_finite()
+                        .then_some(HttpQueryValue::Float(value.0))
+                        .ok_or_else(non_finite_json_error)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            crate::VertexPropertyList::String(values) => values.iter().cloned().map(HttpQueryValue::String).collect(),
+            crate::VertexPropertyList::Date(values) => values
+                .iter()
+                .map(|value| http_property_value(&VertexPropertyValue::Date(*value)))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+    })
+}
+
+#[cfg(feature = "datafusion-cypher-engine")]
+fn http_graph_value(value: CypherValue) -> Result<HttpQueryValue> {
+    match value {
+        CypherValue::Null | CypherValue::Missing => Ok(HttpQueryValue::Null),
+        CypherValue::Boolean(value) => Ok(HttpQueryValue::Boolean(value)),
+        CypherValue::Integer(value) => {
+            if let Ok(value) = u64::try_from(value) {
+                Ok(HttpQueryValue::Integer(value))
+            } else if let Ok(value) = i64::try_from(value) {
+                Ok(HttpQueryValue::SignedInteger(value))
+            } else {
+                Ok(HttpQueryValue::BigInteger(value.to_string()))
+            }
+        }
+        CypherValue::Float(value) if value.is_finite() => Ok(HttpQueryValue::Float(value)),
+        CypherValue::Float(_) => Err(non_finite_json_error()),
+        CypherValue::String(value) => Ok(HttpQueryValue::String(value)),
+        CypherValue::Decimal(value) => Ok(HttpQueryValue::Decimal(value)),
+        CypherValue::Bytes(value) => Ok(HttpQueryValue::Bytes(hydradb_cypher_ast::bytes::hex(&value))),
+        CypherValue::Date(value) => http_date(value.days_since_epoch),
+        CypherValue::List(values) => values
+            .into_iter()
+            .map(http_graph_value)
+            .collect::<Result<Vec<_>>>()
+            .map(HttpQueryValue::List),
+        CypherValue::Map(values) => values
+            .into_iter()
+            .map(|(key, value)| Ok((key, http_graph_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(HttpQueryValue::Map),
+        CypherValue::Record(values) => values
+            .into_iter()
+            .map(|(key, value)| Ok((key, http_graph_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(HttpQueryValue::Record),
+        CypherValue::Temporal(value) => Ok(match value {
+            hydradb_graph_types::CypherTemporal::Date { text, .. } => HttpQueryValue::Date(text),
+            hydradb_graph_types::CypherTemporal::LocalTime { text, .. } => HttpQueryValue::LocalTime(text),
+            hydradb_graph_types::CypherTemporal::ZonedTime { text, .. } => HttpQueryValue::ZonedTime(text),
+            hydradb_graph_types::CypherTemporal::LocalDateTime { text, .. } => HttpQueryValue::LocalDatetime(text),
+            hydradb_graph_types::CypherTemporal::ZonedDateTime { text, .. } => HttpQueryValue::ZonedDatetime(text),
+            hydradb_graph_types::CypherTemporal::Duration { text, .. } => HttpQueryValue::Duration(text),
+        }),
+        CypherValue::Node(id) => Ok(HttpQueryValue::Node {
+            id: id.0,
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        }),
+        CypherValue::NodeEntity(node) => Ok(HttpQueryValue::Node {
+            id: node.id.0,
+            labels: node.labels,
+            properties: node
+                .properties
+                .into_iter()
+                .map(|(key, value)| Ok((key, http_graph_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        }),
+        CypherValue::Relationship(relationship) => http_relationship_value(relationship, BTreeMap::new()),
+        CypherValue::RelationshipEntity(relationship) => http_relationship_value(relationship.identity, relationship.properties),
+        other => hydradb_graph_types::encode_value(&other)
+            .map(HttpQueryValue::GraphValue)
+            .map_err(|error| GraphError::CorruptValue {
+                key: "query/datafusion/http_value".to_string(),
+                reason: error.to_string(),
+            }),
+    }
+}
+
+fn http_date(days_since_epoch: i32) -> Result<HttpQueryValue> {
+    crate::core::model::date_iso_string(days_since_epoch)
+        .map(HttpQueryValue::Date)
+        .ok_or_else(|| GraphError::CorruptValue {
+            key: "query/http/date".into(),
+            reason: format!("epoch day {days_since_epoch} is outside the supported calendar range"),
+        })
+}
+
+#[cfg(feature = "datafusion-cypher-engine")]
+fn http_relationship_value(relationship: RelationshipRef, properties: BTreeMap<String, CypherValue>) -> Result<HttpQueryValue> {
+    let id = match relationship.identity() {
+        RelationshipIdentity::Identified(id) => Some(id.0),
+        RelationshipIdentity::Structural { .. } => None,
+    };
+    Ok(HttpQueryValue::Relationship {
+        id,
+        start_node_id: relationship.source().0,
+        end_node_id: relationship.destination().0,
+        relationship_type: relationship.relationship_type().to_string(),
+        properties: properties
+            .into_iter()
+            .map(|(key, value)| Ok((key, http_graph_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?,
+    })
 }
 
 fn non_finite_json_error() -> GraphError {
@@ -802,6 +1157,9 @@ struct NdjsonQueryState {
     runtime_limit_ms: u64,
     lines: VecDeque<Bytes>,
     done: bool,
+    /// The outcome's GQL-status objects, from the first page; sent in the
+    /// summary line.
+    statuses: Vec<GqlStatusReport>,
 }
 
 fn ndjson_response(
@@ -824,6 +1182,7 @@ fn ndjson_response(
         runtime_limit_ms,
         lines: VecDeque::new(),
         done: false,
+        statuses: first_page.page.statuses.clone(),
     };
     enqueue_ndjson_header(&mut state, &first_page)?;
     enqueue_ndjson_rows(&mut state, &first_page)?;
@@ -839,25 +1198,26 @@ fn ndjson_response(
             if state.done {
                 return None;
             }
-            let remaining_runtime_ms =
-                match remaining_http_runtime_ms(state.deadline, state.runtime_limit_ms) {
-                    Ok(remaining_runtime_ms) => remaining_runtime_ms,
-                    Err(error) => {
-                        enqueue_ndjson_error(&mut state, &error);
-                        state.done = true;
-                        continue;
-                    }
-                };
+            let remaining_runtime_ms = match remaining_http_runtime_ms(state.deadline, state.runtime_limit_ms) {
+                Ok(remaining_runtime_ms) => remaining_runtime_ms,
+                Err(error) => {
+                    state.service.report_rejected_page(
+                        &state.request,
+                        crate::QueryFailureStage::Execute,
+                        &error,
+                        Some(state.page_size),
+                        true,
+                    );
+                    enqueue_ndjson_error(&mut state, &error);
+                    state.done = true;
+                    continue;
+                }
+            };
             state.request.max_runtime_ms = Some(remaining_runtime_ms);
             let cursor = state.next_cursor.take();
             match state
                 .service
-                .execute_page(
-                    &state.session,
-                    state.request.clone(),
-                    cursor,
-                    state.page_size,
-                )
+                .execute_page(&state.session, state.request.clone(), cursor, state.page_size)
                 .await
             {
                 Ok(page) => {
@@ -867,9 +1227,7 @@ fn ndjson_response(
                         enqueue_ndjson_error(&mut state, &error);
                         state.done = true;
                     } else if state.next_cursor.is_none() {
-                        if let Err(error) =
-                            enqueue_ndjson_summary(&mut state, page.bookmark.as_ref())
-                        {
+                        if let Err(error) = enqueue_ndjson_summary(&mut state, page.bookmark.as_ref()) {
                             enqueue_ndjson_error(&mut state, &error);
                         }
                         state.done = true;
@@ -883,10 +1241,9 @@ fn ndjson_response(
         }
     });
     let mut response = Response::new(Body::from_stream(stream));
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
-    );
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson; charset=utf-8"));
     Ok(with_no_store(response))
 }
 
@@ -903,9 +1260,7 @@ fn remaining_http_runtime_ms(deadline: Instant, runtime_limit_ms: u64) -> Result
 }
 
 fn with_no_store(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -923,37 +1278,40 @@ fn enqueue_ndjson_header(state: &mut NdjsonQueryState, page: &ClientQueryPage) -
 
 fn enqueue_ndjson_rows(state: &mut NdjsonQueryState, page: &ClientQueryPage) -> Result<()> {
     for row in &page.page.rows {
-        let values = row
-            .values
-            .iter()
-            .map(http_query_value)
-            .collect::<Result<Vec<_>>>()?;
+        let values = row.values.iter().map(http_query_value).collect::<Result<Vec<_>>>()?;
         enqueue_ndjson(state, &serde_json::json!({"type": "row", "values": values}))?;
     }
     Ok(())
 }
 
-fn enqueue_ndjson_summary(
-    state: &mut NdjsonQueryState,
-    bookmark: Option<&ClientBookmark>,
-) -> Result<()> {
-    enqueue_ndjson(
-        state,
-        &serde_json::json!({
-            "type": "summary",
-            "bookmark": bookmark.map(ClientBookmark::encode),
-            "has_more": false,
-        }),
-    )
+fn enqueue_ndjson_summary(state: &mut NdjsonQueryState, bookmark: Option<&ClientBookmark>) -> Result<()> {
+    let mut summary = serde_json::json!({
+        "type": "summary",
+        "bookmark": bookmark.map(ClientBookmark::encode),
+        "has_more": false,
+    });
+    if !state.statuses.is_empty() {
+        let statuses: Vec<HttpGqlStatus> = state.statuses.iter().map(HttpGqlStatus::from).collect();
+        summary["statuses"] = serde_json::to_value(statuses).map_err(|err| GraphError::CorruptValue {
+            key: "client/http/ndjson".to_string(),
+            reason: err.to_string(),
+        })?;
+    }
+    enqueue_ndjson(state, &summary)
 }
 
 fn enqueue_ndjson_error(state: &mut NdjsonQueryState, error: &GraphError) {
     let api_error = HttpApiError::from_graph_ref(error);
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "type": "error",
         "code": api_error.code,
         "message": api_error.message,
     });
+    if let Some(status) = &api_error.gql {
+        value["gql_status"] = serde_json::json!(status.gql_status);
+        value["description"] = serde_json::json!(status.description);
+        value["diagnostic_record"] = serde_json::json!(status.diagnostic);
+    }
     let _ = enqueue_ndjson(state, &value);
 }
 

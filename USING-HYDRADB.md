@@ -149,46 +149,31 @@ The second call must return one row containing
 **This is the section that catches people.** HydraDB does not behave like
 Neo4j here.
 
-### An id-anchored MATCH does not prove the node exists
+### A node exists while it has a record, labelled or not
 
-`MATCH (n {id: 12345}) RETURN n.id AS id` returns **one row** even when node
-`12345` was never created, and `count(*)` on it returns **1**. The same happens
-immediately after `DETACH DELETE`. Properties come back `null`, but the row is
-there.
+Every node HydraDB stores has a record, and the record is what makes it exist.
+A node keeps its record when you remove its last label or property, so an empty
+node is still a node. Writing an edge creates a record for any endpoint that
+has none. Only `DELETE` / `DETACH DELETE` removes a node.
 
-```text
-MATCH (n {id: 777001}) RETURN n.id AS id     -> [{"type":"vertex_id","value":777001}]   (never created)
-MATCH (n:Person {id: 777001}) RETURN n.id    -> []                                       (correct)
-```
-
-**This affects node-only matches only.** As soon as the pattern contains a
-relationship, an absent id yields no rows, correctly:
+An id in a pattern only names a candidate, so `MATCH (n {id: X})` finds node `X`
+exactly when it exists:
 
 ```text
-MATCH (a {id: 995001}) RETURN a.id AS id            -> 1 phantom row
-MATCH (a {id: 995001})-[:F]->(b) RETURN b.id AS id  -> []            (correct)
+MATCH (n {id: 777001}) RETURN n.id AS id         -> []    (never created, or deleted)
+MATCH (n {id: 777001}) RETURN count(n.id) AS total -> [0]
+MATCH (n {id: 20}) RETURN n.id AS id             -> [20]  (written only as an edge endpoint)
 ```
 
-So `MATCH (a {id: 1})-[:FOLLOWS]->(b)` — the shape used throughout this document
-— is safe. **Anchor on a label whenever the pattern is a bare node**: existence
-checks, "is my id range clean?" checks, and node counts. Written the obvious
-way, those report that everything exists.
+Bare-node existence checks, id-range checks and node counts are therefore safe
+without a label anchor. A `MATCH`-driven write against an absent id, such as
+`MATCH (n {id: X}) SET n.name = 'x'`, matches nothing and writes nothing.
 
-**An unlabelled node is therefore invisible to every existence check.** A node
-created by the edge-batch shape (which cannot write labels) responds to
-`MATCH (n {id: X})` with exactly the same phantom row as an id that was never
-created — byte-identical, verified — and a label-anchored match cannot see it
-either. If a bulk load dies between the edge batch and the label batch, the
-resulting nodes are undetectable by query.
-
-The escape hatch is that **deletes work on ids regardless of labels**:
+To clear an id range you own before seeding, delete by id:
 
 ```cypher
 UNWIND $rows AS row MATCH (n {id: row.id}) DETACH DELETE n
 ```
-
-Clear the id range you own with that before seeding, rather than trying to
-detect what is there.
 
 **`id` is an upsert key, not an ordinary property.** Writing
 `CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})` and then
@@ -633,11 +618,11 @@ UNWIND $rows AS row CREATE (a {id: row.src})-[:FOLLOWS]->(b {id: row.dst})
 ```
 
 **Write the labels first.** Either order produces the same end state, but
-edges-first passes through a window in which the nodes exist *unlabelled* — and
-an unlabelled node is invisible to every existence check and missing from every
-graph-wide count (see above). Crash in that window and the damage is permanent
-and undetectable. Labels-first has no such window: at every instant the graph is
-either missing nodes entirely or fully labelled.
+edges-first passes through a window in which the nodes exist *unlabelled*: they
+are found by id and by an unlabelled `MATCH (n)`, but not by any label-anchored
+match. Crash in that window and you are left with unlabelled nodes to find and
+re-label. Labels-first has no such window: at every instant the graph is either
+missing nodes entirely or fully labelled.
 
 This is safe because **the edge batch does not clobber labels or properties on
 ids that already exist** — verified: a node labelled `:Person` with
@@ -932,6 +917,15 @@ Auto-commit only. Bolt `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected. Each
 [Identity and idempotency](#identity-and-idempotency) — rather than relying on
 rollback.
 
+## Benchmarks
+
+Published latency and throughput numbers are on the
+[HydraDB benchmark site](https://hydra-db.github.io/benchmark/). The benchmark
+harness, its workloads, and the scripts that drive them live in a separate
+repository, [hydra-db/benchmark](https://github.com/hydra-db/benchmark). Clone
+it and follow its `README.md` and `METHODOLOGY.md` to reproduce the measurements
+locally or against S3; the harness drives a `graph-node` built from this tree.
+
 ## Checklist before you ship
 
 - `id` is an upsert key; nodes with the same `id` are the same node
@@ -956,8 +950,8 @@ rollback.
 - Path `properties` use a capitalised tag (`{"String": "x"}`), unlike every
   other cell; path relationship ids are `null`
 - Reading a node id gives `vertex_id`, not `integer`
-- **Anchor existence checks on a label** — `MATCH (n {id: X})` returns a phantom
-  row for ids that do not exist
+- A node exists while it has a record: clearing its labels keeps it, writing an
+  edge creates its endpoints, and only `DELETE` removes it
 - `count(*)` after `OPTIONAL MATCH` counts the null row; use `count(<property>)`
 - Grouped aggregation omits zero-count nodes entirely — default them client-side
 - `maxLen` in the path procedures counts edges

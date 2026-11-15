@@ -6,8 +6,8 @@ executable subset — what to run, what breaks, and what not to do.
 
 ## What this repository is
 
-`slatedb-graph-kernel` (product name **HydraDB**) is a Rust graph database
-built on [SlateDB](https://github.com/usecortex/slatedb). An object store — S3
+`hydradb` (product name **HydraDB**) is a Rust graph database
+built on [SlateDB](https://github.com/hydra-db/slatedb). An object store — S3
 in production, a local directory in development — is the durable source of
 truth. Local SSD/NVMe and memory are caches.
 
@@ -43,8 +43,14 @@ src/sparse_kernel/ Rust sparse traversal and SuiteSparse GraphBLAS FFI
 src/bin/           graph-node and graph-indexer binaries
 crates/placement/  cell placement
 crates/telemetry/  tracing and OTLP export
-examples/          smoke, stress, correctness, benchmark, profiling binaries
-scripts/           local, MinIO, query, stress, and chaos harnesses
+crates/cypher-parser-antlr/
+                    generated Cypher 25 lexer/parser and syntax-tree facade
+crates/cypher-ast/ parser-independent owned Cypher syntax model
+crates/graph-plan/ semantic graph IR, KV physical plan, and plan selection
+crates/cypher-engine/
+                    isolated Cypher preparation and physical-plan interpreter
+scripts/           LAGraph install helper and the runtime smoke test
+query-language/    openCypher and GQL grammar, harness, and the TCK suite
 charts/hydradb/   production Helm chart
 architecture.md    system design and component flows
 ```
@@ -68,7 +74,8 @@ fails on macOS. `just --list` shows every recipe. Common ones:
 
 ```bash
 just native-check   # verify native libs; silent + exit 0 means pass
-just smoke          # local object-store smoke test
+just check          # compile every default-feature target
+just test           # library tests
 just ci             # full CI-equivalent set (long)
 just clippy         # lint the default feature set
 just fmt            # format
@@ -102,12 +109,12 @@ Those lines are not optional decoration.
 
 Every command below runs from the repository root unless stated otherwise.
 
-**Object store.** `just smoke` and `scripts/runtime_smoke.sh` each create and
-configure their own throwaway store, so you do not need to supply one for them.
-Step 7 sets `LOCAL_PATH` to `/tmp/sgk-local/store` for the long-running node,
-deliberately separate so a harness run cannot disturb a server you are keeping
-alive. The `CLOUD_PROVIDER`/`LOCAL_PATH` pair in the env file matters only if
-you run an example directly, e.g. `cargo run --example object_store_smoke`.
+**Object store.** `scripts/runtime_smoke.sh` creates and configures its own
+throwaway store, so you do not need to supply one for it. Step 7 sets
+`LOCAL_PATH` to `/tmp/sgk-local/store` for the long-running node, deliberately
+separate so a harness run cannot disturb a server you are keeping alive. The
+`CLOUD_PROVIDER`/`LOCAL_PATH` pair in the env file matters only when you start a
+node directly, as step 7 does.
 
 **Builds are slow.** Step 4 compiles the dependency tree (~1-3 minutes cold) and
 step 6 compiles again with more features enabled (~1 minute more). Step 7's
@@ -122,7 +129,7 @@ macOS:
 # Check first — `brew list --versions just cmake pkg-config llvm suite-sparse
 # libcypher-parser` lists what you already have. Reinstalling costs minutes.
 xcode-select --install
-brew install just cmake pkg-config llvm suite-sparse coreutils
+brew install just cmake pkg-config llvm suite-sparse
 brew install cleishm/neo4j/libcypher-parser
 
 # Rust, only if `rustup toolchain list` does not already show a stable toolchain:
@@ -169,7 +176,7 @@ mkdir -p /tmp/sgk-store
 printf 'export REPO_ROOT=%q\n' "$PWD" > /tmp/sgk-env.sh
 cat >> /tmp/sgk-env.sh <<'EOF'
 export CLOUD_PROVIDER=local        # only for running examples directly;
-export LOCAL_PATH=/tmp/sgk-store   #   just smoke and runtime_smoke.sh self-configure
+export LOCAL_PATH=/tmp/sgk-store   #   runtime_smoke.sh self-configures
 export RUST_MIN_STACK=33554432     # every platform; the node aborts without it
 export SGK_VENV=/tmp/sgk-venv      # created in step 5; used by steps 6 and 8
 # macOS: scripts call cargo directly and miss the justfile's exports.
@@ -181,16 +188,16 @@ fi
 EOF
 ```
 
-### 4. Smoke-test the storage kernel
+### 4. Compile the workspace
 
 ```bash
 source /tmp/sgk-env.sh && cd "$REPO_ROOT"
-just smoke
+just check
 ```
 
-Prints `graph object-store smoke passed at epoch 10`. In-process, exits. Does
-not start a server. First run compiles the dependency tree — allow several
-minutes.
+Compiles every default-feature target without running anything. First run
+compiles the dependency tree — allow several minutes. The end-to-end storage and
+protocol check is `scripts/runtime_smoke.sh`.
 
 ### 5. Python driver for the Bolt checks
 
@@ -369,13 +376,6 @@ deeper.
 | `No available formula with the name "libcypher-parser"` | Not in homebrew-core. `brew install cleishm/neo4j/libcypher-parser`. |
 
 ## Things that will mislead you
-
-**`main` moves fast and is rebased.** Six hundred commits landed in a single day
-during August 2026, and `origin/main` was force-pushed, leaving local clones
-with diverged histories full of duplicate commits under different SHAs. Before
-concluding that a bug exists, confirm you are on the current tip. Before
-concluding a local branch has unique work, compare commit *subjects* against
-`origin/main`, not SHAs.
 
 **Sparse kernel selection is runtime, not compile time.** `GRAPH_SPARSE_KERNEL`
 picks `adjacency`, `compact`, or `suitesparse` (default) and is read by the

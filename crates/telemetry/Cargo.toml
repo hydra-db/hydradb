@@ -49,3 +49,5 @@ opentelemetry-appender-tracing = { workspace = true, optional = true }
 opentelemetry-semantic-conventions = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true }

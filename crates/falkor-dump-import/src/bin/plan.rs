@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use falkor_dump_import::{
-    build_snapshot_spill_selected, load_spilled_scope, GraphSelection, SnapshotGraph,
+    build_snapshot_spill_with_source_layout, load_spilled_scope, DedicatedLayout, GraphSelection, SnapshotGraph, SourceLayout,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -34,6 +34,7 @@ struct PlanSummary {
     relationships: u64,
     orphan_edges: u64,
     relationship_anomalies: u64,
+    quarantined_vertices: u64,
     workers: usize,
     elapsed_milliseconds: u128,
     results: Vec<ScopeSummary>,
@@ -53,13 +54,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: falkor-dump-plan SNAPSHOT_ROOT [WORKERS]")?;
     let mut workers = std::thread::available_parallelism().map_or(1, usize::from);
     let mut selection = GraphSelection::All;
+    let mut dedicated_layout = None;
+    let mut byog = false;
     let mut first = true;
     while let Some(argument) = args.next() {
-        let argument = argument
-            .into_string()
-            .map_err(|_| "graph selection must be UTF-8")?;
+        let argument = argument.into_string().map_err(|_| "graph selection must be UTF-8")?;
         if first && !argument.starts_with("--") {
             workers = argument.parse::<usize>()?.max(1);
+        } else if argument == "--byog" {
+            byog = true;
+        } else if argument == "--dedicated-layout" {
+            dedicated_layout = Some(DedicatedLayout::read(&PathBuf::from(
+                args.next().ok_or("--dedicated-layout requires a path")?,
+            ))?);
         } else if argument == "--include-graph" || argument == "--exclude-graph" {
             let graph = args
                 .next()
@@ -72,9 +79,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         first = false;
     }
+    if byog && dedicated_layout.is_some() {
+        return Err("--byog and --dedicated-layout are mutually exclusive".into());
+    }
     let started = Instant::now();
     let scratch = tempfile::tempdir()?;
-    let plan = build_snapshot_spill_selected(&root, workers, scratch.path(), &selection)?;
+    let plan = build_snapshot_spill_with_source_layout(
+        &root,
+        workers,
+        scratch.path(),
+        &selection,
+        if byog {
+            SourceLayout::Byog
+        } else {
+            dedicated_layout.as_ref().map_or(SourceLayout::Shared, SourceLayout::Dedicated)
+        },
+    )?;
     let mut results = Vec::with_capacity(plan.scopes.len());
     for spilled in &plan.scopes {
         let scope = load_spilled_scope(spilled)?;
@@ -110,10 +130,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         vertices: results.iter().map(|s| s.vertices as u64).sum(),
         relationships: results.iter().map(|s| s.relationships as u64).sum(),
         orphan_edges: results.iter().map(|s| s.orphan_edges as u64).sum(),
-        relationship_anomalies: results
-            .iter()
-            .map(|s| s.relationship_anomalies as u64)
-            .sum(),
+        relationship_anomalies: results.iter().map(|s| s.relationship_anomalies as u64).sum(),
+        quarantined_vertices: plan.unscoped_vertices.count,
         workers,
         elapsed_milliseconds: started.elapsed().as_millis(),
         results,

@@ -79,10 +79,7 @@ impl fmt::Display for TraceContextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Length { actual } => {
-                write!(
-                    f,
-                    "traceparent must be {TRACEPARENT_LEN} bytes, got {actual}"
-                )
+                write!(f, "traceparent must be {TRACEPARENT_LEN} bytes, got {actual}")
             }
             Self::Delimiters => f.write_str("traceparent delimiters are misplaced"),
             Self::NotHex { field } => write!(f, "traceparent {field} is not hex"),
@@ -139,16 +136,13 @@ impl TraceContext {
     pub fn parse(value: &str) -> Result<Self, TraceContextError> {
         let bytes = value.as_bytes();
         if bytes.len() != TRACEPARENT_LEN {
-            return Err(TraceContextError::Length {
-                actual: bytes.len(),
-            });
+            return Err(TraceContextError::Length { actual: bytes.len() });
         }
         if bytes[2] != b'-' || bytes[35] != b'-' || bytes[52] != b'-' {
             return Err(TraceContextError::Delimiters);
         }
 
-        let version =
-            parse_hex_byte(&bytes[0..2]).ok_or(TraceContextError::NotHex { field: "version" })?;
+        let version = parse_hex_byte(&bytes[0..2]).ok_or(TraceContextError::NotHex { field: "version" })?;
         if version == 0xff {
             return Err(TraceContextError::ForbiddenVersion);
         }
@@ -157,28 +151,20 @@ impl TraceContext {
         }
 
         let mut trace_id = [0u8; 16];
-        decode_hex(&bytes[3..35], &mut trace_id)
-            .ok_or(TraceContextError::NotHex { field: "trace-id" })?;
+        decode_hex(&bytes[3..35], &mut trace_id).ok_or(TraceContextError::NotHex { field: "trace-id" })?;
         if trace_id == [0; 16] {
             return Err(TraceContextError::ZeroId { field: "trace-id" });
         }
 
         let mut span_id = [0u8; 8];
-        decode_hex(&bytes[36..52], &mut span_id)
-            .ok_or(TraceContextError::NotHex { field: "span-id" })?;
+        decode_hex(&bytes[36..52], &mut span_id).ok_or(TraceContextError::NotHex { field: "span-id" })?;
         if span_id == [0; 8] {
             return Err(TraceContextError::ZeroId { field: "span-id" });
         }
 
-        let flags = parse_hex_byte(&bytes[53..55]).ok_or(TraceContextError::NotHex {
-            field: "trace-flags",
-        })?;
+        let flags = parse_hex_byte(&bytes[53..55]).ok_or(TraceContextError::NotHex { field: "trace-flags" })?;
 
-        Ok(Self {
-            trace_id,
-            span_id,
-            flags,
-        })
+        Ok(Self { trace_id, span_id, flags })
     }
 }
 

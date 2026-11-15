@@ -18,6 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
+# LAGraph has no Ubuntu package, so it is built here, statically, against the
+# chef image's libgraphblas-dev. The stage depends on nothing but the script,
+# so a Rust change never rebuilds it, and the builders copy out only the
+# archive and header: the runtime image gains no new library.
+FROM chef AS lagraph
+
+COPY scripts/install_lagraph.sh /tmp/install_lagraph.sh
+RUN bash /tmp/install_lagraph.sh /opt/lagraph
+
 FROM chef AS planner
 
 COPY . .
@@ -25,9 +34,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
+COPY --from=lagraph /opt/lagraph /opt/lagraph
+ENV LAGRAPH_LIB_DIR=/opt/lagraph/lib
 COPY --from=planner /workspace/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json \
-      --features server-runtime,indexer-runtime,experimental-cypher-engine,otlp \
+      --features server-runtime,indexer-runtime,experimental-cypher-engine,datafusion-cypher-engine,otlp \
       --bin graph-node --bin graph-indexer
 
 COPY . .
@@ -53,13 +64,85 @@ ENV GIT_SHA=${GIT_SHA} \
 # wire. It must stay on this line for OTEL_EXPORTER_OTLP_ENDPOINT to mean
 # anything at runtime.
 RUN cargo build --locked --release \
-      --features server-runtime,indexer-runtime,experimental-cypher-engine,otlp \
+      --features server-runtime,indexer-runtime,experimental-cypher-engine,datafusion-cypher-engine,otlp \
       --bin graph-node --bin graph-indexer && \
     cargo build --locked --release \
       -p falkor-dump-import --bin import && \
-    strip target/release/graph-node \
-      target/release/graph-indexer \
+    strip --strip-debug target/release/graph-node && \
+    strip target/release/graph-indexer \
       target/release/import
+
+# The turbolay proxy. It links none of the native graph libraries,
+# so its image is small and its build never touches graph-node's dependency
+# graph beyond the shared lockfile. BoringSSL builds from source here, which is
+# what the chef image's cmake and libclang are for. boring-sys applies its
+# patches to the BoringSSL sources through git, so this stage adds git.
+FROM chef AS proxy-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+      -p turbolay-proxy --features k8s,boringssl
+
+COPY . .
+RUN cargo build --locked --release -p turbolay-proxy --features k8s,boringssl && \
+    strip target/release/turbolay-proxy
+
+FROM ubuntu:24.04 AS proxy
+
+ARG GIT_SHA=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUST_LOG=info
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 graph && \
+    useradd --uid 10001 --gid graph --no-create-home --shell /usr/sbin/nologin graph
+
+COPY --from=proxy-builder /workspace/target/release/turbolay-proxy /usr/local/bin/turbolay-proxy
+
+USER 10001:10001
+EXPOSE 7687 8443 9090
+ENTRYPOINT ["/usr/local/bin/turbolay-proxy"]
+
+# The usage-report receiver behind telemetry.hydradb.com. HydraDB runs one
+# copy for every install, so it is not part of charts/hydradb. Like the proxy it
+# links none of the native graph libraries.
+FROM chef AS telemetry-receiver-builder
+
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+      -p hydradb-query-telemetry --features receiver
+
+COPY . .
+RUN cargo build --locked --release -p hydradb-query-telemetry --features receiver \
+      --bin query-telemetry-receiver && \
+    strip target/release/query-telemetry-receiver
+
+FROM ubuntu:24.04 AS telemetry-receiver
+
+ARG GIT_SHA=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+# The binary's own default is 127.0.0.1, which nothing outside the container
+# can reach.
+ENV DEBIAN_FRONTEND=noninteractive \
+    QUERY_TELEMETRY_ADDR=0.0.0.0:18500
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 graph && \
+    useradd --uid 10001 --gid graph --no-create-home --shell /usr/sbin/nologin graph
+
+COPY --from=telemetry-receiver-builder \
+  /workspace/target/release/query-telemetry-receiver \
+  /usr/local/bin/query-telemetry-receiver
+
+USER 10001:10001
+EXPOSE 18500
+ENTRYPOINT ["/usr/local/bin/query-telemetry-receiver"]
 
 FROM ubuntu:24.04 AS runtime-base
 

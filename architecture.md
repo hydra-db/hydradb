@@ -198,8 +198,15 @@ for diagnostics or targeted failure tests.
 
 Explicit transactions spanning multiple `RUN` requests are not exposed. Each
 accepted mutation is executed and committed as one bounded server operation.
+The turbolay proxy accepts a transaction that holds a single statement, the
+shape a driver's `execute_query` sends, and runs that statement as an
+auto-commit unit: COMMIT returns its bookmark, a second statement is refused,
+and ROLLBACK after a write fails because the write already committed.
+graph-node itself refuses BEGIN.
 
 ## Query Execution
+
+for the datafusion partition, arrow batch and mutation-owner model, see [cypher execution model](docs/architecture/cypher-execution-model.md)
 
 ### Common Pipeline
 
@@ -249,6 +256,7 @@ HydraDB implements three snapshot-scoped path procedures:
 | `algo.SPpaths` | Bounded paths between one source and one target |
 | `algo.SSpaths` | Bounded paths from one source |
 | `algo.MSpaths` | Indexed resolution and batched evaluation of many source and target values |
+| `algo.degree` | Relationship degree per labelled vertex from the same topology, thresholded and ranked; `relDirection` is `outgoing`, `incoming`, `both` (in plus out, a self-loop twice) or `undirected` (Cypher's `-[r]-`, a self-loop once) |
 
 ```mermaid
 flowchart TB

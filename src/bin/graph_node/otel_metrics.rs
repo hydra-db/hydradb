@@ -13,7 +13,7 @@
 //! [`tests::every_histogram_field_reaches_both_exports`] and
 //! [`tests::every_counter_field_reaches_both_exports`] fail the build if a field
 //! the kernel enumerates is missing from either. That is the property §1.6 of
-//! the metrics span-links and alerting design asks for:
+//! the OTel metrics and alerting design asks for:
 //! adding a metric cannot silently reach one export and not the other.
 //!
 //! # One counter snapshot reaches the meter; the other two reach `/metrics` only
@@ -125,8 +125,14 @@
 
 #[path = "otel_metrics/memory_diagnostics.rs"]
 pub(crate) mod memory_diagnostics;
+#[path = "otel_metrics/node_runtime.rs"]
+pub(crate) mod node_runtime;
 #[path = "otel_metrics/planner_statistics.rs"]
 pub(crate) mod planner_statistics;
+#[path = "otel_metrics/remote_object_store.rs"]
+pub(crate) mod remote_object_store;
+#[path = "otel_metrics/storage_caches.rs"]
+pub(crate) mod storage_caches;
 
 // Only the recording half names a snapshot, and that half is behind `otlp`.
 #[cfg(feature = "otlp")]
@@ -268,8 +274,8 @@ pub struct OtelHistogram {
     /// Declared per row rather than inferred, and cross-checked against the
     /// kernel's enumeration by
     /// [`tests::only_the_transport_histograms_declare_no_graph_node_source`].
-    /// This column is the answer to "why does a five-row table have three live
-    /// families".
+    /// This column is the answer to "why does the 28-row table have 26 live
+    /// rows".
     pub source: FieldSource,
 }
 
@@ -278,13 +284,13 @@ pub struct OtelHistogram {
 /// Adding a histogram to a snapshot type and not adding it here fails
 /// [`tests::every_histogram_field_reaches_both_exports`].
 ///
-/// Five rows, three of them with a `graph-node` source. That is not a table
+/// Twenty-eight rows, twenty-six of them with a `graph-node` source. That is not a table
 /// half-finished: see [`FieldSource`], and
 /// [`tests::only_the_transport_histograms_declare_no_graph_node_source`] for the
-/// assertion that keeps the three-of-five accounting honest.
+/// assertion that keeps the twenty-six-of-twenty-eight accounting honest.
 pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
-    // Four rows, one instrument: the operation label splits reads from writes
-    // and `hydradb.cypher_engine` splits the two engines, which the kernel
+    // Six rows, one instrument: the operation label splits reads from writes
+    // and `hydradb.cypher_engine` splits the three engine modes, which the kernel
     // keeps apart at the point of recording. See
     // `crate::admin::cypher_engine_label`.
     OtelHistogram {
@@ -297,6 +303,14 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
     },
     OtelHistogram {
         field: "read_latency_experimental",
+        name: "db.client.operation.duration",
+        description: "End-to-end client operation execution",
+        unit: ExportUnit::Seconds,
+        operation: Some(hydradb_telemetry::semconv::DB_OPERATION_READ),
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "read_latency_datafusion",
         name: "db.client.operation.duration",
         description: "End-to-end client operation execution",
         unit: ExportUnit::Seconds,
@@ -319,11 +333,19 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         operation: Some(hydradb_telemetry::semconv::DB_OPERATION_WRITE),
         source: FieldSource::GraphNode,
     },
+    OtelHistogram {
+        field: "write_latency_datafusion",
+        name: "db.client.operation.duration",
+        description: "End-to-end client operation execution",
+        unit: ExportUnit::Seconds,
+        operation: Some(hydradb_telemetry::semconv::DB_OPERATION_WRITE),
+        source: FieldSource::GraphNode,
+    },
     // `hydradb.*`, not `db.*`: there is no semantic convention for a
     // causal-consistency wait, and the one stable database histogram
     // (`db.client.operation.duration`) is already claimed above by the two
     // rows that genuinely mean it. Change 4 of
-    // the cell-affine read-routing design.
+    // the cell-affine read routing design.
     OtelHistogram {
         field: "bookmark_wait_latency",
         name: "hydradb.client.bookmark_wait.duration",
@@ -903,44 +925,32 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_endpoint_check_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.endpoint_check.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.endpoint_check.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_identity_scan_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.identity_scan.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.identity_scan.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_identity_pointer_hits",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.identity_pointer.hits",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.identity_pointer.hits"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_identity_pointer_misses",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.identity_pointer.misses",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.identity_pointer.misses"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_record_read_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.record_read.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.record_read.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_structural_check_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.structural_check.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.structural_check.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -955,9 +965,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "relationship_import_counter_read_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.relationship_import.counter_read.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.counter_read.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1022,9 +1030,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_batches_profiled",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.reserve_edge_delete_noops.batches_profiled",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.reserve_edge_delete_noops.batches_profiled"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1034,16 +1040,12 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_read_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.reserve_edge_delete_noops.read.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.reserve_edge_delete_noops.read.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "reserve_edge_delete_noops_txn_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.reserve_edge_delete_noops.txn.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.reserve_edge_delete_noops.txn.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1139,23 +1141,17 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_property_seek_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.property_seek.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.property_seek.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_relationship_expand_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.relationship_expand.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.relationship_expand.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_ordered_property_scan_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.ordered_property_scan.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.ordered_property_scan.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1180,16 +1176,12 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_snapshot_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.snapshot.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.snapshot.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_statistics_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.statistics.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.statistics.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1224,58 +1216,42 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_statistics_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.statistics.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.statistics.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_statistics_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.statistics.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.statistics.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_probe_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.probe.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.probe.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_probe_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.probe.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.probe.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_guard_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.guard.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.guard.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_guard_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.guard.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.guard.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_default_requests",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.default.requests",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.default.requests"),
     },
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_default_us",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.default.duration.sum",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.default.duration.sum"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1285,9 +1261,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_planned_without_statistics",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.planned_without_statistics",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.planned_without_statistics"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1312,9 +1286,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_rows_estimated",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.rows_estimated",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.rows_estimated"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1324,9 +1296,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::Shard,
         field: "query_experimental_access_underestimates",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.query.experimental.access.underestimates",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.underestimates"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -1428,8 +1398,30 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     },
     OtelCounter {
         source: CounterSource::Shard,
+        field: "gds_assemblies",
+        export: OtelCounterExport::PerCell("hydradb.shard.gds.assemblies"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
         field: "backpressure_waits",
         export: OtelCounterExport::PerCell("hydradb.shard.backpressure.waits"),
+    },
+    // The graph write permit: acquisitions, queue wait and hold, the
+    // last two as `.duration.sum` like the compute pair above.
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_acquisitions",
+        export: OtelCounterExport::PerCell("hydradb.shard.write_permit.acquisitions"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_wait_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.write_permit.wait.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_permit_held_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.write_permit.held.duration.sum"),
     },
     // `GraphCacheMetricsSnapshot`, in declaration order.
     OtelCounter {
@@ -1567,6 +1559,11 @@ pub const OTEL_FAILURE_COUNTERS: &[OtelCounter] = &[
         field: "queries_failed_by_reason_experimental",
         export: OtelCounterExport::Global("hydradb.client.queries.failed.by_reason"),
     },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_failed_by_reason_datafusion",
+        export: OtelCounterExport::Global("hydradb.client.queries.failed.by_reason"),
+    },
 ];
 
 /// The OTel row for a `(source, field)` pair, over every counter table.
@@ -1680,13 +1677,8 @@ const METER_NAME: &str = "hydradb.graph_node";
 #[cfg(feature = "otlp")]
 #[derive(Debug)]
 pub struct NodeHistograms {
-    registered: std::collections::HashMap<
-        &'static str,
-        (
-            std::sync::Arc<hydradb_telemetry::meter::ObservableHistogram>,
-            Option<&'static str>,
-        ),
-    >,
+    registered:
+        std::collections::HashMap<&'static str, (std::sync::Arc<hydradb_telemetry::meter::ObservableHistogram>, Option<&'static str>)>,
 }
 
 #[cfg(feature = "otlp")]
@@ -1702,9 +1694,7 @@ impl NodeHistograms {
     /// ([`hydradb::DURATION_BUCKET_BOUNDS_US`]) rather than being
     /// restated here, so the Prometheus rendering in [`crate::admin`] and this
     /// one cannot disagree about where a bucket ends.
-    pub fn register(
-        providers: &hydradb_telemetry::otlp::Providers,
-    ) -> Result<Self, hydradb_telemetry::meter::HistogramError> {
+    pub fn register(providers: &hydradb_telemetry::otlp::Providers) -> Result<Self, hydradb_telemetry::meter::HistogramError> {
         use hydradb_telemetry::meter::{HistogramSpec, ObservableHistogram};
 
         let meter = providers.meter(METER_NAME);
@@ -1725,10 +1715,7 @@ impl NodeHistograms {
                 &hydradb::DURATION_BUCKET_BOUNDS_US,
             )?);
             for row in rows {
-                registered.insert(
-                    row.field,
-                    (std::sync::Arc::clone(&histogram), row.operation),
-                );
+                registered.insert(row.field, (std::sync::Arc::clone(&histogram), row.operation));
             }
         }
         Ok(Self { registered })
@@ -1775,16 +1762,13 @@ impl NodeHistograms {
     /// review comment.
     ///
     /// `hydradb.cypher_engine` is the engine that ran the statements in the
-    /// field being recorded, `legacy` or `experimental`, and comes from the
-    /// field rather than from the service: a node the kill switch has flipped
-    /// holds both populations, and labelling them by the node's current engine
-    /// would move a whole history between engines at the next collection. What
-    /// it buys is the ability to overlay legacy and experimental on one latency
-    /// panel and read the gap without a join on the instance.
-    pub fn record_client(
-        &self,
-        snapshot: &hydradb::ClientQueryMetricsSnapshot,
-    ) -> Result<(), hydradb_telemetry::meter::HistogramError> {
+    /// field being recorded, and comes from the field rather than from the
+    /// service: a node the kill switch has flipped holds multiple populations,
+    /// and labelling them by the node's current engine would move a whole
+    /// history between engines at the next collection. What it buys is the
+    /// ability to overlay engine modes on one latency panel and read the gap
+    /// without a join on the instance.
+    pub fn record_client(&self, snapshot: &hydradb::ClientQueryMetricsSnapshot) -> Result<(), hydradb_telemetry::meter::HistogramError> {
         use hydradb_telemetry::semconv::{DB_SYSTEM_NEO4J, L_CYPHER_ENGINE, L_DB_SYSTEM_NAME};
 
         let system = (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J);
@@ -1792,9 +1776,7 @@ impl NodeHistograms {
             // Same split as `/metrics`: the execution families carry the
             // engine, the bookmark-wait family does not.
             match crate::admin::cypher_engine_label(field) {
-                Some(engine) => {
-                    self.record(field, &[system, (L_CYPHER_ENGINE, engine)], histogram)?
-                }
+                Some(engine) => self.record(field, &[system, (L_CYPHER_ENGINE, engine)], histogram)?,
                 None => self.record(field, &[system], histogram)?,
             }
         }
@@ -1808,18 +1790,11 @@ impl NodeHistograms {
     /// arithmetic stops being affordable. And never `scope`, which `/metrics`
     /// does carry — that divergence is deliberate and is the reason both
     /// exports exist.
-    pub fn record_shard(
-        &self,
-        metrics: &hydradb::ScopedGraphShardRuntimeMetrics,
-    ) -> Result<(), hydradb_telemetry::meter::HistogramError> {
+    pub fn record_shard(&self, metrics: &hydradb::ScopedGraphShardRuntimeMetrics) -> Result<(), hydradb_telemetry::meter::HistogramError> {
         use hydradb_telemetry::semconv::L_CELL_ID;
 
         for (field, histogram) in metrics.shard.operational.histogram_fields() {
-            self.record(
-                field,
-                &[(L_CELL_ID, metrics.shard.cell_id.as_str())],
-                histogram,
-            )?;
+            self.record(field, &[(L_CELL_ID, metrics.shard.cell_id.as_str())], histogram)?;
         }
         Ok(())
     }
@@ -1861,10 +1836,7 @@ impl NodeHistograms {
 #[cfg(feature = "otlp")]
 #[derive(Debug)]
 pub struct NodeCounters {
-    registered: std::collections::HashMap<
-        (CounterSource, &'static str),
-        hydradb_telemetry::meter::ObservableCounter,
-    >,
+    registered: std::collections::HashMap<(CounterSource, &'static str), hydradb_telemetry::meter::ObservableCounter>,
 }
 
 #[cfg(feature = "otlp")]
@@ -1997,10 +1969,7 @@ impl NodeCounters {
 /// ignores is still a zero this loop would honour).
 pub struct MetricCollection {
     #[cfg(feature = "otlp")]
-    running: Option<(
-        tokio::sync::watch::Sender<bool>,
-        tokio::task::JoinHandle<()>,
-    )>,
+    running: Option<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
 }
 
 impl MetricCollection {
@@ -2041,6 +2010,9 @@ impl MetricCollection {
             histograms,
             counters: NodeCounters::register(providers),
             planner_statistics: planner_statistics::Gauges::register(providers),
+            remote_object_store: remote_object_store::Instruments::register(providers),
+            node_runtime: node_runtime::Instruments::register(providers),
+            storage_caches: storage_caches::Instruments::register(providers),
         });
 
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -2101,6 +2073,9 @@ struct NodeInstruments {
     histograms: NodeHistograms,
     counters: NodeCounters,
     planner_statistics: planner_statistics::Gauges,
+    remote_object_store: remote_object_store::Instruments,
+    node_runtime: node_runtime::Instruments,
+    storage_caches: storage_caches::Instruments,
 }
 
 /// One pass: publish the client histograms, then every shard's, then the shard
@@ -2127,8 +2102,13 @@ async fn collect_once(
         counters,
         memory,
         planner_statistics,
+        remote_object_store,
+        node_runtime,
+        storage_caches,
     } = instruments;
     memory.record();
+    remote_object_store.record();
+    node_runtime.record().await;
     if let Err(error) = histograms.record_client(&query.metrics()) {
         tracing::warn!(error = %error, "client query histograms were not published");
     }
@@ -2157,12 +2137,16 @@ async fn collect_once(
                 }
             }
             planner_statistics.record(&shards);
+            storage_caches.record(&shards);
         }
         Err(_) => tracing::warn!(
             budget_ms = shard_budget.as_millis() as u64,
             "shard metric collection exceeded its budget; last interval's series stay published"
         ),
     }
+    // Outside the budget too: the shared disk cache's counters are its own
+    // recorder's, and reading them waits on no shard.
+    storage_caches.record_disk(node.shared_disk_cache_metrics());
     // Outside the budget: the runtime's totals are atomics read under one
     // mutex, include closed scopes, and never wait on a shard.
     if let Err(error) = counters.record_shard_totals(&node.cell_operational_counter_totals()) {

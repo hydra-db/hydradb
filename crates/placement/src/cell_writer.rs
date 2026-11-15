@@ -199,12 +199,7 @@ pub fn cell_writer_path(base: &Path, cell_id: &str) -> Result<Path, PlacementErr
 /// rejects; and propagating the error would let a store hiccup fail a write that
 /// has already committed its epoch. The caller logs at `warn!` and carries on —
 /// see the module docs, rule 3.
-pub async fn put_cell_writer(
-    store: &dyn ObjectStore,
-    base: &Path,
-    cell_id: &str,
-    record: &CellWriterRecord,
-) -> Result<(), PlacementError> {
+pub async fn put_cell_writer(store: &dyn ObjectStore, base: &Path, cell_id: &str, record: &CellWriterRecord) -> Result<(), PlacementError> {
     let path = cell_writer_path(base, cell_id)?;
     let payload = serde_json::to_vec(record).map_err(|source| PlacementError::EncodeRecord {
         cell_id: cell_id.to_string(),
@@ -248,11 +243,7 @@ pub async fn put_cell_writer(
 /// longer than the grace window, so the GET would fail with it, once per refused
 /// write. The hint therefore stays rendezvous-only, and this function is called
 /// by the fence log.
-pub async fn read_cell_writer(
-    store: &dyn ObjectStore,
-    base: &Path,
-    cell_id: &str,
-) -> Result<Option<CellWriterRecord>, PlacementError> {
+pub async fn read_cell_writer(store: &dyn ObjectStore, base: &Path, cell_id: &str) -> Result<Option<CellWriterRecord>, PlacementError> {
     let path = cell_writer_path(base, cell_id)?;
     let result = match store.get(&path).await {
         Ok(result) => result,
@@ -265,14 +256,11 @@ pub async fn read_cell_writer(
             })
         }
     };
-    let bytes = result
-        .bytes()
-        .await
-        .map_err(|source| PlacementError::ObjectStore {
-            operation: "get",
-            path: path.to_string(),
-            source,
-        })?;
+    let bytes = result.bytes().await.map_err(|source| PlacementError::ObjectStore {
+        operation: "get",
+        path: path.to_string(),
+        source,
+    })?;
     let record = serde_json::from_slice(&bytes).map_err(|source| PlacementError::DecodeRecord {
         path: path.to_string(),
         source,

@@ -102,42 +102,35 @@ impl GraphBlasCsc {
         }
         let mut adjacency = Adjacency::new();
         for (source_ordinal, source) in self.vertices.iter().copied().enumerate() {
-            let start = usize::try_from(self.pointers[source_ordinal]).map_err(|err| {
-                crate::GraphError::SparseKernel {
-                    backend: "CanonicalAdjacency",
-                    reason: format!("source pointer does not fit usize: {err}"),
-                }
+            let start = usize::try_from(self.pointers[source_ordinal]).map_err(|err| crate::GraphError::SparseKernel {
+                backend: "CanonicalAdjacency",
+                reason: format!("source pointer does not fit usize: {err}"),
             })?;
-            let end = usize::try_from(self.pointers[source_ordinal + 1]).map_err(|err| {
-                crate::GraphError::SparseKernel {
-                    backend: "CanonicalAdjacency",
-                    reason: format!("source pointer does not fit usize: {err}"),
-                }
+            let end = usize::try_from(self.pointers[source_ordinal + 1]).map_err(|err| crate::GraphError::SparseKernel {
+                backend: "CanonicalAdjacency",
+                reason: format!("source pointer does not fit usize: {err}"),
             })?;
-            let row =
-                self.indices
-                    .get(start..end)
-                    .ok_or_else(|| crate::GraphError::SparseKernel {
-                        backend: "CanonicalAdjacency",
-                        reason: format!("source row {source_ordinal} exceeds the index array"),
-                    })?;
+            let row = self.indices.get(start..end).ok_or_else(|| crate::GraphError::SparseKernel {
+                backend: "CanonicalAdjacency",
+                reason: format!("source row {source_ordinal} exceeds the index array"),
+            })?;
             if row.is_empty() {
                 continue;
             }
             let mut neighbors = BTreeSet::new();
             for destination in row {
-                let destination = usize::try_from(*destination).map_err(|err| {
-                    crate::GraphError::SparseKernel {
-                        backend: "CanonicalAdjacency",
-                        reason: format!("destination ordinal does not fit usize: {err}"),
-                    }
+                let destination = usize::try_from(*destination).map_err(|err| crate::GraphError::SparseKernel {
+                    backend: "CanonicalAdjacency",
+                    reason: format!("destination ordinal does not fit usize: {err}"),
                 })?;
-                let vertex = self.vertices.get(destination).copied().ok_or_else(|| {
-                    crate::GraphError::SparseKernel {
+                let vertex = self
+                    .vertices
+                    .get(destination)
+                    .copied()
+                    .ok_or_else(|| crate::GraphError::SparseKernel {
                         backend: "CanonicalAdjacency",
                         reason: format!("destination ordinal {destination} is out of bounds"),
-                    }
-                })?;
+                    })?;
                 neighbors.insert(vertex);
             }
             adjacency.insert(source, neighbors);
@@ -151,17 +144,7 @@ impl GraphBlasCsc {
 /// Non-exhaustive: the ladder is designed to grow, and the whole point of the
 /// consolidation is that adding a rung should not require touching call sites.
 /// Downstream `match`es therefore need a wildcard arm.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SparseKernelBackend {
-    /// Kernel 1: adjacency BFS over `BTreeMap`/`BTreeSet`. Never compiled.
-    Adjacency,
-    /// Kernel 2: BFS over the compiled flat CSC. No SuiteSparse involved.
-    CompactCsc,
-    /// Kernel 3: masked `GrB_mxv` over a compiled `GrB_Matrix`.
-    #[default]
-    SuiteSparse,
-}
+pub use hydradb_graph_slate::SparseKernelBackend;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SparseTraversal {
@@ -178,36 +161,13 @@ pub(crate) struct SparseTraversalCount {
     pub backend: SparseKernelBackend,
 }
 
-/// The kernel a [`GraphCachePolicy`] starts at, resolved once per process.
-///
-/// The legacy `GRAPH_COMPILED_KERNEL` override supplies only this *default*, so
-/// an explicit `sparse_kernel` — whether from `GRAPH_SPARSE_KERNEL` or set in
-/// code — always wins. Resolving it here rather than at each traversal is what
-/// keeps `std::env::var` off the query path: the environment is read once, on
-/// first use, and never again.
-pub(crate) fn env_default_kernel() -> SparseKernelBackend {
-    static RESOLVED: std::sync::OnceLock<SparseKernelBackend> = std::sync::OnceLock::new();
-    *RESOLVED.get_or_init(|| {
-        if graphblas::use_compact_csc_kernel() {
-            SparseKernelBackend::CompactCsc
-        } else {
-            SparseKernelBackend::SuiteSparse
-        }
-    })
-}
-
 /// Resolves the configured kernel for a shard. The policy field is the single
 /// authority; see [`env_default_kernel`] for where that field's default is from.
 pub(crate) fn default_matrix_kernel(policy: &GraphCachePolicy) -> SparseKernelBackend {
     policy.sparse_kernel
 }
 
-pub(crate) fn expand(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    hops: u8,
-    backend: SparseKernelBackend,
-) -> Result<SparseTraversal> {
+pub(crate) fn expand(adjacency: &Adjacency, starts: &[VertexId], hops: u8, backend: SparseKernelBackend) -> Result<SparseTraversal> {
     match backend {
         SparseKernelBackend::Adjacency => Ok(expand_rust(adjacency, starts, hops)),
         SparseKernelBackend::CompactCsc => {
@@ -215,29 +175,24 @@ pub(crate) fn expand(
             compiled.expand(adjacency, starts, hops)
         }
         SparseKernelBackend::SuiteSparse => expand_graphblas(adjacency, starts, hops),
+        _ => Err(crate::GraphError::SparseKernel {
+            backend: "Unknown",
+            reason: "unsupported sparse kernel backend".to_string(),
+        }),
     }
 }
 
 pub(crate) use graphblas::CompiledGraphBlasMatrix;
 
-pub(crate) fn compile_graphblas_matrix(
-    adjacency: &Adjacency,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas(adjacency, kernel)
 }
 
-pub(crate) fn compile_graphblas_csc(
-    csc: &GraphBlasCsc,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+pub(crate) fn compile_graphblas_csc(csc: &GraphBlasCsc, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc(csc, kernel)
 }
 
-pub(crate) fn compile_graphblas_csc_owned(
-    csc: GraphBlasCsc,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+pub(crate) fn compile_graphblas_csc_owned(csc: GraphBlasCsc, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc_owned(csc, kernel)
 }
 
@@ -304,43 +259,27 @@ pub(crate) fn compiled_graphblas_kernel(compiled: &CompiledGraphBlasMatrix) -> S
     compiled.kernel()
 }
 
-pub(crate) fn compiled_graphblas_contains_edge(
-    compiled: &CompiledGraphBlasMatrix,
-    src: VertexId,
-    dst: VertexId,
-) -> bool {
+pub(crate) fn compiled_graphblas_contains_edge(compiled: &CompiledGraphBlasMatrix, src: VertexId, dst: VertexId) -> bool {
     compiled.contains_edge(src, dst)
 }
 
 #[cfg(feature = "opencypher")]
-pub(crate) fn compiled_graphblas_in_neighbors(
-    compiled: &CompiledGraphBlasMatrix,
-    vertex: VertexId,
-) -> Vec<VertexId> {
+pub(crate) fn compiled_graphblas_in_neighbors(compiled: &CompiledGraphBlasMatrix, vertex: VertexId) -> Vec<VertexId> {
     compiled.in_neighbors(vertex)
 }
 
 #[cfg(feature = "opencypher")]
-pub(crate) fn compiled_graphblas_out_neighbors(
-    compiled: &CompiledGraphBlasMatrix,
-    vertex: VertexId,
-) -> Vec<VertexId> {
+pub(crate) fn compiled_graphblas_out_neighbors(compiled: &CompiledGraphBlasMatrix, vertex: VertexId) -> Vec<VertexId> {
     compiled.out_neighbors(vertex)
 }
 
 #[cfg(feature = "opencypher")]
-pub(crate) fn compiled_graphblas_cached_in_degree(
-    compiled: &CompiledGraphBlasMatrix,
-    vertex: VertexId,
-) -> Option<u64> {
+pub(crate) fn compiled_graphblas_cached_in_degree(compiled: &CompiledGraphBlasMatrix, vertex: VertexId) -> Option<u64> {
     compiled.cached_in_degree(vertex)
 }
 
 #[cfg(feature = "opencypher")]
-pub(crate) fn compiled_graphblas_out_degree(
-    compiled: &CompiledGraphBlasMatrix,
-    vertex: VertexId,
-) -> u64 {
+pub(crate) fn compiled_graphblas_out_degree(compiled: &CompiledGraphBlasMatrix, vertex: VertexId) -> u64 {
     compiled.out_degree(vertex)
 }
 
@@ -406,10 +345,7 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
         }
     }
     SparseTraversal {
-        vertices: seen
-            .into_iter()
-            .filter(|vertex| !start_set.contains(vertex))
-            .collect(),
+        vertices: seen.into_iter().filter(|vertex| !start_set.contains(vertex)).collect(),
         edge_visits,
         backend: SparseKernelBackend::Adjacency,
     }
@@ -424,10 +360,7 @@ fn graphblas_vertices_from_adjacency(adjacency: &Adjacency) -> Result<Vec<Vertex
     if vertices.len() as u64 > GRAPHBLAS_INDEX_MAX {
         return Err(crate::GraphError::SparseKernel {
             backend: "SuiteSparseGraphBlas",
-            reason: format!(
-                "{} local vertices exceed GraphBLAS index limit",
-                vertices.len()
-            ),
+            reason: format!("{} local vertices exceed GraphBLAS index limit", vertices.len()),
         });
     }
     Ok(vertices.into_iter().collect())
@@ -435,32 +368,19 @@ fn graphblas_vertices_from_adjacency(adjacency: &Adjacency) -> Result<Vec<Vertex
 
 const GRAPHBLAS_INDEX_MAX: u64 = (1_u64 << 60) - 1;
 
-fn expand_graphblas(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    hops: u8,
-) -> Result<SparseTraversal> {
+fn expand_graphblas(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> Result<SparseTraversal> {
     graphblas::expand(adjacency, starts, hops)
 }
 
-fn compile_graphblas(
-    adjacency: &Adjacency,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+fn compile_graphblas(adjacency: &Adjacency, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new(adjacency, kernel)
 }
 
-fn compile_graphblas_from_csc(
-    csc: &GraphBlasCsc,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+fn compile_graphblas_from_csc(csc: &GraphBlasCsc, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new_from_csc(csc, kernel)
 }
 
-fn compile_graphblas_from_csc_owned(
-    csc: GraphBlasCsc,
-    kernel: SparseKernelBackend,
-) -> Result<CompiledGraphBlasMatrix> {
+fn compile_graphblas_from_csc_owned(csc: GraphBlasCsc, kernel: SparseKernelBackend) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new_from_csc_owned(csc, kernel)
 }
 
@@ -495,3 +415,10 @@ fn expand_range_count_graphblas_compiled(
 }
 
 mod graphblas;
+// The algorithms are reached only through the `gds.*` procedures; LAGraph's
+// initialization is in every build.
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
+mod lagraph;
+
+#[cfg(feature = "opencypher")]
+pub(crate) use lagraph::{betweenness, betweenness_batch, pagerank, OrdinalEdges};

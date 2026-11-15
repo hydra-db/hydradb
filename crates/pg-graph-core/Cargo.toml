@@ -1,0 +1,9 @@
+[package]
+name = "hydradb-pg-graph-core"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }

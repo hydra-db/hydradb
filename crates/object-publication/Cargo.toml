@@ -24,3 +24,7 @@ slatedb-txn-obj = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
 
+[dev-dependencies]
+futures = { workspace = true }
+slatedb-common = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true }

@@ -1,0 +1,358 @@
+{{- /*
+The turbolay proxy: one Bolt and HTTPS endpoint in front of every
+graph-node. Off unless proxy.enabled. It reads the same runtime configmap the
+nodes do, so it hashes over the same fleet (GRAPH_BOLT_NODE_ADDRESSES) and
+resolves database names with the same GRAPH_DATABASE / GRAPH_NAMESPACE /
+GRAPH_ID / GRAPH_CELL_ID. Its replica set for the ROUTE answer and for dividing
+each node's budget comes from a watch on this Service's EndpointSlices.
+*/ -}}
+{{- if .Values.proxy.enabled }}
+{{- $fullname := include "hydradb.fullname" . }}
+{{- $serviceName := include "hydradb.proxyServiceName" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-proxy
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-proxy
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.proxy.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never below the current count during a roll, so proxy capacity does
+      # not dip while a replica is replaced.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        secret.reloader.stakater.com/reload: {{ printf "%s,%s" (include "hydradb.authSecretName" .) (include "hydradb.publicTlsSecretName" .) | quote }}
+        {{- with .Values.proxy.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $fullname }}-proxy
+      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.proxy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        # Even over zones, strictly: a zone loss takes at most its even share
+        # of the replicas with it.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 14 }}
+      containers:
+        - name: turbolay-proxy
+          image: {{ include "hydradb.proxyImage" . }}
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ $fullname }}-runtime
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TURBOLAY_PROXY_BOLT_ADDR
+              value: "0.0.0.0:7687"
+            - name: TURBOLAY_PROXY_HTTP_ADDR
+              value: "0.0.0.0:8443"
+            - name: TURBOLAY_PROXY_ADMIN_ADDR
+              value: "0.0.0.0:9090"
+            - name: TURBOLAY_PROXY_ADVERTISED_BOLT_ADDR
+              value: "$(POD_IP):7687"
+            # The nodes' internal plaintext listeners, same ids as the
+            # configmap's list. These override it for the proxy alone.
+            - name: GRAPH_BOLT_NODE_ADDRESSES
+              value: {{ include "hydradb.nodeAddressesOn" (dict "root" . "port" .Values.proxy.internalPorts.bolt) | quote }}
+            - name: TURBOLAY_PROXY_HTTP_NODE_ADDRESSES
+              value: {{ include "hydradb.nodeAddressesOn" (dict "root" . "port" .Values.proxy.internalPorts.http) | quote }}
+            - name: TURBOLAY_PROXY_SET
+              value: k8s
+            - name: TURBOLAY_PROXY_K8S_NAMESPACE
+              value: "$(POD_NAMESPACE)"
+            - name: TURBOLAY_PROXY_K8S_SERVICE
+              value: {{ $serviceName | quote }}
+            - name: TURBOLAY_PROXY_K8S_PORT
+              value: "7687"
+            {{- /* Drivers check the certificate against every routed address,
+            and pod IPs are not on it, so TLS always advertises the Service. */}}
+            {{- if or .Values.proxy.advertiseService .Values.tls.public.enabled }}
+            - name: TURBOLAY_PROXY_ADVERTISE
+              value: {{ printf "service:%s.%s.svc.cluster.local:%v" $serviceName .Release.Namespace .Values.proxy.service.bolt.port | quote }}
+            {{- end }}
+            - name: GRAPH_READ_ROUTING
+              value: {{ .Values.proxy.readRouting | quote }}
+            - name: TURBOLAY_PROXY_NODE_BUDGET
+              value: {{ include "hydradb.decimalInteger" .Values.proxy.nodeBudget | quote }}
+            - name: TURBOLAY_PROXY_ROUTE_TTL_SECS
+              value: {{ include "hydradb.decimalInteger" .Values.proxy.routeTtlSeconds | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.proxy.rustLog | quote }}
+            {{- with .Values.proxy.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: bolt
+              containerPort: 7687
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Let the EndpointSlice removal reach the other replicas and
+                # the drivers' next ROUTE before the listener closes.
+                command: ["/bin/sh", "-c", "sleep {{ .Values.proxy.preStopSleepSeconds }}"]
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: auth
+              mountPath: /var/run/secrets/hydradb
+              readOnly: true
+            {{- if .Values.tls.public.enabled }}
+            - name: public-tls
+              mountPath: /var/run/secrets/hydradb/public
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: auth
+          secret:
+            secretName: {{ include "hydradb.authSecretName" . }}
+            items:
+              - key: {{ .Values.auth.secretKey }}
+                path: {{ .Values.auth.secretKey }}
+        {{- if .Values.tls.public.enabled }}
+        - name: public-tls
+          secret:
+            secretName: {{ include "hydradb.publicTlsSecretName" . }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $serviceName }}
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+  {{- with .Values.proxy.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.proxy.service.type }}
+  selector:
+    {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 4 }}
+  ports:
+    - name: bolt
+      port: {{ .Values.proxy.service.bolt.port }}
+      targetPort: bolt
+    - name: https
+      port: {{ .Values.proxy.service.https.port }}
+      targetPort: https
+  {{- with .Values.proxy.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-proxy-metrics
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+    graph.hydradb.io/metrics: "true"
+spec:
+  selector:
+    {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: admin
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 6 }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# The nodes' internal plaintext listeners take connections from proxy pods
+# and nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-node-internal
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.proxy.internalPorts.bolt }}
+        - protocol: TCP
+          port: {{ .Values.proxy.internalPorts.http }}
+---
+# The runtime policy lets clients reach 7687/8443 on every pod of the
+# release. The proxy also needs the nodes' internal listeners, and the
+# Kubernetes API for its EndpointSlice watch.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-proxy-nodes
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.proxy.internalPorts.bolt }}
+        - protocol: TCP
+          port: {{ .Values.proxy.internalPorts.http }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-proxy-api
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "proxy") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+      {{- with .Values.proxy.apiServerEgressTo }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

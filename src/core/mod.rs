@@ -1,4 +1,6 @@
+pub(crate) mod available_memory;
 pub(crate) mod cache;
+pub(crate) mod cache_observe;
 pub(crate) mod config;
 pub(crate) mod create_only;
 pub(crate) mod db_cache;

@@ -17,9 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use super::path_procedure::{
-    native_path_result_resident_bytes, PathTopologySource, TypedPathTopology,
-};
+use super::path_procedure::{native_path_result_resident_bytes, PathTopologySource, TypedPathTopology};
 use super::*;
 use crate::query::path_procedure::{NativeDegreeProcedure, NativeDegreeValue};
 use crate::{QueryResultSet, QueryRow, QueryValue};
@@ -32,11 +30,11 @@ const NATIVE_DEGREE_HYDRATION_BATCH_SIZE: usize = 256;
 const NATIVE_DEGREE_HYDRATION_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Copy)]
-struct DegreeRead<'a> {
-    snapshot: &'a GraphStorageSnapshot,
-    cell_id: &'a str,
-    read_epoch: StorageSequence,
-    budget: &'a QueryBudget,
+pub(super) struct DegreeRead<'a> {
+    pub(super) snapshot: &'a GraphStorageSnapshot,
+    pub(super) cell_id: &'a str,
+    pub(super) read_epoch: StorageSequence,
+    pub(super) budget: &'a QueryBudget,
 }
 
 /// Structural edges of one type, as the degree pass needs to consult them
@@ -76,28 +74,18 @@ struct DegreeRule {
 
 impl DegreeRule {
     fn counts_toward(&self, other: VertexId) -> bool {
-        self.neighbors
-            .as_ref()
-            .is_none_or(|neighbors| neighbors.contains(&other))
+        self.neighbors.as_ref().is_none_or(|neighbors| neighbors.contains(&other))
     }
 
     /// The vertices one relationship `src -> dst` counts for, at most two.
     fn endpoints(&self, src: VertexId, dst: VertexId) -> impl Iterator<Item = VertexId> {
         let outgoing = (self.outgoing && self.counts_toward(dst)).then_some(src);
-        let incoming = (self.incoming
-            && self.counts_toward(src)
-            && !(self.self_loops_once && src == dst && outgoing.is_some()))
-        .then_some(dst);
+        let incoming =
+            (self.incoming && self.counts_toward(src) && !(self.self_loops_once && src == dst && outgoing.is_some())).then_some(dst);
         outgoing.into_iter().chain(incoming)
     }
 
-    fn credit(
-        &self,
-        degrees: &mut HashMap<VertexId, u64>,
-        src: VertexId,
-        dst: VertexId,
-        relationships: u64,
-    ) {
+    fn credit(&self, degrees: &mut HashMap<VertexId, u64>, src: VertexId, dst: VertexId, relationships: u64) {
         for vertex in self.endpoints(src, dst) {
             *degrees.entry(vertex).or_default() += relationships;
         }
@@ -136,7 +124,7 @@ impl GraphShard {
         let read_epoch = context
             .validated_read_epoch()
             .unwrap_or(self.current_epoch(&context.cell_id).await?);
-        let snapshot = self.db.snapshot().await?;
+        let snapshot = self.storage.snapshot().await?;
         if snapshot.seq() != read_epoch {
             return Err(GraphError::SnapshotAhead {
                 cell_id: context.cell_id,
@@ -151,12 +139,7 @@ impl GraphShard {
             read_epoch,
             max_result_bytes: context.max_result_bytes,
         };
-        if let Some(cached) = self
-            .native_path_result_cache
-            .lock()
-            .await
-            .get(&result_cache_key)
-        {
+        if let Some(cached) = self.native_path_result_cache.lock().await.get(&result_cache_key) {
             tracing::Span::current().record("hydradb.query.result_cache", "hit");
             let mut result = (*cached).clone();
             result.storage_sequence = context.validated_storage_sequence();
@@ -171,9 +154,7 @@ impl GraphShard {
             budget: &budget,
         };
         let degrees = self.native_degree_counts(read, &procedure).await?;
-        let rows = self
-            .native_degree_rows(read, &procedure, degrees, limit)
-            .await?;
+        let rows = self.native_degree_rows(read, &procedure, degrees, limit).await?;
 
         let result = QueryResultSet::new(procedure.columns(), rows).with_read_epoch(read_epoch);
         let result = match context.validated_storage_sequence() {
@@ -196,17 +177,10 @@ impl GraphShard {
 
     /// Relationship degree of every vertex with at least one relationship of
     /// the requested types and direction, before any label filter.
-    async fn native_degree_counts(
-        &self,
-        read: DegreeRead<'_>,
-        procedure: &NativeDegreeProcedure,
-    ) -> Result<HashMap<VertexId, u64>> {
+    async fn native_degree_counts(&self, read: DegreeRead<'_>, procedure: &NativeDegreeProcedure) -> Result<HashMap<VertexId, u64>> {
         let mut scanned_records = 0_u64;
         let neighbors = match &procedure.neighbor_label {
-            Some(label) => Some(
-                self.native_degree_label_members(read, label, &mut scanned_records)
-                    .await?,
-            ),
+            Some(label) => Some(self.native_degree_label_members(read, label, &mut scanned_records).await?),
             None => None,
         };
         let rule = DegreeRule {
@@ -216,12 +190,7 @@ impl GraphShard {
             neighbors,
         };
         let topologies = self
-            .native_path_topologies(
-                read.cell_id,
-                &procedure.rel_types,
-                read.read_epoch,
-                read.budget,
-            )
+            .native_path_topologies(read.cell_id, &procedure.rel_types, read.read_epoch, read.budget)
             .await?;
         let mut degrees = HashMap::<VertexId, u64>::new();
         for TypedPathTopology { edge_type, source } in &topologies {
@@ -246,10 +215,7 @@ impl GraphShard {
                             &mut check,
                         )?;
                     } else {
-                        matrix.for_each_edge(
-                            |src, dst| rule.credit(&mut degrees, src, dst, 1),
-                            &mut check,
-                        )?;
+                        matrix.for_each_edge(|src, dst| rule.credit(&mut degrees, src, dst, 1), &mut check)?;
                     }
                     // The overlay records the live state at the read epoch of
                     // every pair written since the generation; only a pair whose
@@ -273,9 +239,7 @@ impl GraphShard {
                     }
                 }
                 PathTopologySource::Storage => {
-                    let adjacency = self
-                        .native_degree_storage_adjacency(read, edge_type, &mut scanned_records)
-                        .await?;
+                    let adjacency = self.native_degree_storage_adjacency(read, edge_type, &mut scanned_records).await?;
                     let mut checked = 0_u32;
                     for (src, destinations) in &adjacency {
                         for dst in destinations {
@@ -290,15 +254,8 @@ impl GraphShard {
                 }
             };
             self.ensure_native_degree_vertices(degrees.len())?;
-            self.add_parallel_relationship_degrees(
-                read,
-                edge_type,
-                &edges,
-                &rule,
-                &mut degrees,
-                &mut scanned_records,
-            )
-            .await?;
+            self.add_parallel_relationship_degrees(read, edge_type, &edges, &rule, &mut degrees, &mut scanned_records)
+                .await?;
         }
         degrees.retain(|_, degree| *degree > 0);
         Ok(degrees)
@@ -307,47 +264,53 @@ impl GraphShard {
     /// Every vertex carrying `label` at the read epoch, from the label index:
     /// one sequential scan of id-only keys, never a metadata read. The index
     /// is written in the same transaction as the vertex's labels.
-    async fn native_degree_label_members(
+    pub(super) async fn native_degree_label_members(
         &self,
         read: DegreeRead<'_>,
         label: &str,
         scanned_records: &mut u64,
     ) -> Result<HashSet<VertexId>> {
+        let mut members = HashSet::new();
+        self.for_each_native_degree_label_member(read, label, scanned_records, |vertex| {
+            members.insert(vertex);
+        })
+        .await?;
+        Ok(members)
+    }
+
+    /// Every member of a label, in ascending id order: the label index keys
+    /// are zero-padded ids under one prefix, and the scan is ordered.
+    pub(super) async fn for_each_native_degree_label_member(
+        &self,
+        read: DegreeRead<'_>,
+        label: &str,
+        scanned_records: &mut u64,
+        mut visit: impl FnMut(VertexId),
+    ) -> Result<()> {
         let prefix = keys::vertex_label_prefix(read.cell_id, label);
         let mut iter = read
             .budget
             .read_only_io("native_degree_neighbor_labels", async {
                 Ok::<_, GraphError>(
                     read.snapshot
-                        .scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            ..,
-                            &remote_bulk_scan_options(),
-                        )
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                         .await?,
                 )
             })
             .await?;
-        let mut members = HashSet::new();
         loop {
             let Some(kv) = read
                 .budget
-                .read_only_io("native_degree_neighbor_labels", async {
-                    Ok::<_, GraphError>(iter.next().await?)
-                })
+                .read_only_io("native_degree_neighbor_labels", async { Ok::<_, GraphError>(iter.next().await?) })
                 .await?
             else {
                 break;
             };
             self.charge_native_degree_records(scanned_records, 1)?;
             let key = String::from_utf8_lossy(&kv.key);
-            members.insert(parse_u64(
-                &key,
-                key.strip_prefix(&prefix).unwrap_or_default(),
-                "vertex id",
-            )?);
+            visit(parse_u64(&key, key.strip_prefix(&prefix).unwrap_or_default(), "vertex id")?);
         }
-        Ok(members)
+        Ok(())
     }
 
     /// A structural edge stands for one relationship, or for each of its
@@ -371,11 +334,7 @@ impl GraphShard {
             .read_only_io("native_degree_relationship_counts", async {
                 Ok::<_, GraphError>(
                     read.snapshot
-                        .scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            ..,
-                            &remote_bulk_scan_options(),
-                        )
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                         .await?,
                 )
             })
@@ -421,11 +380,7 @@ impl GraphShard {
             .read_only_io("native_degree_edge_scan", async {
                 Ok::<_, GraphError>(
                     read.snapshot
-                        .scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            ..,
-                            &remote_bulk_scan_options(),
-                        )
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                         .await?,
                 )
             })
@@ -433,9 +388,7 @@ impl GraphShard {
         loop {
             let Some(kv) = read
                 .budget
-                .read_only_io("native_degree_edge_scan", async {
-                    Ok::<_, GraphError>(iter.next().await?)
-                })
+                .read_only_io("native_degree_edge_scan", async { Ok::<_, GraphError>(iter.next().await?) })
                 .await?
             else {
                 break;
@@ -452,11 +405,7 @@ impl GraphShard {
             .read_only_io("native_degree_tombstone_scan", async {
                 Ok::<_, GraphError>(
                     read.snapshot
-                        .scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            ..,
-                            &remote_bulk_scan_options(),
-                        )
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                         .await?,
                 )
             })
@@ -465,17 +414,14 @@ impl GraphShard {
         loop {
             let Some(kv) = read
                 .budget
-                .read_only_io("native_degree_tombstone_scan", async {
-                    Ok::<_, GraphError>(iter.next().await?)
-                })
+                .read_only_io("native_degree_tombstone_scan", async { Ok::<_, GraphError>(iter.next().await?) })
                 .await?
             else {
                 break;
             };
             self.charge_native_degree_records(scanned_records, 1)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
+            let (key_cell_id, key_edge_type, src, dst) = parse_out_edge_segment_tombstone_key(&key)?;
             if key_cell_id != read.cell_id || key_edge_type != edge_type {
                 return Err(GraphError::CorruptValue {
                     key,
@@ -494,11 +440,7 @@ impl GraphShard {
             .read_only_io("native_degree_segment_scan", async {
                 Ok::<_, GraphError>(
                     read.snapshot
-                        .scan_prefix_with_options(
-                            prefix.as_bytes(),
-                            ..,
-                            &remote_bulk_scan_options(),
-                        )
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                         .await?,
                 )
             })
@@ -506,27 +448,19 @@ impl GraphShard {
         loop {
             let Some(kv) = read
                 .budget
-                .read_only_io("native_degree_segment_scan", async {
-                    Ok::<_, GraphError>(iter.next().await?)
-                })
+                .read_only_io("native_degree_segment_scan", async { Ok::<_, GraphError>(iter.next().await?) })
                 .await?
             else {
                 break;
             };
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
-            self.charge_native_degree_records(
-                scanned_records,
-                segment.destinations.len().max(1) as u64,
-            )?;
+            self.charge_native_degree_records(scanned_records, segment.destinations.len().max(1) as u64)?;
             if segment.storage_sequence > read.read_epoch {
                 continue;
             }
             for dst in segment.destinations.iter().copied() {
-                if segment_edge_visible(
-                    segment.storage_sequence,
-                    tombstones.get(&(segment.src, dst)).copied(),
-                ) {
+                if segment_edge_visible(segment.storage_sequence, tombstones.get(&(segment.src, dst)).copied()) {
                     adjacency.entry(segment.src).or_default().push(dst);
                 }
             }
@@ -573,9 +507,7 @@ impl GraphShard {
             )
             .await?;
             for (vertex, degree) in batch {
-                let metadata = vertex_cache
-                    .remove(vertex)
-                    .expect("ranked vertex metadata was hydrated");
+                let metadata = vertex_cache.remove(vertex).expect("ranked vertex metadata was hydrated");
                 if !metadata.labels.contains(&procedure.label) {
                     continue;
                 }
@@ -597,11 +529,7 @@ impl GraphShard {
                 .read_only_io("native_degree_label_scan", async {
                     Ok::<_, GraphError>(
                         read.snapshot
-                            .scan_prefix_with_options(
-                                prefix.as_bytes(),
-                                ..,
-                                &remote_bulk_scan_options(),
-                            )
+                            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_bulk_scan_options())
                             .await?,
                     )
                 })
@@ -610,17 +538,11 @@ impl GraphShard {
             loop {
                 let next = read
                     .budget
-                    .read_only_io("native_degree_label_scan", async {
-                        Ok::<_, GraphError>(iter.next().await?)
-                    })
+                    .read_only_io("native_degree_label_scan", async { Ok::<_, GraphError>(iter.next().await?) })
                     .await?;
                 if let Some(kv) = &next {
                     let key = String::from_utf8_lossy(&kv.key);
-                    let vertex = parse_u64(
-                        &key,
-                        key.strip_prefix(&prefix).unwrap_or_default(),
-                        "vertex id",
-                    )?;
+                    let vertex = parse_u64(&key, key.strip_prefix(&prefix).unwrap_or_default(), "vertex id")?;
                     if !degrees.contains_key(&vertex) {
                         pending.push(vertex);
                     }
@@ -638,9 +560,7 @@ impl GraphShard {
                 )
                 .await?;
                 for vertex in pending.drain(..) {
-                    let metadata = vertex_cache
-                        .remove(&vertex)
-                        .expect("label member metadata was hydrated");
+                    let metadata = vertex_cache.remove(&vertex).expect("label member metadata was hydrated");
                     if !metadata.labels.contains(&procedure.label) {
                         continue;
                     }
@@ -661,11 +581,7 @@ impl GraphShard {
 
     fn charge_native_degree_records(&self, scanned: &mut u64, records: u64) -> Result<()> {
         *scanned = scanned.saturating_add(records);
-        ensure_limit(
-            "native_degree_scan_edges",
-            *scanned,
-            self.limits.max_query_scan_edges,
-        )
+        ensure_limit("native_degree_scan_edges", *scanned, self.limits.max_query_scan_edges)
     }
 
     fn ensure_native_degree_vertices(&self, vertices: usize) -> Result<()> {
@@ -677,12 +593,7 @@ impl GraphShard {
     }
 }
 
-fn native_degree_row(
-    procedure: &NativeDegreeProcedure,
-    vertex: VertexId,
-    degree: u64,
-    metadata: &VertexMetadata,
-) -> QueryRow {
+fn native_degree_row(procedure: &NativeDegreeProcedure, vertex: VertexId, degree: u64, metadata: &VertexMetadata) -> QueryRow {
     QueryRow::new(
         procedure
             .projections
@@ -690,9 +601,7 @@ fn native_degree_row(
             .map(|projection| match &projection.value {
                 NativeDegreeValue::Node => QueryValue::VertexId(vertex),
                 // A Cypher projection of `n.id` is the vertex id.
-                NativeDegreeValue::NodeProperty(property) if property == "id" => {
-                    QueryValue::Property(VertexPropertyValue::Integer(vertex))
-                }
+                NativeDegreeValue::NodeProperty(property) if property == "id" => QueryValue::Property(VertexPropertyValue::Integer(vertex)),
                 NativeDegreeValue::NodeProperty(property) => metadata
                     .properties
                     .get(property)
@@ -713,8 +622,5 @@ fn parse_relationship_count_suffix(key: &str, prefix: &str) -> Result<(VertexId,
             reason: "relationship count key has no source/destination pair".to_string(),
         });
     };
-    Ok((
-        parse_u64(key, src, "source vertex")?,
-        parse_u64(key, dst, "destination vertex")?,
-    ))
+    Ok((parse_u64(key, src, "source vertex")?, parse_u64(key, dst, "destination vertex")?))
 }

@@ -1,0 +1,6 @@
+comment = 'HydraDB graph algorithms over PostgreSQL relations'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_hydradb'
+relocatable = false
+superuser = true
+trusted = false

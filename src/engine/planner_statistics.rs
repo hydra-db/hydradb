@@ -38,9 +38,7 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::time::Duration;
 
 use super::*;
-use hydradb_object_publication::{
-    Acquire, Current, Ownership, PublicationError, PublicationStore, Publish,
-};
+use hydradb_object_publication::{Acquire, Current, Ownership, PublicationError, PublicationStore, Publish};
 use slatedb::bytes::Bytes;
 
 use crate::{decode_vertex_property_value_key, graph_now_millis, VertexPropertyValue};
@@ -90,6 +88,100 @@ pub struct PlannerStatistics {
     pub labels_sampled: BTreeSet<String>,
     /// Edge types whose count in `edge_types` is a lower bound, likewise.
     pub edge_types_sampled: BTreeSet<String>,
+    /// The build ran out of entries or time and kept only what it finished:
+    /// whatever is absent reads as unknown. Not stored; a decoded object is
+    /// never marked, since a reader cannot tell absent from never counted
+    /// anyway.
+    pub truncated: bool,
+    /// How far the build counted. Not stored: a decoded object reads as
+    /// counted in full.
+    pub reach: BuildReach,
+}
+
+/// The key families a build counts, in the order it counts them.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StatisticsFamily {
+    Labels,
+    EdgeTypes,
+    VertexProperties,
+    EdgeMetadataProperties,
+    RelationshipProperties,
+}
+
+/// How far a build counted. Families are counted in order and groups in key
+/// order inside each, so a build that ran out covered every group before
+/// the one it `stopped_at`, except capped properties it `dropped` before
+/// sampling them. A group the build covered but did not find is gone from
+/// the data, not uncounted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BuildReach {
+    pub stopped_at: Option<(StatisticsFamily, Vec<String>)>,
+    pub dropped: BTreeSet<(StatisticsFamily, Vec<String>)>,
+}
+
+impl BuildReach {
+    /// Whether the build read every key of `group` in `family`.
+    pub fn counted(&self, family: StatisticsFamily, group: &[String]) -> bool {
+        let before_stop = |(stop_family, stop): &(StatisticsFamily, Vec<String>)| {
+            family < *stop_family || (family == *stop_family && scanned_before(group, stop))
+        };
+        !self
+            .dropped
+            .iter()
+            .any(|(dropped_family, dropped)| *dropped_family == family && dropped.as_slice() == group)
+            && self.stopped_at.as_ref().is_none_or(before_stop)
+    }
+
+    /// Whether `group` is the one the build stopped inside of.
+    fn stopped_in(&self, family: StatisticsFamily, group: &[String]) -> bool {
+        self.stopped_at
+            .as_ref()
+            .is_some_and(|(stop_family, stop)| *stop_family == family && stop.as_slice() == group)
+    }
+
+    fn record(&mut self, family: StatisticsFamily, coverage: FamilyCoverage) {
+        if self.stopped_at.is_none() {
+            if let Some(stop) = coverage.stopped_at {
+                self.stopped_at = Some((family, stop));
+            }
+        }
+        self.dropped.extend(coverage.dropped.into_iter().map(|group| (family, group)));
+    }
+}
+
+impl PlannerStatistics {
+    /// Whether this build can stand in for `other`: every label, edge type
+    /// and property `other` holds lies inside this build's reach, so this
+    /// build either counted it afresh or found it gone from the data. A
+    /// label or edge type the build stopped inside of is only a lower bound
+    /// here, which stands in for `other`'s only if that was a lower bound
+    /// too. A build that ran out replaces a published object only when it
+    /// covers it: newer partial counts refresh older ones, deleted keys do
+    /// not block them, and a fuller object is never displaced.
+    pub fn covers(&self, other: &PlannerStatistics) -> bool {
+        use StatisticsFamily::*;
+        let reach = &self.reach;
+        let named = |family: StatisticsFamily, name: &String, lower_bound_there: bool| {
+            let group = std::slice::from_ref(name);
+            reach.counted(family, group) || (reach.stopped_in(family, group) && lower_bound_there)
+        };
+        other
+            .labels
+            .keys()
+            .all(|label| named(Labels, label, other.labels_sampled.contains(label)))
+            && other
+                .edge_types
+                .keys()
+                .all(|edge_type| named(EdgeTypes, edge_type, other.edge_types_sampled.contains(edge_type)))
+            && other
+                .vertex_properties
+                .keys()
+                .all(|property| reach.counted(VertexProperties, std::slice::from_ref(property)))
+            && other.edge_properties.keys().all(|(edge_type, property)| {
+                let group = [edge_type.clone(), property.clone()];
+                reach.counted(EdgeMetadataProperties, &group) && reach.counted(RelationshipProperties, &group)
+            })
+    }
 }
 
 /// Counts over one property's index entries.
@@ -128,15 +220,20 @@ pub struct TagRange {
 /// property, label or edge type is read exactly up to `exact_entries`; a
 /// property past that is sampled with `sample_windows` seeks of
 /// `window_entries` each, and a label or edge type past it is recorded as a
-/// lower bound only. `max_entries` bounds the whole build, every family and
-/// window included: a build that would read more fails with
-/// [`GraphError::AdmissionRejected`] and publishes nothing.
+/// lower bound only. `max_entries` and `deadline` bound the whole build,
+/// every family and window included. A build that reaches either stops and
+/// keeps what it finished (labels and edge types first, then properties in
+/// key order), drops the property it was counting, and marks itself
+/// [`PlannerStatistics::truncated`]: absent counts read as unknown, so a
+/// partial object is always safe to plan with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlannerStatisticsBuildLimits {
     pub exact_entries: u64,
     pub sample_windows: u32,
     pub window_entries: u64,
     pub max_entries: u64,
+    /// When the build stops counting. `None` counts until `max_entries`.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for PlannerStatisticsBuildLimits {
@@ -146,6 +243,7 @@ impl Default for PlannerStatisticsBuildLimits {
             sample_windows: 32,
             window_entries: 2_000,
             max_entries: 2_000_000,
+            deadline: None,
         }
     }
 }
@@ -184,23 +282,90 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// sort by a prefix the windows cannot tell apart anyway.
 const STRING_SEEK_NIBBLES: usize = 16;
 
-/// Entries read so far against the build's cap.
+/// Entries read so far against the build's cap and deadline.
 struct BuildBudget {
     read: u64,
     max: u64,
+    deadline: Option<std::time::Instant>,
+    /// Once out of entries or time, every later charge fails too: the
+    /// deadline is only checked every [`DEADLINE_CHECK_ENTRIES`], and a build
+    /// that resumed counting would spend the time kept for publishing.
+    exhausted: bool,
 }
 
+/// Raised by [`BuildBudget::charge`] and caught by the counting loops, which
+/// keep what they finished: running out is how a large build ends, not a
+/// failure.
+const BUDGET_EXHAUSTED: &str = "planner_statistics_build";
+
+/// Which property groups one index family counted completely. A family that
+/// ran out stopped at `stopped_at`: that group and every later one are
+/// unknown. `dropped` holds earlier groups removed because they were capped
+/// but not sampled. Merging two families keeps a property only where both
+/// counted it completely, so a partial count never reads as a whole one.
+#[derive(Default)]
+struct FamilyCoverage {
+    stopped_at: Option<Vec<String>>,
+    dropped: BTreeSet<Vec<String>>,
+}
+
+impl FamilyCoverage {
+    fn complete(&self, group: &[String]) -> bool {
+        !self.dropped.iter().any(|dropped| dropped.as_slice() == group)
+            && self.stopped_at.as_ref().is_none_or(|stopped| scanned_before(group, stopped))
+    }
+}
+
+/// Whether a scan reads every key of `group` before the first key of
+/// `stop`. Scans run in stored-key order, where each component is followed
+/// by `/`, and `-` and `.` sort below `/`: group `A-B` is read before group
+/// `A`, though the string `A` sorts first. So compare the stored prefixes,
+/// not the names. Groups of one family have one arity and no component
+/// holds `/`, so one prefix never extends another.
+fn scanned_before(group: &[String], stop: &[String]) -> bool {
+    let stored = |parts: &[String]| {
+        parts.iter().fold(String::new(), |mut prefix, part| {
+            prefix.push_str(part);
+            prefix.push('/');
+            prefix
+        })
+    };
+    stored(group) < stored(stop)
+}
+
+/// Entries between two deadline checks: often enough to stop within a
+/// fraction of a second on any store, rarely enough to cost nothing.
+const DEADLINE_CHECK_ENTRIES: u64 = 1_024;
+
 impl BuildBudget {
+    fn new(limits: &PlannerStatisticsBuildLimits) -> Self {
+        Self {
+            read: 0,
+            max: limits.max_entries,
+            deadline: limits.deadline,
+            exhausted: false,
+        }
+    }
+
     fn charge(&mut self, entries: u64) -> Result<()> {
+        let before = self.read;
         self.read = self.read.saturating_add(entries);
-        if self.read > self.max {
+        let past_deadline = self.deadline.is_some_and(|deadline| {
+            before / DEADLINE_CHECK_ENTRIES != self.read / DEADLINE_CHECK_ENTRIES && std::time::Instant::now() >= deadline
+        });
+        if self.exhausted || self.read > self.max || past_deadline {
+            self.exhausted = true;
             return Err(GraphError::AdmissionRejected {
-                operation: "planner_statistics_build",
+                operation: BUDGET_EXHAUSTED,
                 actual: self.read,
                 limit: self.max,
             });
         }
         Ok(())
+    }
+
+    fn exhausted(error: &GraphError) -> bool {
+        matches!(error, GraphError::AdmissionRejected { operation, .. } if *operation == BUDGET_EXHAUSTED)
     }
 }
 
@@ -213,61 +378,84 @@ impl GraphShard {
     }
 
     /// [`Self::build_planner_statistics`] under `limits`.
-    pub async fn build_planner_statistics_with(
-        &self,
-        cell_id: &str,
-        limits: &PlannerStatisticsBuildLimits,
-    ) -> Result<PlannerStatistics> {
+    pub async fn build_planner_statistics_with(&self, cell_id: &str, limits: &PlannerStatisticsBuildLimits) -> Result<PlannerStatistics> {
         validate_component("cell_id", cell_id)?;
-        let snapshot = self.db.snapshot().await?;
+        let snapshot = self.storage.snapshot().await?;
         let storage_sequence = snapshot.seq();
-        let mut budget = BuildBudget {
-            read: 0,
-            max: limits.max_entries,
-        };
-        let mut statistics = GraphStore::scope_snapshot(snapshot, async {
+        let mut budget = BuildBudget::new(limits);
+        let mut statistics = SlateGraphStore::scope_snapshot(snapshot, async {
             let mut statistics = PlannerStatistics {
                 cell_id: cell_id.to_string(),
                 storage_sequence,
                 format_version: PLANNER_STATISTICS_FORMAT_VERSION,
                 ..PlannerStatistics::default()
             };
-            let vertex_prefix = crate::keys::vertex_property_index_cell_prefix(cell_id);
-            statistics.vertex_properties = self
-                .count_property_index(&vertex_prefix, 3, 1, limits, &mut budget)
-                .await?
-                .into_iter()
-                .map(|(mut group, statistics)| (group.remove(0), statistics))
-                .collect();
-            let (labels, labels_sampled) = self
-                .count_id_runs(
-                    &crate::keys::vertex_label_cell_prefix(cell_id),
-                    false,
-                    limits,
-                    &mut budget,
-                )
+            // Cheapest and most used first, so a build that runs out still
+            // ranks label and edge-type scans.
+            let mut reach = BuildReach::default();
+            let (labels, labels_sampled, labels_coverage) = self
+                .count_id_runs(&crate::keys::vertex_label_cell_prefix(cell_id), false, limits, &mut budget)
                 .await?;
             statistics.labels = labels;
             statistics.labels_sampled = labels_sampled;
-            let (edge_types, edge_types_sampled) = self
-                .count_id_runs(
-                    &crate::keys::degree_out_cell_prefix(cell_id),
-                    true,
-                    limits,
-                    &mut budget,
-                )
+            reach.record(StatisticsFamily::Labels, labels_coverage);
+            let (edge_types, edge_types_sampled, edge_types_coverage) = self
+                .count_id_runs(&crate::keys::degree_out_cell_prefix(cell_id), true, limits, &mut budget)
                 .await?;
             statistics.edge_types = edge_types;
             statistics.edge_types_sampled = edge_types_sampled;
-            let edge_metadata = self
-                .count_edge_property_index(
-                    &crate::keys::edge_property_index_cell_prefix(cell_id),
-                    5,
+            reach.record(StatisticsFamily::EdgeTypes, edge_types_coverage);
+            let vertex_prefix = crate::keys::vertex_property_index_cell_prefix(cell_id);
+            let (vertex_properties, vertex_coverage) = self.count_property_index(&vertex_prefix, 3, 1, limits, &mut budget).await?;
+            statistics.vertex_properties = vertex_properties
+                .into_iter()
+                .map(|(mut group, statistics)| (group.remove(0), statistics))
+                .collect();
+            // A property the write-back catalog names is read from the
+            // current generation of its write-back index and never from the
+            // classic one, so its count is that generation's and replaces
+            // whatever the classic index still holds for it. The family is
+            // counted per `(property, generation)`; generations the catalog
+            // does not name are a sweep's business, not the planner's. A
+            // catalogued property whose generation was not counted whole is
+            // dropped rather than left at a stale or partial count.
+            let (write_back, write_back_coverage) = self
+                .count_property_index(
+                    &crate::keys::vertex_write_back_index_cell_prefix(cell_id),
+                    4,
+                    2,
                     limits,
                     &mut budget,
                 )
                 .await?;
-            let relationships = self
+            let catalog_prefix = crate::keys::vertex_write_back_generation_prefix(cell_id);
+            let mut catalog = self.scan_remote_prefix(&catalog_prefix).await?;
+            while let Some(kv) = catalog.next().await? {
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let Some(property) = key.strip_prefix(&catalog_prefix) else {
+                    return Err(GraphError::CorruptValue {
+                        key,
+                        reason: "expected a write-back catalog key".to_string(),
+                    });
+                };
+                let generation = decode_u64(&key, &kv.value)?;
+                let group = vec![property.to_string(), format!("{generation:020}")];
+                match write_back.get(&group) {
+                    Some(counted) if write_back_coverage.complete(&group) => {
+                        statistics.vertex_properties.insert(property.to_string(), counted.clone());
+                    }
+                    _ => {
+                        statistics.vertex_properties.remove(property);
+                        reach
+                            .dropped
+                            .insert((StatisticsFamily::VertexProperties, vec![property.to_string()]));
+                    }
+                }
+            }
+            let (edge_metadata, edge_metadata_coverage) = self
+                .count_edge_property_index(&crate::keys::edge_property_index_cell_prefix(cell_id), 5, limits, &mut budget)
+                .await?;
+            let (relationships, relationships_coverage) = self
                 .count_edge_property_index(
                     &crate::keys::relationship_property_index_cell_prefix(cell_id),
                     6,
@@ -275,8 +463,19 @@ impl GraphShard {
                     &mut budget,
                 )
                 .await?;
-            statistics.edge_properties =
-                merge_edge_property_statistics(edge_metadata, relationships);
+            // One property can live in both edge indexes, so its merged count
+            // is whole only where neither family stopped short of it.
+            let mut edge_properties = merge_edge_property_statistics(edge_metadata, relationships);
+            edge_properties.retain(|(edge_type, property), _| {
+                let group = [edge_type.clone(), property.clone()];
+                edge_metadata_coverage.complete(&group) && relationships_coverage.complete(&group)
+            });
+            statistics.edge_properties = edge_properties;
+            reach.record(StatisticsFamily::VertexProperties, vertex_coverage);
+            reach.record(StatisticsFamily::EdgeMetadataProperties, edge_metadata_coverage);
+            reach.record(StatisticsFamily::RelationshipProperties, relationships_coverage);
+            statistics.truncated = reach.stopped_at.is_some() || !reach.dropped.is_empty();
+            statistics.reach = reach;
             Ok::<_, GraphError>(statistics)
         })
         .await?;
@@ -290,8 +489,8 @@ impl GraphShard {
     /// order and a build that fails after claiming leaves it to readers.
     fn planner_statistics_publication(&self, cell_id: &str) -> PublicationStore {
         PublicationStore::new(
-            Arc::clone(self.db.object_store()),
-            planner_statistics_root(self.db.store_path(), cell_id),
+            Arc::clone(self.storage.object_store()),
+            planner_statistics_root(self.storage.store_path(), cell_id),
         )
         .with_legacy_sequence(Arc::new(|bytes: &Bytes| {
             decode_planner_statistics("current", bytes)
@@ -302,12 +501,9 @@ impl GraphShard {
 
     /// The published statistics of `cell_id`, or `None` when none exist.
     /// A claimed cell with nothing published yet is `None` too.
-    pub async fn read_planner_statistics(
-        &self,
-        cell_id: &str,
-    ) -> Result<Option<PlannerStatistics>> {
+    pub async fn read_planner_statistics(&self, cell_id: &str) -> Result<Option<PlannerStatistics>> {
         validate_component("cell_id", cell_id)?;
-        let path = planner_statistics_path(self.db.store_path(), cell_id);
+        let path = planner_statistics_path(self.storage.store_path(), cell_id);
         let current = self
             .planner_statistics_publication(cell_id)
             .read_current()
@@ -339,12 +535,8 @@ impl GraphShard {
         lease: Duration,
     ) -> Result<Option<PlannerStatisticsPublisher>> {
         validate_component("cell_id", cell_id)?;
-        let path = planner_statistics_path(self.db.store_path(), cell_id);
-        match self
-            .planner_statistics_publication(cell_id)
-            .acquire(owner, lease)
-            .await
-        {
+        let path = planner_statistics_path(self.storage.store_path(), cell_id);
+        match self.planner_statistics_publication(cell_id).acquire(owner, lease).await {
             Ok(Acquire::Acquired(ownership)) => Ok(Some(PlannerStatisticsPublisher {
                 cell_id: cell_id.to_string(),
                 path,
@@ -360,22 +552,15 @@ impl GraphShard {
     /// For a single writer, such as a test or a tool; the indexer claims
     /// before it counts so the claim covers the build. A cell another owner
     /// holds is a conflict, not a wait.
-    pub async fn publish_planner_statistics(
-        &self,
-        statistics: &PlannerStatistics,
-    ) -> Result<PlannerStatisticsPublish> {
+    pub async fn publish_planner_statistics(&self, statistics: &PlannerStatistics) -> Result<PlannerStatisticsPublish> {
         let owner = format!("publish-{}", ulid::Ulid::new());
         let Some(mut publisher) = self
-            .claim_planner_statistics_build(
-                &statistics.cell_id,
-                &owner,
-                PLANNER_STATISTICS_PUBLISH_LEASE,
-            )
+            .claim_planner_statistics_build(&statistics.cell_id, &owner, PLANNER_STATISTICS_PUBLISH_LEASE)
             .await?
         else {
             return Err(GraphError::ConditionalWriteConflict {
                 operation: "planner_statistics_publish",
-                key: planner_statistics_path(self.db.store_path(), &statistics.cell_id).to_string(),
+                key: planner_statistics_path(self.storage.store_path(), &statistics.cell_id).to_string(),
             });
         };
         let outcome = publisher.publish(statistics).await;
@@ -399,25 +584,26 @@ impl GraphShard {
         components: usize,
         limits: &PlannerStatisticsBuildLimits,
         budget: &mut BuildBudget,
-    ) -> Result<BTreeMap<(String, String), PropertyIndexStatistics>> {
-        Ok(self
-            .count_property_index(prefix, components, 2, limits, budget)
-            .await?
+    ) -> Result<(BTreeMap<(String, String), PropertyIndexStatistics>, FamilyCoverage)> {
+        let (groups, coverage) = self.count_property_index(prefix, components, 2, limits, budget).await?;
+        let properties = groups
             .into_iter()
             .map(|(group, statistics)| {
-                let [edge_type, property]: [String; 2] = group
-                    .try_into()
-                    .expect("edge property group has two components");
+                let [edge_type, property]: [String; 2] = group.try_into().expect("edge property group has two components");
                 ((edge_type, property), statistics)
             })
-            .collect())
+            .collect();
+        Ok((properties, coverage))
     }
 
     /// Count one property index family. A property is the first `group_len`
     /// key components, before the encoded value: one for vertices, two
     /// (`type/prop`) for edges. Each property is exact up to the cap; past
     /// it the rest of its run is skipped with a seek and the property is
-    /// sampled afterwards.
+    /// sampled afterwards. When the budget runs out the scan stops, the
+    /// property it was in and any capped property not yet sampled are
+    /// dropped (both hold only part of their run), and the result is marked
+    /// truncated.
     async fn count_property_index(
         &self,
         prefix: &str,
@@ -425,19 +611,28 @@ impl GraphShard {
         group_len: usize,
         limits: &PlannerStatisticsBuildLimits,
         budget: &mut BuildBudget,
-    ) -> Result<BTreeMap<Vec<String>, PropertyIndexStatistics>> {
+    ) -> Result<(BTreeMap<Vec<String>, PropertyIndexStatistics>, FamilyCoverage)> {
         let mut counter = PropertyRunCounter::new(limits.exact_entries);
         let mut capped = Vec::new();
         let mut start = None;
+        let mut coverage = FamilyCoverage::default();
         'scan: loop {
             let mut iter = self.scan_remote_prefix_from(prefix, start.take()).await?;
             while let Some(kv) = iter.next().await? {
-                budget.charge(1)?;
                 let key = String::from_utf8_lossy(&kv.key);
                 let parts = index_key_parts(&key, prefix, components)?;
-                if let Pushed::Capped(group) =
-                    counter.push(&key, &parts[..group_len], parts[group_len])?
-                {
+                if let Err(error) = budget.charge(1) {
+                    if !BuildBudget::exhausted(&error) {
+                        return Err(error);
+                    }
+                    // A key of the next property means the current one is
+                    // complete; a key of the current one means it is not.
+                    let group = parts[..group_len].iter().map(|part| part.to_string()).collect::<Vec<_>>();
+                    counter.stop_before(&group, &key)?;
+                    coverage.stopped_at = Some(group);
+                    break 'scan;
+                }
+                if let Pushed::Capped(group) = counter.push(&key, &parts[..group_len], parts[group_len])? {
                     // The smallest key after this property's run: `/` sorts
                     // below `0`, so `{group}0` is past every `{group}/...`.
                     start = Some(format!("{}0", group.join("/")).into_bytes());
@@ -448,15 +643,27 @@ impl GraphShard {
             break;
         }
         let mut finished = counter.finish(prefix)?;
-        for group in capped {
+        let mut capped = capped.into_iter();
+        for group in capped.by_ref() {
             let Some(statistics) = finished.get_mut(&group) else {
                 continue;
             };
             let group_prefix = format!("{prefix}{}/", group.join("/"));
-            self.sample_property(&group_prefix, statistics, limits, budget)
-                .await?;
+            if let Err(error) = self.sample_property(&group_prefix, statistics, limits, budget).await {
+                if !BuildBudget::exhausted(&error) {
+                    return Err(error);
+                }
+                finished.remove(&group);
+                coverage.dropped.insert(group);
+                break;
+            }
         }
-        Ok(finished)
+        // Capped properties never sampled hold only their exact prefix.
+        for group in capped {
+            finished.remove(&group);
+            coverage.dropped.insert(group);
+        }
+        Ok((finished, coverage))
     }
 
     /// Count `{name}/{id}` runs: labels (one entry per vertex) and out-degree
@@ -469,23 +676,35 @@ impl GraphShard {
         weighted: bool,
         limits: &PlannerStatisticsBuildLimits,
         budget: &mut BuildBudget,
-    ) -> Result<(BTreeMap<String, u64>, BTreeSet<String>)> {
+    ) -> Result<(BTreeMap<String, u64>, BTreeSet<String>, FamilyCoverage)> {
         let mut counts = BTreeMap::<String, u64>::new();
         let mut entries = BTreeMap::<String, u64>::new();
         let mut sampled = BTreeSet::new();
         let mut start = None;
+        let mut current: Option<String> = None;
+        let mut coverage = FamilyCoverage::default();
         'scan: loop {
             let mut iter = self.scan_remote_prefix_from(prefix, start.take()).await?;
             while let Some(kv) = iter.next().await? {
-                budget.charge(1)?;
                 let key = String::from_utf8_lossy(&kv.key);
                 let parts = index_key_parts(&key, prefix, 2)?;
                 let name = parts[0];
-                let weight = if weighted {
-                    decode_u64(&key, &kv.value)?
-                } else {
-                    1
-                };
+                if let Err(error) = budget.charge(1) {
+                    if !BuildBudget::exhausted(&error) {
+                        return Err(error);
+                    }
+                    // Out inside a name: its count is a lower bound. Out on
+                    // the first entry of the next name: the last one is whole.
+                    if current.as_deref() == Some(name) {
+                        sampled.insert(name.to_string());
+                    }
+                    coverage.stopped_at = Some(vec![name.to_string()]);
+                    break 'scan;
+                }
+                if current.as_deref() != Some(name) {
+                    current = Some(name.to_string());
+                }
+                let weight = if weighted { decode_u64(&key, &kv.value)? } else { 1 };
                 add_count(&mut counts, name, weight);
                 let seen = entries.entry(name.to_string()).or_default();
                 *seen += 1;
@@ -497,7 +716,7 @@ impl GraphShard {
             }
             break;
         }
-        Ok((counts, sampled))
+        Ok((counts, sampled, coverage))
     }
 
     /// Sample one property whose run exceeded the cap. Every type tag present
@@ -513,15 +732,10 @@ impl GraphShard {
     ) -> Result<()> {
         let mut tags = Vec::new();
         for tag in PROPERTY_VALUE_TAGS {
-            let Some(min) = self
-                .first_value_at_or_after(group_prefix, &tag.to_string(), *tag, budget)
-                .await?
-            else {
+            let Some(min) = self.first_value_at_or_after(group_prefix, &tag.to_string(), *tag, budget).await? else {
                 continue;
             };
-            let max = self
-                .probe_max_value(group_prefix, *tag, &min, budget)
-                .await?;
+            let max = self.probe_max_value(group_prefix, *tag, &min, budget).await?;
             tags.push((*tag, min, max));
         }
         let mut sampler = WindowSampler::new(limits.window_entries);
@@ -529,9 +743,7 @@ impl GraphShard {
         for (tag, min, max) in &tags {
             let seeks = seek_points(*tag, min, max, windows_per_tag);
             for seek in seeks {
-                let mut iter = self
-                    .scan_remote_prefix_from(group_prefix, Some(seek.into_bytes()))
-                    .await?;
+                let mut iter = self.scan_remote_prefix_from(group_prefix, Some(seek.into_bytes())).await?;
                 sampler.open_window();
                 let mut read = 0;
                 while read < limits.window_entries {
@@ -574,9 +786,7 @@ impl GraphShard {
         budget: &mut BuildBudget,
     ) -> Result<Option<String>> {
         budget.charge(1)?;
-        let mut iter = self
-            .scan_remote_prefix_from(group_prefix, Some(suffix.as_bytes().to_vec()))
-            .await?;
+        let mut iter = self.scan_remote_prefix_from(group_prefix, Some(suffix.as_bytes().to_vec())).await?;
         let Some(kv) = iter.next().await? else {
             return Ok(None);
         };
@@ -593,23 +803,12 @@ impl GraphShard {
     /// a tag's payload orders like a number (decimal or hex of fixed width)
     /// or like hex text, so "is there an entry at or above X" bisects to the
     /// maximum in about 64 probes, each a one-entry scan.
-    async fn probe_max_value(
-        &self,
-        group_prefix: &str,
-        tag: char,
-        min: &str,
-        budget: &mut BuildBudget,
-    ) -> Result<String> {
+    async fn probe_max_value(&self, group_prefix: &str, tag: char, min: &str, budget: &mut BuildBudget) -> Result<String> {
         match tag {
-            'b' => Ok(
-                match self
-                    .first_value_at_or_after(group_prefix, "b1", 'b', budget)
-                    .await?
-                {
-                    Some(value) => value,
-                    None => min.to_string(),
-                },
-            ),
+            'b' => Ok(match self.first_value_at_or_after(group_prefix, "b1", 'b', budget).await? {
+                Some(value) => value,
+                None => min.to_string(),
+            }),
             'i' | 'j' | 'n' => {
                 let Some(low) = numeric_payload(tag, min) else {
                     return Ok(min.to_string());
@@ -644,10 +843,7 @@ impl GraphShard {
                     while low < high {
                         let mid = (low + high) / 2;
                         let probe = format!("s{resolved}{}", HEX_DIGITS[mid] as char);
-                        match self
-                            .first_value_at_or_after(group_prefix, &probe, 's', budget)
-                            .await?
-                        {
+                        match self.first_value_at_or_after(group_prefix, &probe, 's', budget).await? {
                             Some(found) => {
                                 hit = Some((mid, found));
                                 low = mid + 1;
@@ -688,10 +884,7 @@ fn numeric_key(tag: char, payload: u64) -> String {
 /// [`STRING_SEEK_NIBBLES`], as the integer those nibbles sort by.
 fn string_payload(encoded: &str, pad: u8) -> u64 {
     let payload = encoded.strip_prefix('s').unwrap_or("");
-    let mut digits = payload
-        .bytes()
-        .take(STRING_SEEK_NIBBLES)
-        .collect::<Vec<_>>();
+    let mut digits = payload.bytes().take(STRING_SEEK_NIBBLES).collect::<Vec<_>>();
     digits.resize(STRING_SEEK_NIBBLES, pad);
     digits.iter().fold(0_u64, |value, digit| {
         let nibble = HEX_DIGITS.iter().position(|hex| hex == digit).unwrap_or(0) as u64;
@@ -704,15 +897,9 @@ fn string_payload(encoded: &str, pad: u8) -> u64 {
 fn seek_points(tag: char, min: &str, max: &str, count: usize) -> Vec<String> {
     let count = count.max(1);
     let (low, high, render): (u64, u64, Box<dyn Fn(u64) -> String>) = match tag {
-        'b' => {
-            return vec!["b0".to_string(), "b1".to_string()]
-                .into_iter()
-                .take(count)
-                .collect()
-        }
+        'b' => return vec!["b0".to_string(), "b1".to_string()].into_iter().take(count).collect(),
         'i' | 'j' | 'n' => {
-            let (Some(low), Some(high)) = (numeric_payload(tag, min), numeric_payload(tag, max))
-            else {
+            let (Some(low), Some(high)) = (numeric_payload(tag, min), numeric_payload(tag, max)) else {
                 return vec![min.to_string()];
             };
             (low, high, Box::new(move |value| numeric_key(tag, value)))
@@ -730,8 +917,7 @@ fn seek_points(tag: char, min: &str, max: &str, count: usize) -> Vec<String> {
     (0..count as u64)
         .map(|index| {
             // `low + span * index / count`, without overflow.
-            let offset = (span / count as u64).saturating_mul(index)
-                + (span % count as u64).saturating_mul(index) / count as u64;
+            let offset = (span / count as u64).saturating_mul(index) + (span % count as u64).saturating_mul(index) / count as u64;
             if index == 0 {
                 min.to_string()
             } else {
@@ -798,8 +984,7 @@ impl WindowSampler {
                     }
                 }
                 None => {
-                    self.seen
-                        .insert(tag, (encoded.to_string(), encoded.to_string()));
+                    self.seen.insert(tag, (encoded.to_string(), encoded.to_string()));
                 }
             }
         }
@@ -850,15 +1035,12 @@ impl WindowSampler {
         let mut ranges = BTreeMap::new();
         for (tag, min, max) in tags {
             let (min, max) = match self.seen.get(&tag) {
-                Some((seen_min, seen_max)) => {
-                    (min.min(seen_min.clone()), max.max(seen_max.clone()))
-                }
+                Some((seen_min, seen_max)) => (min.min(seen_min.clone()), max.max(seen_max.clone())),
                 None => (min, max),
             };
             // NaN sorts outside the floats on both ends and is no bound.
             let nan = |value: &str| {
-                tag == 'n'
-                    && matches!(decode_vertex_property_value_key(value), Ok(VertexPropertyValue::Float(float)) if float.0.is_nan())
+                tag == 'n' && matches!(decode_vertex_property_value_key(value), Ok(VertexPropertyValue::Float(float)) if float.0.is_nan())
             };
             if nan(&min) || nan(&max) {
                 continue;
@@ -873,12 +1055,9 @@ impl WindowSampler {
             );
         }
         statistics.top_values = sorted_top_values(top);
-        statistics.most_common_count = statistics
-            .top_values
-            .first()
-            .map_or(statistics.most_common_count, |(_, count)| {
-                (*count).max(statistics.most_common_count)
-            });
+        statistics.most_common_count = statistics.top_values.first().map_or(statistics.most_common_count, |(_, count)| {
+            (*count).max(statistics.most_common_count)
+        });
         statistics.ranges = ranges;
         let seen = self.saturated.len();
         statistics.saturated_values = self
@@ -892,26 +1071,19 @@ impl WindowSampler {
             sample_entries: self.complete_entries,
             complete_runs: self.complete_runs,
             windows: self.windows,
-            saturated_dropped: u32::try_from(seen - statistics.saturated_values.len())
-                .unwrap_or(u32::MAX),
+            saturated_dropped: u32::try_from(seen - statistics.saturated_values.len()).unwrap_or(u32::MAX),
         });
     }
 }
 
 /// Root of a cell's publication: `current` and `payloads/` live under it.
-pub(crate) fn planner_statistics_root(
-    store_path: &slatedb::object_store::path::Path,
-    cell_id: &str,
-) -> slatedb::object_store::path::Path {
+pub(crate) fn planner_statistics_root(store_path: &slatedb::object_store::path::Path, cell_id: &str) -> slatedb::object_store::path::Path {
     format!("{store_path}/_planner_statistics/v1/{cell_id}").into()
 }
 
 /// The publication's control record, and before it the statistics object
 /// itself. Named in errors and in the tests that corrupt it.
-pub(crate) fn planner_statistics_path(
-    store_path: &slatedb::object_store::path::Path,
-    cell_id: &str,
-) -> slatedb::object_store::path::Path {
+pub(crate) fn planner_statistics_path(store_path: &slatedb::object_store::path::Path, cell_id: &str) -> slatedb::object_store::path::Path {
     format!("{store_path}/_planner_statistics/v1/{cell_id}/current").into()
 }
 
@@ -955,28 +1127,18 @@ impl PlannerStatisticsPublisher {
     /// the payload is uploaded whole, then `current` is moved to it only if
     /// the sequence is newer than the published one and the claim still
     /// stands.
-    pub async fn publish(
-        &mut self,
-        statistics: &PlannerStatistics,
-    ) -> Result<PlannerStatisticsPublish> {
+    pub async fn publish(&mut self, statistics: &PlannerStatistics) -> Result<PlannerStatisticsPublish> {
         self.publish_with(statistics, false).await
     }
 
     /// [`PlannerStatisticsPublisher::publish`] for a published object that
     /// does not decode: a build of the same snapshot replaces it instead of
     /// being superseded. A newer snapshot still wins.
-    pub async fn republish(
-        &mut self,
-        statistics: &PlannerStatistics,
-    ) -> Result<PlannerStatisticsPublish> {
+    pub async fn republish(&mut self, statistics: &PlannerStatistics) -> Result<PlannerStatisticsPublish> {
         self.publish_with(statistics, true).await
     }
 
-    async fn publish_with(
-        &mut self,
-        statistics: &PlannerStatistics,
-        replace_same: bool,
-    ) -> Result<PlannerStatisticsPublish> {
+    async fn publish_with(&mut self, statistics: &PlannerStatistics, replace_same: bool) -> Result<PlannerStatisticsPublish> {
         if statistics.cell_id != self.cell_id {
             return Err(GraphError::InvalidKeyComponent {
                 component: "cell_id",
@@ -985,19 +1147,13 @@ impl PlannerStatisticsPublisher {
         }
         let payload = Bytes::from(encode_planner_statistics(statistics));
         let outcome = if replace_same {
-            self.ownership
-                .republish(statistics.storage_sequence, payload)
-                .await
+            self.ownership.republish(statistics.storage_sequence, payload).await
         } else {
-            self.ownership
-                .publish(statistics.storage_sequence, payload)
-                .await
+            self.ownership.publish(statistics.storage_sequence, payload).await
         };
         match outcome {
             Ok(Publish::Published { .. }) => Ok(PlannerStatisticsPublish::Published),
-            Ok(Publish::Superseded { current_sequence }) => {
-                Ok(PlannerStatisticsPublish::Superseded { current_sequence })
-            }
+            Ok(Publish::Superseded { current_sequence }) => Ok(PlannerStatisticsPublish::Superseded { current_sequence }),
             Err(PublicationError::Fenced) => Ok(PlannerStatisticsPublish::Fenced),
             Err(error) => Err(publication_error(error, &self.path)),
         }
@@ -1015,17 +1171,11 @@ impl PlannerStatisticsPublisher {
     /// Give the claim back; the publication stays. A claim already taken
     /// over has nothing to give back, and that is not an error.
     pub async fn release(self) -> Result<()> {
-        self.ownership
-            .release()
-            .await
-            .map_err(|error| publication_error(error, &self.path))
+        self.ownership.release().await.map_err(|error| publication_error(error, &self.path))
     }
 }
 
-fn publication_error(
-    error: PublicationError,
-    path: &slatedb::object_store::path::Path,
-) -> GraphError {
+fn publication_error(error: PublicationError, path: &slatedb::object_store::path::Path) -> GraphError {
     match error {
         PublicationError::ObjectStore(error) => GraphError::ObjectStore(error),
         PublicationError::Fenced => GraphError::ConditionalWriteConflict {
@@ -1091,18 +1241,11 @@ impl PropertyRunCounter {
     }
 
     fn push(&mut self, key: &str, group: &[&str], encoded: &str) -> Result<Pushed> {
-        let same_group = self
-            .current
-            .as_ref()
-            .is_some_and(|(current, _, _)| current.iter().eq(group.iter()));
+        let same_group = self.current.as_ref().is_some_and(|(current, _, _)| current.iter().eq(group.iter()));
         if !same_group {
             self.close_group(key)?;
             if self.finished.len() < MAX_PROPERTIES_PER_KIND {
-                self.current = Some((
-                    group.iter().map(|part| part.to_string()).collect(),
-                    PropertyRuns::default(),
-                    0,
-                ));
+                self.current = Some((group.iter().map(|part| part.to_string()).collect(), PropertyRuns::default(), 0));
             }
         }
         match &mut self.current {
@@ -1130,6 +1273,19 @@ impl PropertyRunCounter {
             return corrupt(key, "index keys of one property are not contiguous");
         }
         Ok(())
+    }
+
+    /// The budget ran out on a key of `group`. If that is the property being
+    /// counted, its run is unfinished and it is dropped; otherwise the
+    /// current property ended before this key and is kept.
+    fn stop_before(&mut self, group: &[String], key: &str) -> Result<()> {
+        let unfinished = self.current.as_ref().is_some_and(|(current, _, _)| current.as_slice() == group);
+        if unfinished {
+            self.current = None;
+            Ok(())
+        } else {
+            self.close_group(key)
+        }
     }
 
     fn finish(mut self, key: &str) -> Result<BTreeMap<Vec<String>, PropertyIndexStatistics>> {
@@ -1163,6 +1319,15 @@ impl PropertyRuns {
         Ok(())
     }
 
+    /// A whole run of `count` entries of `encoded`, which sorts after every
+    /// value pushed before it.
+    #[cfg(feature = "opencypher")]
+    fn push_run(&mut self, key: &str, encoded: String, count: u64) -> Result<()> {
+        self.close_run(key)?;
+        self.run = Some((encoded, count));
+        Ok(())
+    }
+
     fn close_run(&mut self, key: &str) -> Result<()> {
         let Some((value, count)) = self.run.take() else {
             return Ok(());
@@ -1177,8 +1342,8 @@ impl PropertyRuns {
             })?;
         // NaN sorts outside the numbers on both ends; it is counted but
         // never a bound.
-        let bounded = tag != 'n'
-            || !matches!(decode_vertex_property_value_key(&value)?, VertexPropertyValue::Float(float) if float.0.is_nan());
+        let bounded =
+            tag != 'n' || !matches!(decode_vertex_property_value_key(&value)?, VertexPropertyValue::Float(float) if float.0.is_nan());
         let statistics = &mut self.statistics;
         statistics.total_entries = statistics.total_entries.saturating_add(count);
         statistics.distinct_values += 1;
@@ -1206,20 +1371,227 @@ impl PropertyRuns {
     fn finish(mut self, key: &str) -> Result<PropertyIndexStatistics> {
         self.close_run(key)?;
         let mut statistics = self.statistics;
-        statistics.top_values = sorted_top_values(
-            self.top
-                .into_iter()
-                .map(|Reverse((count, Reverse(value)))| (value, count)),
-        );
+        statistics.top_values = sorted_top_values(self.top.into_iter().map(|Reverse((count, Reverse(value)))| (value, count)));
         statistics.ranges = self
             .ranges
             .into_iter()
-            .filter_map(|(tag, (entries, bounds))| {
-                bounds.map(|(min, max)| (tag, TagRange { entries, min, max }))
-            })
+            .filter_map(|(tag, (entries, bounds))| bounds.map(|(min, max)| (tag, TagRange { entries, min, max })))
             .collect();
         Ok(statistics)
     }
+}
+
+/// A copy of some floats in property index order: the order of their
+/// encoded index keys, which for floats is [`f64::total_cmp`] (negative NaN
+/// first, then negative infinity up through negative zero before positive
+/// zero, to positive NaN last). Values that compare equal in it are the
+/// same bit pattern, so the copy is one sequence whatever the input order.
+#[cfg(feature = "opencypher")]
+pub(crate) struct IndexOrderedFloats(Vec<f64>);
+
+#[cfg(feature = "opencypher")]
+impl IndexOrderedFloats {
+    /// Copy and sort `values`, calling `check` on each side of the sort: the
+    /// sort is one call and cannot be interrupted.
+    pub(crate) fn sort(values: &[f64], mut check: impl FnMut() -> Result<()>) -> Result<Self> {
+        check()?;
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable_by(f64::total_cmp);
+        check()?;
+        Ok(Self(sorted))
+    }
+
+    pub(crate) fn as_slice(&self) -> &[f64] {
+        &self.0
+    }
+}
+
+/// Values a write-back keeps in its generation besides the ones it writes:
+/// a property's values on vertices outside the run, in no order. A float,
+/// which is every value a write-back wrote, is held as one, at 8 bytes; any
+/// other value, which only a hand `SET` puts there, as its encoded key.
+#[cfg(feature = "opencypher")]
+#[derive(Debug, Default)]
+pub(crate) struct CarriedIndexValues {
+    floats: Vec<f64>,
+    keys: Vec<String>,
+}
+
+#[cfg(feature = "opencypher")]
+impl CarriedIndexValues {
+    pub(crate) fn push(&mut self, value: &VertexPropertyValue) {
+        match value {
+            VertexPropertyValue::Float(float) => self.floats.push(float.0),
+            other => self.keys.push(crate::encode_vertex_property_value_key(other)),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.floats.len() + self.keys.len()
+    }
+}
+
+/// [`exact_property_statistics`] of `values` and `carried` together,
+/// counted on the floats themselves: the same statistics, field for field,
+/// at 8 bytes a float rather than an encoded key each. Runs of floats are of
+/// equal bit patterns, which is what equal keys are, and only a run's value
+/// is encoded, once. The carried values are sorted here, floats merged with
+/// `values` in index order and other keys, whose type tags differ from a
+/// float's, merged between the float runs by key.
+///
+/// `check` is called before the count, on each side of the carried values'
+/// sort, and every [`EXACT_STATISTICS_CHECK_STRIDE`] floats while counting.
+#[cfg(feature = "opencypher")]
+pub(crate) fn exact_float_property_statistics(
+    context: &str,
+    values: &IndexOrderedFloats,
+    carried: CarriedIndexValues,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<PropertyIndexStatistics> {
+    check()?;
+    let CarriedIndexValues {
+        floats: mut carried_floats,
+        keys: mut carried_keys,
+    } = carried;
+    carried_floats.sort_unstable_by(f64::total_cmp);
+    carried_keys.sort_unstable();
+    check()?;
+    let mut runs = PropertyRuns::default();
+    let mut carried_keys = carried_keys.into_iter().peekable();
+    // Every carried key below `bound`, or every one left with no bound, in
+    // runs of equal keys.
+    let mut push_keys_below = |runs: &mut PropertyRuns, bound: Option<&str>| -> Result<()> {
+        while let Some(next) = carried_keys.peek() {
+            if bound.is_some_and(|bound| next.as_str() >= bound) {
+                break;
+            }
+            let Some(key) = carried_keys.next() else { break };
+            let mut count = 1;
+            while carried_keys.next_if_eq(&key).is_some() {
+                count += 1;
+            }
+            runs.push_run(context, key, count)?;
+        }
+        Ok(())
+    };
+    let mut push_float_run = |runs: &mut PropertyRuns, value: f64, count: u64| -> Result<()> {
+        let key = float_index_key(value);
+        push_keys_below(runs, Some(&key))?;
+        runs.push_run(context, key, count)
+    };
+    let (written, carried_floats) = (values.as_slice(), carried_floats.as_slice());
+    let (mut next_written, mut next_carried) = (0, 0);
+    let mut run: Option<(f64, u64)> = None;
+    for index in 0.. {
+        let value = match (written.get(next_written), carried_floats.get(next_carried)) {
+            (Some(left), Some(right)) if left.total_cmp(right).is_le() => {
+                next_written += 1;
+                *left
+            }
+            (_, Some(right)) => {
+                next_carried += 1;
+                *right
+            }
+            (Some(left), None) => {
+                next_written += 1;
+                *left
+            }
+            (None, None) => break,
+        };
+        if index > 0 && index % EXACT_STATISTICS_CHECK_STRIDE == 0 {
+            check()?;
+        }
+        match &mut run {
+            Some((held, count)) if held.to_bits() == value.to_bits() => *count += 1,
+            _ => {
+                if let Some((held, count)) = run.replace((value, 1)) {
+                    push_float_run(&mut runs, held, count)?;
+                }
+            }
+        }
+    }
+    if let Some((held, count)) = run {
+        push_float_run(&mut runs, held, count)?;
+    }
+    push_keys_below(&mut runs, None)?;
+    runs.finish(context)
+}
+
+#[cfg(feature = "opencypher")]
+fn float_index_key(value: f64) -> String {
+    crate::encode_vertex_property_value_key(&VertexPropertyValue::Float(crate::QueryFloat(value)))
+}
+
+/// Values between two budget checks in [`exact_property_statistics`] and
+/// [`exact_float_property_statistics`]. A check is a clock read and an
+/// atomic load, invisible next to encoding this many values, and a stride
+/// this size stops a cancelled count within a few milliseconds. A sort is
+/// one call and cannot be interrupted, so it is bounded only by the checks
+/// on each side of it.
+#[cfg(feature = "opencypher")]
+pub(crate) const EXACT_STATISTICS_CHECK_STRIDE: usize = 1 << 16;
+
+/// The value of a [`keys::vertex_write_back_statistics`] key: one planner
+/// statistics object holding only `property`, its `sequence` header the
+/// generation the counts describe. The object's own format and parser are
+/// reused rather than a second encoding kept in step with them.
+#[cfg(feature = "opencypher")]
+pub(crate) fn encode_write_back_property_statistics(
+    cell_id: &str,
+    property: &str,
+    generation: StorageSequence,
+    statistics: &PropertyIndexStatistics,
+) -> Vec<u8> {
+    encode_planner_statistics(&PlannerStatistics {
+        cell_id: cell_id.to_string(),
+        storage_sequence: generation,
+        built_at_ms: graph_now_millis(),
+        format_version: PLANNER_STATISTICS_FORMAT_VERSION,
+        vertex_properties: BTreeMap::from([(property.to_string(), statistics.clone())]),
+        ..PlannerStatistics::default()
+    })
+}
+
+/// One write-back property's published counts, decoded. Read by the
+/// experimental planner's statistics only; the write-back itself only
+/// encodes.
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) struct WriteBackPropertyStatistics {
+    /// The index generation the counts describe.
+    pub(crate) generation: StorageSequence,
+    pub(crate) built_at_ms: u64,
+    pub(crate) statistics: PropertyIndexStatistics,
+}
+
+/// Inverse of [`encode_write_back_property_statistics`]. A value for
+/// another cell or property, or one holding anything but that one
+/// property, is corrupt.
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) fn decode_write_back_property_statistics(
+    key: &str,
+    bytes: &[u8],
+    cell_id: &str,
+    property: &str,
+) -> Result<WriteBackPropertyStatistics> {
+    let mut decoded = decode_planner_statistics(key, bytes)?;
+    if decoded.cell_id != cell_id {
+        return corrupt(key, "write-back statistics cell does not match key");
+    }
+    let Some(statistics) = decoded.vertex_properties.remove(property) else {
+        return corrupt(key, "write-back statistics do not hold the key's property");
+    };
+    if !decoded.vertex_properties.is_empty()
+        || !decoded.labels.is_empty()
+        || !decoded.edge_types.is_empty()
+        || !decoded.edge_properties.is_empty()
+    {
+        return corrupt(key, "write-back statistics hold more than the key's property");
+    }
+    Ok(WriteBackPropertyStatistics {
+        generation: decoded.storage_sequence,
+        built_at_ms: decoded.built_at_ms,
+        statistics,
+    })
 }
 
 /// Count descending, then key ascending, truncated to the top-value limit.
@@ -1251,10 +1623,7 @@ fn merge_edge_property_statistics(
 /// ranges widen. A value present in both is counted as two distinct values, so
 /// `distinct_values` is an upper bound, and a value outside both top lists can
 /// be missed by the merged list.
-fn merge_property_statistics(
-    left: PropertyIndexStatistics,
-    right: PropertyIndexStatistics,
-) -> PropertyIndexStatistics {
+fn merge_property_statistics(left: PropertyIndexStatistics, right: PropertyIndexStatistics) -> PropertyIndexStatistics {
     let mut top = BTreeMap::<String, u64>::new();
     for (value, count) in left.top_values.into_iter().chain(right.top_values) {
         *top.entry(value).or_default() += count;
@@ -1337,12 +1706,7 @@ pub fn encode_planner_statistics(statistics: &PlannerStatistics) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn encode_property_statistics(
-    out: &mut String,
-    kind: &str,
-    name: &str,
-    statistics: &PropertyIndexStatistics,
-) {
+fn encode_property_statistics(out: &mut String, kind: &str, name: &str, statistics: &PropertyIndexStatistics) {
     use std::fmt::Write as _;
 
     let _ = writeln!(
@@ -1354,11 +1718,7 @@ fn encode_property_statistics(
         let _ = writeln!(
             out,
             "{kind}sample\t{name}\t{}\t{}\t{}\t{}\t{}",
-            sample.exact_entries,
-            sample.sample_entries,
-            sample.complete_runs,
-            sample.windows,
-            sample.saturated_dropped
+            sample.exact_entries, sample.sample_entries, sample.complete_runs, sample.windows, sample.saturated_dropped
         );
     }
     for (value, count) in &statistics.top_values {
@@ -1368,11 +1728,7 @@ fn encode_property_statistics(
         let _ = writeln!(out, "{kind}saturated\t{name}\t{value}");
     }
     for (tag, range) in &statistics.ranges {
-        let _ = writeln!(
-            out,
-            "{kind}range\t{name}\t{tag}\t{}\t{}\t{}",
-            range.entries, range.min, range.max
-        );
+        let _ = writeln!(out, "{kind}range\t{name}\t{tag}\t{}\t{}\t{}", range.entries, range.min, range.max);
     }
 }
 
@@ -1384,17 +1740,9 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
     match lines.next() {
         Some(PLANNER_STATISTICS_MAGIC) => {}
         Some(other) if other.starts_with(PLANNER_STATISTICS_MAGIC_PREFIX) => {
-            return corrupt(
-                path,
-                format!("unsupported planner statistics version {other}"),
-            );
+            return corrupt(path, format!("unsupported planner statistics version {other}"));
         }
-        _ => {
-            return corrupt(
-                path,
-                "unsupported planner statistics version: missing header",
-            )
-        }
+        _ => return corrupt(path, "unsupported planner statistics version: missing header"),
     }
     let mut header = |name: &str| -> Result<String> {
         match lines.next().and_then(|line| line.split_once('\t')) {
@@ -1431,10 +1779,7 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
                 validate_component("edge_type", edge_type)?;
                 if statistics
                     .edge_types
-                    .insert(
-                        edge_type.to_string(),
-                        parse_u64(path, count, "edge type count")?,
-                    )
+                    .insert(edge_type.to_string(), parse_u64(path, count, "edge type count")?)
                     .is_some()
                 {
                     return invalid();
@@ -1443,25 +1788,17 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
             ["vprop", property, total, distinct, most_common] => {
                 validate_component("property", property)?;
                 let stats = decode_property_counts(path, total, distinct, most_common)?;
-                if statistics
-                    .vertex_properties
-                    .insert(property.to_string(), stats)
-                    .is_some()
-                {
+                if statistics.vertex_properties.insert(property.to_string(), stats).is_some() {
                     return invalid();
                 }
             }
             ["labelsample", label] => {
-                if !statistics.labels.contains_key(*label)
-                    || !statistics.labels_sampled.insert(label.to_string())
-                {
+                if !statistics.labels.contains_key(*label) || !statistics.labels_sampled.insert(label.to_string()) {
                     return invalid();
                 }
             }
             ["edgesample", edge_type] => {
-                if !statistics.edge_types.contains_key(*edge_type)
-                    || !statistics.edge_types_sampled.insert(edge_type.to_string())
-                {
+                if !statistics.edge_types.contains_key(*edge_type) || !statistics.edge_types_sampled.insert(edge_type.to_string()) {
                     return invalid();
                 }
             }
@@ -1476,12 +1813,7 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
                 let Some(stats) = statistics.vertex_properties.get_mut(*property) else {
                     return invalid();
                 };
-                decode_sample(
-                    path,
-                    line,
-                    stats,
-                    [exact, entries, runs, windows, SAMPLE_DROPPED_UNKNOWN],
-                )?;
+                decode_sample(path, line, stats, [exact, entries, runs, windows, SAMPLE_DROPPED_UNKNOWN])?;
             }
             ["vsaturated", property, value] => {
                 let Some(stats) = statistics.vertex_properties.get_mut(*property) else {
@@ -1514,51 +1846,31 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
                 }
             }
             ["esample", edge_type, property, exact, entries, runs, windows, dropped] => {
-                let Some(stats) = statistics
-                    .edge_properties
-                    .get_mut(&(edge_type.to_string(), property.to_string()))
-                else {
+                let Some(stats) = statistics.edge_properties.get_mut(&(edge_type.to_string(), property.to_string())) else {
                     return invalid();
                 };
                 decode_sample(path, line, stats, [exact, entries, runs, windows, dropped])?;
             }
             ["esample", edge_type, property, exact, entries, runs, windows] => {
-                let Some(stats) = statistics
-                    .edge_properties
-                    .get_mut(&(edge_type.to_string(), property.to_string()))
-                else {
+                let Some(stats) = statistics.edge_properties.get_mut(&(edge_type.to_string(), property.to_string())) else {
                     return invalid();
                 };
-                decode_sample(
-                    path,
-                    line,
-                    stats,
-                    [exact, entries, runs, windows, SAMPLE_DROPPED_UNKNOWN],
-                )?;
+                decode_sample(path, line, stats, [exact, entries, runs, windows, SAMPLE_DROPPED_UNKNOWN])?;
             }
             ["esaturated", edge_type, property, value] => {
-                let Some(stats) = statistics
-                    .edge_properties
-                    .get_mut(&(edge_type.to_string(), property.to_string()))
-                else {
+                let Some(stats) = statistics.edge_properties.get_mut(&(edge_type.to_string(), property.to_string())) else {
                     return invalid();
                 };
                 decode_saturated_value(path, line, stats, value)?;
             }
             ["etop", edge_type, property, value, count] => {
-                let Some(stats) = statistics
-                    .edge_properties
-                    .get_mut(&(edge_type.to_string(), property.to_string()))
-                else {
+                let Some(stats) = statistics.edge_properties.get_mut(&(edge_type.to_string(), property.to_string())) else {
                     return invalid();
                 };
                 decode_top_value(path, line, stats, value, count)?;
             }
             ["erange", edge_type, property, tag, entries, min, max] => {
-                let Some(stats) = statistics
-                    .edge_properties
-                    .get_mut(&(edge_type.to_string(), property.to_string()))
-                else {
+                let Some(stats) = statistics.edge_properties.get_mut(&(edge_type.to_string(), property.to_string())) else {
                     return invalid();
                 };
                 decode_tag_range(path, line, stats, tag, entries, min, max)?;
@@ -1570,12 +1882,7 @@ pub fn decode_planner_statistics(path: &str, bytes: &[u8]) -> Result<PlannerStat
     Ok(statistics)
 }
 
-fn decode_property_counts(
-    path: &str,
-    total: &str,
-    distinct: &str,
-    most_common: &str,
-) -> Result<PropertyIndexStatistics> {
+fn decode_property_counts(path: &str, total: &str, distinct: &str, most_common: &str) -> Result<PropertyIndexStatistics> {
     Ok(PropertyIndexStatistics {
         total_entries: parse_u64(path, total, "total_entries")?,
         distinct_values: parse_u64(path, distinct, "distinct_values")?,
@@ -1588,12 +1895,7 @@ fn decode_property_counts(
 /// object cannot say its list is complete.
 const SAMPLE_DROPPED_UNKNOWN: &str = "1";
 
-fn decode_sample(
-    path: &str,
-    line: &str,
-    statistics: &mut PropertyIndexStatistics,
-    fields: [&str; 5],
-) -> Result<()> {
+fn decode_sample(path: &str, line: &str, statistics: &mut PropertyIndexStatistics, fields: [&str; 5]) -> Result<()> {
     if statistics.sample.is_some() {
         return corrupt(path, format!("invalid planner statistics line {line}"));
     }
@@ -1614,12 +1916,7 @@ fn decode_sample(
     Ok(())
 }
 
-fn decode_saturated_value(
-    path: &str,
-    line: &str,
-    statistics: &mut PropertyIndexStatistics,
-    value: &str,
-) -> Result<()> {
+fn decode_saturated_value(path: &str, line: &str, statistics: &mut PropertyIndexStatistics, value: &str) -> Result<()> {
     if encoded_value_tag(value).is_none()
         || statistics.saturated_values.len() >= PLANNER_STATISTICS_SATURATED_VALUES
         || !statistics.saturated_values.insert(value.to_string())
@@ -1629,22 +1926,13 @@ fn decode_saturated_value(
     Ok(())
 }
 
-fn decode_top_value(
-    path: &str,
-    line: &str,
-    statistics: &mut PropertyIndexStatistics,
-    value: &str,
-    count: &str,
-) -> Result<()> {
-    if encoded_value_tag(value).is_none()
-        || statistics.top_values.len() >= PLANNER_STATISTICS_TOP_VALUES
-    {
+fn decode_top_value(path: &str, line: &str, statistics: &mut PropertyIndexStatistics, value: &str, count: &str) -> Result<()> {
+    if encoded_value_tag(value).is_none() || statistics.top_values.len() >= PLANNER_STATISTICS_TOP_VALUES {
         return corrupt(path, format!("invalid planner statistics line {line}"));
     }
-    statistics.top_values.push((
-        value.to_string(),
-        parse_u64(path, count, "top value count")?,
-    ));
+    statistics
+        .top_values
+        .push((value.to_string(), parse_u64(path, count, "top value count")?));
     Ok(())
 }
 
@@ -1659,13 +1947,7 @@ fn decode_tag_range(
 ) -> Result<()> {
     let mut tag_chars = tag.chars();
     let tag = match (tag_chars.next(), tag_chars.next()) {
-        (Some(tag), None)
-            if encoded_value_tag(min) == Some(tag)
-                && encoded_value_tag(max) == Some(tag)
-                && min <= max =>
-        {
-            tag
-        }
+        (Some(tag), None) if encoded_value_tag(min) == Some(tag) && encoded_value_tag(max) == Some(tag) && min <= max => tag,
         _ => return corrupt(path, format!("invalid planner statistics line {line}")),
     };
     let range = TagRange {
@@ -1681,12 +1963,6 @@ fn decode_tag_range(
 
 /// The type tag of an encoded property index value, if it is well formed.
 fn encoded_value_tag(value: &str) -> Option<char> {
-    let tag = value
-        .chars()
-        .next()
-        .filter(|tag| PROPERTY_VALUE_TAGS.contains(tag))?;
-    value[1..]
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric())
-        .then_some(tag)
+    let tag = value.chars().next().filter(|tag| PROPERTY_VALUE_TAGS.contains(tag))?;
+    value[1..].bytes().all(|byte| byte.is_ascii_alphanumeric()).then_some(tag)
 }

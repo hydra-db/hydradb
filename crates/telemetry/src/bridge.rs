@@ -112,10 +112,7 @@ pub fn current_trace_ids() -> Option<(String, String)> {
     if !span_context.is_valid() {
         return None;
     }
-    Some((
-        span_context.trace_id().to_string(),
-        span_context.span_id().to_string(),
-    ))
+    Some((span_context.trace_id().to_string(), span_context.span_id().to_string()))
 }
 
 /// Make `span` a child of the remote trace named by `traceparent`.

@@ -43,6 +43,18 @@ spec:
           port: 9090
         - protocol: TCP
           port: 9091
+    {{- if .Values.runtime.buddyWal }}
+    # Peer graph-nodes on the public HTTPS port: the buddy WAL feed and its
+    # writer confirmations ride the client listener's TLS. Only with
+    # runtime.buddyWal, so a chart without it never opens 8443 to nodes.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8443
+    {{- end }}
     {{- if .Values.tests.enabled }}
     - from:
         - podSelector:

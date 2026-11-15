@@ -7,3 +7,4 @@ description = "Parser-independent Cypher abstract syntax tree for HydraDB"
 publish = false
 
 [dependencies]
+icu_properties = "2.2"

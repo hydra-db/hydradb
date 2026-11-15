@@ -1,12 +1,7 @@
 use super::*;
 
 impl GraphShard {
-    pub async fn export_live_graph_digest(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        read_epoch: StorageSequence,
-    ) -> Result<GraphExportDigest> {
+    pub async fn export_live_graph_digest(&self, cell_id: &str, edge_type: &str, read_epoch: StorageSequence) -> Result<GraphExportDigest> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
@@ -48,10 +43,7 @@ impl GraphShard {
         report.canonical_edges = canonical.len() as u64;
 
         let mut out_index = canonical.clone();
-        out_index.extend(
-            self.out_segment_edge_pairs_at(cell_id, edge_type, read_epoch)
-                .await?,
-        );
+        out_index.extend(self.out_segment_edge_pairs_at(cell_id, edge_type, read_epoch).await?);
         report.out_index_edges = out_index.len() as u64;
         compare_edge_sets("out_index", &expected_edges, &out_index, &mut report);
 
@@ -71,10 +63,7 @@ impl GraphShard {
         } else if !in_index.is_empty() {
             record_mismatch(
                 &mut report,
-                format!(
-                    "in_index:unexpected-under-outbound-only count={}",
-                    in_index.len()
-                ),
+                format!("in_index:unexpected-under-outbound-only count={}", in_index.len()),
             );
         }
 
@@ -91,23 +80,13 @@ impl GraphShard {
         } else if !actual_in.is_empty() {
             record_mismatch(
                 &mut report,
-                format!(
-                    "in_degree:unexpected-under-outbound-only count={}",
-                    actual_in.len()
-                ),
+                format!("in_degree:unexpected-under-outbound-only count={}", actual_in.len()),
             );
         }
 
-        self.verify_relationship_indexes(
-            cell_id,
-            edge_type,
-            read_epoch,
-            &expected_edges,
-            &mut report,
-        )
-        .await?;
-        self.verify_matrix_artifact(cell_id, edge_type, read_epoch, &mut report)
+        self.verify_relationship_indexes(cell_id, edge_type, read_epoch, &expected_edges, &mut report)
             .await?;
+        self.verify_matrix_artifact(cell_id, edge_type, read_epoch, &mut report).await?;
         self.verify_traversals(
             TraversalVerifyRequest {
                 cell_id,
@@ -132,9 +111,7 @@ impl GraphShard {
         expected_edges: &BTreeSet<(VertexId, VertexId)>,
         report: &mut GraphCorrectnessReport,
     ) -> Result<()> {
-        let relationships = self
-            .scan_live_relationship_records(cell_id, edge_type, report)
-            .await?;
+        let relationships = self.scan_live_relationship_records(cell_id, edge_type, report).await?;
         report.relationship_records = relationships.len() as u64;
 
         let mut expected_counts = BTreeMap::<(VertexId, VertexId), u64>::new();
@@ -152,6 +129,9 @@ impl GraphShard {
             }
             *expected_counts.entry((record.src, record.dst)).or_insert(0) += 1;
             for (property, value) in &record.metadata.properties {
+                if !value.is_scalar_indexable() {
+                    continue;
+                }
                 expected_property_indexes.insert((
                     property.clone(),
                     encode_vertex_property_value_key(value),
@@ -161,31 +141,18 @@ impl GraphShard {
                 ));
                 if property == "id" {
                     live_identities
-                        .entry((
-                            encode_vertex_property_value_key(value),
-                            record.src,
-                            record.dst,
-                        ))
+                        .entry((encode_vertex_property_value_key(value), record.src, record.dst))
                         .or_default()
                         .insert(record.relationship_id);
                 }
             }
         }
 
-        let actual_counts = self
-            .scan_relationship_count_counters(cell_id, edge_type)
-            .await?;
+        let actual_counts = self.scan_relationship_count_counters(cell_id, edge_type).await?;
         report.relationship_count_counters = actual_counts.len() as u64;
-        compare_relationship_count_maps(
-            "relationship_count",
-            &expected_counts,
-            &actual_counts,
-            report,
-        );
+        compare_relationship_count_maps("relationship_count", &expected_counts, &actual_counts, report);
 
-        let actual_property_indexes = self
-            .scan_relationship_property_index_entries(cell_id, edge_type)
-            .await?;
+        let actual_property_indexes = self.scan_relationship_property_index_entries(cell_id, edge_type).await?;
         report.relationship_property_indexes = actual_property_indexes.len() as u64;
         compare_relationship_property_index_sets(
             "relationship_property_index",
@@ -201,9 +168,7 @@ impl GraphShard {
         // present pointer can be wrong are checked. Deleting a bad pointer is
         // always a safe repair: the next MERGE falls back to the scan and
         // re-earns it if the identity is unique.
-        let merge_pointers = self
-            .scan_relationship_merge_index_entries(cell_id, edge_type)
-            .await?;
+        let merge_pointers = self.scan_relationship_merge_index_entries(cell_id, edge_type).await?;
         report.relationship_merge_indexes = merge_pointers.len() as u64;
         for ((encoded, src, dst), relationship_id) in &merge_pointers {
             match live_identities.get(&(encoded.clone(), *src, *dst)) {
@@ -242,9 +207,7 @@ impl GraphShard {
         edge_type: &str,
         report: &mut GraphCorrectnessReport,
     ) -> Result<Vec<RelationshipRecord>> {
-        let mut iter = self
-            .scan_remote_prefix(&crate::keys::relationship_cell_prefix(cell_id))
-            .await?;
+        let mut iter = self.scan_remote_prefix(&crate::keys::relationship_cell_prefix(cell_id)).await?;
         let mut records = Vec::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -255,10 +218,7 @@ impl GraphShard {
             if record.cell_id != cell_id {
                 record_mismatch(
                     report,
-                    format!(
-                        "relationship:record-identity key={key} got={}/{}",
-                        record.cell_id, record.edge_type
-                    ),
+                    format!("relationship:record-identity key={key} got={}/{}", record.cell_id, record.edge_type),
                 );
             }
             records.push(record);
@@ -266,14 +226,8 @@ impl GraphShard {
         Ok(records)
     }
 
-    async fn scan_relationship_count_counters(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<BTreeMap<(VertexId, VertexId), u64>> {
-        let mut iter = self
-            .scan_remote_prefix(&format!("cell/{cell_id}/rel_count/{edge_type}/"))
-            .await?;
+    async fn scan_relationship_count_counters(&self, cell_id: &str, edge_type: &str) -> Result<BTreeMap<(VertexId, VertexId), u64>> {
+        let mut iter = self.scan_remote_prefix(&format!("cell/{cell_id}/rel_count/{edge_type}/")).await?;
         let mut counters = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -291,9 +245,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
     ) -> Result<BTreeMap<(String, VertexId, VertexId), u64>> {
-        let mut iter = self
-            .scan_remote_prefix(&format!("cell/{cell_id}/rmerge_idx/{edge_type}/"))
-            .await?;
+        let mut iter = self.scan_remote_prefix(&format!("cell/{cell_id}/rmerge_idx/{edge_type}/")).await?;
         let mut entries = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -309,9 +261,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
     ) -> Result<BTreeSet<RelationshipPropertyIndexEntry>> {
-        let mut iter = self
-            .scan_remote_prefix(&format!("cell/{cell_id}/rprop_idx/{edge_type}/"))
-            .await?;
+        let mut iter = self.scan_remote_prefix(&format!("cell/{cell_id}/rprop_idx/{edge_type}/")).await?;
         let mut entries = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -339,10 +289,7 @@ impl GraphShard {
             if edge.cell_id != cell_id || edge.edge_type != edge_type {
                 record_mismatch(
                     report,
-                    format!(
-                        "{index_name}:record-identity key={key} got={}/{}",
-                        edge.cell_id, edge.edge_type
-                    ),
+                    format!("{index_name}:record-identity key={key} got={}/{}", edge.cell_id, edge.edge_type),
                 );
             }
             pairs.insert((edge.src, edge.dst));
@@ -369,13 +316,8 @@ impl GraphShard {
         read_epoch: StorageSequence,
         report: &mut GraphCorrectnessReport,
     ) -> Result<()> {
-        if let Some(artifact) = self
-            .latest_matrix_artifact(cell_id, edge_type, read_epoch)
-            .await?
-        {
-            let adjacency = self
-                .cached_matrix_adjacency(cell_id, edge_type, artifact.base_epoch)
-                .await?;
+        if let Some(artifact) = self.latest_matrix_artifact(cell_id, edge_type, read_epoch).await? {
+            let adjacency = self.cached_matrix_adjacency(cell_id, edge_type, artifact.base_epoch).await?;
             report.matrix_edges_checked = adjacency_edge_count(adjacency.as_ref());
             if report.matrix_edges_checked != artifact.edge_count {
                 record_mismatch(
@@ -386,10 +328,7 @@ impl GraphShard {
                     ),
                 );
             }
-            if let Some(csc) = self
-                .graphblas_csc(cell_id, edge_type, artifact.base_epoch)
-                .await?
-            {
+            if let Some(csc) = self.graphblas_csc(cell_id, edge_type, artifact.base_epoch).await? {
                 if csc.indices.len() as u64 != artifact.edge_count {
                     record_mismatch(
                         report,
@@ -407,31 +346,17 @@ impl GraphShard {
         Ok(())
     }
 
-    async fn verify_traversals(
-        &self,
-        request: TraversalVerifyRequest<'_>,
-        report: &mut GraphCorrectnessReport,
-    ) -> Result<()> {
+    async fn verify_traversals(&self, request: TraversalVerifyRequest<'_>, report: &mut GraphCorrectnessReport) -> Result<()> {
         if request.max_hops == 0 || request.root_limit == 0 {
             return Ok(());
         }
         let adjacency = adjacency_from_edges(request.edges);
-        let roots = adjacency
-            .keys()
-            .copied()
-            .take(request.root_limit)
-            .collect::<Vec<_>>();
+        let roots = adjacency.keys().copied().take(request.root_limit).collect::<Vec<_>>();
         for root in roots {
             for hops in 1..=request.max_hops {
                 let expected = naive_reachable(&adjacency, root, hops);
                 let direct = self
-                    .direct_snapshot_reachable(
-                        request.cell_id,
-                        request.edge_type,
-                        &[root],
-                        hops,
-                        request.read_epoch,
-                    )
+                    .direct_snapshot_reachable(request.cell_id, request.edge_type, &[root], hops, request.read_epoch)
                     .await?
                     .vertices;
                 let matrix = self

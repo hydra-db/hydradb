@@ -4,9 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hydradb::{
-    local_object_store, object_store_from_env, EdgeIngestOptions, EdgeMutation, GraphCacheConfig,
-    GraphDurabilityConfig, GraphIndexPolicy, GraphLimits, GraphOpenOptions,
-    GraphOperationalMetricsSnapshot, GraphShard, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    local_object_store, object_store_from_env, EdgeIngestOptions, EdgeMutation, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
+    GraphLimits, GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphShard, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 use slatedb::object_store::ObjectStore;
 
@@ -27,10 +26,7 @@ async fn main() -> ProfileResult<()> {
     let cache_bytes = env_usize("GRAPH_WRITE_PROFILE_DISK_CACHE_BYTES", 1024 * 1024 * 1024);
     let wal_flush_interval_ms = env_u64("GRAPH_WRITE_PROFILE_WAL_FLUSH_INTERVAL_MS", 1);
     let await_durable_writes = env_bool("GRAPH_WRITE_PROFILE_AWAIT_DURABLE", true);
-    let trusted_chunk_size = env_usize(
-        "GRAPH_WRITE_PROFILE_TRUSTED_CHUNK_SIZE",
-        DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
-    );
+    let trusted_chunk_size = env_usize("GRAPH_WRITE_PROFILE_TRUSTED_CHUNK_SIZE", DEFAULT_TRUSTED_APPEND_CHUNK_EDGES);
     let index_policy = parse_index_policy(&string_env("GRAPH_WRITE_PROFILE_INDEX_POLICY", "full"))?;
     let keep_data = env_bool("GRAPH_WRITE_PROFILE_KEEP_DATA", false);
 
@@ -51,12 +47,7 @@ async fn main() -> ProfileResult<()> {
     );
     let default_shard_path = format!("graph-write-profile-{}", std::process::id());
     let shard_path = string_env("GRAPH_WRITE_PROFILE_DB_PATH", &default_shard_path);
-    let shard = GraphShard::open_standalone_writer_with_options(
-        shard_path.clone(),
-        Arc::clone(&object_store),
-        options,
-    )
-    .await?;
+    let shard = GraphShard::open_standalone_writer_with_options(shard_path.clone(), Arc::clone(&object_store), options).await?;
 
     if seed_degree > 0 {
         let started = Instant::now();
@@ -88,29 +79,11 @@ async fn main() -> ProfileResult<()> {
     eprintln!(
         "graph write profile mode={mode} object_store={object_label} db_path={shard_path} batch_size={batch_size} batches={batches} warmup_batches={warmup_batches} seed_degree={seed_degree} wal_flush_interval_ms={wal_flush_interval_ms} await_durable={await_durable_writes} index_policy={index_policy:?} trusted_chunk_size={trusted_chunk_size}"
     );
-    run_warmup(
-        &shard,
-        &mode,
-        src,
-        batch_size,
-        warmup_batches,
-        trusted_chunk_size,
-    )
-    .await?;
+    run_warmup(&shard, &mode, src, batch_size, warmup_batches, trusted_chunk_size).await?;
     let metrics_before = shard.graph_operational_metrics();
-    let stats = run_measured(
-        &shard,
-        &mode,
-        src,
-        batch_size,
-        warmup_batches,
-        batches,
-        trusted_chunk_size,
-    )
-    .await?;
+    let stats = run_measured(&shard, &mode, src, batch_size, warmup_batches, batches, trusted_chunk_size).await?;
     let metrics_after = shard.graph_operational_metrics();
-    let breakdown =
-        WriteProfileBreakdown::from_metrics(&metrics_before, &metrics_after, stats.total_edges);
+    let breakdown = WriteProfileBreakdown::from_metrics(&metrics_before, &metrics_after, stats.total_edges);
     let epoch = shard.current_epoch(CELL_ID).await?;
     shard.close().await?;
     if keep_data {
@@ -148,16 +121,7 @@ async fn run_warmup(
     trusted_chunk_size: usize,
 ) -> ProfileResult<()> {
     for batch in 0..warmup_batches {
-        run_batch(
-            shard,
-            mode,
-            src,
-            batch_size,
-            batch,
-            "warmup",
-            trusted_chunk_size,
-        )
-        .await?;
+        run_batch(shard, mode, src, batch_size, batch, "warmup", trusted_chunk_size).await?;
     }
     Ok(())
 }
@@ -208,16 +172,7 @@ async fn run_measured(
     let mut total_edges = 0_u64;
     for offset in 0..batches {
         let started = Instant::now();
-        let inserted = run_batch(
-            shard,
-            mode,
-            src,
-            batch_size,
-            first_batch + offset,
-            "measure",
-            trusted_chunk_size,
-        )
-        .await?;
+        let inserted = run_batch(shard, mode, src, batch_size, first_batch + offset, "measure", trusted_chunk_size).await?;
         let elapsed = started.elapsed();
         total_edges = total_edges.saturating_add(inserted);
         per_edge.push(duration_div(elapsed, inserted.max(1)));
@@ -331,9 +286,7 @@ async fn run_batch(
                             edge_type: EDGE_TYPE.to_string(),
                             src,
                             dst,
-                            idempotency_key: format!(
-                                "write-profile-ingest-{phase}-{batch}-{index}"
-                            ),
+                            idempotency_key: format!("write-profile-ingest-{phase}-{batch}-{index}"),
                         }
                     }),
                     EdgeIngestOptions { batch_size },
@@ -353,18 +306,19 @@ fn writer_options(
     await_durable_writes: bool,
     index_policy: GraphIndexPolicy,
 ) -> GraphOpenOptions {
-    let mut options = GraphOpenOptions::default();
-    options.limits = GraphLimits {
-        max_bulk_import_edges: usize::try_from(max_edges).unwrap_or(usize::MAX),
-        max_artifact_source_epochs: u64::MAX,
-        max_artifact_build_edges: u64::MAX,
-        ..Default::default()
-    };
-    options.cache = GraphCacheConfig::disk_cache_without_preload(cache_dir, cache_bytes);
-    options.durability = GraphDurabilityConfig::low_latency_durable(wal_flush_interval_ms)
-        .with_await_durable_writes(await_durable_writes);
-    options.index_policy = index_policy;
-    options
+    let options = GraphOpenOptions::default();
+    GraphOpenOptions {
+        limits: GraphLimits {
+            max_bulk_import_edges: usize::try_from(max_edges).unwrap_or(usize::MAX),
+            max_artifact_source_epochs: u64::MAX,
+            max_artifact_build_edges: u64::MAX,
+            ..Default::default()
+        },
+        cache: GraphCacheConfig::disk_cache_without_preload(cache_dir, cache_bytes),
+        durability: GraphDurabilityConfig::low_latency_durable(wal_flush_interval_ms).with_await_durable_writes(await_durable_writes),
+        index_policy,
+        ..options
+    }
 }
 
 fn parse_index_policy(value: &str) -> ProfileResult<GraphIndexPolicy> {
@@ -377,17 +331,11 @@ fn parse_index_policy(value: &str) -> ProfileResult<GraphIndexPolicy> {
 
 fn object_store(root: &TempProfileRoot) -> ProfileResult<(Arc<dyn ObjectStore>, String)> {
     if let Ok(env_file) = std::env::var("GRAPH_WRITE_PROFILE_OBJECT_ENV") {
-        return Ok((
-            object_store_from_env(Some(env_file.clone()))?,
-            format!("env:{env_file}"),
-        ));
+        return Ok((object_store_from_env(Some(env_file.clone()))?, format!("env:{env_file}")));
     }
     let object_root = root.path().join("object-store");
     fs::create_dir_all(&object_root)?;
-    Ok((
-        local_object_store(&object_root)?,
-        format!("local:{}", object_root.display()),
-    ))
+    Ok((local_object_store(&object_root)?, format!("local:{}", object_root.display())))
 }
 
 fn write_base(phase: &str, batch: usize) -> u64 {
@@ -415,17 +363,11 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn env_usize_allow_zero(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 fn string_env(name: &str, default: &str) -> String {
@@ -435,9 +377,7 @@ fn string_env(name: &str, default: &str) -> String {
 fn env_bool(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(value) if value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true") => true,
-        Ok(value) if value.eq_ignore_ascii_case("0") || value.eq_ignore_ascii_case("false") => {
-            false
-        }
+        Ok(value) if value.eq_ignore_ascii_case("0") || value.eq_ignore_ascii_case("false") => false,
         _ => default,
     }
 }
@@ -465,23 +405,11 @@ struct WriteProfileBreakdown {
 }
 
 impl WriteProfileBreakdown {
-    fn from_metrics(
-        before: &GraphOperationalMetricsSnapshot,
-        after: &GraphOperationalMetricsSnapshot,
-        total_edges: u64,
-    ) -> Self {
-        let preflight_us = after
-            .bulk_import_preflight_us
-            .saturating_sub(before.bulk_import_preflight_us);
-        let batch_build_us = after
-            .bulk_import_batch_build_us
-            .saturating_sub(before.bulk_import_batch_build_us);
-        let counter_read_us = after
-            .bulk_import_counter_read_us
-            .saturating_sub(before.bulk_import_counter_read_us);
-        let commit_us = after
-            .bulk_import_commit_us
-            .saturating_sub(before.bulk_import_commit_us);
+    fn from_metrics(before: &GraphOperationalMetricsSnapshot, after: &GraphOperationalMetricsSnapshot, total_edges: u64) -> Self {
+        let preflight_us = after.bulk_import_preflight_us.saturating_sub(before.bulk_import_preflight_us);
+        let batch_build_us = after.bulk_import_batch_build_us.saturating_sub(before.bulk_import_batch_build_us);
+        let counter_read_us = after.bulk_import_counter_read_us.saturating_sub(before.bulk_import_counter_read_us);
+        let commit_us = after.bulk_import_commit_us.saturating_sub(before.bulk_import_commit_us);
         let total_profiled_us = preflight_us
             .saturating_add(batch_build_us)
             .saturating_add(counter_read_us)
@@ -517,10 +445,7 @@ impl LatencyStats {
         if values.is_empty() {
             return Self::default();
         }
-        let mut micros: Vec<_> = values
-            .iter()
-            .map(|duration| duration.as_secs_f64() * 1_000_000.0)
-            .collect();
+        let mut micros: Vec<_> = values.iter().map(|duration| duration.as_secs_f64() * 1_000_000.0).collect();
         micros.sort_by(f64::total_cmp);
         let sum: f64 = micros.iter().sum();
         Self {
@@ -545,11 +470,7 @@ struct TempProfileRoot {
 
 impl TempProfileRoot {
     fn new() -> ProfileResult<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "graph-write-profile-{}-{}",
-            std::process::id(),
-            chrono_like_millis()
-        ));
+        let path = std::env::temp_dir().join(format!("graph-write-profile-{}-{}", std::process::id(), chrono_like_millis()));
         fs::create_dir_all(&path)?;
         Ok(Self { path, keep: false })
     }

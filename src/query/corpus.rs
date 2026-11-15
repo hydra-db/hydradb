@@ -1,7 +1,4 @@
-use crate::{
-    GraphError, QueryColumn, QueryFloat, QueryResultSet, QueryRow, QueryValue, Result,
-    VertexPropertyValue,
-};
+use crate::{GraphError, QueryColumn, QueryFloat, QueryResultSet, QueryRow, QueryValue, Result, VertexPropertyValue};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,7 +21,7 @@ pub struct CypherTckCase {
 /// SyntaxError should be raised at compile time: ...` - and the parser used to
 /// drop those lines silently, so a scenario that tested a refusal was recorded
 /// as one missing a result table. Both outcomes are cases now, which matters
-/// here: an engine that accepts what the TCK says to reject has
+/// for engine parity: an engine that accepts what the TCK says to reject has
 /// regressed just as surely as one that returns the wrong rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CypherTckOutcome {
@@ -73,21 +70,12 @@ pub fn parse_opencypher_tck_corpus_dir(root: impl AsRef<Path>) -> Result<CypherT
         })?;
         let corpus = parse_opencypher_tck_corpus(&input)?;
         total_scenarios += corpus.total_scenarios;
-        let relative = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .display()
-            .to_string();
+        let relative = file.strip_prefix(root).unwrap_or(&file).display().to_string();
         cases.extend(corpus.cases.into_iter().map(|mut case| {
             case.name = format!("{relative}: {}", case.name);
             case
         }));
-        skipped.extend(
-            corpus
-                .skipped
-                .into_iter()
-                .map(|reason| format!("{relative}: {reason}")),
-        );
+        skipped.extend(corpus.skipped.into_iter().map(|reason| format!("{relative}: {reason}")));
     }
 
     Ok(CypherTckCorpus {
@@ -169,9 +157,7 @@ impl<'a> TckCorpusParser<'a> {
                 || line.starts_with("And after")
                 || line.starts_with("When executing control query")
             {
-                unsupported = Some(format!(
-                    "{name}: setup/control clauses require an external TCK fixture runner"
-                ));
+                unsupported = Some(format!("{name}: setup/control clauses require an external TCK fixture runner"));
             }
             if line.starts_with("When executing query:") {
                 self.idx += 1;
@@ -195,12 +181,8 @@ impl<'a> TckCorpusParser<'a> {
                 self.idx += 1;
                 continue;
             }
-            if line.starts_with("Then no side effects")
-                || line.starts_with("Then the side effects should be")
-            {
-                unsupported = Some(format!(
-                    "{name}: side-effect assertions are not row-query corpus cases"
-                ));
+            if line.starts_with("Then no side effects") || line.starts_with("Then the side effects should be") {
+                unsupported = Some(format!("{name}: side-effect assertions are not row-query corpus cases"));
             }
             self.idx += 1;
         }
@@ -208,11 +190,7 @@ impl<'a> TckCorpusParser<'a> {
         match (unsupported, query, expected) {
             (Some(reason), _, _) => self.skipped.push(reason),
             (None, Some(query), Some(expected)) => {
-                self.cases.push(CypherTckCase {
-                    name,
-                    query,
-                    expected,
-                });
+                self.cases.push(CypherTckCase { name, query, expected });
             }
             (None, None, _) => self.skipped.push(format!("{name}: missing query block")),
             (None, _, None) => self.skipped.push(format!("{name}: missing result table")),
@@ -266,22 +244,14 @@ impl<'a> TckCorpusParser<'a> {
         if rows.is_empty() {
             return Ok(None);
         }
-        let columns = rows
-            .remove(0)
-            .into_iter()
-            .map(QueryColumn::new)
-            .collect::<Vec<_>>();
+        let columns = rows.remove(0).into_iter().map(QueryColumn::new).collect::<Vec<_>>();
         let query_rows = rows
             .into_iter()
             .map(|row| {
                 if row.len() != columns.len() {
                     return Err(GraphError::QueryParse {
                         dialect: "OpenCypherTCK",
-                        reason: format!(
-                            "{scenario}: result row has {} cells, expected {}",
-                            row.len(),
-                            columns.len()
-                        ),
+                        reason: format!("{scenario}: result row has {} cells, expected {}", row.len(), columns.len()),
                     });
                 }
                 let values = row
@@ -314,8 +284,7 @@ impl<'a> TckCorpusParser<'a> {
 fn raised_error(line: &str) -> Option<String> {
     let rest = line.strip_prefix("Then a ")?;
     let (error, rest) = rest.split_once(' ')?;
-    rest.starts_with("should be raised")
-        .then(|| error.to_string())
+    rest.starts_with("should be raised").then(|| error.to_string())
 }
 
 fn scenario_name(line: &str) -> Option<String> {
@@ -334,11 +303,7 @@ fn parse_table_row(line: &str) -> Result<Vec<String>> {
             reason: format!("invalid table row: {line}"),
         });
     }
-    Ok(line
-        .trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_string())
-        .collect())
+    Ok(line.trim_matches('|').split('|').map(|cell| cell.trim().to_string()).collect())
 }
 
 fn parse_expected_value(column: &QueryColumn, cell: &str) -> Result<QueryValue> {
@@ -353,9 +318,7 @@ fn parse_expected_value(column: &QueryColumn, cell: &str) -> Result<QueryValue> 
         return Ok(QueryValue::Property(VertexPropertyValue::Bool(false)));
     }
     if let Some(string) = quoted_string(cell) {
-        return Ok(QueryValue::Property(VertexPropertyValue::String(
-            string.to_string(),
-        )));
+        return Ok(QueryValue::Property(VertexPropertyValue::String(string.to_string())));
     }
     if let Some(list) = parse_expected_list(column, cell)? {
         return Ok(QueryValue::List(list));
@@ -372,9 +335,7 @@ fn parse_expected_value(column: &QueryColumn, cell: &str) -> Result<QueryValue> 
     if let Ok(value) = cell.parse::<f64>() {
         return Ok(QueryValue::Float(QueryFloat(value)));
     }
-    Ok(QueryValue::Property(VertexPropertyValue::String(
-        cell.to_string(),
-    )))
+    Ok(QueryValue::Property(VertexPropertyValue::String(cell.to_string())))
 }
 
 fn looks_like_vertex_id_column(column: &str) -> bool {
@@ -391,18 +352,11 @@ fn quoted_string(value: &str) -> Option<&str> {
     value
         .strip_prefix('\'')
         .and_then(|value| value.strip_suffix('\''))
-        .or_else(|| {
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-        })
+        .or_else(|| value.strip_prefix('"').and_then(|value| value.strip_suffix('"')))
 }
 
 fn parse_expected_list(column: &QueryColumn, cell: &str) -> Result<Option<Vec<QueryValue>>> {
-    let Some(inner) = cell
-        .strip_prefix('[')
-        .and_then(|cell| cell.strip_suffix(']'))
-    else {
+    let Some(inner) = cell.strip_prefix('[').and_then(|cell| cell.strip_suffix(']')) else {
         return Ok(None);
     };
     if inner.trim().is_empty() {
@@ -410,11 +364,7 @@ fn parse_expected_list(column: &QueryColumn, cell: &str) -> Result<Option<Vec<Qu
     }
     let mut values = Vec::new();
     for item in inner.split(',') {
-        let pseudo_column = QueryColumn::new(if column.name.contains("id") {
-            "item.id"
-        } else {
-            "item"
-        });
+        let pseudo_column = QueryColumn::new(if column.name.contains("id") { "item.id" } else { "item" });
         values.push(parse_expected_value(&pseudo_column, item.trim())?);
     }
     Ok(Some(values))

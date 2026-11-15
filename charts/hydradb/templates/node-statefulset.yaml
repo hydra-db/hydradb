@@ -27,7 +27,12 @@ spec:
         {{- end }}
       annotations:
         checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        secret.reloader.stakater.com/reload: {{ printf "%s,%s" (include "hydradb.authSecretName" .) (include "hydradb.publicTlsSecretName" .) | quote }}
+        {{- $reloadSecrets := list (include "hydradb.authSecretName" .) (include "hydradb.publicTlsSecretName" .) }}
+        {{- with include "hydradb.peerCaSecretName" . }}
+        {{- /* Nodes read the peer CA once, at startup: a rotation needs a restart. */}}
+        {{- $reloadSecrets = append $reloadSecrets . }}
+        {{- end }}
+        secret.reloader.stakater.com/reload: {{ join "," $reloadSecrets | quote }}
         {{- with .Values.node.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -111,6 +116,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.proxy.enabled }}
+            # Plaintext listeners for the proxy, which terminates client TLS
+            # itself. The network policy lets only proxy pods reach them.
+            - name: GRAPH_BOLT_INTERNAL_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.proxy.internalPorts.bolt | quote }}
+            - name: GRAPH_HTTP_INTERNAL_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.proxy.internalPorts.http | quote }}
+            {{- end }}
             {{- with .Values.node.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -121,6 +134,12 @@ spec:
               containerPort: 8443
             - name: admin
               containerPort: 9090
+            {{- if .Values.proxy.enabled }}
+            - name: bolt-internal
+              containerPort: {{ .Values.proxy.internalPorts.bolt }}
+            - name: http-internal
+              containerPort: {{ .Values.proxy.internalPorts.http }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /livez
@@ -165,6 +184,11 @@ spec:
               mountPath: /var/run/secrets/hydradb/public
               readOnly: true
             {{- end }}
+            {{- if include "hydradb.peerCaSecretName" . }}
+            - name: peer-ca
+              mountPath: /var/run/secrets/hydradb/peer-ca
+              readOnly: true
+            {{- end }}
       volumes:
         {{- if eq .Values.node.cache.type "emptyDir" }}
         - name: cache
@@ -187,6 +211,14 @@ spec:
         - name: public-tls
           secret:
             secretName: {{ include "hydradb.publicTlsSecretName" . }}
+        {{- end }}
+        {{- with include "hydradb.peerCaSecretName" . }}
+        - name: peer-ca
+          secret:
+            secretName: {{ . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
         {{- end }}
   {{- if eq .Values.node.cache.type "persistentVolume" }}
   volumeClaimTemplates:

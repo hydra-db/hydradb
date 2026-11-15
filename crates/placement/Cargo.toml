@@ -19,16 +19,27 @@ publish = false
 # manifest so the member cannot drift from the kernel — `slatedb` especially,
 # since the whole point of depending on it is that `Arc<dyn ObjectStore>` names
 # the same type on both sides of the crate boundary.
+#
+# Everything that touches the object store sits behind `store`, on by default
+# for the kernel. The turbolay proxy turns it off: it needs the hash and the
+# node address list and nothing else, and must not link slatedb.
 [dependencies]
-chrono = { workspace = true }
-futures = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-slatedb = { workspace = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+slatedb = { workspace = true, optional = true }
 thiserror = { workspace = true }
+
+[features]
+default = ["store"]
+store = ["dep:chrono", "dep:futures", "dep:serde", "dep:serde_json", "dep:slatedb"]
 
 # `async-trait` is a dev-dependency and must stay one. `ObjectStore` is an
 # `#[async_trait]` trait, so the only thing in this crate that needs the macro is
 # the `#[cfg(test)]` `FaultStore`; written by hand instead, its five async
 # methods cost ~30 lines of `'life0`/`'async_trait` bounds that cannot be elided
 # (E0195, late-bound vs early-bound). None of it ships.
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }

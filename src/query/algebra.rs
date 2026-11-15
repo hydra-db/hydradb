@@ -1,18 +1,12 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::Notify;
 
 use crate::QueryFailureReason;
 use crate::{
-    validate_component, CommitResult, EdgeMetadata, GraphError, GraphScope, QueryFloat,
-    RelationshipId, Result, StorageSequence, VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, CommitResult, EdgeMetadata, GraphError, GraphScope, QueryFloat, RelationshipId, Result, StorageSequence, VertexId,
+    VertexMetadata, VertexPropertyValue,
 };
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryPathNode {
     pub id: VertexId,
@@ -20,10 +14,7 @@ pub struct QueryPathNode {
     pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryPathRelationship {
     pub id: Option<RelationshipId>,
@@ -33,20 +24,14 @@ pub struct QueryPathRelationship {
     pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryPath {
     pub nodes: Vec<QueryPathNode>,
     pub relationships: Vec<QueryPathRelationship>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryParameterValue {
     Scalar(VertexPropertyValue),
@@ -60,40 +45,28 @@ impl From<VertexPropertyValue> for QueryParameterValue {
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryBatchEdge {
     pub src: VertexId,
     pub dst: VertexId,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryBatchVertex {
     pub vertex: VertexId,
     pub metadata: VertexMetadata,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryBatchIsolatedVertex {
     pub vertex: VertexId,
     pub path_node_constraints: VertexMetadata,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryBatchRelationship {
     pub src: VertexId,
@@ -101,10 +74,7 @@ pub struct QueryBatchRelationship {
     pub metadata: EdgeMetadata,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryBatchRelationshipMerge {
     pub src: VertexId,
@@ -113,45 +83,85 @@ pub struct QueryBatchRelationshipMerge {
     pub metadata: EdgeMetadata,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// How an upsert row lands on a vertex or relationship that already exists:
+/// the `MERGE … ON CREATE SET … ON MATCH SET …` of the writer.
+///
+/// With `update_if_newer_by` a row lands only when its guard value is newer
+/// than the stored one; with `update_if_not_older_by`, also when it is equal
+/// (FalkorDB's `CASE WHEN stored <= incoming`). At most one is set. Without
+/// either every row lands. Either way a row that lands on an existing record
+/// leaves its create-only properties as they are: they are written when the
+/// record is created.
+///
+/// The not-older guard is a field of its own, not a flag beside
+/// `update_if_newer_by`: a peer from before it requires `update_if_newer_by`,
+/// so it refuses such a policy rather than applying it as a strict guard.
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryBatchMergePolicy {
-    pub update_if_newer_by: String,
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub update_if_newer_by: Option<String>,
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub update_if_not_older_by: Option<String>,
     pub create_only_properties: std::collections::BTreeSet<String>,
 }
 
 impl QueryBatchMergePolicy {
+    /// The guard property, whichever rule it has.
+    pub fn guard(&self) -> Option<&str> {
+        self.update_if_newer_by.as_deref().or(self.update_if_not_older_by.as_deref())
+    }
+
+    /// Whether a row whose guard value equals the stored one lands.
+    pub fn lands_on_equal(&self) -> bool {
+        self.update_if_not_older_by.is_some()
+    }
+
     pub fn validate(&self) -> Result<()> {
-        validate_component("property", &self.update_if_newer_by)?;
+        let unsupported = |feature: String| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
+            dialect: "QueryBatch",
+            feature,
+        };
         for property in &self.create_only_properties {
             validate_component("property", property)?;
         }
-        if self
-            .create_only_properties
-            .contains(&self.update_if_newer_by)
-        {
-            return Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Unwind,
-                dialect: "QueryBatch",
-                feature: format!(
-                    "update guard {} cannot also be create-only",
-                    self.update_if_newer_by
-                ),
-            });
+        if self.update_if_newer_by.is_some() && self.update_if_not_older_by.is_some() {
+            return Err(unsupported("a merge policy takes one update guard".into()));
+        }
+        match self.guard() {
+            Some(guard) => {
+                validate_component("property", guard)?;
+                if self.create_only_properties.contains(guard) {
+                    return Err(unsupported(format!("update guard {guard} cannot also be create-only")));
+                }
+            }
+            None if self.create_only_properties.is_empty() => {
+                return Err(unsupported("a merge policy needs an update guard or a create-only property".into()))
+            }
+            None => {}
         }
         Ok(())
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryBatchOperation {
+    /// `UNWIND $rows AS <alias> MATCH ... [WHERE ...] (SET | REMOVE)+`, run on
+    /// the writer as one statement: `query` is lowered once per row with
+    /// `<alias>.<field>` bound to that row, and every row's update commits
+    /// together. `parameters` and `list_parameters` are the request's other
+    /// parameters; both forms are retained so `IN` keeps collection semantics
+    /// while value expressions can bind a homogeneous list as one property.
+    MatchMutation {
+        query: String,
+        alias: String,
+        rows: Vec<BTreeMap<String, VertexPropertyValue>>,
+        parameters: BTreeMap<String, VertexPropertyValue>,
+        #[cfg_attr(feature = "query-transport", serde(default))]
+        list_parameters: BTreeMap<String, Vec<VertexPropertyValue>>,
+    },
     OutNeighbors {
         edge_type: String,
         sources: Vec<VertexId>,
@@ -222,7 +232,8 @@ impl QueryBatchOperation {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Self::CreateEdges { .. }
+            Self::MatchMutation { .. }
+                | Self::CreateEdges { .. }
                 | Self::CreateEdgesBetweenLabeledVertices { .. }
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
@@ -239,30 +250,23 @@ impl QueryBatchOperation {
 
     pub fn len(&self) -> usize {
         match self {
+            Self::MatchMutation { rows, .. } => rows.len(),
             Self::OutNeighbors { sources, .. } => sources.len(),
-            Self::CreateEdges { edges, .. }
-            | Self::CreateEdgesBetweenLabeledVertices { edges, .. }
-            | Self::DeleteEdges { edges, .. } => edges.len(),
+            Self::CreateEdges { edges, .. } | Self::CreateEdgesBetweenLabeledVertices { edges, .. } | Self::DeleteEdges { edges, .. } => {
+                edges.len()
+            }
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteIsolatedVertices { candidates, .. } => candidates.len(),
             Self::DeleteVerticesAndIsolatedCandidates {
                 detach_vertices,
                 isolated_candidates,
                 ..
-            } => detach_vertices
-                .len()
-                .saturating_add(isolated_candidates.len()),
+            } => detach_vertices.len().saturating_add(isolated_candidates.len()),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
-            Self::UpsertVertices { vertices } | Self::GuardedUpsertVertices { vertices, .. } => {
-                vertices.len()
-            }
-            Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
-                relationships.len()
-            }
+            Self::UpsertVertices { vertices } | Self::GuardedUpsertVertices { vertices, .. } => vertices.len(),
+            Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => relationships.len(),
             Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. }
-            | Self::GuardedMergeRelationshipsBetweenLabeledVertices { relationships, .. } => {
-                relationships.len()
-            }
+            | Self::GuardedMergeRelationshipsBetweenLabeledVertices { relationships, .. } => relationships.len(),
         }
     }
 
@@ -271,16 +275,16 @@ impl QueryBatchOperation {
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "query-transport", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CypherEngineMode {
     #[default]
     Legacy,
     Experimental,
+    #[cfg(feature = "datafusion-cypher-engine")]
+    #[cfg_attr(feature = "query-transport", serde(rename = "datafusion"))]
+    DataFusion,
 }
 
 impl CypherEngineMode {
@@ -288,6 +292,8 @@ impl CypherEngineMode {
         match self {
             Self::Legacy => "legacy",
             Self::Experimental => "experimental",
+            #[cfg(feature = "datafusion-cypher-engine")]
+            Self::DataFusion => "datafusion",
         }
     }
 
@@ -297,15 +303,45 @@ impl CypherEngineMode {
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+/// The mutation commit semantics selected before a statement executes.
+///
+/// `LegacyChunked` is the compatibility default for existing deployments.
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "query-transport", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MutationAtomicityPolicy {
+    /// Keep the historical action/chunk commit boundaries during migration.
+    #[default]
+    LegacyChunked,
+    /// Commit all effects of one Cypher statement together or abort them all.
+    Statement,
+}
+
+impl MutationAtomicityPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Statement => "statement",
+            Self::LegacyChunked => "legacy_chunked",
+        }
+    }
+
+    #[cfg(feature = "query-transport")]
+    fn is_legacy_chunked(&self) -> bool {
+        *self == Self::LegacyChunked
+    }
+}
+
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     pub scope: GraphScope,
     pub cell_id: String,
     pub idempotency_key: String,
+    /// Authenticated principal used to scope provider-side mutation receipts.
+    /// Older serialized contexts default to the anonymous compatibility
+    /// identity; client services set this from their authenticated session.
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub idempotency_principal: String,
     pub read_epoch: Option<StorageSequence>,
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
@@ -318,15 +354,26 @@ pub struct QueryContext {
     pub list_parameters: BTreeMap<String, Vec<VertexPropertyValue>>,
     pub max_runtime_ms: Option<u64>,
     pub max_result_bytes: Option<u64>,
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "CypherEngineMode::is_legacy"))]
+    pub cypher_engine: CypherEngineMode,
+    /// Resolved at service admission and pinned across preparation and every
+    /// page of the statement. Missing fields from older serialized contexts
+    /// retain the compatibility policy.
     #[cfg_attr(
         feature = "query-transport",
-        serde(default, skip_serializing_if = "CypherEngineMode::is_legacy")
+        serde(default, skip_serializing_if = "MutationAtomicityPolicy::is_legacy_chunked")
     )]
-    pub cypher_engine: CypherEngineMode,
+    pub mutation_atomicity_policy: MutationAtomicityPolicy,
     #[cfg_attr(feature = "query-transport", serde(default))]
     refreshed_reader: bool,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
+    /// The caller's authorization identifier, which GQL's `SESSION_USER`
+    /// reads in the experimental engine: the transport principal (a hash of
+    /// a bearer token, an mTLS fingerprint, or `insecure`), never a secret.
+    /// `serde(default)` keeps a context from an older node decodable.
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub session_user: Option<String>,
     #[cfg(feature = "opencypher")]
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     validated_read: Option<ValidatedQueryRead>,
@@ -338,6 +385,7 @@ impl QueryContext {
             scope: GraphScope::default(),
             cell_id: cell_id.into(),
             idempotency_key: idempotency_key.into(),
+            idempotency_principal: String::new(),
             read_epoch: None,
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
@@ -345,15 +393,28 @@ impl QueryContext {
             max_runtime_ms: None,
             max_result_bytes: None,
             cypher_engine: CypherEngineMode::Legacy,
+            mutation_atomicity_policy: MutationAtomicityPolicy::LegacyChunked,
             refreshed_reader: false,
             cancellation_token: None,
+            session_user: None,
             #[cfg(feature = "opencypher")]
             validated_read: None,
         }
     }
 
+    /// The authorization identifier `SESSION_USER` reads.
+    pub fn as_session_user(mut self, session_user: impl Into<String>) -> Self {
+        self.session_user = Some(session_user.into());
+        self
+    }
+
     pub fn in_scope(mut self, scope: GraphScope) -> Self {
         self.scope = scope;
+        self
+    }
+
+    pub fn with_idempotency_principal(mut self, principal: impl Into<String>) -> Self {
+        self.idempotency_principal = principal.into();
         self
     }
 
@@ -372,18 +433,12 @@ impl QueryContext {
         self
     }
 
-    pub fn with_parameters(
-        mut self,
-        parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
-    ) -> Self {
+    pub fn with_parameters(mut self, parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>) -> Self {
         self.parameters.extend(parameters);
         self
     }
 
-    pub fn with_list_parameters(
-        mut self,
-        parameters: impl IntoIterator<Item = (String, Vec<VertexPropertyValue>)>,
-    ) -> Self {
+    pub fn with_list_parameters(mut self, parameters: impl IntoIterator<Item = (String, Vec<VertexPropertyValue>)>) -> Self {
         self.list_parameters.extend(parameters);
         self
     }
@@ -403,7 +458,12 @@ impl QueryContext {
         self
     }
 
-    #[cfg(any(feature = "client-api", test))]
+    pub fn with_mutation_atomicity_policy(mut self, policy: MutationAtomicityPolicy) -> Self {
+        self.mutation_atomicity_policy = policy;
+        self
+    }
+
+    #[cfg(feature = "client-api")]
     #[cfg(feature = "opencypher")]
     pub(crate) fn with_refreshed_reader(mut self) -> Self {
         self.refreshed_reader = true;
@@ -439,8 +499,7 @@ impl QueryContext {
     pub(crate) fn validated_read_epoch(&self) -> Option<StorageSequence> {
         self.validated_read.as_ref().and_then(|validated| {
             let _retention = &validated.retention;
-            (validated.cell_id == self.cell_id && self.read_epoch == Some(validated.read_epoch))
-                .then_some(validated.read_epoch)
+            (validated.cell_id == self.cell_id && self.read_epoch == Some(validated.read_epoch)).then_some(validated.read_epoch)
         })
     }
 
@@ -471,63 +530,9 @@ enum ValidatedQueryReadRetention {
     StorageSnapshot(crate::StorageSequence),
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct QueryCancellationToken {
-    cancelled: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-}
+pub use hydradb_graph_slate::QueryCancellationToken;
 
-tokio::task_local! {
-    static ACTIVE_QUERY_CANCELLATION: QueryCancellationToken;
-}
-
-impl QueryCancellationToken {
-    #[cfg(any(feature = "query-transport", test))]
-    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
-        ACTIVE_QUERY_CANCELLATION.scope(self.clone(), future).await
-    }
-
-    pub(crate) fn current() -> Option<Self> {
-        ACTIVE_QUERY_CANCELLATION.try_with(Clone::clone).ok()
-    }
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn cancel(&self) {
-        if !self.cancelled.swap(true, Ordering::SeqCst) {
-            self.notify.notify_waiters();
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    pub async fn cancelled(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-impl PartialEq for QueryCancellationToken {
-    fn eq(&self, other: &Self) -> bool {
-        self.is_cancelled() == other.is_cancelled()
-    }
-}
-
-impl Eq for QueryCancellationToken {}
-
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryWindow {
     pub skip: u64,
@@ -541,294 +546,6 @@ impl QueryWindow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryCardinalityStatsKind {
-    EdgeType {
-        edge_type: String,
-    },
-    EdgeExpansion {
-        edge_type: String,
-        direction: QueryStatsDirection,
-        source_labels: Vec<String>,
-    },
-    VertexLabel {
-        label: String,
-    },
-    VertexLabelIntersection {
-        labels: Vec<String>,
-    },
-    VertexProperty {
-        property: String,
-        value: VertexPropertyValue,
-    },
-    EdgeProperty {
-        edge_type: String,
-        property: String,
-        value: VertexPropertyValue,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryStatsDirection {
-    Outgoing,
-    Incoming,
-    Undirected,
-}
-
-impl QueryStatsDirection {
-    #[cfg(feature = "opencypher")]
-    pub(crate) fn as_key_component(self) -> &'static str {
-        match self {
-            Self::Outgoing => "out",
-            Self::Incoming => "in",
-            Self::Undirected => "both",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryCardinalityStatsRefresh {
-    pub cell_id: String,
-    pub read_epoch: StorageSequence,
-    pub kind: QueryCardinalityStatsKind,
-    pub count: u64,
-    pub stats: QueryStatsRecord,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryStatsRecord {
-    pub count: u64,
-    pub read_epoch: StorageSequence,
-    pub refreshed_at_ms: u64,
-    pub distinct_values: u64,
-    pub total_values: u64,
-    pub most_common_count: u64,
-    pub bloom: Option<QueryStatsBloom>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryStatsBloom {
-    pub bit_count: u64,
-    pub hash_count: u32,
-    pub inserted_count: u64,
-    pub false_positive_rate_ppm: u32,
-    pub bits: Vec<u8>,
-}
-
-impl QueryStatsBloom {
-    pub fn from_encoded_values<'a>(values: impl Iterator<Item = &'a str>) -> Self {
-        const BITS_PER_VALUE: u64 = 10;
-        const HASH_COUNT: u32 = 7;
-        let values = values.collect::<Vec<_>>();
-        let inserted_count = values.len() as u64;
-        let requested_bits = inserted_count.saturating_mul(BITS_PER_VALUE).max(64);
-        let bit_count = requested_bits.saturating_add(7) / 8 * 8;
-        let mut bloom = Self {
-            bit_count,
-            hash_count: HASH_COUNT,
-            inserted_count,
-            false_positive_rate_ppm: bloom_false_positive_rate_ppm(
-                bit_count,
-                HASH_COUNT,
-                inserted_count,
-            ),
-            bits: vec![
-                0;
-                usize::try_from(bit_count / 8)
-                    .expect("bloom size derives from an in-memory value count")
-            ],
-        };
-        for value in values {
-            bloom.insert(value.as_bytes());
-        }
-        bloom
-    }
-
-    pub fn may_contain_encoded(&self, value: &str) -> bool {
-        if self.bit_count == 0
-            || self.bits.len() as u64 != self.bit_count / 8
-            || !(1..=32).contains(&self.hash_count)
-        {
-            return true;
-        }
-        bloom_indexes(value.as_bytes(), self.bit_count, self.hash_count).all(|index| {
-            let byte = usize::try_from(index / 8).expect("bloom index fits its backing vector");
-            self.bits[byte] & (1 << (index % 8)) != 0
-        })
-    }
-
-    fn insert(&mut self, value: &[u8]) {
-        for index in bloom_indexes(value, self.bit_count, self.hash_count) {
-            let byte = usize::try_from(index / 8).expect("bloom index fits its backing vector");
-            self.bits[byte] |= 1 << (index % 8);
-        }
-    }
-}
-
-fn bloom_indexes(value: &[u8], bit_count: u64, hash_count: u32) -> impl Iterator<Item = u64> {
-    let first = stable_bloom_hash(value, 0x517c_c1b7_2722_0a95);
-    let second = stable_bloom_hash(value, 0x6c8e_9cf5_7093_2bd5) | 1;
-    (0..hash_count)
-        .map(move |index| first.wrapping_add(u64::from(index).wrapping_mul(second)) % bit_count)
-}
-
-fn stable_bloom_hash(value: &[u8], seed: u64) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
-    for byte in value {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn bloom_false_positive_rate_ppm(bit_count: u64, hash_count: u32, values: u64) -> u32 {
-    if values == 0 || bit_count == 0 {
-        return 0;
-    }
-    let exponent = -(f64::from(hash_count) * values as f64 / bit_count as f64);
-    let rate = (1.0 - exponent.exp()).powf(f64::from(hash_count));
-    (rate * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
-}
-
-impl QueryStatsRecord {
-    pub fn point_count(count: u64, read_epoch: StorageSequence, refreshed_at_ms: u64) -> Self {
-        Self {
-            count,
-            read_epoch,
-            refreshed_at_ms,
-            distinct_values: 1,
-            total_values: count,
-            most_common_count: count,
-            bloom: None,
-        }
-    }
-
-    pub fn histogram(
-        count: u64,
-        read_epoch: StorageSequence,
-        refreshed_at_ms: u64,
-        distinct_values: u64,
-        most_common_count: u64,
-    ) -> Self {
-        Self {
-            count,
-            read_epoch,
-            refreshed_at_ms,
-            distinct_values,
-            total_values: count,
-            most_common_count,
-            bloom: None,
-        }
-    }
-
-    /// Older optimizer stats remain useful estimates. Publishing stats itself
-    /// advances SlateDB's sequence, so only future records are unusable.
-    pub fn is_unusable_at(&self, current_epoch: StorageSequence, now_ms: u64) -> bool {
-        self.read_epoch > current_epoch || self.refreshed_at_ms > now_ms
-    }
-
-    pub fn equality_estimate(&self) -> u64 {
-        if self.distinct_values == 0 {
-            return self.count.max(1);
-        }
-        self.count
-            .checked_div(self.distinct_values)
-            .unwrap_or(self.count)
-            .max(1)
-            .min(self.most_common_count.max(1))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryStatsHistogramRefresh {
-    pub cell_id: String,
-    pub read_epoch: StorageSequence,
-    pub property: String,
-    pub edge_type: Option<String>,
-    pub stats: QueryStatsRecord,
-    pub buckets: BTreeMap<String, u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryStatsRefreshSpec {
-    pub cell_id: String,
-    pub kind: QueryStatsRefreshKind,
-}
-
-impl QueryStatsRefreshSpec {
-    pub fn new(cell_id: impl Into<String>, kind: impl Into<QueryStatsRefreshKind>) -> Self {
-        Self {
-            cell_id: cell_id.into(),
-            kind: kind.into(),
-        }
-    }
-
-    pub fn vertex_property_histogram(
-        cell_id: impl Into<String>,
-        property: impl Into<String>,
-    ) -> Self {
-        Self {
-            cell_id: cell_id.into(),
-            kind: QueryStatsRefreshKind::VertexPropertyHistogram {
-                property: property.into(),
-            },
-        }
-    }
-
-    pub fn edge_expansion<I, S>(
-        cell_id: impl Into<String>,
-        edge_type: impl Into<String>,
-        direction: QueryStatsDirection,
-        source_labels: I,
-    ) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            cell_id: cell_id.into(),
-            kind: QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeExpansion {
-                edge_type: edge_type.into(),
-                direction,
-                source_labels: source_labels.into_iter().map(Into::into).collect(),
-            }),
-        }
-    }
-
-    pub fn edge_property_histogram(
-        cell_id: impl Into<String>,
-        edge_type: impl Into<String>,
-        property: impl Into<String>,
-    ) -> Self {
-        Self {
-            cell_id: cell_id.into(),
-            kind: QueryStatsRefreshKind::EdgePropertyHistogram {
-                edge_type: edge_type.into(),
-                property: property.into(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryStatsRefreshKind {
-    Cardinality(QueryCardinalityStatsKind),
-    VertexPropertyHistogram { property: String },
-    EdgePropertyHistogram { edge_type: String, property: String },
-}
-
-impl From<QueryCardinalityStatsKind> for QueryStatsRefreshKind {
-    fn from(value: QueryCardinalityStatsKind) -> Self {
-        Self::Cardinality(value)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryStatsRefreshResult {
-    Cardinality(QueryCardinalityStatsRefresh),
-    Histogram(QueryStatsHistogramRefresh),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryOutput {
     Write(CommitResult),
     Mutation(QueryMutationResult),
@@ -838,10 +555,7 @@ pub enum QueryOutput {
     Bool(bool),
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryColumn {
     pub name: String,
@@ -853,10 +567,7 @@ impl QueryColumn {
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QueryValue {
     Null,
@@ -867,12 +578,55 @@ pub enum QueryValue {
     Property(VertexPropertyValue),
     List(Vec<QueryValue>),
     Path(Box<QueryPath>),
+    /// A record (GQL §4.15.4): its fields, ordered by name.
+    Record(Vec<(String, QueryValue)>),
+    /// A temporal instant or duration (GQL §4.16.6).
+    Temporal(QueryTemporal),
+    /// An exact decimal (GQL §4.16.5, GV17) as its literal, `1.50`.
+    Decimal(String),
+    /// A byte string (GQL §4.16.4, GV35).
+    Bytes(Vec<u8>),
+    /// Canonically encoded `hydradb_graph_types::CypherValue`, preserving the
+    /// full DataFusion value model, including entities and extended values.
+    GraphValue(Vec<u8>),
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+/// A temporal value as the protocols send it: Bolt's fields, and the GQL
+/// literal string, without its type word, that HTTP sends.
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTemporal {
+    pub kind: QueryTemporalKind,
+    pub text: String,
+}
+
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QueryTemporalKind {
+    /// Days since the Unix epoch.
+    Date { days: i64 },
+    /// Nanoseconds since midnight.
+    LocalTime { nanoseconds: i64 },
+    /// Local nanoseconds since midnight at a displacement of
+    /// `offset_seconds` east of UTC.
+    ZonedTime { nanoseconds: i64, offset_seconds: i32 },
+    /// The local date and time as seconds since the epoch.
+    LocalDatetime { seconds: i64, nanoseconds: u32 },
+    /// The instant as UTC seconds since the epoch, at a displacement.
+    ZonedDatetime {
+        seconds: i64,
+        nanoseconds: u32,
+        offset_seconds: i32,
+    },
+    Duration {
+        months: i64,
+        days: i64,
+        seconds: i64,
+        nanoseconds: i32,
+    },
+}
+
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRow {
     pub values: Vec<QueryValue>,
@@ -885,11 +639,9 @@ impl QueryRow {
 
     #[cfg(feature = "opencypher")]
     pub(crate) fn estimated_resident_bytes(&self) -> u64 {
-        self.values
-            .iter()
-            .fold(std::mem::size_of::<Self>() as u64, |total, value| {
-                total.saturating_add(value.estimated_resident_bytes())
-            })
+        self.values.iter().fold(std::mem::size_of::<Self>() as u64, |total, value| {
+            total.saturating_add(value.estimated_resident_bytes())
+        })
     }
 }
 
@@ -898,19 +650,21 @@ impl QueryValue {
     pub(crate) fn estimated_resident_bytes(&self) -> u64 {
         let inline = std::mem::size_of::<Self>() as u64;
         match self {
-            Self::Property(VertexPropertyValue::String(value)) => {
-                inline.saturating_add(value.len() as u64)
-            }
-            Self::List(values) => values.iter().fold(inline, |total, value| {
-                total.saturating_add(value.estimated_resident_bytes())
-            }),
+            Self::Property(value) => inline.saturating_add(value.estimated_heap_bytes() as u64),
+            Self::List(values) => values
+                .iter()
+                .fold(inline, |total, value| total.saturating_add(value.estimated_resident_bytes())),
             Self::Path(path) => path.estimated_resident_bytes(),
-            Self::Null
-            | Self::VertexId(_)
-            | Self::Count(_)
-            | Self::Bool(_)
-            | Self::Float(_)
-            | Self::Property(_) => inline,
+            Self::Temporal(temporal) => inline.saturating_add(temporal.text.len() as u64),
+            Self::Decimal(text) => inline.saturating_add(text.len() as u64),
+            Self::Bytes(bytes) => inline.saturating_add(bytes.len() as u64),
+            Self::Record(fields) => fields.iter().fold(inline, |total, (name, value)| {
+                total
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(value.estimated_resident_bytes())
+            }),
+            Self::GraphValue(value) => inline.saturating_add(value.len() as u64),
+            Self::Null | Self::VertexId(_) | Self::Count(_) | Self::Bool(_) | Self::Float(_) => inline,
         }
     }
 }
@@ -924,14 +678,12 @@ impl QueryPath {
                 .saturating_add(node.labels.iter().map(|label| label.len() as u64).sum())
                 .saturating_add(property_map_resident_bytes(&node.properties))
         });
-        self.relationships
-            .iter()
-            .fold(node_bytes, |total, relationship| {
-                total
-                    .saturating_add(std::mem::size_of::<QueryPathRelationship>() as u64)
-                    .saturating_add(relationship.edge_type.len() as u64)
-                    .saturating_add(property_map_resident_bytes(&relationship.properties))
-            })
+        self.relationships.iter().fold(node_bytes, |total, relationship| {
+            total
+                .saturating_add(std::mem::size_of::<QueryPathRelationship>() as u64)
+                .saturating_add(relationship.edge_type.len() as u64)
+                .saturating_add(property_map_resident_bytes(&relationship.properties))
+        })
     }
 }
 
@@ -940,23 +692,23 @@ fn property_map_resident_bytes(properties: &BTreeMap<String, VertexPropertyValue
     properties.iter().fold(0_u64, |total, (key, value)| {
         total
             .saturating_add(key.len() as u64)
-            .saturating_add(match value {
-                VertexPropertyValue::String(value) => value.len() as u64,
-                _ => std::mem::size_of::<VertexPropertyValue>() as u64,
-            })
+            .saturating_add(std::mem::size_of::<VertexPropertyValue>() as u64)
+            .saturating_add(value.estimated_heap_bytes() as u64)
     })
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
     pub read_epoch: Option<StorageSequence>,
     pub storage_sequence: Option<crate::StorageSequence>,
+    /// The GQL-status objects of the outcome (ISO/IEC 39075 §4.9): the
+    /// primary one first, then the rest. Empty when the engine that ran the
+    /// query reports none. Optional on the wire both ways.
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub statuses: Vec<crate::GqlStatusReport>,
 }
 
 impl PartialEq for QueryResultSet {
@@ -975,7 +727,14 @@ impl QueryResultSet {
             rows,
             read_epoch: None,
             storage_sequence: None,
+            statuses: Vec::new(),
         }
+    }
+
+    /// The outcome's GQL-status objects, primary first.
+    pub fn with_statuses(mut self, statuses: Vec<crate::GqlStatusReport>) -> Self {
+        self.statuses = statuses;
+        self
     }
 
     pub fn with_read_epoch(mut self, read_epoch: StorageSequence) -> Self {
@@ -997,16 +756,13 @@ impl QueryResultSet {
     // alone failed E0599 here.
     #[cfg(feature = "client-api")]
     pub(crate) fn estimated_resident_bytes(&self) -> u64 {
-        self.rows.iter().fold(0_u64, |total, row| {
-            total.saturating_add(row.estimated_resident_bytes())
-        })
+        self.rows
+            .iter()
+            .fold(0_u64, |total, row| total.saturating_add(row.estimated_resident_bytes()))
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryCursorToken {
     pub offset: u64,
@@ -1018,34 +774,41 @@ impl QueryCursorToken {
     }
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryResultPage {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
     pub next_cursor: Option<QueryCursorToken>,
+    /// The GQL-status objects of the outcome this page belongs to, as
+    /// [`QueryResultSet::statuses`]. Optional on the wire both ways.
+    #[cfg_attr(feature = "query-transport", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub statuses: Vec<crate::GqlStatusReport>,
 }
 
 impl QueryResultPage {
-    pub fn new(
-        columns: Vec<QueryColumn>,
-        rows: Vec<QueryRow>,
-        next_cursor: Option<QueryCursorToken>,
-    ) -> Self {
+    pub fn new(columns: Vec<QueryColumn>, rows: Vec<QueryRow>, next_cursor: Option<QueryCursorToken>) -> Self {
         Self {
             columns,
             rows,
             next_cursor,
+            statuses: Vec::new(),
         }
+    }
+
+    /// The outcome's GQL-status objects, primary first.
+    pub fn with_statuses(mut self, statuses: Vec<crate::GqlStatusReport>) -> Self {
+        self.statuses = statuses;
+        self
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryMutationResult {
     pub matched_rows: u64,
+    /// Standalone vertices a `CREATE (n {...})` wrote. Relationship endpoints
+    /// are not counted here.
+    pub created_vertices: u64,
     pub created_edges: u64,
     pub created_relationships: u64,
     pub deleted_edges: u64,
@@ -1066,9 +829,7 @@ impl QueryMutationResult {
     /// without keeps the historical empty result. Either way the topology
     /// sequence rides along, so a caller can still wait on its own write.
     pub fn into_result_set(self) -> QueryResultSet {
-        let rows = self
-            .returned_rows
-            .unwrap_or_else(|| QueryResultSet::new(Vec::new(), Vec::new()));
+        let rows = self.returned_rows.unwrap_or_else(|| QueryResultSet::new(Vec::new(), Vec::new()));
         match self.topology_sequence {
             Some(sequence) => rows.with_storage_sequence(sequence),
             None => rows,
@@ -1146,10 +907,7 @@ pub struct QueryPlan {
     pub physical: PhysicalQueryPlan,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlan {
     pub cell_id: String,
@@ -1160,10 +918,7 @@ pub struct RowQueryPlan {
     pub union_arms: Vec<RowQueryPlan>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlanGroup {
     pub optional: bool,
@@ -1173,10 +928,7 @@ pub struct RowQueryPlanGroup {
     pub optimizer_passes: Vec<RowQueryOptimizerPass>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlanPattern {
     pub original_index: usize,
@@ -1186,47 +938,22 @@ pub struct RowQueryPlanPattern {
     pub optimizer_passes: Vec<RowQueryOptimizerPass>,
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowQueryAccess {
     VertexIdSeek,
-    VertexPropertyIndex {
-        property: String,
-    },
-    VertexLabelScan {
-        label: String,
-    },
+    VertexPropertyIndex { property: String },
+    VertexLabelScan { label: String },
     AllVertexScan,
-    BoundOutExpand {
-        edge_type: String,
-    },
-    BoundInExpand {
-        edge_type: String,
-    },
-    ExpandInto {
-        edge_type: String,
-    },
-    EdgePropertyIndex {
-        edge_type: String,
-        property: String,
-    },
-    FullEdgeScan {
-        edge_type: String,
-    },
-    VariableLengthExpand {
-        edge_type: String,
-        min_hops: u8,
-        max_hops: u8,
-    },
+    BoundOutExpand { edge_type: String },
+    BoundInExpand { edge_type: String },
+    ExpandInto { edge_type: String },
+    EdgePropertyIndex { edge_type: String, property: String },
+    FullEdgeScan { edge_type: String },
+    VariableLengthExpand { edge_type: String, min_hops: u8, max_hops: u8 },
 }
 
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowQueryOptimizerPass {
     UtilizeVertexIndex,
@@ -1362,10 +1089,7 @@ impl QueryPlan {
             self.physical,
             PhysicalQueryPlan::OutNeighbors { .. }
                 | PhysicalQueryPlan::EdgeExistsToVertices { .. }
-                | PhysicalQueryPlan::ReachableVertices {
-                    return_count: false,
-                    ..
-                }
+                | PhysicalQueryPlan::ReachableVertices { return_count: false, .. }
         )
     }
 
@@ -1396,8 +1120,7 @@ impl QueryPlan {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "GraphQuery",
-                feature: "result windows are only valid for vertex-returning read queries"
-                    .to_string(),
+                feature: "result windows are only valid for vertex-returning read queries".to_string(),
             });
         }
         Ok(())
@@ -1430,11 +1153,7 @@ impl QueryPlanner {
 
 fn logical_plan(statement: &QueryStatement) -> Result<LogicalQueryPlan> {
     Ok(match statement {
-        QueryStatement::CreateEdge {
-            edge_type,
-            src,
-            dst,
-        } => LogicalQueryPlan::CreateEdge {
+        QueryStatement::CreateEdge { edge_type, src, dst } => LogicalQueryPlan::CreateEdge {
             edge_type: edge_type.clone(),
             src: *src,
             dst: *dst,
@@ -1548,11 +1267,7 @@ fn validate_logical_plan(plan: &LogicalQueryPlan) -> Result<()> {
 
 fn physical_plan(logical: &LogicalQueryPlan) -> PhysicalQueryPlan {
     match logical {
-        LogicalQueryPlan::CreateEdge {
-            edge_type,
-            src,
-            dst,
-        } => PhysicalQueryPlan::WriteEdge {
+        LogicalQueryPlan::CreateEdge { edge_type, src, dst } => PhysicalQueryPlan::WriteEdge {
             edge_type: edge_type.clone(),
             src: *src,
             dst: *dst,

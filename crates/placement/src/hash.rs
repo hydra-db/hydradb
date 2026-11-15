@@ -25,8 +25,8 @@
 //! `scope` is `GraphScope`'s `Display` — `"{namespace}/graphs/{graph_id}"`.
 //! Pinning golden values against it freezes that impl as a wire format too.
 //!
-//! Ported from `sleet/src/placement.rs`, which is the proven version of exactly
-//! this, with sleet's `(database, service)` pair replaced by `(scope, cell)`.
+//! Adapted from a proven rendezvous-placement implementation, with its
+//! `(database, service)` pair replaced by `(scope, cell)`.
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
@@ -55,22 +55,13 @@ fn mix64(mut z: u64) -> u64 {
 
 /// The frozen score of one candidate node for one `(scope, cell)`.
 pub fn score(scope: &str, cell_id: &str, node_id: &str) -> u64 {
-    mix64(fnv1a64(&[
-        scope.as_bytes(),
-        b"\0",
-        cell_id.as_bytes(),
-        b"\0",
-        node_id.as_bytes(),
-    ]))
+    mix64(fnv1a64(&[scope.as_bytes(), b"\0", cell_id.as_bytes(), b"\0", node_id.as_bytes()]))
 }
 
 /// Candidate node ids ranked best-first for a `(scope, cell)`. Callers pass the
 /// live nodes — this function has no opinion on liveness.
 pub fn rank<'a>(scope: &str, cell_id: &str, live: &[&'a str]) -> Vec<&'a str> {
-    let mut ranked: Vec<(u64, &str)> = live
-        .iter()
-        .map(|&n| (score(scope, cell_id, n), n))
-        .collect();
+    let mut ranked: Vec<(u64, &str)> = live.iter().map(|&n| (score(scope, cell_id, n), n)).collect();
     // Descending by score; ties broken by node id so every node agrees.
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     ranked.into_iter().map(|(_, n)| n).collect()
