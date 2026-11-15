@@ -3,10 +3,7 @@
 use super::*;
 
 fn scalar(value: &VertexPropertyValue) -> usize {
-    match value {
-        VertexPropertyValue::String(value) => value.capacity(),
-        _ => 0,
-    }
+    value.estimated_heap_bytes()
 }
 // Bound estimator recursion independently of transport/parser validation.
 const MAX_ESTIMATE_DEPTH: usize = 64;
@@ -33,10 +30,7 @@ fn parameter_at_depth(value: &QueryParameterValue, depth: usize) -> usize {
         QueryParameterValue::List(values) => {
             values.capacity() * std::mem::size_of::<QueryParameterValue>()
                 + if depth < MAX_ESTIMATE_DEPTH {
-                    values
-                        .iter()
-                        .map(|v| parameter_at_depth(v, depth + 1))
-                        .sum::<usize>()
+                    values.iter().map(|v| parameter_at_depth(v, depth + 1)).sum::<usize>()
                 } else {
                     0
                 }
@@ -47,9 +41,7 @@ fn parameter_at_depth(value: &QueryParameterValue, depth: usize) -> usize {
 fn properties(values: &BTreeMap<String, VertexPropertyValue>) -> usize {
     values
         .iter()
-        .map(|(key, value)| {
-            std::mem::size_of::<(String, VertexPropertyValue)>() + key.capacity() + scalar(value)
-        })
+        .map(|(key, value)| std::mem::size_of::<(String, VertexPropertyValue)>() + key.capacity() + scalar(value))
         .sum()
 }
 fn metadata(value: &VertexMetadata) -> usize {
@@ -64,7 +56,10 @@ fn vec_bytes<T>(values: &Vec<T>) -> usize {
     values.capacity() * std::mem::size_of::<T>()
 }
 fn policy(value: &QueryBatchMergePolicy) -> usize {
-    value.update_if_newer_by.capacity()
+    [&value.update_if_newer_by, &value.update_if_not_older_by]
+        .into_iter()
+        .map(|guard| guard.as_ref().map_or(0, String::capacity))
+        .sum::<usize>()
         + value
             .create_only_properties
             .iter()
@@ -74,10 +69,7 @@ fn policy(value: &QueryBatchMergePolicy) -> usize {
 pub(super) fn request(value: &ClientQueryRequest) -> u64 {
     (value.query.capacity() + value.query_id.capacity() + parameters(&value.parameters)) as u64
 }
-pub(super) fn bound(
-    scalars: &BTreeMap<String, VertexPropertyValue>,
-    lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
-) -> u64 {
+pub(super) fn bound(scalars: &BTreeMap<String, VertexPropertyValue>, lists: &BTreeMap<String, Vec<VertexPropertyValue>>) -> u64 {
     (properties(scalars)
         + lists
             .iter()
@@ -93,19 +85,32 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
     use QueryBatchOperation::*;
     let Some(value) = value else { return 0 };
     (match value {
-        OutNeighbors {
-            edge_type, sources, ..
-        } => edge_type.capacity() + vec_bytes(sources),
-        CreateEdges { edge_type, edges } | DeleteEdges { edge_type, edges } => {
-            edge_type.capacity() + vec_bytes(edges)
+        MatchMutation {
+            query,
+            alias,
+            rows,
+            parameters,
+            list_parameters,
+        } => {
+            query.capacity()
+                + alias.capacity()
+                + vec_bytes(rows)
+                + rows
+                    .iter()
+                    .flatten()
+                    .chain(parameters)
+                    .map(|(name, value)| name.capacity() + scalar(value))
+                    .sum::<usize>()
+                + list_parameters
+                    .iter()
+                    .map(|(name, values)| name.capacity() + vec_bytes(values) + values.iter().map(scalar).sum::<usize>())
+                    .sum::<usize>()
         }
+        OutNeighbors { edge_type, sources, .. } => edge_type.capacity() + vec_bytes(sources),
+        CreateEdges { edge_type, edges } | DeleteEdges { edge_type, edges } => edge_type.capacity() + vec_bytes(edges),
         DeleteVertices { vertices, .. } => vec_bytes(vertices),
         DeleteIsolatedVertices { candidates, .. } => {
-            vec_bytes(candidates)
-                + candidates
-                    .iter()
-                    .map(|v| metadata(&v.path_node_constraints))
-                    .sum::<usize>()
+            vec_bytes(candidates) + candidates.iter().map(|v| metadata(&v.path_node_constraints)).sum::<usize>()
         }
         DeleteVerticesAndIsolatedCandidates {
             detach_vertices,
@@ -123,40 +128,16 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
             edge_type,
             property,
             values,
-        } => {
-            edge_type.capacity()
-                + property.capacity()
-                + vec_bytes(values)
-                + values.iter().map(scalar).sum::<usize>()
-        }
+        } => edge_type.capacity() + property.capacity() + vec_bytes(values) + values.iter().map(scalar).sum::<usize>(),
         CreateEdgesBetweenLabeledVertices {
             edge_type,
             edges,
             source_label,
             destination_label,
-        } => {
-            edge_type.capacity()
-                + vec_bytes(edges)
-                + source_label.capacity()
-                + destination_label.capacity()
-        }
-        UpsertVertices { vertices } => {
-            vec_bytes(vertices)
-                + vertices
-                    .iter()
-                    .map(|v| metadata(&v.metadata))
-                    .sum::<usize>()
-        }
-        GuardedUpsertVertices {
-            vertices,
-            merge_policy,
-        } => {
-            vec_bytes(vertices)
-                + vertices
-                    .iter()
-                    .map(|v| metadata(&v.metadata))
-                    .sum::<usize>()
-                + policy(merge_policy)
+        } => edge_type.capacity() + vec_bytes(edges) + source_label.capacity() + destination_label.capacity(),
+        UpsertVertices { vertices } => vec_bytes(vertices) + vertices.iter().map(|v| metadata(&v.metadata)).sum::<usize>(),
+        GuardedUpsertVertices { vertices, merge_policy } => {
+            vec_bytes(vertices) + vertices.iter().map(|v| metadata(&v.metadata)).sum::<usize>() + policy(merge_policy)
         }
         CreateRelationshipsBetweenLabeledVertices {
             edge_type,
@@ -166,10 +147,7 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
         } => {
             edge_type.capacity()
                 + vec_bytes(relationships)
-                + relationships
-                    .iter()
-                    .map(|v| properties(&v.metadata.properties))
-                    .sum::<usize>()
+                + relationships.iter().map(|v| properties(&v.metadata.properties)).sum::<usize>()
                 + source_label.capacity()
                 + destination_label.capacity()
         }
@@ -181,10 +159,7 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
         } => {
             edge_type.capacity()
                 + vec_bytes(relationships)
-                + relationships
-                    .iter()
-                    .map(|v| properties(&v.metadata.properties))
-                    .sum::<usize>()
+                + relationships.iter().map(|v| properties(&v.metadata.properties)).sum::<usize>()
                 + source_label.capacity()
                 + destination_label.capacity()
         }
@@ -197,10 +172,7 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
         } => {
             edge_type.capacity()
                 + vec_bytes(relationships)
-                + relationships
-                    .iter()
-                    .map(|v| properties(&v.metadata.properties))
-                    .sum::<usize>()
+                + relationships.iter().map(|v| properties(&v.metadata.properties)).sum::<usize>()
                 + source_label.capacity()
                 + destination_label.capacity()
                 + policy(merge_policy)

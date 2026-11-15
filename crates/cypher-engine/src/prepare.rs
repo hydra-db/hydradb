@@ -1,16 +1,16 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    explain_physical_plan, explain_physical_plan_shape, lower_cypher_ast,
-    plan_physical_with_statistics, GraphLogicalPlan, GraphPhysicalPlan, PhysicalPlanningContext,
-    PhysicalProjection, StatisticsProvider, Symbol, UnknownStatistics,
+    explain_physical_plan, explain_physical_plan_shape, lower_cypher_ast_with_id_properties, plan_physical_with_provider, GraphLogicalPlan,
+    GraphPhysicalPlan, PhysicalPlanningContext, PhysicalProjection, StatisticsProvider, Symbol,
 };
 use hydradb_cypher_ast::{Document, QueryFailureReason};
 use hydradb_cypher_parser_antlr::parse_cypher25;
 
 use crate::capability::{logical_capability, physical_capability, EngineCapability};
-use crate::{EngineError, EngineResult, ListParameterMap, ParameterMap};
+use crate::{EngineError, EngineResult, ListParameterMap, ParameterMap, ScalarValue};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedQuery {
@@ -58,39 +58,26 @@ impl PreparedQuery {
 pub fn plan_shape_hash(shape: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    shape.bytes().fold(OFFSET, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
-    })
+    shape
+        .bytes()
+        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 
 pub(crate) fn column_names(plan: &GraphPhysicalPlan) -> EngineResult<Vec<String>> {
     match plan {
-        GraphPhysicalPlan::Project { items, .. } => {
-            Ok(items.iter().map(PhysicalProjection::column_name).collect())
-        }
+        GraphPhysicalPlan::Project { items, .. } => Ok(items.iter().map(PhysicalProjection::column_name).collect()),
+        // FINISH has an omitted result: no columns (§14.10).
+        GraphPhysicalPlan::Finish { .. } => Ok(Vec::new()),
+        GraphPhysicalPlan::Next { next, .. } => column_names(next),
         GraphPhysicalPlan::Union { arms, .. } => arms
             .first()
-            .ok_or_else(|| {
-                EngineError::UnsupportedPlan(
-                    QueryFailureReason::Union,
-                    "UNION has no arms".to_string(),
-                )
-            })
+            .ok_or_else(|| EngineError::UnsupportedPlan(QueryFailureReason::Union, "UNION has no arms".to_string()))
             .and_then(column_names),
         _ => Err(EngineError::UnsupportedPlan(
             QueryFailureReason::Other,
             "a result-producing plan must have Project or Union at its root".to_string(),
         )),
     }
-}
-
-pub(crate) fn prepare_query(query: &str, parameters: &ParameterMap) -> EngineResult<PreparedQuery> {
-    prepare_query_with_statistics(
-        query,
-        parameters,
-        &ListParameterMap::new(),
-        &UnknownStatistics,
-    )
 }
 
 /// Parsed and lowered query awaiting a coherent statistics view. Lowering is
@@ -120,11 +107,16 @@ impl LogicalQuery {
         logical_capability(&self.logical)
     }
 
-    pub fn plan_with_statistics(
-        self,
-        statistics: &dyn StatisticsProvider,
-    ) -> EngineResult<PreparedQuery> {
-        let physical = plan_physical_with_statistics(&self.logical, &self.planning, statistics)?;
+    pub fn plan_with_statistics(self, statistics: &dyn StatisticsProvider) -> EngineResult<PreparedQuery> {
+        self.plan_with_provider(&crate::SlateDbDataSource::new(statistics))
+    }
+
+    pub fn plan_with_provider(self, provider: &crate::SlateDbDataSource<'_>) -> EngineResult<PreparedQuery> {
+        let mut physical = plan_physical_with_provider(&self.logical, &self.planning, provider)?;
+        // Settled here and not in the planner, which plans fragment by
+        // fragment: a seek only knows what reads its binding once the whole
+        // plan stands.
+        crate::plan::mark_index_only_range_seeks(&mut physical);
         Ok(PreparedQuery {
             ast: self.ast,
             logical: self.logical,
@@ -161,12 +153,16 @@ impl LoweredTemplate {
     /// [`Self::lower`], also reporting how long each half took, so a slow
     /// preparation can be attributed to the parser or to lowering.
     pub fn lower_timed(query: &str) -> EngineResult<(Self, LowerTimings)> {
+        Self::lower_timed_with_id_properties(query, false)
+    }
+
+    /// Prepare BYOG property semantics without changing managed collections.
+    pub fn lower_timed_with_id_properties(query: &str, id_properties: bool) -> EngineResult<(Self, LowerTimings)> {
         let started = Instant::now();
-        let ast =
-            parse_cypher25(query).map_err(|error| EngineError::Parse(format!("{error:?}")))?;
+        let ast = parse_cypher25(query).map_err(|error| EngineError::Parse(format!("{error:?}")))?;
         let parse = started.elapsed();
         let started = Instant::now();
-        let logical = lower_cypher_ast(&ast)?;
+        let logical = lower_cypher_ast_with_id_properties(&ast, id_properties)?;
         let lower = started.elapsed();
         Ok((
             Self {
@@ -183,22 +179,42 @@ impl LoweredTemplate {
     /// once, so they track allocated size within a small constant factor.
     /// Computed once per lowering, never per request.
     pub fn estimated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + format!("{:?}", self.ast).len()
-            + format!("{:?}", self.logical).len()
+        std::mem::size_of::<Self>() + format!("{:?}", self.ast).len() + format!("{:?}", self.logical).len()
     }
 
     /// Attach one request's parameter values, producing the same
-    /// [`LogicalQuery`] that lowering from scratch would.
+    /// [`LogicalQuery`] that lowering from scratch would. `SESSION_USER` reads
+    /// [`DEFAULT_SESSION_USER`]; see [`Self::bind_as`].
     pub fn bind(&self, parameters: &ParameterMap, lists: &ListParameterMap) -> LogicalQuery {
+        self.bind_as(parameters, lists, None)
+    }
+
+    /// [`Self::bind`] for a session whose authorization identifier is
+    /// `session_user`, which `SESSION_USER` reads (GQL §20.3). A caller's
+    /// parameter named [`SESSION_USER_PARAMETER`] is dropped, so a request
+    /// cannot choose its own session user.
+    pub fn bind_as(&self, parameters: &ParameterMap, lists: &ListParameterMap, session_user: Option<&str>) -> LogicalQuery {
+        let mut bound: BTreeMap<Symbol, ScalarValue> = parameters
+            .iter()
+            .filter(|(name, _)| name.as_str() != SESSION_USER_PARAMETER)
+            .map(|(name, value)| (Symbol::from(name.as_str()), value.clone()))
+            .collect();
+        bound.insert(
+            Symbol::from(SESSION_USER_PARAMETER),
+            ScalarValue::String(session_user.unwrap_or(DEFAULT_SESSION_USER).into()),
+        );
+        // §20.27 General Rule 1: the request timestamp, set once for the
+        // request, as nanoseconds since the Unix epoch.
+        bound.retain(|name, _| name.as_str() != REQUEST_TIMESTAMP_PARAMETER);
+        bound.insert(
+            Symbol::from(REQUEST_TIMESTAMP_PARAMETER),
+            ScalarValue::Integer(chrono::Utc::now().timestamp_nanos_opt().map_or(0, i128::from)),
+        );
         LogicalQuery {
             ast: Arc::clone(&self.ast),
             logical: Arc::clone(&self.logical),
             planning: PhysicalPlanningContext {
-                parameters: parameters
-                    .iter()
-                    .map(|(name, value)| (Symbol::from(name.as_str()), value.clone()))
-                    .collect(),
+                parameters: bound,
                 list_parameters: lists
                     .iter()
                     .map(|(name, values)| (Symbol::from(name.as_str()), values.clone()))
@@ -208,19 +224,34 @@ impl LoweredTemplate {
     }
 }
 
-pub(crate) fn lower_query(
+pub(crate) fn lower_query_as(
     query: &str,
     parameters: &ParameterMap,
     lists: &ListParameterMap,
+    session_user: Option<&str>,
 ) -> EngineResult<LogicalQuery> {
-    Ok(LoweredTemplate::lower(query)?.bind(parameters, lists))
+    Ok(LoweredTemplate::lower(query)?.bind_as(parameters, lists, session_user))
 }
 
-pub(crate) fn prepare_query_with_statistics(
+/// The parameter `SESSION_USER` lowers to (GQL §20.3). No `$parameter` in
+/// query text can name it (`$hydradb.session_user` reads a property of
+/// `$hydradb`), and binding sets it from the session alone.
+pub const SESSION_USER_PARAMETER: &str = "hydradb.session_user";
+
+/// The parameter the temporal functions read the request timestamp from
+/// (GQL §20.27 General Rule 1); like [`SESSION_USER_PARAMETER`], no query
+/// can name it.
+pub const REQUEST_TIMESTAMP_PARAMETER: &str = "hydradb.request_timestamp";
+
+/// `SESSION_USER` when the engine is given no session user (ID061, IV015).
+pub const DEFAULT_SESSION_USER: &str = "anonymous";
+
+pub(crate) fn prepare_query_as(
     query: &str,
     parameters: &ParameterMap,
     lists: &ListParameterMap,
     statistics: &dyn StatisticsProvider,
+    session_user: Option<&str>,
 ) -> EngineResult<PreparedQuery> {
-    lower_query(query, parameters, lists)?.plan_with_statistics(statistics)
+    lower_query_as(query, parameters, lists, session_user)?.plan_with_statistics(statistics)
 }

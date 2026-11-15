@@ -8,22 +8,19 @@ use std::time::{Duration, Instant};
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
 
 use crate::sparse_kernel::{
-    compile_graphblas_compact_csc_u32, compile_graphblas_csc, compile_graphblas_csc_owned,
-    compile_graphblas_matrix, expand_compiled_graphblas, CompiledGraphBlasMatrix,
+    compile_graphblas_compact_csc_u32, compile_graphblas_csc, compile_graphblas_csc_owned, compile_graphblas_matrix,
+    expand_compiled_graphblas, CompiledGraphBlasMatrix,
 };
 use crate::sparse_kernel::{
-    default_matrix_kernel, expand as expand_sparse, graphblas_csc_from_adjacency, GraphBlasCsc,
-    SparseKernelBackend,
+    default_matrix_kernel, expand as expand_sparse, graphblas_csc_from_adjacency, GraphBlasCsc, SparseKernelBackend,
 };
 use crate::{
-    decode_edge_record, decode_out_edge_segment, decode_relationship_record, decode_u64,
-    encode_vertex_property_value_key, ensure_limit, parse_out_edge_segment_tombstone_key,
-    parse_u64, process_writer_registry, segment_edge_visible, validate_component, EdgeRecord,
-    GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes,
-    GraphCorrectnessReport, GraphError, GraphExportDigest, GraphMemoryConfig, GraphOpenOptions,
-    GraphOperationalMetricsSnapshot, GraphScope, GraphShard, GraphStorageMetricsSnapshot,
-    GraphStore, GraphWriteBatch, GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey,
-    ProcessWriterRegistry, RelationshipId, RelationshipRecord, Result, StorageSequence, VertexId,
+    decode_edge_record, decode_out_edge_segment, decode_relationship_record, decode_u64, encode_vertex_property_value_key, ensure_limit,
+    parse_out_edge_segment_tombstone_key, parse_u64, process_writer_registry, segment_edge_visible, validate_component, EdgeRecord,
+    GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes, GraphCorrectnessReport, GraphError,
+    GraphExportDigest, GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphScope, GraphShard,
+    GraphStorageMetricsSnapshot, GraphWriteBatch, GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, ProcessWriterRegistry,
+    RelationshipId, RelationshipRecord, Result, SlateGraphStore, StorageSequence, VertexId,
 };
 #[cfg(feature = "query-transport")]
 use crate::{GraphId, NamespacePath, SharedSlateDbCache, SlateDbCacheMetricsSnapshot};
@@ -70,14 +67,11 @@ pub struct BenchmarkResult {
 
 pub struct GraphCluster {
     scope: GraphScope,
-    shards: BTreeMap<String, GraphShard>,
+    shards: BTreeMap<String, Arc<GraphShard>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Serialize, serde::Deserialize))]
 pub struct ObjectStoreNodeDirectory {
     cells: BTreeSet<String>,
     nodes: BTreeSet<String>,
@@ -129,13 +123,15 @@ pub struct ScopedRoutedGraphCluster {
     writer_gate: crate::WriterGate,
     scope_directory: ObjectStoreGraphScopeDirectory,
     indexer_change_wake: Option<Arc<tokio::sync::Notify>>,
+    /// The node's one disk cache, read through by every scope; `None` when
+    /// the node keeps no disk cache. See [`SharedDiskCache`].
+    shared_disk_cache: Option<SharedDiskCache>,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
     max_open_scopes: usize,
     access_clock: AtomicU64,
     clusters: tokio::sync::Mutex<BTreeMap<GraphScope, ScopedRoutedClusterEntry>>,
-    scope_open_gates:
-        tokio::sync::Mutex<BTreeMap<GraphScope, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    scope_open_gates: tokio::sync::Mutex<BTreeMap<GraphScope, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Scopes removed from `clusters` whose SlateDB handles are still closing.
     /// A reopen must wait for the stored watch receiver to become `true`, or it
     /// can overlap the retiring writer and fence it from the same process.
@@ -143,11 +139,27 @@ pub struct ScopedRoutedGraphCluster {
     scope_capacity_gate: tokio::sync::Mutex<()>,
     scope_capacity_available: Arc<tokio::sync::Notify>,
     scope_open_reservations: Arc<AtomicUsize>,
+    /// Permits for evicted scopes that finish closing in the background, so
+    /// the request that evicted them need not wait; see
+    /// `BACKGROUND_SCOPE_CLOSES`. Open and closing scopes together never
+    /// exceed `max_open_scopes` plus these permits.
+    scope_close_budget: Arc<tokio::sync::Semaphore>,
+    background_scope_closes: u32,
+    /// Failures of background closes, reported by `close`: the request that
+    /// evicted the scope has moved on, so shutdown is where they surface.
+    background_close_failures: Arc<std::sync::Mutex<cluster::BackgroundCloseFailures>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphShardRuntimeMetrics {
     pub cell_id: String,
+    /// Number of permits currently held on this scope's write semaphore.
+    ///
+    /// Kept beside the per-scope snapshot so exporters can calculate a
+    /// bounded per-cell maximum without adding a scope label to Prometheus.
+    pub write_permits_in_use: usize,
+    /// Configured capacity of this scope's write semaphore.
+    pub write_permit_capacity: usize,
     pub operational: GraphOperationalMetricsSnapshot,
     pub cache: GraphCacheMetricsSnapshot,
     pub cache_entries: GraphCacheEntryCounts,
@@ -241,35 +253,49 @@ mod cluster;
 mod index_store;
 mod placement;
 mod planner_statistics;
+pub(crate) mod remote_io;
 mod scope_directory;
+mod shared_disk_cache;
 mod writer_lease;
 
+#[cfg(feature = "query-transport")]
+pub(crate) use cluster::run_write_to_completion;
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
+pub use remote_io::{remote_object_store_snapshot, RemoteObjectStoreSnapshot, RemoteStorageProfile};
 
-pub use scope_directory::{
-    GraphScopeChange, ObjectStoreGraphScopeDirectory, PlannerStatisticsRequest,
-};
-pub use writer_lease::{
-    ObjectStoreWriterLeaseDirectory, WriterLeaseOwner, WriterLeaseRenewalFailure,
-};
+pub use scope_directory::{GraphScopeChange, ObjectStoreGraphScopeDirectory, PlannerStatisticsRequest};
+pub use shared_disk_cache::{SharedDiskCache, SharedDiskCacheMetrics};
+pub use writer_lease::{ObjectStoreWriterLeaseDirectory, WriterLeaseOwner, WriterLeaseRenewalFailure};
 mod matrix_cache;
 mod traversal;
 mod verify;
 
 pub use index_store::{GraphIndexBuildPath, GraphIndexGeneration};
 pub use planner_statistics::{
-    decode_planner_statistics, encode_planner_statistics, PlannerStatistics,
-    PlannerStatisticsBuildLimits, PlannerStatisticsPublish, PlannerStatisticsPublisher,
-    PropertyIndexStatistics, PropertySample, TagRange, PLANNER_STATISTICS_FORMAT_VERSION,
+    decode_planner_statistics, encode_planner_statistics, PlannerStatistics, PlannerStatisticsBuildLimits, PlannerStatisticsPublish,
+    PlannerStatisticsPublisher, PropertyIndexStatistics, PropertySample, TagRange, PLANNER_STATISTICS_FORMAT_VERSION,
     PLANNER_STATISTICS_TOP_VALUES,
+};
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) use planner_statistics::{decode_write_back_property_statistics, WriteBackPropertyStatistics};
+#[cfg(feature = "opencypher")]
+pub(crate) use planner_statistics::{
+    encode_write_back_property_statistics, exact_float_property_statistics, CarriedIndexValues, IndexOrderedFloats,
 };
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
 }
 
+/// The configured object store. A remote one has its GETs and PUTs counted into
+/// the process totals [`remote_object_store_snapshot`] reads; see [`remote_io`]
+/// for what those totals do and do not include.
 pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectStore>> {
-    Ok(slatedb::admin::load_object_store_from_env(env_file)?)
+    let store = slatedb::admin::load_object_store_from_env(env_file)?;
+    // The loader has just read `CLOUD_PROVIDER`, from the process environment
+    // or the env file it loaded into it, so the value is there to read again.
+    let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_default();
+    Ok(remote_io::count_if_remote(&cloud_provider, store))
 }
 
 fn matrix_rows_to_graphblas_csc(rows: &MatrixRows) -> Result<GraphBlasCsc> {
@@ -300,12 +326,10 @@ fn matrix_rows_pointers(rows: &MatrixRows, vertices: &[VertexId]) -> Result<Vec<
     pointers.push(offset);
     for vertex in vertices {
         let degree = rows.rows.get(vertex).map_or(0_usize, Vec::len);
-        offset = offset
-            .checked_add(degree as u64)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: "graphblas_csc_pointers".to_string(),
-                reason: "CSC pointer offset overflow".to_string(),
-            })?;
+        offset = offset.checked_add(degree as u64).ok_or_else(|| GraphError::CorruptValue {
+            key: "graphblas_csc_pointers".to_string(),
+            reason: "CSC pointer offset overflow".to_string(),
+        })?;
         pointers.push(offset);
     }
     Ok(pointers)
@@ -320,22 +344,16 @@ fn matrix_rows_indices(rows: &MatrixRows, vertices: &[VertexId]) -> Result<Vec<u
     Ok(indices)
 }
 
-fn append_matrix_rows_indices(
-    rows: &MatrixRows,
-    vertices: &[VertexId],
-    mut append: impl FnMut(u64) -> Result<()>,
-) -> Result<()> {
+fn append_matrix_rows_indices(rows: &MatrixRows, vertices: &[VertexId], mut append: impl FnMut(u64) -> Result<()>) -> Result<()> {
     for src in vertices {
         let Some(dsts) = rows.rows.get(src) else {
             continue;
         };
         for dst in dsts {
-            let ordinal = vertices
-                .binary_search(dst)
-                .map_err(|_| GraphError::CorruptValue {
-                    key: "graphblas_csc_indices".to_string(),
-                    reason: format!("destination vertex {dst} missing from CSC vertex dictionary"),
-                })? as u64;
+            let ordinal = vertices.binary_search(dst).map_err(|_| GraphError::CorruptValue {
+                key: "graphblas_csc_indices".to_string(),
+                reason: format!("destination vertex {dst} missing from CSC vertex dictionary"),
+            })? as u64;
             append(ordinal)?;
         }
     }
@@ -367,9 +385,7 @@ fn adjacency_resident_bytes(adjacency: &MatrixAdjacency) -> usize {
         .saturating_add(
             usize::try_from(adjacency_edge_count(adjacency))
                 .unwrap_or(usize::MAX)
-                .saturating_mul(
-                    std::mem::size_of::<VertexId>().saturating_add(BTREE_ENTRY_OVERHEAD_BYTES),
-                ),
+                .saturating_mul(std::mem::size_of::<VertexId>().saturating_add(BTREE_ENTRY_OVERHEAD_BYTES)),
         )
 }
 
@@ -377,12 +393,7 @@ const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;
 
 type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, RelationshipId);
 
-fn graph_export_digest(
-    cell_id: &str,
-    edge_type: &str,
-    read_epoch: StorageSequence,
-    edges: &[EdgeRecord],
-) -> GraphExportDigest {
+fn graph_export_digest(cell_id: &str, edge_type: &str, read_epoch: StorageSequence, edges: &[EdgeRecord]) -> GraphExportDigest {
     let (out_degrees, in_degrees) = degree_maps(edges);
     GraphExportDigest {
         cell_id: cell_id.to_string(),
@@ -435,16 +446,10 @@ fn compare_edge_sets(
     actual: &BTreeSet<(VertexId, VertexId)>,
     report: &mut GraphCorrectnessReport,
 ) {
-    for (src, dst) in expected
-        .difference(actual)
-        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
-    {
+    for (src, dst) in expected.difference(actual).take(GRAPH_VERIFY_MISMATCH_SAMPLES) {
         record_mismatch(report, format!("{label}:missing src={src} dst={dst}"));
     }
-    for (src, dst) in actual
-        .difference(expected)
-        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
-    {
+    for (src, dst) in actual.difference(expected).take(GRAPH_VERIFY_MISMATCH_SAMPLES) {
         record_mismatch(report, format!("{label}:extra src={src} dst={dst}"));
     }
     let missing = expected.difference(actual).count();
@@ -473,10 +478,7 @@ fn compare_degree_maps(
     }
     for (vertex, actual_degree) in actual {
         if *actual_degree > 0 && !expected.contains_key(vertex) {
-            record_mismatch(
-                report,
-                format!("{label}:extra vertex={vertex} actual={actual_degree}"),
-            );
+            record_mismatch(report, format!("{label}:extra vertex={vertex} actual={actual_degree}"));
         }
     }
 }
@@ -498,10 +500,7 @@ fn compare_relationship_count_maps(
     }
     for ((src, dst), actual_count) in actual {
         if *actual_count > 0 && !expected.contains_key(&(*src, *dst)) {
-            record_mismatch(
-                report,
-                format!("{label}:extra src={src} dst={dst} actual={actual_count}"),
-            );
+            record_mismatch(report, format!("{label}:extra src={src} dst={dst} actual={actual_count}"));
         }
     }
 }
@@ -512,19 +511,13 @@ fn compare_relationship_property_index_sets(
     actual: &BTreeSet<RelationshipPropertyIndexEntry>,
     report: &mut GraphCorrectnessReport,
 ) {
-    for (property, encoded, src, dst, relationship_id) in expected
-        .difference(actual)
-        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
-    {
+    for (property, encoded, src, dst, relationship_id) in expected.difference(actual).take(GRAPH_VERIFY_MISMATCH_SAMPLES) {
         record_mismatch(
             report,
             format!("{label}:missing property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"),
         );
     }
-    for (property, encoded, src, dst, relationship_id) in actual
-        .difference(expected)
-        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
-    {
+    for (property, encoded, src, dst, relationship_id) in actual.difference(expected).take(GRAPH_VERIFY_MISMATCH_SAMPLES) {
         record_mismatch(
             report,
             format!("{label}:extra property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"),
@@ -554,27 +547,17 @@ fn parse_relationship_count_key(key: &str) -> Result<(VertexId, VertexId)> {
 
 fn parse_relationship_property_index_key_for_verify(
     key: &str,
-) -> Result<(
-    String,
-    String,
-    String,
-    String,
-    VertexId,
-    VertexId,
-    RelationshipId,
-)> {
+) -> Result<(String, String, String, String, VertexId, VertexId, RelationshipId)> {
     match key.split('/').collect::<Vec<_>>().as_slice() {
-        ["cell", cell_id, "rprop_idx", edge_type, property, encoded, src, dst, relationship_id] => {
-            Ok((
-                (*cell_id).to_string(),
-                (*edge_type).to_string(),
-                (*property).to_string(),
-                (*encoded).to_string(),
-                parse_u64(key, src, "src")?,
-                parse_u64(key, dst, "dst")?,
-                parse_u64(key, relationship_id, "relationship_id")?,
-            ))
-        }
+        ["cell", cell_id, "rprop_idx", edge_type, property, encoded, src, dst, relationship_id] => Ok((
+            (*cell_id).to_string(),
+            (*edge_type).to_string(),
+            (*property).to_string(),
+            (*encoded).to_string(),
+            parse_u64(key, src, "src")?,
+            parse_u64(key, dst, "dst")?,
+            parse_u64(key, relationship_id, "relationship_id")?,
+        )),
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected relationship property index key".to_string(),
@@ -585,15 +568,11 @@ fn parse_relationship_property_index_key_for_verify(
 /// The `rmerge_idx` twin of the parser above: same components minus the
 /// trailing relationship id, which lives in the value. Only the components
 /// the verifier compares are returned.
-fn parse_relationship_merge_index_key_for_verify(
-    key: &str,
-) -> Result<(String, VertexId, VertexId)> {
+fn parse_relationship_merge_index_key_for_verify(key: &str) -> Result<(String, VertexId, VertexId)> {
     match key.split('/').collect::<Vec<_>>().as_slice() {
-        ["cell", _cell_id, "rmerge_idx", _edge_type, _property, encoded, src, dst] => Ok((
-            (*encoded).to_string(),
-            parse_u64(key, src, "src")?,
-            parse_u64(key, dst, "dst")?,
-        )),
+        ["cell", _cell_id, "rmerge_idx", _edge_type, _property, encoded, src, dst] => {
+            Ok(((*encoded).to_string(), parse_u64(key, src, "src")?, parse_u64(key, dst, "dst")?))
+        }
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected relationship merge index key".to_string(),
@@ -615,12 +594,7 @@ fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec
         let mut next = BTreeSet::new();
         for vertex in &frontier {
             if let Some(neighbors) = adjacency.get(vertex) {
-                next.extend(
-                    neighbors
-                        .iter()
-                        .copied()
-                        .filter(|neighbor| reachable.insert(*neighbor)),
-                );
+                next.extend(neighbors.iter().copied().filter(|neighbor| reachable.insert(*neighbor)));
             }
         }
         frontier = next;
@@ -661,20 +635,11 @@ fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: StorageSequen
     format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{base_epoch:020}")
 }
 
-pub(crate) fn matrix_cleanup_marker_key(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: StorageSequence,
-) -> String {
+pub(crate) fn matrix_cleanup_marker_key(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> String {
     format!("cell/{cell_id}/meta/matrix_cleanup/{edge_type}/{base_epoch:020}")
 }
 
-async fn prepare_artifact_build(
-    shard: &GraphShard,
-    cell_id: &str,
-    operation: &'static str,
-    cleanup_marker_keys: &[String],
-) -> Result<()> {
+async fn prepare_artifact_build(shard: &GraphShard, cell_id: &str, operation: &'static str, cleanup_marker_keys: &[String]) -> Result<()> {
     let mut guards = Vec::new();
     let mut batch = GraphWriteBatch::new();
     for marker_key in cleanup_marker_keys {
@@ -687,9 +652,7 @@ async fn prepare_artifact_build(
         return Ok(());
     }
     let lock = shard.acquire_local_write_guard(cell_id, operation).await?;
-    let result = shard
-        .write_graph_batch_strict_guarded(cell_id, operation, guards, batch)
-        .await;
+    let result = shard.write_graph_batch_strict_guarded(cell_id, operation, guards, batch).await;
     crate::finish_local_write(lock, result).await
 }
 
@@ -700,13 +663,8 @@ async fn publish_artifact_records_guarded(
     cleanup_marker_keys: &[String],
     batch: GraphWriteBatch,
 ) -> Result<()> {
-    let guards = cleanup_marker_keys
-        .iter()
-        .map(GraphWriteGuard::absent)
-        .collect();
-    shard
-        .write_graph_batch_strict_guarded(cell_id, operation, guards, batch)
-        .await
+    let guards = cleanup_marker_keys.iter().map(GraphWriteGuard::absent).collect();
+    shard.write_graph_batch_strict_guarded(cell_id, operation, guards, batch).await
 }
 
 async fn publish_artifact_records_guarded_with_cell_lock(
@@ -717,9 +675,7 @@ async fn publish_artifact_records_guarded_with_cell_lock(
     batch: GraphWriteBatch,
 ) -> Result<()> {
     let lock = shard.acquire_local_write_guard(cell_id, operation).await?;
-    let result =
-        publish_artifact_records_guarded(shard, cell_id, operation, cleanup_marker_keys, batch)
-            .await;
+    let result = publish_artifact_records_guarded(shard, cell_id, operation, cleanup_marker_keys, batch).await;
     crate::finish_local_write(lock, result).await
 }
 
@@ -739,12 +695,7 @@ fn matrix_tile_key(tile: &MatrixTile) -> String {
     )
 }
 
-fn matrix_tile_prefix(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: StorageSequence,
-    direction: MatrixDirection,
-) -> String {
+fn matrix_tile_prefix(cell_id: &str, edge_type: &str, base_epoch: StorageSequence, direction: MatrixDirection) -> String {
     format!(
         "cell/{cell_id}/artifact/matrix/{edge_type}/{base_epoch:020}/{}/",
         direction_str(direction)
@@ -763,21 +714,11 @@ fn graphblas_csc_chunk_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/")
 }
 
-fn graphblas_csc_chunk_epoch_prefix(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: StorageSequence,
-) -> String {
+fn graphblas_csc_chunk_epoch_prefix(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/")
 }
 
-fn graphblas_csc_chunk_key(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: StorageSequence,
-    field: &str,
-    chunk_id: u64,
-) -> String {
+fn graphblas_csc_chunk_key(cell_id: &str, edge_type: &str, base_epoch: StorageSequence, field: &str, chunk_id: u64) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/{field}/{chunk_id:020}")
 }
 
@@ -799,9 +740,7 @@ fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<StorageSequence>> {
         ["cell", _, "artifact", "graphblas_csc_chunk", _, base_epoch, ..] => Some(*base_epoch),
         _ => None,
     };
-    epoch
-        .map(|value| parse_u64(key, value, "base_epoch"))
-        .transpose()
+    epoch.map(|value| parse_u64(key, value, "base_epoch")).transpose()
 }
 
 const GRAPH_ARTIFACT_WRITE_BATCH_KEYS: usize = 512;
@@ -821,15 +760,7 @@ async fn put_artifact_record(
     batch.put(key, value);
     *pending_writes += 1;
     if *pending_writes >= GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
-        flush_artifact_put_batch(
-            shard,
-            artifact_locks,
-            cell_id,
-            operation,
-            batch,
-            pending_writes,
-        )
-        .await?;
+        flush_artifact_put_batch(shard, artifact_locks, cell_id, operation, batch, pending_writes).await?;
     }
     Ok(())
 }
@@ -908,32 +839,15 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
         }
         Ok(None) => {}
         Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "read_matrix_manifest",
-                &err,
-            );
+            result.record_error(cell_id, edge_type, base_epoch, operation, "read_matrix_manifest", &err);
             return result;
         }
     }
 
-    let artifact_lock = match shard
-        .acquire_local_artifact_guard(cell_id, edge_type, base_epoch, operation)
-        .await
-    {
+    let artifact_lock = match shard.acquire_local_artifact_guard(cell_id, edge_type, base_epoch, operation).await {
         Ok(lock) => lock,
         Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "acquire_matrix_artifact_lock",
-                &err,
-            );
+            result.record_error(cell_id, edge_type, base_epoch, operation, "acquire_matrix_artifact_lock", &err);
             return result;
         }
     };
@@ -950,14 +864,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
             }
             Ok(None) => {}
             Err(err) => {
-                result.record_error(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    "recheck_matrix_manifest",
-                    &err,
-                );
+                result.record_error(cell_id, edge_type, base_epoch, operation, "recheck_matrix_manifest", &err);
                 return Ok(());
             }
         }
@@ -965,12 +872,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
         let mut claim_batch = GraphWriteBatch::new();
         claim_batch.put(&cleanup_marker_key, &cleanup_token);
         match shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![GraphWriteGuard::absent(&manifest_key)],
-                claim_batch,
-            )
+            .write_graph_batch_strict_guarded(cell_id, operation, vec![GraphWriteGuard::absent(&manifest_key)], claim_batch)
             .await
         {
             Ok(()) => cleanup_claimed = true,
@@ -979,14 +881,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
                 return Ok(());
             }
             Err(err) => {
-                result.record_error(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    "claim_matrix_cleanup_generation",
-                    &err,
-                );
+                result.record_error(cell_id, edge_type, base_epoch, operation, "claim_matrix_cleanup_generation", &err);
                 return Ok(());
             }
         }
@@ -1000,14 +895,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
                 pending_deletes += 1;
             }
             Ok(None) => {}
-            Err(err) => result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "read_graphblas_manifest",
-                &err,
-            ),
+            Err(err) => result.record_error(cell_id, edge_type, base_epoch, operation, "read_graphblas_manifest", &err),
         }
         if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
             && !flush_unpublished_artifact_gc_batch_best_effort(
@@ -1046,14 +934,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
             let mut iter = match shard.scan_remote_prefix(&prefix).await {
                 Ok(iter) => iter,
                 Err(err) => {
-                    result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    );
+                    result.record_error(cell_id, edge_type, base_epoch, operation, cleanup_step, &err);
                     continue;
                 }
             };
@@ -1062,14 +943,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
                     Ok(Some(kv)) => kv,
                     Ok(None) => break,
                     Err(err) => {
-                        result.record_error(
-                            cell_id,
-                            edge_type,
-                            base_epoch,
-                            operation,
-                            cleanup_step,
-                            &err,
-                        );
+                        result.record_error(cell_id, edge_type, base_epoch, operation, cleanup_step, &err);
                         break;
                     }
                 };
@@ -1114,15 +988,21 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
         )
         .await
         {
-            shard.matrix_artifact_cache.lock().await.retain(|key, _| {
-                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-            });
-            shard.matrix_cache.lock().await.retain(|key, _| {
-                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-            });
-            shard.graphblas_cache.lock().await.retain(|key, _| {
-                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-            });
+            shard
+                .matrix_artifact_cache
+                .lock()
+                .await
+                .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch);
+            shard
+                .matrix_cache
+                .lock()
+                .await
+                .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch);
+            shard
+                .graphblas_cache
+                .lock()
+                .await
+                .retain(|key, _| key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch);
         }
 
         Ok(())
@@ -1140,25 +1020,11 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
             )
             .await
         {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "release_matrix_cleanup_generation",
-                &err,
-            );
+            result.record_error(cell_id, edge_type, base_epoch, operation, "release_matrix_cleanup_generation", &err);
         }
     }
     if let Err(err) = crate::finish_local_write(artifact_lock, cleanup_run).await {
-        result.record_error(
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            "release_matrix_artifact_lock",
-            &err,
-        );
+        result.record_error(cell_id, edge_type, base_epoch, operation, "release_matrix_artifact_lock", &err);
     }
 
     result
@@ -1225,25 +1091,11 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
                 operation: conflict_operation,
                 key,
             };
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "lost_matrix_cleanup_generation",
-                &err,
-            );
+            result.record_error(cell_id, edge_type, base_epoch, operation, "lost_matrix_cleanup_generation", &err);
             return false;
         }
         Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "delete_artifact_batch",
-                &err,
-            );
+            result.record_error(cell_id, edge_type, base_epoch, operation, "delete_artifact_batch", &err);
         }
     }
     true
@@ -1421,12 +1273,10 @@ async fn append_graphblas_csc_chunks_from_rows(
             continue;
         };
         for dst in dsts {
-            let ordinal = vertices
-                .binary_search(dst)
-                .map_err(|_| GraphError::CorruptValue {
-                    key: "graphblas_csc_indices".to_string(),
-                    reason: format!("destination vertex {dst} missing from CSC vertex dictionary"),
-                })? as u64;
+            let ordinal = vertices.binary_search(dst).map_err(|_| GraphError::CorruptValue {
+                key: "graphblas_csc_indices".to_string(),
+                reason: format!("destination vertex {dst} missing from CSC vertex dictionary"),
+            })? as u64;
             checksum_u64(&mut checksum, ordinal);
             index_chunk.push(ordinal);
             if index_chunk.len() == GRAPHBLAS_CSC_CHUNK_U64S {
@@ -1531,10 +1381,7 @@ fn decode_graphblas_csc_manifest(key: &str, value: &[u8]) -> Result<GraphBlasCsc
     let text = text_value(key, value)?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
     if parts.len() != 12 || parts[0] != GRAPHBLAS_CSC_MANIFEST_MAGIC {
-        return corrupt(
-            key,
-            "expected graph-graphblas-csc-manifest-v1 record with 12 fields",
-        );
+        return corrupt(key, "expected graph-graphblas-csc-manifest-v1 record with 12 fields");
     }
     let manifest = GraphBlasCscManifest {
         cell_id: parts[1].to_string(),
@@ -1583,10 +1430,7 @@ fn decode_graphblas_csc(
     let cell_id = decode_binary_string(key, value, &mut cursor, "cell_id")?;
     let edge_type = decode_binary_string(key, value, &mut cursor, "edge_type")?;
     let base_epoch = decode_binary_u64(key, value, &mut cursor, "base_epoch")?;
-    if cell_id != expected_cell_id
-        || edge_type != expected_edge_type
-        || base_epoch != expected_base_epoch
-    {
+    if cell_id != expected_cell_id || edge_type != expected_edge_type || base_epoch != expected_base_epoch {
         return corrupt(key, "GraphBLAS CSC identity does not match key");
     }
     let vertices = decode_binary_u64s(key, value, &mut cursor, "vertices")?;
@@ -1613,12 +1457,7 @@ fn encode_graphblas_csc_chunk(field: &str, chunk_id: u64, values: &[u64]) -> Vec
     out
 }
 
-fn decode_graphblas_csc_chunk(
-    key: &str,
-    value: &[u8],
-    expected_field: &str,
-    expected_chunk_id: u64,
-) -> Result<Vec<u64>> {
+fn decode_graphblas_csc_chunk(key: &str, value: &[u8], expected_field: &str, expected_chunk_id: u64) -> Result<Vec<u64>> {
     if !value.starts_with(GRAPHBLAS_CSC_CHUNK_MAGIC) {
         return corrupt(key, "expected graphblas_csc_chunk1 binary artifact");
     }
@@ -1635,12 +1474,7 @@ fn decode_graphblas_csc_chunk(
     Ok(values)
 }
 
-fn decode_graphblas_csc_chunk_u32(
-    key: &str,
-    value: &[u8],
-    expected_field: &str,
-    expected_chunk_id: u64,
-) -> Result<Vec<u32>> {
+fn decode_graphblas_csc_chunk_u32(key: &str, value: &[u8], expected_field: &str, expected_chunk_id: u64) -> Result<Vec<u32>> {
     if !value.starts_with(GRAPHBLAS_CSC_CHUNK_MAGIC) {
         return corrupt(key, "expected graphblas_csc_chunk1 binary artifact");
     }
@@ -1672,12 +1506,7 @@ fn validate_graphblas_csc_artifact(key: &str, csc: &GraphBlasCsc) -> Result<()> 
     if csc.pointers.last().copied().unwrap_or(0) as usize != csc.indices.len() {
         return corrupt(key, "CSC edge count does not match index count");
     }
-    if let Some(index) = csc
-        .indices
-        .iter()
-        .copied()
-        .find(|index| *index >= csc.vertices.len() as u64)
-    {
+    if let Some(index) = csc.indices.iter().copied().find(|index| *index >= csc.vertices.len() as u64) {
         return corrupt(key, format!("CSC index {index} exceeds vertex count"));
     }
     for window in csc.vertices.windows(2) {
@@ -1762,10 +1591,7 @@ fn decode_matrix_tile(key: &str, value: &[u8]) -> Result<MatrixTile> {
             let Some((src, dsts)) = row.split_once(':') else {
                 return corrupt(key, "invalid matrix row encoding");
             };
-            rows.insert(
-                parse_u64(key, src, "matrix_row")?,
-                decode_vertices(key, dsts)?,
-            );
+            rows.insert(parse_u64(key, src, "matrix_row")?, decode_vertices(key, dsts)?);
         }
     }
     Ok(MatrixTile {
@@ -1781,21 +1607,14 @@ fn decode_matrix_tile(key: &str, value: &[u8]) -> Result<MatrixTile> {
 }
 
 fn encode_vertices(vertices: &[VertexId]) -> String {
-    vertices
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+    vertices.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
 }
 
 fn decode_vertices(key: &str, value: &str) -> Result<Vec<VertexId>> {
     if value.is_empty() {
         return Ok(Vec::new());
     }
-    value
-        .split(',')
-        .map(|part| parse_u64(key, part, "vertex"))
-        .collect()
+    value.split(',').map(|part| parse_u64(key, part, "vertex")).collect()
 }
 
 fn encode_binary_string(out: &mut Vec<u8>, value: &str) {
@@ -1814,12 +1633,7 @@ fn encode_binary_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn decode_binary_string(
-    key: &str,
-    value: &[u8],
-    cursor: &mut usize,
-    field: &str,
-) -> Result<String> {
+fn decode_binary_string(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<String> {
     let len = decode_binary_len(key, value, cursor, field)?;
     let bytes = take_binary(key, value, cursor, len, field)?;
     String::from_utf8(bytes.to_vec()).map_err(|err| GraphError::CorruptValue {
@@ -1828,12 +1642,7 @@ fn decode_binary_string(
     })
 }
 
-fn decode_binary_u64s(
-    key: &str,
-    value: &[u8],
-    cursor: &mut usize,
-    field: &str,
-) -> Result<Vec<u64>> {
+fn decode_binary_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<Vec<u64>> {
     let len = decode_binary_len(key, value, cursor, field)?;
     let bytes = take_binary(
         key,
@@ -1854,12 +1663,7 @@ fn decode_binary_u64s(
         .collect()
 }
 
-fn decode_binary_u32s_from_u64s(
-    key: &str,
-    value: &[u8],
-    cursor: &mut usize,
-    field: &str,
-) -> Result<Vec<u32>> {
+fn decode_binary_u32s_from_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<Vec<u32>> {
     let len = decode_binary_len(key, value, cursor, field)?;
     let bytes = take_binary(
         key,
@@ -1904,19 +1708,11 @@ fn decode_binary_u64_bytes(key: &str, bytes: &[u8], field: &str) -> Result<u64> 
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn take_binary<'a>(
-    key: &str,
-    value: &'a [u8],
-    cursor: &mut usize,
-    len: usize,
-    field: &str,
-) -> Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("binary cursor overflow while reading {field}"),
-        })?;
+fn take_binary<'a>(key: &str, value: &'a [u8], cursor: &mut usize, len: usize, field: &str) -> Result<&'a [u8]> {
+    let end = cursor.checked_add(len).ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("binary cursor overflow while reading {field}"),
+    })?;
     if end > value.len() {
         return corrupt(key, format!("truncated binary field {field}"));
     }
@@ -1940,30 +1736,20 @@ fn corrupt<T>(key: &str, reason: impl Into<String>) -> Result<T> {
 }
 
 fn matrix_profile_enabled() -> bool {
-    std::env::var("GRAPH_PROFILE_MATRIX").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    std::env::var("GRAPH_PROFILE_MATRIX")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn record_matrix_profile(enabled: bool, stage: &str, elapsed: Duration, units: u64) {
     if enabled {
-        eprintln!(
-            "matrix_profile stage={stage} elapsed_us={} units={units}",
-            elapsed.as_micros()
-        );
+        eprintln!("matrix_profile stage={stage} elapsed_us={} units={units}", elapsed.as_micros());
     }
 }
 
 pub(crate) fn trim_process_memory_after_hydration() {
-    if !std::env::var("GRAPH_TRIM_MEMORY_AFTER_HYDRATION").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }) {
+    if !std::env::var("GRAPH_TRIM_MEMORY_AFTER_HYDRATION")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    {
         return;
     }
     trim_process_memory();

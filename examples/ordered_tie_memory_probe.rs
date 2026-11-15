@@ -3,8 +3,7 @@ use std::{io, path::Path, path::PathBuf, time::Instant};
 
 #[cfg(feature = "experimental-cypher-engine")]
 use hydradb::{
-    local_object_store, CypherEngineMode, GraphLimits, GraphShard, QueryContext, QueryValue,
-    VertexMetadata, VertexPropertyValue,
+    local_object_store, CypherEngineMode, GraphLimits, GraphShard, QueryContext, QueryValue, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg(not(feature = "experimental-cypher-engine"))]
@@ -29,8 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode.is_empty() || store.as_os_str().is_empty() || tie_rows == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: ordered_tie_memory_probe <seed|query> <store> <tie_rows> [query_limit]"
-                .to_string(),
+            "usage: ordered_tie_memory_probe <seed|query> <store> <tie_rows> [query_limit]".to_string(),
         )
         .into());
     }
@@ -38,11 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode.as_str() {
         "seed" => seed(&store, tie_rows).await,
         "query" => query(&store, tie_rows, query_limit).await,
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown mode {other}; expected seed or query"),
-        )
-        .into()),
+        other => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown mode {other}; expected seed or query")).into()),
     }
 }
 
@@ -51,21 +45,14 @@ fn parse_usize(value: Option<String>, field: &str) -> Result<usize, io::Error> {
     value
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {field}")))?
         .parse::<usize>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid {field}: {error}"),
-            )
-        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {field}: {error}")))
 }
 
 #[cfg(feature = "experimental-cypher-engine")]
 async fn seed(store: &Path, tie_rows: usize) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(store)?;
     let started = Instant::now();
-    let shard =
-        GraphShard::open_standalone_writer("ordered-tie-memory", local_object_store(store)?)
-            .await?;
+    let shard = GraphShard::open_standalone_writer("ordered-tie-memory", local_object_store(store)?).await?;
     for start in (1..=tie_rows).step_by(10_000) {
         let end = tie_rows.min(start.saturating_add(9_999));
         shard
@@ -76,10 +63,7 @@ async fn seed(store: &Path, tie_rows: usize) -> Result<(), Box<dyn std::error::E
                         vertex_id as u64,
                         VertexMetadata::default()
                             .with_label("Entity")
-                            .with_property(
-                                "created_at",
-                                VertexPropertyValue::String("2026-01-01".to_string()),
-                            ),
+                            .with_property("created_at", VertexPropertyValue::String("2026-01-01".to_string())),
                     )
                 }),
             )
@@ -94,11 +78,7 @@ async fn seed(store: &Path, tie_rows: usize) -> Result<(), Box<dyn std::error::E
 }
 
 #[cfg(feature = "experimental-cypher-engine")]
-async fn query(
-    store: &Path,
-    tie_rows: usize,
-    query_limit: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn query(store: &Path, tie_rows: usize, query_limit: usize) -> Result<(), Box<dyn std::error::Error>> {
     let work_limit = tie_rows.saturating_add(1);
     let limits = GraphLimits {
         max_query_intermediate_rows: work_limit,
@@ -106,12 +86,7 @@ async fn query(
         max_query_runtime_ms: None,
         ..GraphLimits::default()
     };
-    let shard = GraphShard::open_standalone_writer_with_limits(
-        "ordered-tie-memory",
-        local_object_store(store)?,
-        limits,
-    )
-    .await?;
+    let shard = GraphShard::open_standalone_writer_with_limits("ordered-tie-memory", local_object_store(store)?, limits).await?;
     let statement = format!(
         "MATCH (n:Entity) WHERE n.created_at STARTS WITH '' \
          RETURN n.id AS id ORDER BY n.created_at ASC, n.id DESC LIMIT {query_limit}"
@@ -119,8 +94,7 @@ async fn query(
     let started = Instant::now();
     let result = shard
         .execute_cypher_rows(
-            QueryContext::new("cell-a", "ordered-tie-memory-probe")
-                .with_cypher_engine(CypherEngineMode::Experimental),
+            QueryContext::new("cell-a", "ordered-tie-memory-probe").with_cypher_engine(CypherEngineMode::Experimental),
             &statement,
         )
         .await?;
@@ -133,10 +107,7 @@ async fn query(
             ref other => panic!("unexpected ID: {other:?}"),
         })
         .collect::<Vec<_>>();
-    let expected = (1..=tie_rows as u64)
-        .rev()
-        .take(query_limit)
-        .collect::<Vec<_>>();
+    let expected = (1..=tie_rows as u64).rev().take(query_limit).collect::<Vec<_>>();
     assert_eq!(actual, expected, "exact ordered winners");
     let metrics = shard.graph_operational_metrics();
     shard.close().await?;

@@ -1,0 +1,140 @@
+=== MATCH (e:Entity {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id}) WHERE e.entity_id IN $entity_ids RETURN e.entity_id, e.name
+--- unknown
+ProjectExec(distinct=false, items=[e.entity_id, e.name])
+  FilterExec(predicate=(((e.tenant_id = $tenant_id) AND (e.sub_tenant_id = $sub_tenant_id)) AND e.entity_id IN [2 values]))
+    VertexScan(provider=slatedb, access=property-point, binding=e, labels=[Entity], property=tenant_id, value=$tenant_id)
+--- rich
+ProjectExec(distinct=false, items=[e.entity_id, e.name])
+  FilterExec(predicate=(((e.tenant_id = $tenant_id) AND (e.sub_tenant_id = $sub_tenant_id)) AND e.entity_id IN [2 values]))
+    VertexScan(provider=slatedb, access=label-prefix, binding=e, labels=[Entity], label=Entity)
+=== MATCH (s:Source {app_provider: $app_provider, tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id}) WHERE s.thread_id = $thread_id RETURN s.source_id
+--- unknown
+ProjectExec(distinct=false, items=[s.source_id])
+  FilterExec(predicate=((((s.app_provider = $app_provider) AND (s.tenant_id = $tenant_id)) AND (s.sub_tenant_id = $sub_tenant_id)) AND (s.thread_id = $thread_id)))
+    VertexScan(provider=slatedb, access=property-point, binding=s, labels=[Source], property=app_provider, value=$app_provider)
+--- rich
+ProjectExec(distinct=false, items=[s.source_id])
+  FilterExec(predicate=((((s.app_provider = $app_provider) AND (s.tenant_id = $tenant_id)) AND (s.sub_tenant_id = $sub_tenant_id)) AND (s.thread_id = $thread_id)))
+    VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+=== MATCH (s:Source {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id}) WHERE s.created_at >= $since RETURN s.source_id
+--- unknown
+ProjectExec(distinct=false, items=[s.source_id])
+  FilterExec(predicate=(((s.tenant_id = $tenant_id) AND (s.sub_tenant_id = $sub_tenant_id)) AND (s.created_at >= $since)))
+    VertexScan(provider=slatedb, access=property-point, binding=s, labels=[Source], property=tenant_id, value=$tenant_id)
+--- rich
+ProjectExec(distinct=false, items=[s.source_id])
+  FilterExec(predicate=(((s.tenant_id = $tenant_id) AND (s.sub_tenant_id = $sub_tenant_id)) AND (s.created_at >= $since)))
+    VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+=== MATCH (s:Source) RETURN s.source_id
+--- unknown
+ProjectExec(distinct=false, items=[s.source_id])
+  VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+--- rich
+ProjectExec(distinct=false, items=[s.source_id])
+  VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+=== MATCH (s:Source) WHERE s.source_id IN $ids RETURN s
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=s.source_id IN [2 values])
+    VertexScan(provider=slatedb, access=property-points, binding=s, labels=[Source], property=source_id, values=[$ids, $ids])
+--- rich
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=s.source_id IN [2 values])
+    VertexScan(provider=slatedb, access=property-points, binding=s, labels=[Source], property=source_id, values=[$ids, $ids])
+=== MATCH (s:Source) WHERE s.thread_id = $a OR s.thread_id = $b RETURN s
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=((s.thread_id = $a) OR (s.thread_id = $b)))
+    VertexScan(provider=slatedb, access=property-points, binding=s, labels=[Source], property=thread_id, values=[$a, $b])
+--- rich
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=((s.thread_id = $a) OR (s.thread_id = $b)))
+    VertexScan(provider=slatedb, access=property-points, binding=s, labels=[Source], property=thread_id, values=[$a, $b])
+=== MATCH (s:Source) WHERE s.created_at >= 10 AND s.created_at < 20 RETURN s
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=((s.created_at >= 10) AND (s.created_at < 20)))
+    VertexScan(provider=slatedb, access=property-presence, binding=s, labels=[Source], property=created_at)
+--- rich
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=((s.created_at >= 10) AND (s.created_at < 20)))
+    VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+=== MATCH (s:Source {tenant_id: $tenant_id}) WHERE s.created_at > 10 / s.weight RETURN s
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=(s.created_at > (10 / s.weight)))
+    FilterExec(predicate=(s.tenant_id = $tenant_id))
+      VertexScan(provider=slatedb, access=property-point, binding=s, labels=[Source], property=tenant_id, value=$tenant_id)
+--- rich
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=(s.created_at > (10 / s.weight)))
+    FilterExec(predicate=(s.tenant_id = $tenant_id))
+      VertexScan(provider=slatedb, access=label-prefix, binding=s, labels=[Source], label=Source)
+=== MATCH (s:Source) WHERE s.created_at >= 10 RETURN s ORDER BY s.created_at LIMIT 3
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  LimitExec(count=3)
+    VertexScan(provider=slatedb, access=ordered-property, binding=s, labels=[Source], property=created_at, direction=ASC, prefix=none, lower=inclusive 10, upper=none, required=3, residual=none, items=[s.created_at ASC])
+--- rich
+ProjectExec(distinct=false, items=[s])
+  LimitExec(count=3)
+    VertexScan(provider=slatedb, access=ordered-property, binding=s, labels=[Source], property=created_at, direction=ASC, prefix=none, lower=inclusive 10, upper=none, required=3, residual=none, items=[s.created_at ASC])
+=== MATCH (a:Source)-[r:RELATES {kind: $kind}]->(b) RETURN b
+--- unknown
+ProjectExec(distinct=false, items=[b])
+  FilterExec(predicate=(r.kind = $kind))
+    RelationshipPropertySeek(from=a, source_labels=[Source], relationship=r, type=RELATES, property=kind, value=$kind, direction=outgoing, to=b, target_labels=[])
+--- rich
+ProjectExec(distinct=false, items=[b])
+  FilterExec(predicate=(r.kind = $kind))
+    RelationshipPropertySeek(from=a, source_labels=[Source], relationship=r, type=RELATES, property=kind, value=$kind, direction=outgoing, to=b, target_labels=[])
+=== MATCH (a:Source)-[r:RELATES]->(b) WHERE r.weight >= 5 RETURN b
+--- unknown
+ProjectExec(distinct=false, items=[b])
+  FilterExec(predicate=(r.weight >= 5))
+    RelationshipPropertyRangeProbe(from=a, source_labels=[Source], relationship=r, type=RELATES, property=weight, lower>=5, direction=outgoing, to=b, target_labels=[])
+      ExpandExec(from=a, relationship=r, types=[RELATES], direction=outgoing, to=b, target_labels=[])
+        VertexScan(provider=slatedb, access=label-prefix, binding=a, labels=[Source], label=Source)
+--- rich
+ProjectExec(distinct=false, items=[b])
+  FilterExec(predicate=(r.weight >= 5))
+    RelationshipPropertyRangeProbe(from=a, source_labels=[Source], relationship=r, type=RELATES, property=weight, lower>=5, direction=outgoing, to=b, target_labels=[])
+      ExpandExec(from=a, relationship=r, types=[RELATES], direction=outgoing, to=b, target_labels=[])
+        VertexScan(provider=slatedb, access=label-prefix, binding=a, labels=[Source], label=Source)
+=== MATCH (a:Source {tenant_id: $tenant_id})-[r:RELATES]->(b:Entity) WHERE a.created_at >= $since RETURN b
+--- unknown
+ProjectExec(distinct=false, items=[b])
+  ExpandExec(from=a, relationship=r, types=[RELATES], direction=outgoing, to=b, target_labels=[Entity])
+    FilterExec(predicate=((a.tenant_id = $tenant_id) AND (a.created_at >= $since)))
+      VertexScan(provider=slatedb, access=property-point, binding=a, labels=[Source], property=tenant_id, value=$tenant_id)
+--- rich
+ProjectExec(distinct=false, items=[b])
+  ExpandExec(from=a, relationship=r, types=[RELATES], direction=outgoing, to=b, target_labels=[Entity])
+    FilterExec(predicate=((a.tenant_id = $tenant_id) AND (a.created_at >= $since)))
+      VertexScan(provider=slatedb, access=label-prefix, binding=a, labels=[Source], label=Source)
+=== MATCH (a:Entity {entity_id: 'e1'}) OPTIONAL MATCH (a)-[:RELATES]->(b:Source {tenant_id: $tenant_id}) WHERE b.created_at >= 3 RETURN a, b
+--- unknown
+ProjectExec(distinct=false, items=[a, b])
+  LeftOuterNaturalJoinExec
+    FilterExec(predicate=(a.entity_id = 'e1'))
+      VertexScan(provider=slatedb, access=property-point, binding=a, labels=[Entity], property=entity_id, value='e1')
+    FilterExec(predicate=((b.tenant_id = $tenant_id) AND (b.created_at >= 3)))
+      ExpandExec(from=a, relationship=_, types=[RELATES], direction=outgoing, to=b, target_labels=[Source])
+        VertexScan(provider=slatedb, access=inventory, binding=a, labels=[])
+--- rich
+ProjectExec(distinct=false, items=[a, b])
+  LeftOuterNaturalJoinExec
+    FilterExec(predicate=(a.entity_id = 'e1'))
+      VertexScan(provider=slatedb, access=property-point, binding=a, labels=[Entity], property=entity_id, value='e1')
+    FilterExec(predicate=((b.tenant_id = $tenant_id) AND (b.created_at >= 3)))
+      ExpandExec(from=a, relationship=_, types=[RELATES], direction=outgoing, to=b, target_labels=[Source])
+        VertexScan(provider=slatedb, access=inventory, binding=a, labels=[])
+=== MATCH (s) WHERE s.created_at >= 10 RETURN s
+--- unknown
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=(s.created_at >= 10))
+    VertexScan(provider=slatedb, access=property-presence, binding=s, labels=[], property=created_at)
+--- rich
+ProjectExec(distinct=false, items=[s])
+  FilterExec(predicate=(s.created_at >= 10))
+    VertexScan(provider=slatedb, access=property-presence, binding=s, labels=[], property=created_at)

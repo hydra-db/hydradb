@@ -1,0 +1,19 @@
+[package]
+name = "turbolay-proxy-k8s"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The turbolay proxy's replica set from the proxy service's EndpointSlices"
+publish = false
+
+# kube and k8s-openapi are the slowest compile in the proxy after pingora, so
+# they live here alone. Local runs and tests use the file source in
+# `turbolay-proxy-topology` and never build this crate's dependencies.
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turbolay-proxy-topology = { path = "../topology" }

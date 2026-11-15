@@ -1,0 +1,2600 @@
+use super::values::bolt_parameter_to_property;
+use super::*;
+use crate::{
+    ClientQueryServiceConfig, ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory, PlacementConfig, PlacementView, QueryCellClient,
+    QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue, QueryPath, QueryPathNode, QueryPathRelationship,
+    QueryResultPage, QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
+    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider, VertexMetadata,
+    VertexPropertyList, VertexPropertyValue,
+};
+use boltr::chunk::{ChunkReader, ChunkWriter};
+use boltr::client::BoltSession;
+use boltr::message::encode::encode_client_message;
+use boltr::message::sig;
+use boltr::packstream::marker;
+use bytes::BytesMut;
+use hydradb_protocol::bolt::{
+    server_handshake as bolt_server_handshake, strict_decode_client_message, BOLT_MAGIC, BOLT_MAX_PACKSTREAM_DEPTH,
+};
+use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::ObjectStore;
+use std::collections::HashMap;
+use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+struct BoltTestClient;
+
+#[test]
+fn bolt_consistency_metadata_accepts_only_causal_or_strong() {
+    assert_eq!(
+        bolt_read_consistency(&BoltDict::from([(
+            "consistency".to_string(),
+            BoltValue::String("strong".to_string()),
+        )]))
+        .unwrap(),
+        Some(ClientReadConsistency::Strong)
+    );
+    assert_eq!(
+        bolt_read_consistency(&BoltDict::from([(
+            "tx_metadata".to_string(),
+            BoltValue::Dict(BoltDict::from([(
+                "hydradb.consistency".to_string(),
+                BoltValue::String("causal".to_string()),
+            )])),
+        )]))
+        .unwrap(),
+        Some(ClientReadConsistency::Causal)
+    );
+    assert!(bolt_read_consistency(&BoltDict::from([(
+        "consistency".to_string(),
+        BoltValue::String("eventual".to_string()),
+    )]))
+    .is_err());
+}
+
+#[async_trait::async_trait]
+impl QueryCellClient for BoltTestClient {
+    async fn execute_cypher_rows(&self, _context: QueryContext, _query: &str) -> Result<QueryResultSet> {
+        Ok(
+            QueryResultSet::new(vec![QueryColumn::new("answer")], vec![QueryRow::new(vec![QueryValue::Count(42)])])
+                .with_read_epoch(9)
+                .with_storage_sequence(9),
+        )
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(&self, _scope: &GraphScope, _cell_id: &str) -> Result<Option<u64>> {
+        Ok(Some(9))
+    }
+}
+
+struct PagedBoltTestClient;
+
+#[async_trait::async_trait]
+impl QueryCellClient for PagedBoltTestClient {
+    async fn execute_cypher_rows(&self, _context: QueryContext, _query: &str) -> Result<QueryResultSet> {
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("answer")],
+            (1..=5).map(|value| QueryRow::new(vec![QueryValue::Count(value)])).collect(),
+        )
+        .with_read_epoch(9)
+        .with_storage_sequence(9))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let rows: Vec<_> = (1..=5).map(|value| QueryRow::new(vec![QueryValue::Count(value)])).collect();
+        let offset = cursor.map_or(0, |cursor| cursor.offset as usize);
+        let end = (offset + page_size).min(rows.len());
+        Ok(QueryResultPage::new(
+            vec![QueryColumn::new("answer")],
+            rows[offset..end].to_vec(),
+            (end < rows.len()).then(|| QueryCursorToken::new(end as u64)),
+        ))
+    }
+
+    async fn current_storage_sequence(&self, _scope: &GraphScope, _cell_id: &str) -> Result<Option<u64>> {
+        Ok(Some(9))
+    }
+}
+
+struct NativePathBoltTestClient;
+
+#[async_trait::async_trait]
+impl QueryCellClient for NativePathBoltTestClient {
+    async fn execute_cypher_rows(&self, _context: QueryContext, _query: &str) -> Result<QueryResultSet> {
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("path")],
+            vec![QueryRow::new(vec![QueryValue::Path(Box::new(QueryPath {
+                nodes: vec![
+                    QueryPathNode {
+                        id: 1,
+                        labels: vec!["Entity".to_string()],
+                        properties: BTreeMap::new(),
+                    },
+                    QueryPathNode {
+                        id: 2,
+                        labels: vec!["Entity".to_string()],
+                        properties: BTreeMap::new(),
+                    },
+                ],
+                relationships: vec![QueryPathRelationship {
+                    id: Some(7),
+                    edge_type: "RELATES".to_string(),
+                    src: 1,
+                    dst: 2,
+                    properties: BTreeMap::new(),
+                }],
+            }))])],
+        )
+        .with_read_epoch(9)
+        .with_storage_sequence(9))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(&self, _scope: &GraphScope, _cell_id: &str) -> Result<Option<u64>> {
+        Ok(Some(9))
+    }
+}
+
+struct BlockingBoltTestClient {
+    started: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl QueryCellClient for BlockingBoltTestClient {
+    async fn execute_cypher_rows(&self, context: QueryContext, _query: &str) -> Result<QueryResultSet> {
+        let token = context.cancellation_token.ok_or_else(|| GraphError::CorruptValue {
+            key: "bolt/test/cancellation".to_string(),
+            reason: "missing cancellation token".to_string(),
+        })?;
+        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        token.cancelled().await;
+        Err(GraphError::QueryTimeout {
+            operation: "bolt_test_cancelled",
+            elapsed_ms: 0,
+            limit_ms: 0,
+        })
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(&self, _scope: &GraphScope, _cell_id: &str) -> Result<Option<u64>> {
+        Ok(Some(9))
+    }
+}
+
+fn bolt_test_service() -> ClientQueryService {
+    bolt_service_for(Arc::new(BoltTestClient))
+}
+
+fn bolt_service_for(client: Arc<dyn QueryCellClient>) -> ClientQueryService {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant("bolt-secret", QueryTransportScopeGrant::read_graph(GraphScope::default()))
+        .unwrap();
+    ClientQueryService::new(
+        client,
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("bolt-secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap()
+}
+
+fn bolt_test_config() -> BoltServerConfig {
+    let resolver =
+        StaticClientDatabaseResolver::single("default", ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap()).unwrap();
+    BoltServerConfig::new(Arc::new(resolver)).insecure_allow_plaintext()
+}
+
+#[tokio::test]
+async fn routing_validates_bookmarks_without_waiting_for_graph_data() {
+    let service = bolt_test_service();
+    let target = ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap();
+    let context = BoltConnectionContext::new(
+        service.clone(),
+        Arc::new(StaticClientDatabaseResolver::single("default", target.clone()).unwrap()),
+        "default".to_string(),
+        60,
+        ["ROUTE", "READ", "WRITE"]
+            .into_iter()
+            .map(|role| BoltRoutingServer::new(role, ["localhost:7687".to_string()]).unwrap())
+            .collect(),
+        None,
+        QueryTransportConnectionIdentity::default(),
+    );
+    let mut session = BoltProtocolSession::new();
+    let bookmark = crate::ClientBookmark::new(target.clone(), 10).encode();
+    assert!(prepare_bolt_route(&session, &context, vec![bookmark.clone()], &BoltDict::new())
+        .await
+        .is_err());
+    session.authenticated = Some(
+        service
+            .authenticate(&ClientQueryCredentials::Bearer("bolt-secret".to_string()), &context.identity)
+            .unwrap(),
+    );
+
+    // The router has epoch 9. It can still direct a client with epoch 10 to a reader.
+    prepare_bolt_route(&session, &context, vec![bookmark.clone()], &BoltDict::new())
+        .await
+        .unwrap();
+    assert!(
+        prepare_bolt_route(&session, &context, vec!["malformed".to_string()], &BoltDict::new())
+            .await
+            .is_err()
+    );
+    let other = crate::ClientBookmark::new(ClientQueryTarget::new(GraphScope::default(), "cell-b").unwrap(), 10).encode();
+    assert!(prepare_bolt_route(&session, &context, vec![other], &BoltDict::new()).await.is_err());
+
+    let (authenticated, _, request) = prepare_bolt_run(
+        &mut session,
+        &context,
+        "MATCH (n {id: 1}) RETURN n.id".to_string(),
+        BoltDict::new(),
+        BoltDict::from([("bookmarks".to_string(), BoltValue::List(vec![BoltValue::String(bookmark)]))]),
+    )
+    .unwrap();
+    // RUN still carries the bookmark into execution, which must reject this stale reader.
+    let error = service.execute_rows(&authenticated, request).await.unwrap_err();
+    assert!(matches!(error, GraphError::SnapshotAhead { .. }));
+}
+
+#[tokio::test]
+async fn classic_handshake_selects_highest_supported_version_in_client_order() {
+    let (mut client, mut server) = duplex(64);
+    let server_task = tokio::spawn(async move { bolt_server_handshake(&mut server).await });
+    client.write_all(&BOLT_MAGIC).await.unwrap();
+    client
+        .write_all(&[
+            0, 2, 6, 5, // 5.6 through 5.4
+            0, 0, 2, 5, // 5.2
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .await
+        .unwrap();
+    let mut selected = [0_u8; 4];
+    client.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+    assert_eq!(server_task.await.unwrap().unwrap(), (5, 4));
+}
+
+/// What the neo4j 6.2.0 driver sends: the manifest proposal first, then plain
+/// fallback ranges. The manifest comes first, so it is the one answered.
+#[tokio::test]
+async fn the_neo4j_6_driver_proposal_gets_the_manifest_exchange() {
+    let (mut client, mut server) = duplex(64);
+    let server_task = tokio::spawn(async move { bolt_server_handshake(&mut server).await });
+    client.write_all(&BOLT_MAGIC).await.unwrap();
+    client
+        .write_all(&[
+            0, 0, 1, 0xff, // Manifest v1
+            0, 8, 8, 5, // 5.8 through 5.0
+            0, 2, 4, 4, // 4.4 through 4.2
+            0, 0, 0, 3, // 3.0
+        ])
+        .await
+        .unwrap();
+    let mut response = [0_u8; 10];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(response, [0, 0, 1, 0xff, 1, 0, 3, 4, 5, 0]);
+    client.write_all(&[0, 0, 4, 5, 0]).await.unwrap();
+    assert_eq!(server_task.await.unwrap().unwrap(), (5, 4));
+}
+
+#[tokio::test]
+async fn manifest_handshake_offers_and_validates_bolt_5_range() {
+    let (mut client, mut server) = duplex(64);
+    let server_task = tokio::spawn(async move { bolt_server_handshake(&mut server).await });
+    client.write_all(&BOLT_MAGIC).await.unwrap();
+    client
+        .write_all(&[
+            0, 0, 1, 0xff, // Manifest v1
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .await
+        .unwrap();
+    let mut response = [0_u8; 10];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(response, [0, 0, 1, 0xff, 1, 0, 3, 4, 5, 0]);
+    client.write_all(&[0, 0, 4, 5, 0]).await.unwrap();
+    assert_eq!(server_task.await.unwrap().unwrap(), (5, 4));
+}
+
+#[test]
+fn bolt_value_conversion_rejects_unsigned_overflow() {
+    assert!(query_value_to_bolt(&QueryValue::Count(u64::MAX)).is_err());
+    assert_eq!(
+        query_value_to_bolt(&QueryValue::Property(VertexPropertyValue::Float(QueryFloat(42.5)))).unwrap(),
+        BoltValue::Float(42.5)
+    );
+    assert_eq!(
+        bolt_parameter_to_property("offset", &BoltValue::Integer(-1)).unwrap(),
+        VertexPropertyValue::SignedInteger(-1)
+    );
+    assert_eq!(
+        query_value_to_bolt(&QueryValue::Property(VertexPropertyValue::SignedInteger(-1))).unwrap(),
+        BoltValue::Integer(-1)
+    );
+    assert_eq!(
+        bolt_parameter_to_property("joined", &BoltValue::Date(boltr::types::BoltDate { days: 20_753 })).unwrap(),
+        VertexPropertyValue::Date(20_753)
+    );
+    assert!(bolt_parameter_to_property("joined", &BoltValue::Date(boltr::types::BoltDate { days: i64::from(i32::MAX) })).is_err());
+    assert_eq!(
+        query_value_to_bolt(&QueryValue::Property(VertexPropertyValue::List(VertexPropertyList::String(vec![
+            "engineer".into(),
+            "database".into(),
+        ]))))
+        .unwrap(),
+        BoltValue::List(vec![BoltValue::String("engineer".into()), BoltValue::String("database".into())])
+    );
+    #[cfg(feature = "datafusion-cypher-engine")]
+    assert_eq!(
+        query_value_to_bolt(&QueryValue::GraphValue(
+            hydradb_graph_types::encode_value_stable(&hydradb_graph_types::CypherValue::List(vec![
+                hydradb_graph_types::CypherValue::Integer(1),
+                hydradb_graph_types::CypherValue::Integer(-1),
+            ]))
+            .unwrap(),
+        ))
+        .unwrap(),
+        BoltValue::List(vec![BoltValue::Integer(1), BoltValue::Integer(-1)])
+    );
+}
+
+#[test]
+fn bolt_path_conversion_preserves_incoming_relationship_direction() {
+    let value = query_value_to_bolt(&QueryValue::Path(Box::new(QueryPath {
+        nodes: vec![
+            QueryPathNode {
+                id: 2,
+                labels: vec!["Entity".to_string()],
+                properties: BTreeMap::new(),
+            },
+            QueryPathNode {
+                id: 1,
+                labels: vec!["Entity".to_string()],
+                properties: BTreeMap::new(),
+            },
+        ],
+        relationships: vec![QueryPathRelationship {
+            id: Some(9),
+            edge_type: "RELATES".to_string(),
+            src: 1,
+            dst: 2,
+            properties: BTreeMap::new(),
+        }],
+    })))
+    .unwrap();
+    let BoltValue::Path(path) = value else {
+        panic!("path query value must encode as a Bolt path");
+    };
+    assert_eq!(path.indices, vec![-1, 1]);
+    assert_eq!(path.rels[0].id, 9);
+    assert_eq!(path.nodes[0].id, 2);
+    assert_eq!(path.nodes[1].id, 1);
+}
+
+#[test]
+fn bolt_parameters_decode_nested_unwind_rows_without_changing_scalar_types() {
+    let value = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("src".to_string(), BoltValue::Integer(7)),
+        ("active".to_string(), BoltValue::Boolean(true)),
+    ]))]);
+    assert_eq!(
+        bolt_parameter_to_query_value("rows", &value).unwrap(),
+        QueryParameterValue::List(vec![QueryParameterValue::Map(BTreeMap::from([
+            ("active".to_string(), QueryParameterValue::Scalar(VertexPropertyValue::Bool(true)),),
+            ("src".to_string(), QueryParameterValue::Scalar(VertexPropertyValue::Integer(7)),),
+        ]))])
+    );
+}
+
+#[test]
+fn strict_decoder_rejects_surplus_fields_and_excessive_nesting() {
+    let mut hello = BytesMut::new();
+    encode_client_message(&mut hello, &ClientMessage::Hello { extra: BoltDict::new() });
+    hello.extend_from_slice(&[marker::NULL]);
+    assert!(strict_decode_client_message(&hello).unwrap_err().to_string().contains("trailing"));
+
+    assert!(strict_decode_client_message(&[0xb0, sig::HELLO])
+        .unwrap_err()
+        .to_string()
+        .contains("expected 1"));
+
+    let mut nested = vec![0xb1, sig::HELLO];
+    nested.extend(std::iter::repeat_n(0x91, BOLT_MAX_PACKSTREAM_DEPTH + 1));
+    nested.push(marker::NULL);
+    assert!(strict_decode_client_message(&nested)
+        .unwrap_err()
+        .to_string()
+        .contains("nesting exceeds"));
+}
+
+#[tokio::test]
+async fn bolt_server_runs_autocommit_queries_and_rejects_fake_transactions() {
+    let server = ClientBoltServer::bind("127.0.0.1:0".parse().unwrap(), bolt_test_service(), bolt_test_config())
+        .await
+        .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    assert_eq!(session.version(), (5, 4));
+    let result = session.run("MATCH (n {id: 1}) RETURN n.id AS answer").await.unwrap();
+    assert_eq!(result.columns, vec!["answer"]);
+    assert_eq!(result.records, vec![vec![BoltValue::Integer(42)]]);
+    assert!(result
+        .summary
+        .get("bookmark")
+        .and_then(BoltValue::as_str)
+        .unwrap()
+        .starts_with("sgk:1:"));
+    assert_eq!(result.summary.get("type").and_then(BoltValue::as_str), Some("r"));
+
+    let transaction_error = session.begin().await.unwrap_err();
+    assert!(transaction_error.to_string().contains("explicit transactions are not supported"));
+    session.reset().await.unwrap();
+    assert_eq!(
+        session.run("MATCH (n {id: 1}) RETURN n.id AS answer").await.unwrap().records.len(),
+        1
+    );
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_runs_native_path_procedure_calls() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_service_for(Arc::new(NativePathBoltTestClient)),
+        bolt_test_config(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let result = session
+        .run(
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], \
+             pairwise: true, relTypes: ['RELATES'], maxLen: 3, \
+             relDirection: 'both', pathCount: 5, \
+             fairRelationshipVariants: true, resultLimit: 100}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["path"]);
+    assert_eq!(result.records.len(), 1);
+    assert!(matches!(result.records[0].as_slice(), [BoltValue::Path(_)]));
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap();
+    let cluster = Arc::new(
+        RoutedGraphCluster::open_promotable(
+            "bolt-create/data",
+            "node-a",
+            placement,
+            test_placement_view("node-a", &["node-a"]),
+            object_store,
+        )
+        .await
+        .unwrap(),
+    );
+    let scope = GraphScope::default();
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "bolt-secret",
+            QueryTransportScopeGrant::graph(
+                scope.clone(),
+                [
+                    QueryTransportAction::Read,
+                    QueryTransportAction::Write,
+                    QueryTransportAction::Cancel,
+                ],
+            ),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        cluster.clone(),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("bolt-secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap();
+    let resolver = StaticClientDatabaseResolver::single("default", ClientQueryTarget::new(scope, "cell-a").unwrap()).unwrap();
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        BoltServerConfig::new(Arc::new(resolver)).insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let result = session.run("CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})").await.unwrap();
+    assert!(result.columns.is_empty());
+    assert!(result.records.is_empty());
+    assert_eq!(result.summary.get("type").and_then(BoltValue::as_str), Some("rw"));
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let _ = session
+        .run(
+            "CREATE ({id: 1})-[:FOLLOWS]->({id: 3}), \
+             ({id: 1})-[:FOLLOWS]->({id: 4})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors_batch("cell-a", "FOLLOWS", [1])
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![2, 3, 4]
+    );
+
+    let _ = session.run("MATCH ({id: 1})-[r:FOLLOWS]->() DELETE r").await.unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .out_neighbors_batch("cell-a", "FOLLOWS", [1])
+        .await
+        .unwrap()[0]
+        .neighbors
+        .is_empty());
+
+    let edge_rows = BoltValue::List(vec![
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(10)),
+            ("dst".to_string(), BoltValue::Integer(20)),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(10)),
+            ("dst".to_string(), BoltValue::Integer(21)),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(11)),
+            ("dst".to_string(), BoltValue::Integer(22)),
+        ])),
+    ]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             CREATE ({id: edge.src})-[:FOLLOWS]->({id: edge.dst})",
+            BoltDict::from([("edges".to_string(), edge_rows.clone())]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let vertex_rows = BoltValue::List(vec![
+        BoltValue::Dict(BoltDict::from([
+            ("vertex".to_string(), BoltValue::Integer(70)),
+            ("entity_id".to_string(), BoltValue::String("entity-a".to_string())),
+            ("active".to_string(), BoltValue::Boolean(true)),
+            ("tenant_id".to_string(), BoltValue::String("tenant-a".to_string())),
+            ("sub_tenant_id".to_string(), BoltValue::String("sub-a".to_string())),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("vertex".to_string(), BoltValue::Integer(71)),
+            ("entity_id".to_string(), BoltValue::String("entity-b".to_string())),
+            ("active".to_string(), BoltValue::Boolean(true)),
+            ("tenant_id".to_string(), BoltValue::String("tenant-a".to_string())),
+            ("sub_tenant_id".to_string(), BoltValue::String("sub-a".to_string())),
+        ])),
+    ]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) \
+             SET n:Entity, n.entity_id = row.entity_id, n.active = row.active, \
+                 n.tenant_id = row.tenant_id, n.sub_tenant_id = row.sub_tenant_id",
+            BoltDict::from([("rows".to_string(), vertex_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let upserted = session
+        .run("MATCH (n:Entity {entity_id: 'entity-a'}) RETURN n.id AS id, n.active AS active")
+        .await
+        .unwrap();
+    assert_eq!(upserted.records, vec![vec![BoltValue::Integer(70), BoltValue::Boolean(true)]]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) \
+             SET n:Entity, n.name = row.name",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+                    ("vertex".to_string(), BoltValue::Integer(70)),
+                    ("name".to_string(), BoltValue::String("Entity A".to_string())),
+                ]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merged = session
+        .run(
+            "MATCH (n:Entity {entity_id: 'entity-a'}) \
+             RETURN n.active AS active, n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.records,
+        vec![vec![BoltValue::Boolean(true), BoltValue::String("Entity A".to_string()),]]
+    );
+
+    let relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        ("relationship_id".to_string(), BoltValue::String("relationship-a".to_string())),
+        ("chunk_id".to_string(), BoltValue::String("chunk-a".to_string())),
+    ]))]);
+    let relationship_query = "UNWIND $rows AS row \
+         MATCH (s:Entity {id: row.source_vertex}), \
+               (d:Entity {id: row.destination_vertex}) \
+         CREATE (s)-[:RELATES {id: row.relationship_vertex, \
+                 relationship_id: row.relationship_id, chunk_id: row.chunk_id}]->(d)";
+    for _ in 0..2 {
+        let _ = session
+            .run_with_params(
+                relationship_query,
+                BoltDict::from([("rows".to_string(), relationship_rows.clone())]),
+                BoltDict::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let updated_relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        ("relationship_id".to_string(), BoltValue::String("relationship-a".to_string())),
+        ("chunk_id".to_string(), BoltValue::String("chunk-b".to_string())),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            relationship_query,
+            BoltDict::from([("rows".to_string(), updated_relationship_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             RETURN r.chunk_id AS chunk_id ORDER BY chunk_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relationship.records,
+        vec![
+            vec![BoltValue::String("chunk-a".to_string())],
+            vec![BoltValue::String("chunk-a".to_string())],
+            vec![BoltValue::String("chunk-b".to_string())],
+        ]
+    );
+    let merge_created_relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        ("replayed".to_string(), BoltValue::Boolean(true)),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
+             SET r.replayed = row.replayed",
+            BoltDict::from([("rows".to_string(), merge_created_relationship_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merged_created_relationships = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {id: 900, replayed: true}]->({id: 71}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged_created_relationships.records, vec![vec![BoltValue::Integer(3)]]);
+    let merge_relationship_query = "UNWIND $rows AS row \
+         MATCH (s:Entity {id: row.source_vertex}), \
+               (d:Entity {id: row.destination_vertex}) \
+         MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
+         SET r.relationship_id = row.relationship_id, r.chunk_id = row.chunk_id";
+    let merge_relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(901)),
+        ("relationship_id".to_string(), BoltValue::String("relationship-merge".to_string())),
+        ("chunk_id".to_string(), BoltValue::String("chunk-a".to_string())),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            merge_relationship_query,
+            BoltDict::from([("rows".to_string(), merge_relationship_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merge_update_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(901)),
+        ("chunk_id".to_string(), BoltValue::String("chunk-b".to_string())),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
+             SET r.chunk_id = row.chunk_id",
+            BoltDict::from([("rows".to_string(), merge_update_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merged_relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-merge'}]->({id: 71}) \
+             RETURN r.chunk_id AS chunk_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged_relationship.records, vec![vec![BoltValue::String("chunk-b".to_string())]]);
+    let sequential_match_query = "UNWIND $rows AS row \
+         MATCH (s:Entity {id: row.source_vertex}) \
+         MATCH (d:Entity {id: row.destination_vertex}) \
+         MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d)";
+    let sequential_match_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(902)),
+    ]))]);
+    for _ in 0..2 {
+        let _ = session
+            .run_with_params(
+                sequential_match_query,
+                BoltDict::from([("rows".to_string(), sequential_match_rows.clone())]),
+                BoltDict::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let sequential_match_relationships = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {id: 902}]->({id: 71}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(sequential_match_relationships.records, vec![vec![BoltValue::Integer(1)]]);
+
+    let mixed_alias_rows = BoltValue::List(vec![
+        BoltValue::Dict(BoltDict::from([
+            ("source_vertex".to_string(), BoltValue::Integer(70)),
+            ("destination_vertex".to_string(), BoltValue::Integer(71)),
+            ("relationship_vertex".to_string(), BoltValue::Integer(903)),
+            ("stage".to_string(), BoltValue::String("llm".to_string())),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("source_vertex".to_string(), BoltValue::Integer(70)),
+            ("destination_vertex".to_string(), BoltValue::Integer(999)),
+            ("relationship_vertex".to_string(), BoltValue::Integer(904)),
+            ("stage".to_string(), BoltValue::String("llm".to_string())),
+        ])),
+    ]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             MERGE (s)-[r:ALIAS_OF {id: row.relationship_vertex}]->(d) \
+             SET r.stage = row.stage",
+            BoltDict::from([("rows".to_string(), mixed_alias_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let matched_alias = session
+        .run("MATCH ({id: 70})-[r:ALIAS_OF {id: 903}]->({id: 71}) RETURN count(*) AS count")
+        .await
+        .unwrap();
+    assert_eq!(
+        matched_alias.records,
+        vec![vec![BoltValue::Integer(1)]],
+        "the row whose MATCH endpoints exist should be merged"
+    );
+    let unmatched_alias = session
+        .run("MATCH ({id: 70})-[r:ALIAS_OF {id: 904}]->({id: 999}) RETURN count(*) AS count")
+        .await
+        .unwrap();
+    assert_eq!(
+        unmatched_alias.records,
+        vec![vec![BoltValue::Integer(0)]],
+        "a missing MATCH endpoint should skip only that row"
+    );
+
+    let _ = session
+        .run(
+            "MATCH (scope:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+                   -[r:RELATES {relationship_id: 'relationship-a'}]->() \
+             SET r.superseded_by = 'relationship-b', r.valid_to = 42.5",
+        )
+        .await
+        .unwrap();
+    let updated_relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             WHERE r.superseded_by = 'relationship-b' AND r.valid_to = 42.5 \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_relationship.records, vec![vec![BoltValue::Integer(3)]]);
+    let _ = session
+        .run(
+            "MATCH (scope:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+                   -[r:RELATES]->() \
+             WHERE r.chunk_id = 'chunk-a' OR r.chunk_id = 'chunk-b' DELETE r",
+        )
+        .await
+        .unwrap();
+    let deleted_relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_relationship.records, vec![vec![BoltValue::Integer(0)]]);
+    let _ = session.run("CREATE (:Source {id: 60})-[:SEED]->(:Source {id: 61})").await.unwrap();
+    let shard = cluster.shard("cell-a").unwrap();
+    shard
+        .write_edge_mutations_batch_between_labeled_vertices(
+            "cell-a",
+            [crate::EdgeMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: "FORCEFUL_RELATION".to_string(),
+                src: 60,
+                dst: 61,
+                idempotency_key: "bolt-matched-create-direct-check".to_string(),
+            }],
+            "Source",
+            "Source",
+        )
+        .await
+        .unwrap();
+    shard
+        .delete_edge(crate::EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FORCEFUL_RELATION".to_string(),
+            src: 60,
+            dst: 61,
+            idempotency_key: "bolt-matched-create-direct-cleanup".to_string(),
+        })
+        .await
+        .unwrap();
+    let matched_edge_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(60)),
+        ("related_vertex".to_string(), BoltValue::Integer(61)),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([("rows".to_string(), matched_edge_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 61)
+        .await
+        .unwrap());
+
+    let missing_endpoint = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+                    ("source_vertex".to_string(), BoltValue::Integer(60)),
+                    ("related_vertex".to_string(), BoltValue::Integer(62)),
+                ]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_endpoint.to_string().contains("does not exist"));
+    session.reset().await.unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 62)
+        .await
+        .unwrap());
+    let rows = session
+        .run_with_params(
+            "UNWIND $sources AS row \
+             MATCH ({id: row.src})-[:FOLLOWS]->(v) \
+             RETURN row.src AS src, v.id AS dst",
+            BoltDict::from([(
+                "sources".to_string(),
+                BoltValue::List(vec![
+                    BoltValue::Dict(BoltDict::from([("src".to_string(), BoltValue::Integer(10))])),
+                    BoltValue::Dict(BoltDict::from([("src".to_string(), BoltValue::Integer(11))])),
+                ]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.columns, vec!["src", "dst"]);
+    assert_eq!(
+        rows.records,
+        vec![
+            vec![BoltValue::Integer(10), BoltValue::Integer(20)],
+            vec![BoltValue::Integer(10), BoltValue::Integer(21)],
+            vec![BoltValue::Integer(11), BoltValue::Integer(22)],
+        ]
+    );
+    let _ = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             MATCH ({id: edge.src})-[r:FOLLOWS]->({id: edge.dst}) DELETE r",
+            BoltDict::from([("edges".to_string(), edge_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists_batch("cell-a", "FOLLOWS", [(10, 20), (10, 21), (11, 22)])
+        .await
+        .unwrap()
+        .iter()
+        .all(|entry| !entry.exists));
+
+    let _ = session.run("CREATE ({id: 30})-[:FOLLOWS]->({id: 31})").await.unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $vertices AS row MATCH (n {id: row.vertex}) DETACH DELETE n",
+            BoltDict::from([(
+                "vertices".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "vertex".to_string(),
+                    BoltValue::Integer(30),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FOLLOWS", 30, 31)
+        .await
+        .unwrap());
+
+    let entity_metadata = VertexMetadata::default().with_label("Entity");
+    cluster
+        .shard("cell-a")
+        .unwrap()
+        .set_vertex_metadata_batch(
+            "cell-a",
+            [(50, entity_metadata.clone()), (51, entity_metadata.clone()), (52, entity_metadata)],
+        )
+        .await
+        .unwrap();
+    let _ = session
+        .run("CREATE ({id: 51})-[:PRESENT_IN]->({id: 53}), ({id: 54})-[:RELATES]->({id: 52})")
+        .await
+        .unwrap();
+    let isolated_rows = BoltValue::List(
+        [50, 51, 52]
+            .into_iter()
+            .map(|vertex| BoltValue::Dict(BoltDict::from([("vertex".to_string(), BoltValue::Integer(vertex))])))
+            .collect(),
+    );
+    let deleted = session
+        .run_with_params(
+            "UNWIND $rows AS row MATCH (n {id: row.vertex}) \
+             WHERE NOT (n)--() DELETE n RETURN count(n) AS deleted",
+            BoltDict::from([("rows".to_string(), isolated_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.columns, vec!["deleted"]);
+    assert_eq!(deleted.records, vec![vec![BoltValue::Integer(1)]]);
+    let survivors = session.run("MATCH (n:Entity) RETURN n.id AS id ORDER BY id").await.unwrap();
+    assert!(!survivors.records.contains(&vec![BoltValue::Integer(50)]));
+    assert!(survivors.records.contains(&vec![BoltValue::Integer(51)]));
+    assert!(survivors.records.contains(&vec![BoltValue::Integer(52)]));
+
+    let constrained_metadata = VertexMetadata::default()
+        .with_label("Location")
+        .with_property("kind", VertexPropertyValue::String("place".to_string()))
+        .with_property("region", VertexPropertyValue::String("us".to_string()));
+    cluster
+        .shard("cell-a")
+        .unwrap()
+        .set_vertex_metadata_batch(
+            "cell-a",
+            [
+                (260, constrained_metadata),
+                (
+                    261,
+                    VertexMetadata::default()
+                        .with_label("Entity")
+                        .with_property("kind", VertexPropertyValue::String("place".to_string()))
+                        .with_property("region", VertexPropertyValue::String("us".to_string())),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    let _ = session.run("CREATE ({id: 261})-[:RELATES]->({id: 262})").await.unwrap();
+    let constrained_rows = |vertices: &[i64]| {
+        BoltValue::List(
+            vertices
+                .iter()
+                .map(|vertex| {
+                    BoltValue::Dict(BoltDict::from([
+                        ("vertex".to_string(), BoltValue::Integer(*vertex)),
+                        ("kind".to_string(), BoltValue::String("place".to_string())),
+                    ]))
+                })
+                .collect(),
+        )
+    };
+    let constrained_query = "UNWIND $rows AS row MATCH (n {id: row.vertex}) \
+                             WHERE NOT (n:Location {kind: row.kind, region: $region})--() \
+                             DELETE n RETURN count(n) AS deleted";
+    let error = session
+        .run_with_params(
+            constrained_query,
+            BoltDict::from([
+                ("rows".to_string(), constrained_rows(&[260, 261])),
+                ("region".to_string(), BoltValue::String("us".to_string())),
+            ]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("requires DETACH"), "{error}");
+    session.reset().await.unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .read_remote(&crate::keys::vertex("cell-a", 260))
+        .await
+        .unwrap()
+        .is_some());
+
+    let constrained_deleted = session
+        .run_with_params(
+            constrained_query,
+            BoltDict::from([
+                ("rows".to_string(), constrained_rows(&[260])),
+                ("region".to_string(), BoltValue::String("us".to_string())),
+            ]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(constrained_deleted.records, vec![vec![BoltValue::Integer(1)]]);
+
+    cluster
+        .shard("cell-a")
+        .unwrap()
+        .set_vertex_metadata_batch(
+            "cell-a",
+            [160, 161, 162, 170, 171].map(|vertex| (vertex, VertexMetadata::default().with_label("Entity"))),
+        )
+        .await
+        .unwrap();
+    let _ = session
+        .run(
+            "CREATE ({id: 171})-[:HAS_CHUNK]->({id: 170}), \
+             ({id: 160})-[:PRESENT_IN]->({id: 171}), \
+             ({id: 161})-[:PRESENT_IN]->({id: 171}), \
+             ({id: 161})-[:RELATES]->({id: 162})",
+        )
+        .await
+        .unwrap();
+    let detach_rows = BoltValue::List(
+        [170, 171]
+            .into_iter()
+            .map(|vertex| BoltValue::Dict(BoltDict::from([("vertex".to_string(), BoltValue::Integer(vertex))])))
+            .collect(),
+    );
+    let candidate_rows = BoltValue::List(
+        [160, 161]
+            .into_iter()
+            .map(|vertex| BoltValue::Dict(BoltDict::from([("vertex".to_string(), BoltValue::Integer(vertex))])))
+            .collect(),
+    );
+    let cleaned = session
+        .run_with_params(
+            "UNWIND $detach_rows AS row MATCH (n {id: row.vertex}) \
+             DETACH DELETE n WITH count(n) AS detached \
+             UNWIND $candidate_rows AS candidate \
+             MATCH (e {id: candidate.vertex}) WHERE NOT (e)--() \
+             DELETE e RETURN count(e) AS deleted",
+            BoltDict::from([
+                ("detach_rows".to_string(), detach_rows),
+                ("candidate_rows".to_string(), candidate_rows),
+            ]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleaned.columns, vec!["deleted"]);
+    assert_eq!(cleaned.records, vec![vec![BoltValue::Integer(1)]]);
+    let survivors = session.run("MATCH (n:Entity) RETURN n.id AS id ORDER BY id").await.unwrap();
+    for deleted in [160, 170, 171] {
+        assert!(!survivors.records.contains(&vec![BoltValue::Integer(deleted)]));
+    }
+    assert!(survivors.records.contains(&vec![BoltValue::Integer(161)]));
+
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-a'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-b'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH ()-[r:RELATES {chunk_id: row.chunk_id}]->() DELETE r",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "chunk_id".to_string(),
+                    BoltValue::String("chunk-a".to_string()),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "RELATES", 40, 41)
+        .await
+        .unwrap());
+    let chunk_a = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-a'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    let chunk_b = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-b'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_a.records, vec![vec![BoltValue::Integer(0)]]);
+    assert_eq!(chunk_b.records, vec![vec![BoltValue::Integer(1)]]);
+
+    let malformed = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             CREATE ({id: edge.src})-[:FOLLOWS]->({id: edge.dst})",
+            BoltDict::from([(
+                "edges".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([("src".to_string(), BoltValue::Integer(30))]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(malformed.to_string().contains("missing field dst"));
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .out_neighbors("cell-a", "FOLLOWS", 30)
+        .await
+        .unwrap()
+        .is_empty());
+
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+    cluster.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_pull_uses_snapshot_backed_server_cursor_pages() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_service_for(Arc::new(PagedBoltTestClient)),
+        bolt_test_config().with_prefetch_rows(2),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    session
+        .connection()
+        .run("MATCH (n {id: 1}) RETURN n.id AS answer", HashMap::new(), BoltDict::new())
+        .await
+        .unwrap();
+    let (first, first_summary) = session.connection().pull_n(1).await.unwrap();
+    assert_eq!(first, vec![vec![BoltValue::Integer(1)]]);
+    assert_eq!(first_summary.get("has_more"), Some(&BoltValue::Boolean(true)));
+    let (remaining, summary) = session.connection().pull_all().await.unwrap();
+    assert_eq!(
+        remaining,
+        vec![
+            vec![BoltValue::Integer(2)],
+            vec![BoltValue::Integer(3)],
+            vec![BoltValue::Integer(4)],
+            vec![BoltValue::Integer(5)],
+        ]
+    );
+    assert_eq!(summary.get("has_more"), Some(&BoltValue::Boolean(false)));
+
+    session
+        .connection()
+        .run("MATCH (n {id: 1}) RETURN n.id AS answer", HashMap::new(), BoltDict::new())
+        .await
+        .unwrap();
+    session
+        .connection()
+        .send(&ClientMessage::Discard {
+            extra: BoltDict::from([
+                ("n".to_string(), BoltValue::Integer(2)),
+                ("qid".to_string(), BoltValue::Integer(-1)),
+            ]),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Success { ref metadata }
+            if metadata.get("has_more") == Some(&BoltValue::Boolean(true))
+    ));
+    let (after_discard, _) = session.connection().pull_all().await.unwrap();
+    assert_eq!(
+        after_discard,
+        vec![
+            vec![BoltValue::Integer(3)],
+            vec![BoltValue::Integer(4)],
+            vec![BoltValue::Integer(5)],
+        ]
+    );
+
+    session
+        .connection()
+        .run("MATCH (n {id: 1}) RETURN n.id AS answer", HashMap::new(), BoltDict::new())
+        .await
+        .unwrap();
+    session
+        .connection()
+        .send(&ClientMessage::Discard {
+            extra: BoltDict::from([
+                ("n".to_string(), BoltValue::Integer(-1)),
+                ("qid".to_string(), BoltValue::Integer(-1)),
+            ]),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Success { ref metadata }
+            if metadata.get("has_more") == Some(&BoltValue::Boolean(false))
+                && metadata.get("bookmark").and_then(BoltValue::as_str).is_some()
+    ));
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_reset_interrupts_active_query_and_returns_connection_to_ready() {
+    let backend = Arc::new(BlockingBoltTestClient {
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let service = bolt_service_for(backend.clone());
+    let server = ClientBoltServer::bind("127.0.0.1:0".parse().unwrap(), service.clone(), bolt_test_config())
+        .await
+        .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    session
+        .connection()
+        .send(&ClientMessage::Run {
+            query: "MATCH (n {id: 1}) RETURN n.id".to_string(),
+            parameters: BoltDict::new(),
+            extra: BoltDict::new(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Success { .. }));
+    session.connection().send(&ClientMessage::pull_all()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !backend.started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    session.connection().send(&ClientMessage::pull_all()).await.unwrap();
+    session.connection().send(&ClientMessage::Reset).await.unwrap();
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Ignored));
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Ignored));
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Success { .. }));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.active_query_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_reset_after_run_does_not_start_backend_execution() {
+    let backend = Arc::new(BlockingBoltTestClient {
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_service_for(backend.clone()),
+        bolt_test_config(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    session
+        .connection()
+        .send(&ClientMessage::Run {
+            query: "MATCH (n {id: 1}) RETURN n.id".to_string(),
+            parameters: BoltDict::new(),
+            extra: BoltDict::new(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Success { .. }));
+    session.connection().send(&ClientMessage::Reset).await.unwrap();
+    assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Success { .. }));
+    assert!(!backend.started.load(std::sync::atomic::Ordering::SeqCst));
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_accepts_authenticated_queries_over_tls() {
+    let tls = crate::client::client_test_tls_bundle();
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config().with_tls_provider(Arc::new(StaticQueryTransportTlsServerConfigProvider::new(tls.server))),
+    )
+    .await
+    .unwrap();
+    let tcp = TcpStream::connect(server.local_addr()).await.unwrap();
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut stream = tokio_rustls::TlsConnector::from(tls.client)
+        .connect(server_name, tcp)
+        .await
+        .unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream.write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::from([("user_agent".to_string(), BoltValue::String("sgk-tls-test".to_string()))]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Logon {
+            auth: BoltDict::from([
+                ("scheme".to_string(), BoltValue::String("basic".to_string())),
+                ("principal".to_string(), BoltValue::String("neo4j".to_string())),
+                ("credentials".to_string(), BoltValue::String("bolt-secret".to_string())),
+            ]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Run {
+            query: "MATCH (n {id: 1}) RETURN n.id AS answer".to_string(),
+            parameters: BoltDict::new(),
+            extra: BoltDict::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    send_test_bolt_client_message(&mut writer, &ClientMessage::pull_all()).await;
+    assert_eq!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Record {
+            data: vec![BoltValue::Integer(42)]
+        }
+    );
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    drop(reader);
+    drop(writer);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_closes_connections_that_miss_the_authentication_deadline() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream.write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Hello { extra: BoltDict::new() }).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    let read = tokio::time::timeout(Duration::from_secs(2), reader.read_message()).await.unwrap();
+    assert!(read.is_err());
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_message_too_short_for_a_structure_gets_the_strict_decode_failure() {
+    let server = ClientBoltServer::bind("127.0.0.1:0".parse().unwrap(), bolt_test_service(), bolt_test_config())
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream.write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    // One chunk of one byte, then the end-of-message marker.
+    write_half.write_all(&[0, 1, 0xb1, 0, 0]).await.unwrap();
+    let ServerMessage::Failure { metadata } = decode_test_bolt_server_message(&mut reader).await else {
+        panic!("expected FAILURE");
+    };
+    assert_eq!(
+        metadata.get("message").and_then(BoltValue::as_str),
+        Some("Bolt message must be a PackStream structure")
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn unauthenticated_reset_logoff_cannot_refresh_authentication_deadline() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream.write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Hello { extra: BoltDict::new() }).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Logoff).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+
+    let read = tokio::time::timeout(Duration::from_secs(1), reader.read_message()).await.unwrap();
+    assert!(read.is_err());
+    server.stop().await.unwrap();
+}
+#[tokio::test]
+async fn authenticated_bolt_connections_use_the_separate_idle_timeout() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream.write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::from([("user_agent".to_string(), BoltValue::String("sgk-auth-timeout-test".to_string()))]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Logon {
+            auth: BoltDict::from([
+                ("scheme".to_string(), BoltValue::String("basic".to_string())),
+                ("principal".to_string(), BoltValue::String("neo4j".to_string())),
+                ("credentials".to_string(), BoltValue::String("bolt-secret".to_string())),
+            ]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    drop(reader);
+    drop(writer);
+    server.stop().await.unwrap();
+}
+
+/// A placement view over a hand-picked fleet. No store, no heartbeats: an
+/// unrefreshed view is `Grace(members)` — decision 8's assume-the-configured-
+/// fleet posture — so ownership here is the rendezvous winner over exactly
+/// `members`.
+fn test_placement_view(local_node_id: &str, members: &[&str]) -> PlacementView {
+    PlacementView::new(local_node_id, members.iter().copied(), PlacementConfig::default()).expect("a valid test fleet")
+}
+
+fn routing_role(table: &BoltRoutingTable, role: &str) -> Vec<String> {
+    table
+        .servers
+        .iter()
+        .find(|server| server.role == role)
+        .unwrap_or_else(|| panic!("routing table is missing the {role} role"))
+        .addresses
+        .clone()
+}
+
+async fn routing_table_for(provider: &ObjectStoreBoltRoutingTableProvider, cell_id: &str) -> BoltRoutingTable {
+    provider
+        .routing_table("default", &ClientQueryTarget::new(GraphScope::default(), cell_id).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Touch point (c): a refused write arrives as a code drivers already act on —
+/// discard the routing table, re-route, retry — with the owner carried as a
+/// hint. Before this the module had exactly one Neo code and a fenced write was
+/// an opaque backend error, so the driver retried into the same wrong node.
+#[test]
+fn a_write_to_a_non_owner_maps_to_the_not_a_leader_code_with_the_owner_hint() {
+    let hinted = graph_error_to_bolt(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: Some("node-b".to_string()),
+    });
+    match hinted {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Cluster.NotALeader");
+            assert!(message.contains("node-b"), "the hint must reach the driver");
+        }
+        other => panic!("expected a Neo-coded query error, got {other:?}"),
+    }
+
+    // A node that has shed its view refuses with the same code and no hint,
+    // rather than guessing at an owner that may itself have shed.
+    let shed = graph_error_to_bolt(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: None,
+    });
+    match shed {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Cluster.NotALeader");
+            assert!(message.contains("unknown"));
+        }
+        other => panic!("expected a Neo-coded query error, got {other:?}"),
+    }
+}
+
+#[test]
+fn only_a_stale_vertex_delete_preparation_is_a_transient_bolt_conflict() {
+    let conflict = |operation| GraphError::ConditionalWriteConflict {
+        operation,
+        key: "private-storage-key".to_string(),
+    };
+    let atomic = crate::query::coordination::atomic_vertex_delete_error;
+    match graph_error_to_bolt(atomic(conflict("validate_vertex_delete_preparation"))) {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.DeadlockDetected");
+            assert_eq!(message, "vertex delete preparation conflicted with a concurrent write");
+        }
+        other => panic!("expected a retryable query error, got {other:?}"),
+    }
+    assert!(matches!(graph_error_to_bolt(atomic(conflict("other"))), BoltError::Backend(_)));
+    let check_partial = |err| match graph_error_to_bolt(err) {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.Statement.ExecutionFailed");
+            assert!(message.contains("earlier writes may have succeeded"));
+            assert!(!message.contains("private-storage-key"));
+        }
+        other => panic!("expected a non-retryable statement failure, got {other:?}"),
+    };
+    check_partial(conflict("validate_vertex_delete_preparation"));
+    #[cfg(feature = "query-transport")]
+    {
+        use crate::query::coordination::transport_round_trip_for_tests;
+        let (remote, _) = transport_round_trip_for_tests(conflict("validate_vertex_delete_preparation"));
+        check_partial(remote);
+        let (remote, _) = transport_round_trip_for_tests(atomic(conflict("validate_vertex_delete_preparation")));
+        assert!(matches!(remote, GraphError::AtomicVertexDeleteConflict));
+    }
+}
+
+#[test]
+fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
+    let error = graph_error_to_bolt(GraphError::IdempotencyConflict {
+        operation: "relationship-import",
+        idempotency_key: "caller-operation-42".to_string(),
+        reason: "this key already stored a result for a different payload",
+    });
+
+    match error {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Transaction.Invalid");
+            assert!(message.contains("relationship-import"));
+            assert!(message.contains("caller-operation-42"));
+            assert!(message.contains("different payload"));
+        }
+        other => panic!("expected a non-retryable Neo client error, got {other:?}"),
+    }
+}
+
+/// A batch whose rows set one property to two values is a problem with the
+/// rows, not the statement, so it must not reach the client as a syntax error.
+#[test]
+fn a_batch_value_conflict_reaches_bolt_clients_as_an_argument_error() {
+    let error = graph_error_to_bolt(GraphError::BatchValueConflict {
+        target: "vertex 5039557825821168673 property filename".to_string(),
+    });
+
+    match error {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Statement.ArgumentError");
+            assert_eq!(
+                message,
+                "conflicting metadata values for vertex 5039557825821168673 property filename in one batch"
+            );
+        }
+        other => panic!("expected a Neo-coded query error, got {other:?}"),
+    }
+}
+
+/// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
+/// `ensure_local_writer` enforces. Under [`BoltReadRouting::Owner`], `READ` is
+/// that same single address, so a read lands on the node whose writer minted
+/// the bookmark and the causal wait exits on its first check instead of polling
+/// its own manifest for 17–38s
+/// (the cell-affine read routing design, change 1). `ROUTE`
+/// stays the whole live fleet: routers must remain redundant, and it is the
+/// `ROUTE` list a driver re-fetches from when it invalidates a dead reader.
+///
+/// `READ` is asserted as *exactly one* address, not "contains the owner". A
+/// Neo4j driver load-balances across every address in a role rather than
+/// reading it as a preference order, so an owner-plus-fallback list would send
+/// most reads back to non-owners and buy nothing.
+#[tokio::test]
+async fn object_store_routing_names_the_rendezvous_owner_for_writes() {
+    let addresses = [
+        ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+        ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+        ("node-c".to_string(), "10.0.0.3:7687".to_string()),
+    ];
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        addresses.clone(),
+        30,
+        test_placement_view("node-a", &["node-a", "node-b", "node-c"]),
+    )
+    .unwrap()
+    .with_read_routing(BoltReadRouting::Owner);
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    assert!(table.ttl_secs > 0 && table.ttl_secs <= 30);
+
+    let every_address = vec![
+        "10.0.0.1:7687".to_string(),
+        "10.0.0.2:7687".to_string(),
+        "10.0.0.3:7687".to_string(),
+    ];
+    assert_eq!(routing_role(&table, "ROUTE"), every_address);
+
+    let scope = GraphScope::default().to_string();
+    let owner = hydradb_placement::hash::owner(&scope, "cell-a", &["node-a", "node-b", "node-c"]).expect("a non-empty fleet has an owner");
+    let owner_address = addresses
+        .iter()
+        .find(|(node_id, _)| node_id == owner)
+        .map(|(_, address)| address.clone())
+        .unwrap();
+    assert_eq!(routing_role(&table, "WRITE"), vec![owner_address.clone()]);
+    assert_eq!(routing_role(&table, "READ"), vec![owner_address]);
+}
+
+/// The switch in its default position must be provably inert: `fleet` has to
+/// reproduce the table the provider built before cell-affine reads existed,
+/// role for role and address for address. Asserted against a literal
+/// [`BoltRoutingTable`] rather than against another provider's output, so the
+/// expectation cannot drift along with the code that produces it.
+#[tokio::test]
+async fn object_store_routing_in_fleet_mode_reproduces_the_previous_table() {
+    let addresses = [
+        ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+        ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+        ("node-c".to_string(), "10.0.0.3:7687".to_string()),
+    ];
+    let every_address = vec![
+        "10.0.0.1:7687".to_string(),
+        "10.0.0.2:7687".to_string(),
+        "10.0.0.3:7687".to_string(),
+    ];
+    let scope = GraphScope::default().to_string();
+    let owner = hydradb_placement::hash::owner(&scope, "cell-a", &["node-a", "node-b", "node-c"]).expect("a non-empty fleet has an owner");
+    let owner_address = addresses
+        .iter()
+        .find(|(node_id, _)| node_id == owner)
+        .map(|(_, address)| address.clone())
+        .unwrap();
+    let expected = BoltRoutingTable::new(
+        30,
+        vec![
+            BoltRoutingServer::new("ROUTE", every_address.clone()).unwrap(),
+            BoltRoutingServer::new("READ", every_address).unwrap(),
+            BoltRoutingServer::new("WRITE", [owner_address]).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    // Unset and explicitly `fleet` are the same table, and both are the old one.
+    let default_provider = ObjectStoreBoltRoutingTableProvider::new(
+        addresses.clone(),
+        30,
+        test_placement_view("node-a", &["node-a", "node-b", "node-c"]),
+    )
+    .unwrap();
+    let explicit_provider =
+        ObjectStoreBoltRoutingTableProvider::new(addresses, 30, test_placement_view("node-a", &["node-a", "node-b", "node-c"]))
+            .unwrap()
+            .with_read_routing(BoltReadRouting::Fleet);
+
+    assert_eq!(routing_table_for(&default_provider, "cell-a").await, expected);
+    assert_eq!(routing_table_for(&explicit_provider, "cell-a").await, expected);
+}
+
+#[tokio::test]
+async fn object_store_routing_prefers_the_durable_lease_owner() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let leases = Arc::new(ObjectStoreWriterLeaseDirectory::with_duration_and_holder(
+        "graph/data",
+        store,
+        Duration::from_secs(5),
+        "holder-b",
+    ));
+    let scope = GraphScope::default();
+    let cell = (0..64)
+        .map(|index| format!("cell-{index}"))
+        .find(|cell| hydradb_placement::hash::owner(&scope.to_string(), cell, &["node-a", "node-b"]) == Some("node-a"))
+        .unwrap();
+    leases.acquire_or_renew(&scope, &cell, "node-b").await.unwrap();
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [
+            ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+            ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+        ],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap()
+    .with_writer_lease_directory(leases)
+    .with_read_routing(BoltReadRouting::Owner);
+
+    let table = routing_table_for(&provider, &cell).await;
+    assert_eq!(routing_role(&table, "WRITE"), vec!["10.0.0.2:7687".to_string()]);
+    // The divergence case, and the one that would silently reintroduce the
+    // wait: `cell` is chosen so rendezvous says node-a while the durable lease
+    // says node-b. A `READ` list derived from `placement_owner` rather than
+    // from the resolved owner would name 10.0.0.1 here and route every read at
+    // a node whose writer holds nothing — the exact poll loop this replaced.
+    assert_eq!(
+        routing_role(&table, "READ"),
+        vec!["10.0.0.2:7687".to_string()],
+        "reads must follow the lease holder through a handoff, as writes do"
+    );
+    // `ROUTE` is unaffected by the lease; routers stay the whole live fleet.
+    assert_eq!(
+        routing_role(&table, "ROUTE"),
+        vec!["10.0.0.1:7687".to_string(), "10.0.0.2:7687".to_string()]
+    );
+}
+
+/// The writer is resolved per cell rather than pinned to one node, which is what
+/// makes the table an answer to the client's target instead of a fixed
+/// preference order. `with_preferred_writer_node` — which pinned it — is gone
+/// (decision 9): once ownership is enforced, an override routing writes to a
+/// node that then refuses them is a loop no timeout breaks.
+#[tokio::test]
+async fn object_store_routing_resolves_the_writer_per_cell() {
+    let fleet = ["node-a", "node-b", "node-c"];
+    let addresses: Vec<(String, String)> = fleet
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| ((*node_id).to_string(), format!("10.0.0.{}:7687", index + 1)))
+        .collect();
+    let provider = ObjectStoreBoltRoutingTableProvider::new(addresses.clone(), 30, test_placement_view("node-a", &fleet))
+        .unwrap()
+        .with_read_routing(BoltReadRouting::Owner);
+    let scope = GraphScope::default().to_string();
+
+    let mut writers = std::collections::BTreeSet::new();
+    let mut readers = std::collections::BTreeSet::new();
+    for index in 0..16 {
+        let cell_id = format!("cell-{index}");
+        let owner = hydradb_placement::hash::owner(&scope, &cell_id, &fleet).unwrap();
+        let expected = addresses
+            .iter()
+            .find(|(node_id, _)| node_id == owner)
+            .map(|(_, address)| address.clone())
+            .unwrap();
+        let table = routing_table_for(&provider, &cell_id).await;
+        assert_eq!(routing_role(&table, "WRITE"), vec![expected.clone()]);
+        assert_eq!(routing_role(&table, "READ"), vec![expected.clone()]);
+        writers.insert(expected.clone());
+        readers.insert(expected);
+    }
+    assert!(
+        writers.len() > 1,
+        "sixteen cells over three nodes must not all resolve to one writer: {writers:?}"
+    );
+    // Affinity is per cell, not per node: read locality is a property of the
+    // target, so the fleet still shares the read load across tenants even
+    // though one tenant's reads all land in one place.
+    assert!(
+        readers.len() > 1,
+        "sixteen cells over three nodes must not all resolve to one reader: {readers:?}"
+    );
+}
+
+/// Only the live fleet is advertised, and the owner is chosen from it: a
+/// configured node that placement does not consider live is not a router, is
+/// not a reader under either mode, and cannot become the owner. Under
+/// [`BoltReadRouting::Owner`] the dead node-c is excluded twice over — it is
+/// absent from `ROUTE`, and it cannot win the rendezvous that `READ` and
+/// `WRITE` both name.
+#[tokio::test]
+async fn object_store_routing_advertises_only_the_live_fleet() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [
+            ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+            ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+            ("node-c".to_string(), "10.0.0.3:7687".to_string()),
+        ],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap()
+    .with_read_routing(BoltReadRouting::Owner);
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    let live = vec!["10.0.0.1:7687".to_string(), "10.0.0.2:7687".to_string()];
+    assert_eq!(routing_role(&table, "ROUTE"), live);
+
+    let scope = GraphScope::default().to_string();
+    let owner = hydradb_placement::hash::owner(&scope, "cell-a", &["node-a", "node-b"]).unwrap();
+    let owner_address = if owner == "node-a" {
+        "10.0.0.1:7687".to_string()
+    } else {
+        "10.0.0.2:7687".to_string()
+    };
+    assert!(
+        routing_role(&table, "WRITE") == vec![owner_address.clone()],
+        "the writer comes from the live set"
+    );
+    assert_eq!(routing_role(&table, "READ"), vec![owner_address]);
+}
+
+/// Decision 4's deletion, asserted rather than assumed: nothing listens on any
+/// of these addresses and there is no readiness endpoint anywhere, yet the table
+/// is built. The old provider opened a TCP connection to every configured node's
+/// `/readyz` on every refresh and would have answered "no reachable graph
+/// nodes" here.
+#[tokio::test]
+async fn object_store_routing_builds_a_table_without_probing_any_node() {
+    let unbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unbound_address = unbound.local_addr().unwrap().to_string();
+    drop(unbound);
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), unbound_address.clone())],
+        30,
+        test_placement_view("node-a", &["node-a"]),
+    )
+    .unwrap();
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    assert_eq!(routing_role(&table, "READ"), vec![unbound_address.clone()]);
+    assert_eq!(routing_role(&table, "WRITE"), vec![unbound_address]);
+}
+
+/// A node with no live peer it has an address for advertises nothing at all,
+/// rather than a stale fleet. This is the posture a shed view produces
+/// (decision 7): `LiveView::nodes()` is empty, so there is no reader list and no
+/// writer to name.
+///
+/// The refusal must be **transient**, and that is the half worth pinning. A
+/// shed node is one node in trouble while every peer answers normally, so the
+/// driver has to move to the next router; a `ClientError` would end the attempt
+/// and turn one node's object-store trouble into a failed query.
+#[tokio::test]
+async fn object_store_routing_advertises_nothing_when_no_live_node_is_addressable() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), "10.0.0.1:7687".to_string())],
+        30,
+        test_placement_view("node-z", &["node-z"]),
+    )
+    .unwrap();
+
+    let error = provider
+        .routing_table("default", &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, GraphError::RoutingUnavailable { .. }),
+        "expected a transient routing refusal, got {error:?}"
+    );
+    match graph_error_to_bolt(error) {
+        BoltError::Query { code, .. } => assert_eq!(
+            code, "Neo.TransientError.General.DatabaseUnavailable",
+            "a driver reads the class of this code to decide whether to try the next router"
+        ),
+        other => panic!("expected a coded Bolt error, got {other:?}"),
+    }
+}
+
+/// The other half of the split: a routing *misconfiguration* stays a client
+/// error, because no other router will answer differently. Reached by giving the
+/// provider an address map that does not cover the fleet the placement view
+/// names — `graph-node` builds the directory from the address map's own keys, so
+/// only an embedder can construct this.
+#[tokio::test]
+async fn object_store_routing_reports_a_missing_owner_address_as_a_config_error() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), "10.0.0.1:7687".to_string())],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap();
+
+    // node-b owns some cell over this two-node fleet, and the provider has no
+    // address for it. Find that cell rather than assuming which one it is.
+    let scope = GraphScope::default();
+    let cell = (0..64)
+        .map(|n| format!("cell-{n}"))
+        .find(|cell| hydradb_placement::hash::owner(&scope.to_string(), cell, &["node-a", "node-b"]) == Some("node-b"))
+        .expect("some cell hashes to node-b");
+
+    let error = provider
+        .routing_table("default", &ClientQueryTarget::new(scope, cell.as_str()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, GraphError::UnsupportedQuery { .. }),
+        "a config mismatch is not transient: {error:?}"
+    );
+}
+
+async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut bytes = BytesMut::new();
+    encode_client_message(&mut bytes, message);
+    writer.write_message(&bytes).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
+async fn decode_test_bolt_server_message<R>(reader: &mut ChunkReader<R>) -> ServerMessage
+where
+    R: AsyncRead + Unpin,
+{
+    boltr::message::decode::decode_server_message(&reader.read_message().await.unwrap()).unwrap()
+}
+
+/// A RUN the node cannot prepare names the statement on its log line -- the
+/// literal-free shape, the failure reason and the engine -- so a dashboard
+/// can show *which* query failed instead of only counting failures.
+#[cfg(feature = "server-runtime")]
+#[tokio::test]
+async fn bolt_preparation_failure_logs_the_statement_shape_without_literals() {
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    // `#[tokio::test]` is single-threaded, so the server's tasks run on this
+    // thread and see this default subscriber.
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = ClientBoltServer::bind("127.0.0.1:0".parse().unwrap(), bolt_test_service(), bolt_test_config())
+        .await
+        .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let error = session
+        .run(
+            "MATCH (u:User {name: 'secret-tenant'}) \
+             WITH u ORDER BY u.id LIMIT 1 RETURN u.id AS id",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not supported yet"), "{error}");
+    session.reset().await.unwrap();
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+
+    let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.contains("Bolt RUN preparation failed"))
+        .unwrap_or_else(|| panic!("no preparation-failure line in:\n{output}"));
+    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    let fields = &event["fields"];
+    assert_eq!(fields["failure_reason"], "unsupported_return", "{line}");
+    assert_eq!(fields["cypher_engine"], "legacy", "{line}");
+    let shape = fields["query_shape"].as_str().expect("query_shape field");
+    assert!(shape.contains("WITH u ORDER BY u.id LIMIT ? RETURN u.id AS id"), "{shape}");
+    assert!(!shape.contains("secret-tenant"), "shape leaked a literal: {shape}");
+    assert!(!line.contains("secret-tenant"), "line leaked a literal: {line}");
+}
+
+/// A timeout is a transient termination, never a syntax error: clients such
+/// as an ingestion pipeline read `InvalidSyntax` as "this dialect cannot run the
+/// query" and stop retrying. A genuinely unsupported Cypher 25 shape keeps
+/// `InvalidSyntax`.
+#[test]
+fn a_timeout_reaches_bolt_as_terminated_and_unsupported_syntax_as_invalid_syntax() {
+    match graph_error_to_bolt(GraphError::QueryTimeout {
+        operation: "experimental_cypher_expand_relationship",
+        elapsed_ms: 119_999,
+        limit_ms: 119_999,
+    }) {
+        BoltError::Query { code, .. } => assert_eq!(code, "Neo.TransientError.Transaction.Terminated"),
+        other => panic!("a timeout must be a transaction termination: {other:?}"),
+    }
+    match graph_error_to_bolt(GraphError::UnsupportedQuery {
+        dialect: "Cypher25",
+        feature: "function labels is not supported".into(),
+        reason: crate::QueryFailureReason::Return,
+    }) {
+        BoltError::Query { code, .. } => assert_eq!(code, "Neo.ClientError.Statement.InvalidSyntax"),
+        other => panic!("unsupported syntax must remain a syntax error: {other:?}"),
+    }
+}
+
+#[cfg(feature = "datafusion-cypher-engine")]
+#[test]
+fn invalid_provider_values_reach_bolt_as_type_errors() {
+    let error = graph_error_to_bolt(GraphError::DataFusionProvider(
+        hydradb_graph_provider::GraphProviderError::InvalidRequest("list property values must be homogeneous".into()),
+    ));
+
+    match error {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Statement.TypeError");
+            assert!(message.contains("list property values must be homogeneous"));
+        }
+        other => panic!("invalid provider values must be a client type error: {other:?}"),
+    }
+}
+
+/// Typed storage failures inside the experimental engine, end to end from
+/// the engine's error to Bolt: each reaches the client exactly as the same
+/// failure on the legacy route does. They used to arrive as `InvalidSyntax`
+/// with "Cypher25 query is not supported yet: graph storage error: ...".
+#[cfg(feature = "experimental-cypher-engine")]
+#[test]
+fn experimental_engine_storage_failures_reach_bolt_with_legacy_codes() {
+    fn relayed(error: GraphError) -> BoltError {
+        graph_error_to_bolt(crate::query::experimental_cypher::experimental_engine_error(
+            hydradb_cypher_engine::EngineError::Storage(hydradb_cypher_engine::StorageError::from_backend(error)),
+        ))
+    }
+    type Kind = (fn() -> GraphError, &'static str);
+    let kinds: [Kind; 6] = [
+        (
+            || GraphError::QueryTimeout {
+                operation: "cypher_relationship_edge_records",
+                elapsed_ms: 119_999,
+                limit_ms: 119_999,
+            },
+            "Query(Neo.TransientError.Transaction.Terminated)",
+        ),
+        (
+            || GraphError::AdmissionRejected {
+                operation: "experimental_cypher_expand_inputs",
+                actual: 200_001,
+                limit: 200_000,
+            },
+            "ResourceExhausted",
+        ),
+        (
+            || GraphError::AdmissionRejected {
+                operation: "client_cursor_buffer_bytes",
+                actual: 65,
+                limit: 64,
+            },
+            "ResourceExhausted",
+        ),
+        (
+            || GraphError::SnapshotUnavailable {
+                cell_id: "cell-a".into(),
+                read_epoch: 7,
+                current_epoch: 9,
+            },
+            "Query(Neo.DatabaseError.Statement.ExecutionFailed)",
+        ),
+        (
+            || GraphError::QueryAllocation {
+                operation: "experimental_cypher_hydration",
+                reason: "capacity overflow".into(),
+            },
+            "Backend",
+        ),
+        (
+            || GraphError::CorruptValue {
+                key: "cell/edge".into(),
+                reason: "short header".into(),
+            },
+            "Backend",
+        ),
+    ];
+    let shape = |error: &BoltError| match error {
+        BoltError::Query { code, .. } => format!("Query({code})"),
+        BoltError::ResourceExhausted(_) => "ResourceExhausted".to_string(),
+        BoltError::Backend(_) => "Backend".to_string(),
+        other => format!("{other:?}"),
+    };
+    for (error, expected) in kinds {
+        let experimental = relayed(error());
+        let legacy = graph_error_to_bolt(error());
+        assert_eq!(shape(&experimental), expected, "{experimental:?}");
+        assert_eq!(format!("{experimental:?}"), format!("{legacy:?}"));
+    }
+}
+
+/// A query routed to another node that refuses it for a routing reason
+/// reaches the Bolt client with the code the same refusal gets on the node it
+/// connected to, so the driver re-routes or retries. Through the transport it
+/// used to arrive as `InvalidSyntax`, which drivers treat as final.
+#[test]
+fn routing_refusals_from_a_remote_owner_reach_bolt_with_legacy_codes() {
+    type Kind = (fn() -> GraphError, &'static str);
+    let kinds: [Kind; 4] = [
+        (
+            || GraphError::NotCellWriter {
+                cell_id: "cell-a".into(),
+                owner: Some("node-2".into()),
+            },
+            "Neo.ClientError.Cluster.NotALeader",
+        ),
+        (
+            || GraphError::NotCellWriter {
+                cell_id: "cell-a".into(),
+                owner: None,
+            },
+            "Neo.ClientError.Cluster.NotALeader",
+        ),
+        (
+            || GraphError::RoutingUnavailable {
+                reason: "no live owner for cell-a".into(),
+            },
+            "Neo.TransientError.General.DatabaseUnavailable",
+        ),
+        (
+            || GraphError::SnapshotAhead {
+                cell_id: "cell-a".into(),
+                read_epoch: 9,
+                current_epoch: 4,
+            },
+            "Neo.TransientError.Transaction.BookmarkTimeout",
+        ),
+    ];
+    for (error, expected) in kinds {
+        let (remote, _) = crate::query::coordination::transport_round_trip_for_tests(error());
+        let remote = graph_error_to_bolt(remote);
+        let local = graph_error_to_bolt(error());
+        match &remote {
+            BoltError::Query { code, .. } => assert_eq!(code, expected),
+            other => panic!("a routing refusal must keep its code: {other:?}"),
+        }
+        assert_eq!(format!("{remote:?}"), format!("{local:?}"));
+    }
+}
+
+/// A read refused because a write-back of its property has not completed
+/// succeeds once a run of the property completes, so drivers must see a
+/// transient code they retry, on the node that refused it and through the
+/// transport from a remote owner alike.
+#[test]
+fn a_write_back_in_progress_refusal_reaches_bolt_as_transient_locally_and_remotely() {
+    let refusal = || hydradb_graph_slate::write::write_back_in_progress("rank", 7);
+    let (remote, _) = crate::query::coordination::transport_round_trip_for_tests(refusal());
+    for error in [refusal(), remote] {
+        match graph_error_to_bolt(error) {
+            BoltError::Query { code, message } => {
+                assert_eq!(code, "Neo.TransientError.General.DatabaseUnavailable");
+                assert!(message.contains("write_back_in_progress"), "{message}");
+            }
+            other => panic!("write_back_in_progress must be a transient query failure: {other:?}"),
+        }
+    }
+}
+
+/// A read refused because its index generation is behind the WAL succeeds
+/// once the indexer publishes a newer one, so drivers must see a transient
+/// code they retry, on the node that refused it and through the transport
+/// from a remote owner alike. It used to arrive as `InvalidSyntax`.
+#[test]
+fn an_index_behind_refusal_reaches_bolt_as_transient_locally_and_remotely() {
+    let index_behind = || GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: "index_behind: the WAL tail of type LINKS from its generation at 4 to the read epoch 9 cannot be read".into(),
+        reason: crate::QueryFailureReason::IndexBehind,
+    };
+    let (remote, _) = crate::query::coordination::transport_round_trip_for_tests(index_behind());
+    for error in [index_behind(), remote] {
+        match graph_error_to_bolt(error) {
+            BoltError::Query { code, message } => {
+                assert_eq!(code, "Neo.TransientError.General.DatabaseUnavailable");
+                assert!(message.contains("index_behind"), "{message}");
+            }
+            other => panic!("index_behind must be a transient query failure: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unavailable_snapshot_reaches_bolt_as_an_execution_error() {
+    let error = GraphError::SnapshotUnavailable {
+        cell_id: "cell-a".into(),
+        read_epoch: 7,
+        current_epoch: 9,
+    };
+    let expected = error.to_string();
+    match graph_error_to_bolt(error) {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.DatabaseError.Statement.ExecutionFailed");
+            assert_eq!(message, expected);
+            assert!(message.contains("requested storage sequence 7, current sequence 9"));
+        }
+        other => panic!("expected an execution error, got {other:?}"),
+    }
+    match graph_error_to_bolt(GraphError::QueryParse {
+        dialect: "OpenCypher",
+        reason: "invalid token".into(),
+    }) {
+        BoltError::Query { code, .. } => assert_eq!(code, "Neo.ClientError.Statement.InvalidSyntax"),
+        other => panic!("parse errors must remain syntax errors: {other:?}"),
+    }
+}
+
+/// An engine failure reaches a Bolt client with its GQL-status object, in the
+/// fields Bolt 5.7 gives FAILURE, beside the `code` and `message` every
+/// version reads; any other failure keeps the two it always had.
+#[test]
+fn an_engine_failure_carries_its_gql_status_in_bolt_failure() {
+    let metadata = bolt_graph_failure_metadata(GraphError::GqlQuery {
+        dialect: "Cypher25",
+        feature: "arithmetic division by zero".to_string(),
+        reason: crate::QueryFailureReason::Evaluation,
+        status: Box::new(GqlStatusReport {
+            gql_status: "22012".to_string(),
+            description: "error: data exception - division by zero".to_string(),
+            diagnostic: BTreeMap::from([("OPERATION_CODE".to_string(), "0".to_string())]),
+        }),
+    });
+    let string = |key: &str| match metadata.get(key) {
+        Some(BoltValue::String(value)) => value.clone(),
+        other => panic!("{key}: {other:?}"),
+    };
+    assert_eq!(string("code"), "Neo.ClientError.Statement.InvalidSyntax");
+    assert_eq!(string("neo4j_code"), string("code"));
+    assert_eq!(string("gql_status"), "22012");
+    assert_eq!(string("description"), "error: data exception - division by zero");
+    assert!(string("message").contains("division by zero"));
+    let Some(BoltValue::Dict(record)) = metadata.get("diagnostic_record") else {
+        panic!("{metadata:?}");
+    };
+    assert!(matches!(record.get("OPERATION_CODE"), Some(BoltValue::String(code)) if code == "0"));
+
+    let plain = bolt_graph_failure_metadata(GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: "WHERE".to_string(),
+        reason: crate::QueryFailureReason::Where,
+    });
+    assert!(!plain.contains_key("gql_status") && plain.contains_key("code"), "{plain:?}");
+}
+
+/// A result's GQL-status objects become Bolt 5.6's `statuses` list.
+#[test]
+fn result_statuses_are_bolt_statuses() {
+    let BoltValue::List(statuses) = bolt_statuses(&[GqlStatusReport {
+        gql_status: "02000".to_string(),
+        description: "note: no data".to_string(),
+        diagnostic: BTreeMap::new(),
+    }]) else {
+        panic!("statuses is a list");
+    };
+    let [BoltValue::Dict(status)] = statuses.as_slice() else {
+        panic!("{statuses:?}");
+    };
+    assert!(matches!(status.get("gql_status"), Some(BoltValue::String(code)) if code == "02000"));
+    assert!(matches!(status.get("status_description"), Some(BoltValue::String(text)) if text == "note: no data"));
+    assert!(matches!(status.get("diagnostic_record"), Some(BoltValue::Dict(_))));
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn shared_bolt_session_preserves_gql_outcomes() {
+    let cluster = Arc::new(
+        RoutedGraphCluster::open_promotable(
+            "bolt-gql/data",
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap(),
+            test_placement_view("node-a", &["node-a"]),
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap(),
+    );
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant("bolt-secret", QueryTransportScopeGrant::read_graph(GraphScope::default()))
+        .unwrap();
+    let service = ClientQueryService::new(
+        cluster,
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("bolt-secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(crate::CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let server = ClientBoltServer::bind("127.0.0.1:0".parse().unwrap(), service, bolt_test_config())
+        .await
+        .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let has_status = |summary: &BoltDict, expected: &str| {
+        let Some(BoltValue::List(statuses)) = summary.get("statuses") else {
+            panic!("{summary:?}");
+        };
+        statuses.iter().any(
+            |status| matches!(status, BoltValue::Dict(fields) if fields.get("gql_status").and_then(BoltValue::as_str) == Some(expected)),
+        )
+    };
+    let query = "UNWIND [1, null, 2] AS x RETURN sum(x) AS answer";
+    let result = session.run(query).await.unwrap();
+    assert_eq!(result.records, vec![vec![BoltValue::Integer(3)]]);
+    assert!(has_status(&result.summary, "01G11"));
+
+    session.connection().run(query, BoltDict::new(), BoltDict::new()).await.unwrap();
+    session.connection().send(&ClientMessage::discard_all()).await.unwrap();
+    let ServerMessage::Success { metadata } = session.connection().recv().await.unwrap() else {
+        panic!("DISCARD must return a summary");
+    };
+    assert!(has_status(&metadata, "01G11"));
+
+    let empty = session.run("UNWIND [] AS x RETURN x AS answer").await.unwrap();
+    assert!(empty.records.is_empty());
+    assert!(has_status(&empty.summary, "02000"));
+
+    for (query, execute, expected) in [
+        ("RETURN absent_binding AS answer", false, "42"),
+        ("RETURN 1 / 0 AS answer", true, "22012"),
+    ] {
+        session
+            .connection()
+            .send(&ClientMessage::Run {
+                query: query.to_string(),
+                parameters: BoltDict::new(),
+                extra: BoltDict::new(),
+            })
+            .await
+            .unwrap();
+        if execute {
+            assert!(matches!(session.connection().recv().await.unwrap(), ServerMessage::Success { .. }));
+            session.connection().send(&ClientMessage::pull_all()).await.unwrap();
+        }
+        let ServerMessage::Failure { metadata } = session.connection().recv().await.unwrap() else {
+            panic!("{query} must fail");
+        };
+        assert!(
+            metadata
+                .get("gql_status")
+                .and_then(BoltValue::as_str)
+                .unwrap()
+                .starts_with(expected),
+            "{metadata:?}"
+        );
+        assert_eq!(metadata.get("neo4j_code"), metadata.get("code"));
+        assert!(matches!(metadata.get("diagnostic_record"), Some(BoltValue::Dict(_))));
+        session.reset().await.unwrap();
+    }
+    assert_eq!(
+        session.run("RETURN 1 AS answer").await.unwrap().records,
+        vec![vec![BoltValue::Integer(1)]]
+    );
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}

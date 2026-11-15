@@ -1,0 +1,22 @@
+[package]
+name = "hydradb-scope"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Graph scope identity for HydraDB: ids, namespace paths and the client protocol spellings of a scope"
+publish = false
+
+# No dependency on `hydradb`, so anything outside the kernel, such as the
+# turbolay proxy, names a tenant exactly as a graph-node does without linking
+# slatedb, the planner or the native graph libraries. The kernel re-exports
+# every public item, so kernel call sites do not name this crate.
+[dependencies]
+base64 = { workspace = true }
+serde = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+# Only the kernel's `query-transport` serialises these types, so only it turns
+# this on.
+serde = ["dep:serde"]

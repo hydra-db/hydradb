@@ -134,11 +134,7 @@ impl RedactingFields {
 }
 
 impl<'writer> FormatFields<'writer> for RedactingFields {
-    fn format_fields<R: RecordFields>(
-        &self,
-        mut writer: Writer<'writer>,
-        fields: R,
-    ) -> fmt::Result {
+    fn format_fields<R: RecordFields>(&self, mut writer: Writer<'writer>, fields: R) -> fmt::Result {
         if self.json {
             let mut visitor = JsonFieldVisitor::default();
             let mut redacting = RedactingVisitor::new(&mut visitor);
@@ -179,11 +175,7 @@ impl<'writer> FormatFields<'writer> for RedactingFields {
     /// OTLP was never affected — `tracing-opentelemetry` handles `on_record`
     /// itself — so this silently degraded the stdout logs alone, which is the
     /// half somebody reads at 2am with `grep`.
-    fn add_fields(
-        &self,
-        current: &'writer mut FormattedFields<Self>,
-        fields: &tracing::span::Record<'_>,
-    ) -> fmt::Result {
+    fn add_fields(&self, current: &'writer mut FormattedFields<Self>, fields: &tracing::span::Record<'_>) -> fmt::Result {
         if !self.json {
             if !current.fields.is_empty() {
                 current.fields.push(' ');
@@ -266,11 +258,7 @@ impl tracing::field::Visit for JsonFieldVisitor {
         }
     }
 
-    fn record_error(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &(dyn std::error::Error + 'static),
-    ) {
+    fn record_error(&mut self, field: &tracing::field::Field, value: &(dyn std::error::Error + 'static)) {
         self.insert(field, serde_json::Value::String(value.to_string()));
     }
 }
@@ -279,7 +267,7 @@ impl tracing::field::Visit for JsonFieldVisitor {
 /// takes there.
 ///
 /// The log collector maps a line's **root** keys onto warehouse columns by
-/// name, and `cortex.cortex_logs_v2` has a column waiting for each entry below.
+/// name, and the log warehouse table has a column waiting for each entry below.
 /// Nothing in that pipeline lifts a nested key: a value under `fields`, or
 /// inside the `spans` array below, is bucketed whole into an opaque attributes
 /// blob and the column stays null. So these are hoisted out of the enclosing
@@ -292,10 +280,9 @@ impl tracing::field::Visit for JsonFieldVisitor {
 /// refusal and error logged underneath inherits it without knowing it exists.
 ///
 /// The rest are plain renames from the name a Rust call site writes to the name
-/// the warehouse column has. Two days of staging traffic put `error_type`,
-/// `correlation_id` and `operation` at exactly zero populated rows out of
-/// 82,807, because every one of them was spelled the `hydradb.*` way and left
-/// nested. A rename table is all that gap ever was.
+/// the warehouse column has. Left nested and spelled the `hydradb.*` way,
+/// `error_type`, `correlation_id` and `operation` never populated their
+/// columns at all. A rename table is all that gap ever was.
 ///
 /// Values are copied **verbatim**, with no type coercion: `duration_ms` and
 /// `result_count` face numeric columns, and the collector coerces them there.
@@ -357,10 +344,7 @@ const RESERVED_ROOT_KEYS: &[&str] = &[
 /// Whether `key` is a root key the line owns — either structural or a promoted
 /// column.
 fn is_reserved_root_key(key: &str) -> bool {
-    RESERVED_ROOT_KEYS.contains(&key)
-        || PROMOTED_SPAN_FIELDS
-            .iter()
-            .any(|(_, column)| *column == key)
+    RESERVED_ROOT_KEYS.contains(&key) || PROMOTED_SPAN_FIELDS.iter().any(|(_, column)| *column == key)
 }
 
 /// A field value rendered as message text.
@@ -383,7 +367,7 @@ fn text_of(value: &serde_json::Value) -> String {
 /// cannot promise that.
 ///
 /// The struct field stays `service`; only the emitted key is `service_name`,
-/// which is the name of the `cortex_logs_v2` column and of the OTel resource
+/// which is the name of the log warehouse table's column and of the OTel resource
 /// attribute every other service already writes. Spelling it `service` on the
 /// wire bought a hydradb-only rename rule in the collector config, and a
 /// collector rule that exists for exactly one producer is a rule that stops
@@ -424,53 +408,25 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
     N: for<'a> FormatFields<'a> + 'static,
 {
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
-        event: &Event<'_>,
-    ) -> fmt::Result {
+    fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> fmt::Result {
         let meta = event.metadata();
         let mut line = serde_json::Map::new();
 
         line.insert(
             "timestamp".to_string(),
-            serde_json::Value::String(
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            ),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
         );
-        line.insert(
-            "level".to_string(),
-            serde_json::Value::String(meta.level().to_string()),
-        );
+        line.insert("level".to_string(), serde_json::Value::String(meta.level().to_string()));
         // Identity first-class on every line, not in a resource block the log
         // sink cannot see.
-        line.insert(
-            "binary".to_string(),
-            serde_json::Value::String(self.binary.to_string()),
-        );
-        line.insert(
-            "service_name".to_string(),
-            serde_json::Value::String(self.service.to_string()),
-        );
-        line.insert(
-            "instance".to_string(),
-            serde_json::Value::String(self.instance.clone()),
-        );
-        line.insert(
-            "version".to_string(),
-            serde_json::Value::String(self.version.clone()),
-        );
+        line.insert("binary".to_string(), serde_json::Value::String(self.binary.to_string()));
+        line.insert("service_name".to_string(), serde_json::Value::String(self.service.to_string()));
+        line.insert("instance".to_string(), serde_json::Value::String(self.instance.clone()));
+        line.insert("version".to_string(), serde_json::Value::String(self.version.clone()));
         if let Some(environment) = &self.environment {
-            line.insert(
-                "environment".to_string(),
-                serde_json::Value::String(environment.clone()),
-            );
+            line.insert("environment".to_string(), serde_json::Value::String(environment.clone()));
         }
-        line.insert(
-            "target".to_string(),
-            serde_json::Value::String(meta.target().to_string()),
-        );
+        line.insert("target".to_string(), serde_json::Value::String(meta.target().to_string()));
 
         // Trace correlation, top-level rather than under `fields`, because the
         // log collector reads these two keys by name to fill the OTLP
@@ -538,23 +494,15 @@ where
                 // massaging is needed to make them comparable.
                 operation = Some(span.name().to_string());
                 let mut entry = serde_json::Map::new();
-                entry.insert(
-                    "name".to_string(),
-                    serde_json::Value::String(span.name().to_string()),
-                );
+                entry.insert("name".to_string(), serde_json::Value::String(span.name().to_string()));
                 let extensions = span.extensions();
                 if let Some(formatted) = extensions.get::<FormattedFields<N>>() {
-                    if let Ok(serde_json::Value::Object(parsed)) =
-                        serde_json::from_str::<serde_json::Value>(formatted.fields.as_str())
-                    {
+                    if let Ok(serde_json::Value::Object(parsed)) = serde_json::from_str::<serde_json::Value>(formatted.fields.as_str()) {
                         for (key, value) in parsed {
                             // Walking root-first means the innermost span
                             // writes last and wins, which is what a nested
                             // scope should do.
-                            if let Some((_, column)) = PROMOTED_SPAN_FIELDS
-                                .iter()
-                                .find(|(field, _)| *field == key.as_str())
-                            {
+                            if let Some((_, column)) = PROMOTED_SPAN_FIELDS.iter().find(|(field, _)| *field == key.as_str()) {
                                 promoted.insert((*column).to_string(), value.clone());
                             }
                             // The synthetic `name` above is never merged in: it
@@ -579,8 +527,8 @@ where
         // level is what makes the line readable in a log viewer.
         //
         // It is also emitted *unconditionally*, and that is the fix for the
-        // worst thing these logs did: 1,559 of 1,570 staging ERROR rows carried
-        // the entire raw JSON log line in `message`. The collector merges the
+        // worst thing these logs did: nearly every ERROR row carried the
+        // entire raw JSON log line in `message`. The collector merges the
         // parsed keys over a record whose `message` starts out as the raw line,
         // so a line with no `message` key of its own never overwrites it and
         // the escape hatch becomes the value. `tracing::error!(error = …, name
@@ -595,12 +543,9 @@ where
             None => {
                 // Event before span at each rung: the event is closer to the
                 // call site, so its `error` is the one being reported.
-                let fallback = ["error", "name"].into_iter().find_map(|key| {
-                    fields
-                        .get(key)
-                        .or_else(|| span_merged.get(key))
-                        .map(|value| (key, text_of(value)))
-                });
+                let fallback = ["error", "name"]
+                    .into_iter()
+                    .find_map(|key| fields.get(key).or_else(|| span_merged.get(key)).map(|value| (key, text_of(value))));
                 match fallback {
                     Some((key, text)) => {
                         consumed.push(key);
@@ -629,9 +574,7 @@ where
         // Gated on ERROR and WARN because an `error_type` on an INFO line would
         // make every healthy line look classified, and the column's whole use
         // is `WHERE error_type = …` over the ones that failed.
-        if !promoted.contains_key("error_type")
-            && matches!(*meta.level(), tracing::Level::ERROR | tracing::Level::WARN)
-        {
+        if !promoted.contains_key("error_type") && matches!(*meta.level(), tracing::Level::ERROR | tracing::Level::WARN) {
             let class = match fields.get("name").or_else(|| span_merged.get("name")) {
                 Some(value) => {
                     consumed.push("name");
@@ -644,10 +587,7 @@ where
 
         line.extend(promoted);
         if let Some(operation) = operation {
-            line.insert(
-                "operation".to_string(),
-                serde_json::Value::String(operation),
-            );
+            line.insert("operation".to_string(), serde_json::Value::String(operation));
         }
         if !span_merged.is_empty() {
             line.insert("span".to_string(), serde_json::Value::Object(span_merged));
@@ -677,8 +617,7 @@ where
             line.insert("fields".to_string(), serde_json::Value::Object(nested));
         }
 
-        let rendered =
-            serde_json::to_string(&serde_json::Value::Object(line)).map_err(|_| fmt::Error)?;
+        let rendered = serde_json::to_string(&serde_json::Value::Object(line)).map_err(|_| fmt::Error)?;
         writeln!(writer, "{rendered}")
     }
 }

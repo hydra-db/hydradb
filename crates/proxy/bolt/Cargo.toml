@@ -1,0 +1,25 @@
+[package]
+name = "turbolay-proxy-bolt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The turbolay proxy's Bolt adapter: terminates client sessions, answers ROUTE, pools backend connections and relays units of work"
+publish = false
+
+# No pingora types. The session runs over any `AsyncRead + AsyncWrite`, so tests
+# drive it over an in-memory duplex or plain TCP and a server can put it behind
+# any listener, with or without TLS.
+[dependencies]
+deadpool = { workspace = true }
+hydradb-protocol = { path = "../../protocol" }
+hydradb-scope = { path = "../../scope" }
+prometheus = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
+tracing = { workspace = true }
+turbolay-proxy-core = { path = "../core" }
+turbolay-proxy-types = { path = "../types" }
+
+[dev-dependencies]
+arc-swap = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }

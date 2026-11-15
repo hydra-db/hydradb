@@ -1,9 +1,10 @@
 use std::fmt::{self, Write};
 
 use crate::{
-    BoundValue, GraphPhysicalPlan, GuardedAccess, PhysicalBinaryOperator, PhysicalExpression,
-    PhysicalProjection, PhysicalSort, PhysicalUnaryOperator, ScalarValue, Symbol, ValueOrigin,
+    BoundValue, GraphPhysicalPlan, PhysicalBinaryOperator, PhysicalExpression, PhysicalProjection, PhysicalSort, PhysicalUnaryOperator,
+    ScalarValue, Symbol, ValueOrigin,
 };
+use hydradb_cypher_ast::{NullOrdering, PathSearchKind, QueryConjunction};
 
 pub fn explain_physical_plan(plan: &GraphPhysicalPlan) -> String {
     let mut output = String::new();
@@ -18,7 +19,7 @@ thread_local! {
     static REDACT_LITERALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn redacting_literals() -> bool {
+pub(crate) fn redacting_literals() -> bool {
     REDACT_LITERALS.with(std::cell::Cell::get)
 }
 
@@ -31,7 +32,7 @@ fn redacting_literals() -> bool {
 /// redact the copy. Rendered as `?` in a shape, they stop `LIMIT 5` and
 /// `LIMIT 10` — or one query before and after a statistics refresh — from
 /// hashing to two plan identities for one operator tree.
-fn render_derived(value: impl fmt::Display) -> String {
+pub(crate) fn render_derived(value: impl fmt::Display) -> String {
     if redacting_literals() {
         "?".to_string()
     } else {
@@ -61,102 +62,18 @@ pub fn explain_physical_plan_shape(plan: &GraphPhysicalPlan) -> String {
 fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
     let indent = "  ".repeat(depth);
     match plan {
-        GraphPhysicalPlan::Union { arms, all } => {
-            let _ = writeln!(output, "{indent}UnionExec(all={all})");
+        GraphPhysicalPlan::Union { arms, all, conjunction } => {
+            let name = plan.operator_name();
+            let _ = if *conjunction == QueryConjunction::Otherwise {
+                writeln!(output, "{indent}{name}")
+            } else {
+                writeln!(output, "{indent}{name}(all={all})")
+            };
             for arm in arms {
                 render_plan(arm, depth + 1, output);
             }
         }
-        GraphPhysicalPlan::VertexIdSeek {
-            binding,
-            labels,
-            value,
-        } => {
-            let _ = writeln!(
-                output,
-                "{indent}VertexIdSeek(binding={binding}, labels={}, value={})",
-                render_symbols(labels),
-                render_value(value)
-            );
-        }
-        GraphPhysicalPlan::VertexPropertySeek {
-            binding,
-            labels,
-            property,
-            value,
-        } => {
-            let _ = writeln!(
-                output,
-                "{indent}VertexPropertySeek(binding={binding}, labels={}, property={property}, value={})",
-                render_symbols(labels),
-                render_value(value)
-            );
-        }
-        GraphPhysicalPlan::VertexPropertyMultiSeek {
-            binding,
-            labels,
-            property,
-            values,
-        } => {
-            // A plan shape must not vary with how many values a list bound.
-            let values = if redacting_literals() {
-                "...".to_string()
-            } else {
-                values
-                    .iter()
-                    .map(render_value)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let _ = writeln!(
-                output,
-                "{indent}VertexPropertyMultiSeek(binding={binding}, labels={}, property={property}, values=[{values}])",
-                render_symbols(labels)
-            );
-        }
-        GraphPhysicalPlan::VertexPropertyScan {
-            binding,
-            labels,
-            property,
-        } => {
-            let _ = writeln!(
-                output,
-                "{indent}VertexPropertyScan(binding={binding}, labels={}, property={property})",
-                render_symbols(labels)
-            );
-        }
-        GraphPhysicalPlan::OrderedVertexPropertyScan {
-            binding,
-            labels,
-            property,
-            direction,
-            prefix,
-            lower,
-            upper,
-            required,
-            items,
-            residual,
-        } => {
-            let prefix = prefix
-                .as_ref()
-                .map(render_value)
-                .unwrap_or_else(|| "none".to_string());
-            let lower = render_bound(lower.as_ref());
-            let upper = render_bound(upper.as_ref());
-            // Printed because the scan absorbed a Filter: without it the plan
-            // would read as though the index proved the whole predicate.
-            let residual = residual
-                .as_ref()
-                .map(render_expression)
-                .unwrap_or_else(|| "none".to_string());
-            let required = render_derived(required);
-            let _ = writeln!(
-                output,
-                "{indent}OrderedVertexPropertyScan(binding={binding}, labels={}, property={property}, direction={direction}, prefix={prefix}, lower={lower}, upper={upper}, required={required}, residual={residual}, items=[{}])",
-                render_symbols(labels),
-                SortList(items)
-            );
-        }
+        GraphPhysicalPlan::VertexScan { scan } => scan.render(depth, output),
         GraphPhysicalPlan::OrderedRelationshipPropertyScan {
             from,
             source_labels,
@@ -174,14 +91,8 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             items,
             residual,
         } => {
-            let residual = residual
-                .as_ref()
-                .map(render_expression)
-                .unwrap_or_else(|| "none".to_string());
-            let prefix = prefix
-                .as_ref()
-                .map(render_value)
-                .unwrap_or_else(|| "none".to_string());
+            let residual = residual.as_ref().map(render_expression).unwrap_or_else(|| "none".to_string());
+            let prefix = prefix.as_ref().map(render_value).unwrap_or_else(|| "none".to_string());
             let lower = render_bound(lower.as_ref());
             let upper = render_bound(upper.as_ref());
             let _ = writeln!(
@@ -192,20 +103,6 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
                 SortList(items)
             );
         }
-        GraphPhysicalPlan::VertexLabelScan {
-            binding,
-            label,
-            labels,
-        } => {
-            let _ = writeln!(
-                output,
-                "{indent}VertexLabelScan(binding={binding}, label={label}, labels={})",
-                render_symbols(labels)
-            );
-        }
-        GraphPhysicalPlan::AllVertexScan { binding } => {
-            let _ = writeln!(output, "{indent}AllVertexScan(binding={binding})");
-        }
         GraphPhysicalPlan::SingleRow => {
             let _ = writeln!(output, "{indent}SingleRowExec");
         }
@@ -213,10 +110,16 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             input,
             expression,
             binding,
+            position,
+            ..
         } => {
+            let position = match position {
+                Some((name, first)) => format!(", position={name} from {first}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 output,
-                "{indent}UnwindExec(binding={binding}, expression={})",
+                "{indent}UnwindExec(binding={binding}, expression={}{position})",
                 render_expression(expression)
             );
             render_plan(input, depth + 1, output);
@@ -256,11 +159,7 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             let values = if redacting_literals() {
                 "...".to_string()
             } else {
-                values
-                    .iter()
-                    .map(render_value)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                values.iter().map(render_value).collect::<Vec<_>>().join(", ")
             };
             let _ = writeln!(
                 output,
@@ -292,63 +191,6 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             );
             render_plan(fallback, depth + 1, output);
         }
-        GraphPhysicalPlan::VertexPropertyRangeSeek {
-            binding,
-            labels,
-            property,
-            lower,
-            upper,
-            estimated_rows,
-            read_limit,
-            fallback,
-        } => {
-            // Both numbers come from statistics: a refresh must not give one
-            // operator tree two plan identities.
-            let _ = writeln!(
-                output,
-                "{indent}VertexPropertyRangeSeek(binding={binding}, labels={}, property={property}, lower={}, upper={}, estimated_rows={}, read_limit={})",
-                render_symbols(labels),
-                render_bound(lower.as_ref()),
-                render_bound(upper.as_ref()),
-                render_derived(estimated_rows),
-                render_derived(read_limit)
-            );
-            render_plan(fallback, depth + 1, output);
-        }
-        GraphPhysicalPlan::VertexGuardedAccess {
-            binding,
-            labels,
-            access,
-            estimated_rows,
-            read_limit,
-            fallback,
-        } => {
-            let access = match access {
-                GuardedAccess::PropertySeek { property, values } => {
-                    // As for the multi-seek: a shape must not vary with how
-                    // many values a list bound.
-                    let values = if redacting_literals() && values.len() > 1 {
-                        "...".to_string()
-                    } else {
-                        values
-                            .iter()
-                            .map(render_value)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    format!("property={property}, values=[{values}]")
-                }
-                GuardedAccess::LabelScan { label } => format!("label={label}"),
-            };
-            let _ = writeln!(
-                output,
-                "{indent}VertexGuardedAccess(binding={binding}, labels={}, {access}, estimated_rows={}, read_limit={})",
-                render_symbols(labels),
-                render_derived(estimated_rows),
-                render_derived(read_limit)
-            );
-            render_plan(fallback, depth + 1, output);
-        }
         GraphPhysicalPlan::RelationshipTypeProbe {
             from,
             source_labels,
@@ -376,10 +218,7 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             to,
             target_labels,
         } => {
-            let relationship = relationship
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "_".to_string());
+            let relationship = relationship.as_ref().map(ToString::to_string).unwrap_or_else(|| "_".to_string());
             let _ = writeln!(
                 output,
                 "{indent}ExpandExec(from={from}, relationship={relationship}, types={}, direction={direction}, to={to}, target_labels={})",
@@ -398,6 +237,9 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             target_labels,
             min_hops,
             max_hops,
+            trail,
+            nodes,
+            iteration,
         } => {
             // `*1..2` and `*1..5` are the same operator tree over the same
             // schema names, so they are one shape however differently they
@@ -411,34 +253,108 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
                 .as_ref()
                 .map(|relationship| format!(", relationship={relationship}"))
                 .unwrap_or_default();
+            // Printed only for a walk, so a trail keeps its shape and hash.
+            let walk = if *trail { "" } else { ", walk" };
+            // Likewise printed only when a path mode prunes the walk.
+            let walk = match nodes {
+                crate::WalkNodes::Any => walk.to_string(),
+                crate::WalkNodes::Simple => format!("{walk}, simple"),
+                crate::WalkNodes::Acyclic => format!("{walk}, acyclic"),
+            };
             let _ = writeln!(
                 output,
-                "{indent}VariableExpandExec(from={from}{relationship}, types={}, direction={direction}, to={to}, target_labels={}, hops={hops})",
+                "{indent}VariableExpandExec(from={from}{relationship}, types={}, direction={direction}, to={to}, target_labels={}, hops={hops}{walk})",
                 render_symbols(relationship_types),
                 render_symbols(target_labels)
             );
             render_plan(input, depth + 1, output);
+            if let Some(iteration) = iteration {
+                let _ = writeln!(
+                    output,
+                    "{indent}  Iteration(source={}, relationship={}, target={})",
+                    iteration.source, iteration.relationship, iteration.target
+                );
+                render_plan(&iteration.plan, depth + 2, output);
+            }
         }
-        GraphPhysicalPlan::NaturalJoin {
-            left,
-            right,
-            optional,
+        GraphPhysicalPlan::Exists { input, subquery, binding } => {
+            let _ = writeln!(output, "{indent}ExistsMarkExec(binding={binding})");
+            render_plan(input, depth + 1, output);
+            render_plan(subquery, depth + 1, output);
+        }
+        GraphPhysicalPlan::ScalarSubquery {
+            input,
+            subquery,
+            column,
+            binding,
         } => {
-            let name = if *optional {
-                "LeftOuterNaturalJoinExec"
-            } else {
-                "NaturalJoinExec"
+            let _ = writeln!(output, "{indent}ScalarSubqueryExec(binding={binding}, column={column})");
+            render_plan(input, depth + 1, output);
+            render_plan(subquery, depth + 1, output);
+        }
+        GraphPhysicalPlan::CallProcedure {
+            input,
+            subquery,
+            columns,
+            optional,
+            ..
+        } => {
+            let columns = columns.iter().map(Symbol::as_str).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(output, "{indent}CallProcedureExec(columns=[{columns}], optional={optional})");
+            render_plan(input, depth + 1, output);
+            render_plan(subquery, depth + 1, output);
+        }
+        GraphPhysicalPlan::Next { input, next } => {
+            let _ = writeln!(output, "{indent}{}", plan.operator_name());
+            render_plan(input, depth + 1, output);
+            render_plan(next, depth + 1, output);
+        }
+        GraphPhysicalPlan::Finish { input } => {
+            let _ = writeln!(output, "{indent}FinishExec");
+            render_plan(input, depth + 1, output);
+        }
+        GraphPhysicalPlan::BindPath { input, names, .. } => {
+            let _ = writeln!(output, "{indent}BindPathExec(names={})", render_symbols(names));
+            render_plan(input, depth + 1, output);
+        }
+        GraphPhysicalPlan::SelectPaths {
+            input,
+            first,
+            last,
+            kind,
+            count,
+            ..
+        } => {
+            let kind = match kind {
+                PathSearchKind::Any => "any",
+                PathSearchKind::Shortest => "shortest",
+                PathSearchKind::ShortestGroups => "shortest_groups",
             };
+            let _ = writeln!(
+                output,
+                "{indent}SelectPathsExec(first={first}, last={last}, search={kind}, count={})",
+                render_expression(count)
+            );
+            render_plan(input, depth + 1, output);
+        }
+        GraphPhysicalPlan::PathUnion { inputs, words } => {
+            let _ = writeln!(output, "{indent}PathUnionExec(multiset={})", words.is_none());
+            for input in inputs {
+                render_plan(input, depth + 1, output);
+            }
+        }
+        GraphPhysicalPlan::NaturalJoin { left, right, optional } => {
+            let name = if *optional { "LeftOuterNaturalJoinExec" } else { "NaturalJoinExec" };
             let _ = writeln!(output, "{indent}{name}");
             render_plan(left, depth + 1, output);
             render_plan(right, depth + 1, output);
         }
-        GraphPhysicalPlan::Filter { input, predicate } => {
-            let _ = writeln!(
-                output,
-                "{indent}FilterExec(predicate={})",
-                render_expression(predicate)
-            );
+        GraphPhysicalPlan::Filter {
+            operation: _,
+            input,
+            predicate,
+        } => {
+            let _ = writeln!(output, "{indent}FilterExec(predicate={})", render_expression(predicate));
             render_plan(input, depth + 1, output);
         }
         GraphPhysicalPlan::Sort {
@@ -458,10 +374,7 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
                     .map(|rows| rows.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             };
-            let _ = writeln!(
-                output,
-                "{indent}SortExec(items=[{items}], estimated_input_rows={estimate})"
-            );
+            let _ = writeln!(output, "{indent}SortExec(items=[{items}], estimated_input_rows={estimate})");
             render_plan(input, depth + 1, output);
         }
         GraphPhysicalPlan::Skip { input, count } => {
@@ -473,6 +386,7 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             render_plan(input, depth + 1, output);
         }
         GraphPhysicalPlan::Project {
+            context,
             input,
             items,
             distinct,
@@ -480,31 +394,28 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             post_limit,
             ..
         } => {
-            let items = items
-                .iter()
-                .map(render_projection)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let items = items.iter().map(render_projection).collect::<Vec<_>>().join(", ");
             // A window applied after aggregation or DISTINCT has no operator
             // of its own, so it is shown here rather than silently dropped.
             let window = [("skip", post_skip), ("limit", post_limit)]
                 .into_iter()
-                .filter_map(|(name, count)| {
-                    count
-                        .as_ref()
-                        .map(|count| format!(", {name}={}", render_value(count)))
-                })
+                .filter_map(|(name, count)| count.as_ref().map(|count| format!(", {name}={}", render_value(count))))
                 .collect::<String>();
-            let _ = writeln!(
-                output,
-                "{indent}ProjectExec(distinct={distinct}, items=[{items}]{window})"
-            );
+            let frame = if context.fixed.is_empty() && context.defined.is_empty() && !context.explicit_grouping {
+                String::new()
+            } else {
+                format!(
+                    ", fixed={:?}, table={:?}, defines={:?}, explicit_grouping={}",
+                    context.fixed, context.table_columns, context.defined, context.explicit_grouping
+                )
+            };
+            let _ = writeln!(output, "{indent}ProjectExec(distinct={distinct}, items=[{items}]{window}{frame})");
             render_plan(input, depth + 1, output);
         }
     }
 }
 
-fn render_bound(bound: Option<&(BoundValue, bool)>) -> String {
+pub(crate) fn render_bound(bound: Option<&(BoundValue, bool)>) -> String {
     match bound {
         Some((value, true)) => format!("inclusive {}", render_value(value)),
         Some((value, false)) => format!("exclusive {}", render_value(value)),
@@ -512,7 +423,7 @@ fn render_bound(bound: Option<&(BoundValue, bool)>) -> String {
     }
 }
 
-fn render_sort(sort: &PhysicalSort) -> String {
+pub(crate) fn render_sort(sort: &PhysicalSort) -> String {
     let mut output = String::new();
     let _ = write_sort(&mut output, sort);
     output
@@ -534,7 +445,12 @@ impl fmt::Display for SortList<'_> {
 
 fn write_sort(output: &mut impl Write, sort: &PhysicalSort) -> fmt::Result {
     write_expression(output, &sort.expression)?;
-    write!(output, " {}", sort.direction)
+    write!(output, " {}", sort.direction)?;
+    match sort.nulls {
+        Some(NullOrdering::First) => output.write_str(" NULLS FIRST"),
+        Some(NullOrdering::Last) => output.write_str(" NULLS LAST"),
+        None => Ok(()),
+    }
 }
 
 fn render_projection(projection: &PhysicalProjection) -> String {
@@ -545,7 +461,7 @@ fn render_projection(projection: &PhysicalProjection) -> String {
     }
 }
 
-fn render_expression(expression: &PhysicalExpression) -> String {
+pub(crate) fn render_expression(expression: &PhysicalExpression) -> String {
     let mut output = String::new();
     let _ = write_expression(&mut output, expression);
     output
@@ -565,6 +481,66 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
     match expression {
         PhysicalExpression::Binding(binding) => write!(output, "{binding}"),
         PhysicalExpression::Identity(binding) => write!(output, "{binding}.id"),
+        PhysicalExpression::ElementTest { binding, test } => write!(output, "{}", test.expression_name(binding)),
+        PhysicalExpression::TypeTest {
+            expression,
+            value_type,
+            negated,
+        } => {
+            write_expression(output, expression)?;
+            write!(output, " IS {}TYPED {value_type}", if *negated { "NOT " } else { "" })
+        }
+        PhysicalExpression::Cast {
+            expression, value_type, ..
+        } => {
+            write!(output, "CAST(")?;
+            write_expression(output, expression)?;
+            write!(output, " AS {value_type})")
+        }
+        PhysicalExpression::Let { bindings, body } => {
+            write!(output, "LET ")?;
+            for (index, (name, value)) in bindings.iter().enumerate() {
+                if index > 0 {
+                    write!(output, ", ")?;
+                }
+                write!(output, "{name} = ")?;
+                write_expression(output, value)?;
+            }
+            write!(output, " IN ")?;
+            write_expression(output, body)?;
+            write!(output, " END")
+        }
+        PhysicalExpression::PathConstructor(elements) => {
+            write!(output, "PATH[")?;
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 {
+                    write!(output, ", ")?;
+                }
+                write_expression(output, element)?;
+            }
+            write!(output, "]")
+        }
+        PhysicalExpression::Record(fields) => {
+            write!(output, "{{")?;
+            for (index, (name, value)) in fields.iter().enumerate() {
+                if index > 0 {
+                    write!(output, ", ")?;
+                }
+                write!(output, "{name}: ")?;
+                write_expression(output, value)?;
+            }
+            write!(output, "}}")
+        }
+        PhysicalExpression::Field { expression, field } => {
+            write_expression(output, expression)?;
+            write!(output, ".{field}")
+        }
+        PhysicalExpression::PathNodesDistinct { simple, parts } => write!(
+            output,
+            "{}({})",
+            if *simple { "simple" } else { "acyclic" },
+            parts.iter().map(|part| part.name().as_str()).collect::<Vec<_>>().join(", ")
+        ),
         PhysicalExpression::Property { binding, property } => {
             write!(output, "{binding}.{property}")
         }
@@ -584,6 +560,8 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
             function,
             distinct,
             expression,
+            fraction,
+            ..
         } => {
             write!(output, "{}(", function.name())?;
             if *distinct {
@@ -592,6 +570,10 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
             match expression.as_deref() {
                 Some(expression) => write_expression(output, expression)?,
                 None => output.write_char('*')?,
+            }
+            if let Some(fraction) = fraction.as_deref() {
+                output.write_str(", ")?;
+                write_expression(output, fraction)?;
             }
             output.write_char(')')
         }
@@ -631,9 +613,13 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
             output.write_char(']')
         }
         PhysicalExpression::Function {
-            function,
+            function: super::ScalarFunction::IdProperty,
             arguments,
         } => {
+            write_expression(output, &arguments[0])?;
+            write!(output, ".id")
+        }
+        PhysicalExpression::Function { function, arguments } => {
             write!(output, "{}(", function.name())?;
             for (index, argument) in arguments.iter().enumerate() {
                 if index > 0 {
@@ -643,10 +629,7 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
             }
             output.write_char(')')
         }
-        PhysicalExpression::Unary {
-            operator,
-            expression,
-        } => {
+        PhysicalExpression::Unary { operator, expression } => {
             let (prefix, suffix) = match operator {
                 PhysicalUnaryOperator::Not => ("NOT ", ""),
                 PhysicalUnaryOperator::Plus => ("+", ""),
@@ -658,11 +641,7 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
             write_expression(output, expression)?;
             output.write_str(suffix)
         }
-        PhysicalExpression::Binary {
-            left,
-            operator,
-            right,
-        } => {
+        PhysicalExpression::Binary { left, operator, right } => {
             let operator = match operator {
                 PhysicalBinaryOperator::Equal => "=",
                 PhysicalBinaryOperator::NotEqual => "<>",
@@ -672,12 +651,17 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
                 PhysicalBinaryOperator::GreaterThanOrEqual => ">=",
                 PhysicalBinaryOperator::And => "AND",
                 PhysicalBinaryOperator::Or => "OR",
+                PhysicalBinaryOperator::Xor => "XOR",
                 PhysicalBinaryOperator::Add => "+",
                 PhysicalBinaryOperator::Subtract => "-",
                 PhysicalBinaryOperator::Multiply => "*",
                 PhysicalBinaryOperator::Divide => "/",
                 PhysicalBinaryOperator::Modulo => "%",
                 PhysicalBinaryOperator::StartsWith => "STARTS WITH",
+                PhysicalBinaryOperator::EndsWith => "ENDS WITH",
+                PhysicalBinaryOperator::Contains => "CONTAINS",
+                PhysicalBinaryOperator::Concatenate => "||",
+                PhysicalBinaryOperator::In => "IN",
             };
             output.write_char('(')?;
             write_expression(output, left)?;
@@ -688,7 +672,7 @@ fn write_expression(output: &mut impl Write, expression: &PhysicalExpression) ->
     }
 }
 
-fn render_value(value: &BoundValue) -> String {
+pub(crate) fn render_value(value: &BoundValue) -> String {
     let mut output = String::new();
     let _ = write_value(&mut output, value);
     output
@@ -704,17 +688,14 @@ fn write_value(output: &mut impl Write, value: &BoundValue) -> fmt::Result {
             ScalarValue::Integer(value) => write!(output, "{value}"),
             ScalarValue::Float(value) => write!(output, "{value}"),
             ScalarValue::String(value) => write!(output, "'{value}'"),
+            ScalarValue::Decimal(value) => write!(output, "{value}M"),
+            ScalarValue::Bytes(value) => write!(output, "X'{}'", hydradb_cypher_ast::bytes::hex(value)),
+            ScalarValue::Date(value) => write!(output, "DATE_EPOCH_DAY({value})"),
+            ScalarValue::List(values) => write!(output, "{values:?}"),
         },
     }
 }
 
-fn render_symbols(symbols: &[Symbol]) -> String {
-    format!(
-        "[{}]",
-        symbols
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+pub(crate) fn render_symbols(symbols: &[Symbol]) -> String {
+    format!("[{}]", symbols.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
 }

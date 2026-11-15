@@ -156,9 +156,7 @@ impl HydraDBSampler {
             return false;
         }
         let bytes = trace_id.to_bytes();
-        let low = u64::from_be_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
+        let low = u64::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]);
         // Shift away the sign bit so the comparison stays in the positive half
         // of the space, matching the upstream `TraceIdRatioBased` sampler.
         (low >> 1) < (self.ratio * (1u64 << 63) as f64) as u64
@@ -175,8 +173,7 @@ impl ShouldSample for HydraDBSampler {
         attributes: &[KeyValue],
         _links: &[Link],
     ) -> SamplingResult {
-        let parent_span_context =
-            parent_context.map(|context| context.span().span_context().clone());
+        let parent_span_context = parent_context.map(|context| context.span().span_context().clone());
 
         // A remote or local parent decides for the whole trace. Re-deciding per
         // span is what produces traces with holes in the middle.
@@ -200,9 +197,7 @@ impl ShouldSample for HydraDBSampler {
         SamplingResult {
             decision,
             attributes: Vec::new(),
-            trace_state: parent_span_context
-                .map(|parent| parent.trace_state().clone())
-                .unwrap_or_default(),
+            trace_state: parent_span_context.map(|parent| parent.trace_state().clone()).unwrap_or_default(),
         }
     }
 }

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hydra-db.github.io/hydradb/tck/divergences-v1.schema.json",
+  "title": "openCypher TCK divergence policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "divergences"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "divergences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["corpus_revision", "case_id", "engine", "layer", "expected_signature", "reason", "owner", "reference", "review_by"],
+        "properties": {
+          "corpus_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "case_id": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$"},
+          "engine": {"enum": ["legacy", "experimental"]},
+          "layer": {"enum": ["parser", "semantics", "execution", "diagnostics"]},
+          "expected_signature": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$"},
+          "reason": {"type": "string", "minLength": 1},
+          "owner": {"type": "string", "minLength": 1},
+          "reference": {"type": "string", "minLength": 1},
+          "review_by": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}

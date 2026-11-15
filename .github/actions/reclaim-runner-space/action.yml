@@ -1,0 +1,21 @@
+name: Reclaim runner disk space
+description: Remove unused Ubuntu runner SDKs and caches before a large build
+
+runs:
+  using: composite
+  steps:
+    - name: Remove unused runner software
+      shell: bash
+      run: |
+        set -euo pipefail
+        df -h "$GITHUB_WORKSPACE"
+        for unused_sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; do
+          if [ -d "$unused_sdk" ]; then
+            sudo find "$unused_sdk" -mindepth 1 -delete
+          fi
+        done
+        sudo docker image prune --all --force
+        sudo apt-get clean
+        df -h "$GITHUB_WORKSPACE"
+        available_kb="$(df --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')"
+        test "$available_kb" -ge 20971520

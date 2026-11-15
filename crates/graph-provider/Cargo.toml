@@ -1,0 +1,18 @@
+[package]
+name = "hydradb-graph-provider"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Backend-neutral graph catalog, read, and mutation provider contracts"
+publish = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+hydradb-graph-types = { path = "../graph-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -22,6 +22,10 @@ spec:
     - {{ include "hydradb.fullname" . }}-https.{{ .Release.Namespace }}.svc.cluster.local
     - {{ printf "*.%s-node-headless.%s.svc" (include "hydradb.fullname" .) .Release.Namespace | quote }}
     - {{ printf "*.%s-node-headless.%s.svc.cluster.local" (include "hydradb.fullname" .) .Release.Namespace | quote }}
+    {{- if .Values.proxy.enabled }}
+    - {{ include "hydradb.proxyServiceName" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "hydradb.proxyServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local
+    {{- end }}
     {{- range .Values.tls.public.additionalDnsNames }}
     - {{ . | quote }}
     {{- end }}

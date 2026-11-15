@@ -1,0 +1,461 @@
+// GQL additions to the staged Cypher 25 parser (ISO/IEC 39075:2024, as
+// Technical Corrigendum 1:2026 amends it). build.rs applies these to its copy
+// of query-language/cypher/grammar/Cypher25Parser.g4; the vendored file is untouched.
+//
+// Directives, one per item:
+//   //@ replace RULE       the item is RULE's new definition
+//   //@ extend RULE        the item is more alternatives for RULE (`| ...`)
+//   //@ insert-after RULE  the item is new rules, placed after RULE
+// A directive naming a rule the grammar lacks fails the build.
+//
+// Every item only adds: text Cypher 25 already parses keeps its parse.
+
+// §19.4: `EXISTS ( graph pattern )` beside `EXISTS { graph pattern }`.
+//@ extend existsExpression
+   | EXISTS LPAREN (queryWithLocalDefinitions | matchMode? patternList whereClause?) RPAREN
+
+//@ replace listLiteral
+listLiteral
+   : (LIST | ARRAY)? LBRACKET (expression (COMMA expression)* )? RBRACKET
+   ;
+
+
+// §16.4 G002: `DIFFERENT EDGES` and `DIFFERENT EDGE BINDINGS`.
+//@ extend matchMode
+   | DIFFERENT (EDGE BINDINGS? | EDGES)
+
+// §21.3: a <delimited identifier> may be double-quoted. GQL allows it where
+// it takes an <identifier> (labels, property names, other names), never for
+// a variable (§21.1: a <binding variable> is a <regular identifier>), so the
+// variable rule keeps backticks only. In a value expression a double-quoted
+// sequence is still a string literal: `literal` comes first there.
+//@ replace escapedSymbolicNameString
+escapedSymbolicNameString
+   : ESCAPED_SYMBOLIC_NAME
+   | STRING_LITERAL2
+   ;
+
+//@ replace escapedSymbolicVariableNameString
+escapedSymbolicVariableNameString
+   : ESCAPED_SYMBOLIC_NAME
+   ;
+
+// `edges`, `source`, `destination`, `nulls`, `first`, `last`, `otherwise`,
+// `except`, `intersect`, `ordinality`, `simple`, `keep`, `cast` and the type
+// name words stay names now that they are keywords.
+//@ extend unescapedSymbolicNameString_
+   | CAST
+   | UINT
+   | UINT8
+   | UINT16
+   | UINT32
+   | UINT64
+   | UINT128
+   | UINT256
+   | INT128
+   | INT256
+   | INTEGER128
+   | INTEGER256
+   | SMALLINT
+   | BIGINT
+   | USMALLINT
+   | UBIGINT
+   | UNSIGNED
+   | SMALL
+   | BIG
+   | DECIMAL
+   | DEC
+   | FLOAT16
+   | FLOAT128
+   | FLOAT256
+   | REAL
+   | DOUBLE
+   | PRECISION
+   | CHAR
+   | BYTES
+   | BINARY
+   | VARBINARY
+   | RECORD
+   | YEAR
+   | MONTH
+   | DAY
+   | DURATION_BETWEEN
+   | INTERVAL
+   | HOUR
+   | MINUTE
+   | EDGES
+   | SOURCE
+   | DESTINATION
+   | NULLS
+   | FIRST
+   | LAST
+   | OTHERWISE
+   | EXCEPT
+   | INTERSECT
+   | ORDINALITY
+   | SIMPLE
+   | KEEP
+
+// §21.2 GL11: no-escape string literals.
+//@ extend stringLiteral
+   | NO_ESCAPE_STRING_LITERAL1
+   | NO_ESCAPE_STRING_LITERAL2
+
+// §21.2 GL03: binary integer literals.
+//@ replace numberLiteral
+numberLiteral
+   : MINUS? (
+      DECIMAL_DOUBLE
+      | UNSIGNED_DECIMAL_INTEGER
+      | UNSIGNED_HEX_INTEGER
+      | UNSIGNED_OCTAL_INTEGER
+      | UNSIGNED_BINARY_INTEGER
+   )
+   ;
+
+// §16.7 G044, G045: abbreviated edge patterns `-`, `->`, `<-` and `<->`. Only
+// in a graph pattern element: pattern expressions keep the Cypher rule, so
+// `(a)-(b)` and `(a)<-(b)` in a value expression stay arithmetic. G046, G047:
+// node patterns side by side, and edges with no node pattern between or
+// around them. G043, G045: edges that may be undirected. §16.12 G039, G080
+// to G082: simplified path pattern expressions. G037: `?` after an edge or a
+// parenthesized path.
+//@ replace patternElement
+patternElement
+   : (nodePattern (quantifier | QUESTION)? | (relationshipPattern | abbreviatedRelationshipPattern | tildeRelationshipPattern | simplifiedPathPattern) (quantifier | QUESTION)? | parenthesizedPath QUESTION?)+
+   ;
+
+//@ insert-after patternElement
+abbreviatedRelationshipPattern
+   : leftArrow? arrowLine rightArrow?
+   ;
+
+// §16.11, §21.2 SR7: every unsigned integer spelling is a bound.
+//@ replace quantifier
+quantifier
+   : LCURLY (UNSIGNED_DECIMAL_INTEGER | UNSIGNED_HEX_INTEGER | UNSIGNED_OCTAL_INTEGER | UNSIGNED_BINARY_INTEGER) RCURLY
+   | LCURLY (UNSIGNED_DECIMAL_INTEGER | UNSIGNED_HEX_INTEGER | UNSIGNED_OCTAL_INTEGER | UNSIGNED_BINARY_INTEGER)?
+     COMMA (UNSIGNED_DECIMAL_INTEGER | UNSIGNED_HEX_INTEGER | UNSIGNED_OCTAL_INTEGER | UNSIGNED_BINARY_INTEGER)? RCURLY
+   | PLUS
+   | TIMES
+   ;
+
+// §14.11: a <return item alias> is AS <identifier>, so it may be
+// double-quoted too.
+//@ replace returnItem
+returnItem
+   : expression (AS (variable | STRING_LITERAL2))?
+   ;
+
+// §19.10 G112: `n IS [NOT] SOURCE OF e`, `n IS [NOT] DESTINATION OF e`.
+//@ extend comparisonExpression6
+   | IS NOT? (SOURCE | DESTINATION) OF variable       # SourceDestinationComparison
+
+// §16.17 GA03: an explicit null ordering after the direction.
+//@ replace orderItem
+orderItem
+   : expression (ascToken | descToken)? (NULLS (FIRST | LAST))?
+   ;
+
+// §14.2 GQ02, GQ04 to GQ07: every query conjunction, not only UNION.
+//@ replace union
+union
+   : singleQuery (((UNION | EXCEPT | INTERSECT) (ALL | DISTINCT)? | OTHERWISE) singleQuery)*
+   ;
+
+// §14.8 GQ11, GQ24: `FOR x IN list WITH ORDINALITY i` or `WITH OFFSET i`.
+//@ replace forListClause
+forListClause
+   : FOR variable IN expression (WITH (ORDINALITY | OFFSET) variable)?
+   ;
+
+// §14.4 GQ21: `OPTIONAL { MATCH ... }` and `OPTIONAL ( MATCH ... )`.
+//@ extend clause
+   | optionalBlockClause
+
+//@ insert-after matchClause
+optionalBlockClause
+   : OPTIONAL (LCURLY optionalBlockStatement+ RCURLY | LPAREN optionalBlockStatement+ RPAREN)
+   ;
+
+optionalBlockStatement
+   : matchClause
+   | optionalBlockClause
+   ;
+
+// §20.6 GQ18: `VALUE { query }`; §20.8 GA05: CAST; §20.18 GV45: a record
+// constructor, first, so `RECORD {a: 1}` is not read as a map projection of
+// a variable named `record`.
+//@ replace expression1
+expression1
+   : recordConstructor
+   | letValueExpression
+   | pathConstructor
+   | temporalLiteral
+   | durationBetween
+   | literal
+   | parameter
+   | caseExpression
+   | extendedCaseExpression
+   | countStar
+   | existsExpression
+   | countExpression
+   | collectExpression
+   | mapProjection
+   | listComprehension
+   | listLiteral
+   | patternComprehension
+   | reduceExpression
+   | allReduceExpression
+   | listItemsPredicate
+   | normalizeFunction
+   | vectorFunction
+   | vectorDistanceFunction
+   | vectorNormFunction
+   | trimFunction
+   | propertyExistsPredicate
+   | patternExpression
+   | shortestPathExpression
+   | parenthesizedExpression
+   | functionInvocation
+   | interpolatedStringLiteral
+   | variable
+   | obfuscatedLiteral
+   | valueQueryExpression
+   | castSpecification
+   ;
+
+//@ insert-after existsExpression
+valueQueryExpression
+   : VALUE LCURLY queryWithLocalDefinitions RCURLY
+   ;
+
+// §16.6 G012: SIMPLE beside WALK, TRAIL and ACYCLIC.
+//@ extend pathMode
+   | SIMPLE
+
+// §16.4 G006, G007: `KEEP <path pattern prefix>` after the path patterns;
+// §16.3 GQ19: `YIELD` after the graph pattern's WHERE.
+//@ replace matchClause
+matchClause
+   : OPTIONAL? MATCH matchMode? patternList (KEEP pathPatternPrefix)? hint* (whereClause? searchClause? | searchClause whereClause) (YIELD variable (COMMA variable)*)?
+   ;
+
+// §16.7 G030 to G033: a <path pattern union>, `A | B`, or a <path multiset
+// alternation>, `A |+| B`; the two operators do not mix.
+//@ replace anonymousPattern
+anonymousPattern
+   : shortestPathPattern
+   | patternElement ((BAR patternElement)+ | (MULTISET_ALTERNATION patternElement)+)?
+   ;
+
+// §16.7 G043, G045: `~[ ]~`, `<~[ ]~`, `~[ ]~>`, and abbreviated `~`, `<~`,
+// `~>`.
+//@ insert-after patternElement
+tildeRelationshipPattern
+   : TILDE (LBRACKET tildeEdgeFiller RBRACKET TILDE)? GT?
+   | LT TILDE (LBRACKET tildeEdgeFiller RBRACKET TILDE)?
+   ;
+
+tildeEdgeFiller
+   : WHERE expression
+   | variable? labelExpression? properties? (WHERE expression)?
+   ;
+
+// §16.12: a <simplified path pattern expression>, its delimiters spelled as
+// the tokens they are made of (`-/` is a minus and a slash), so `4/-2` stays
+// arithmetic.
+simplifiedPathPattern
+   : leftArrow? arrowLine DIVIDE simplifiedContents DIVIDE arrowLine rightArrow?
+   | TILDE DIVIDE simplifiedContents DIVIDE TILDE GT?
+   | LT TILDE DIVIDE simplifiedContents DIVIDE TILDE
+   ;
+
+simplifiedContents
+   : simplifiedTerm ((BAR simplifiedTerm)+ | (MULTISET_ALTERNATION simplifiedTerm)+)?
+   ;
+
+simplifiedTerm
+   : simplifiedFactorLow+
+   ;
+
+simplifiedFactorLow
+   : simplifiedFactorHigh (AMPERSAND simplifiedFactorHigh)*
+   ;
+
+simplifiedFactorHigh
+   : simplifiedTertiary (quantifier | QUESTION)?
+   ;
+
+simplifiedTertiary
+   : LT simplifiedSecondary GT?
+   | LT TILDE simplifiedSecondary
+   | TILDE simplifiedSecondary GT?
+   | MINUS simplifiedSecondary
+   | simplifiedSecondary GT?
+   ;
+
+simplifiedSecondary
+   : EXCLAMATION_MARK? simplifiedPrimary
+   ;
+
+simplifiedPrimary
+   : symbolicNameString
+   | LPAREN simplifiedContents RPAREN
+   ;
+
+// §20.8 GA05: `CAST ( operand AS value type )`.
+//@ insert-after expression1
+castSpecification
+   : CAST LPAREN expression AS type RPAREN
+   ;
+
+// §21.2 GV39 to GV41: `DATE '...'`, `TIME '...'`, `DATETIME '...'`,
+// `TIMESTAMP '...'` and `DURATION '...'`.
+temporalLiteral
+   : (DATE | TIME | DATETIME | TIMESTAMP | DURATION) stringLiteral
+   | INTERVAL (PLUS | MINUS)? stringLiteral intervalQualifier
+   ;
+
+// §21.2 GL12, ISO/IEC 9075-2 §10.1: `YEAR TO MONTH`, `DAY(3)`, `SECOND(2, 3)`.
+intervalQualifier
+   : intervalField (TO intervalField)?
+   ;
+
+intervalField
+   : (YEAR | MONTH | DAY | HOUR | MINUTE | SECOND) (LPAREN UNSIGNED_DECIMAL_INTEGER (COMMA UNSIGNED_DECIMAL_INTEGER)? RPAREN)?
+   ;
+
+// §20.28 GV41: `DURATION_BETWEEN(a, b) [YEAR TO MONTH | DAY TO SECOND]`.
+durationBetween
+   : DURATION_BETWEEN LPAREN expression COMMA expression RPAREN temporalDurationQualifier?
+   ;
+
+temporalDurationQualifier
+   : YEAR TO MONTH
+   | DAY TO SECOND
+   ;
+
+// §20.5 GE03: `LET x = value, ... IN expression END`.
+letValueExpression
+   : LET letItem (COMMA letItem)* IN expression END
+   ;
+
+// §20.14 GE06: `PATH[node, edge, node, ...]`.
+pathConstructor
+   : PATH LBRACKET expression (COMMA expression)* RBRACKET
+   ;
+
+// §20.18 GV45: `RECORD { field: value, ... }`; without the word, a map.
+recordConstructor
+   : RECORD map
+   ;
+
+// §18.9: GQL's value types beside Cypher's type names. A list type may give
+// a maximum length (GV51).
+//@ replace typeName
+typeName
+   : NOTHING
+   | NULL
+   | BOOL
+   | BOOLEAN
+   | VARCHAR (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | STRING (LPAREN (UNSIGNED_DECIMAL_INTEGER COMMA)? UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | CHAR (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | BYTES (LPAREN (UNSIGNED_DECIMAL_INTEGER COMMA)? UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | BINARY (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | VARBINARY (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | UUID
+   | INT8 | INT16 | INT32 | INT64 | INT128 | INT256 | SMALLINT | BIGINT
+   | INT (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | UINT8 | UINT16 | UINT32 | UINT64 | UINT128 | UINT256 | USMALLINT | UBIGINT
+   | UINT (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?
+   | (SIGNED | UNSIGNED)? (INTEGER8 | INTEGER16 | INTEGER32 | INTEGER64 | INTEGER128 | INTEGER256 | SMALL INTEGER | BIG INTEGER | INTEGER (LPAREN UNSIGNED_DECIMAL_INTEGER RPAREN)?)
+   | (DECIMAL | DEC) (LPAREN UNSIGNED_DECIMAL_INTEGER (COMMA UNSIGNED_DECIMAL_INTEGER)? RPAREN)?
+   | FLOAT16 | FLOAT32 | FLOAT64 | FLOAT128 | FLOAT256 | REAL | DOUBLE PRECISION?
+   | FLOAT (LPAREN UNSIGNED_DECIMAL_INTEGER (COMMA UNSIGNED_DECIMAL_INTEGER)? RPAREN)?
+   | DATE
+   | LOCAL (TIME | DATETIME)
+   | ZONED (TIME | DATETIME)
+   | TIME (WITHOUT | WITH) (TIMEZONE | TIME ZONE)
+   | TIMESTAMP ((WITHOUT | WITH) (TIMEZONE | TIME ZONE))?
+   | DURATION (LPAREN temporalDurationQualifier RPAREN)?
+   | POINT
+   | NODE
+   | VECTOR LPAREN signedIntegerLiteral COMMA vectorCoordinateType RPAREN
+   | VECTOR (LT vectorCoordinateType GT)? (LPAREN signedIntegerLiteral RPAREN)?
+   | VERTEX
+   | RELATIONSHIP
+   | EDGE
+   | MAP
+   | (LIST | ARRAY) LT type GT listMaximumLength?
+   | (LIST | ARRAY) listMaximumLength?
+   | PATH
+   | PATHS
+   | PROPERTY VALUE
+   | ANY? PROPERTY? GRAPH
+   | RECORD
+   | RECORD? LCURLY (fieldType (COMMA fieldType)*)? RCURLY
+   | ANY (
+      NODE
+      | VERTEX
+      | RELATIONSHIP
+      | EDGE
+      | MAP
+      | RECORD
+      | PROPERTY VALUE
+      | VALUE? LT type GT
+      | VALUE
+   )?
+   ;
+
+listMaximumLength
+   : LBRACKET UNSIGNED_DECIMAL_INTEGER RBRACKET
+   ;
+
+// §18.10: a <field type>.
+fieldType
+   : symbolicNameString (TYPED | COLONCOLON)? type
+   ;
+
+//@ replace typeListSuffix
+typeListSuffix
+   : (LIST | ARRAY) listMaximumLength? typeNullability?
+   ;
+
+// §21.2 GV35: `X'00FF'`.
+//@ extend literal
+   | byteStringSequence # ByteStringLiteral
+
+//@ insert-after literal
+byteStringSequence
+   : BYTE_STRING_LITERAL STRING_LITERAL1*
+   ;
+// §9.2 GP17, §10.3 GP05 to GP07: a procedure body's binding variable
+// definition block, before its statements.
+//@ replace queryWithLocalDefinitions
+queryWithLocalDefinitions
+   : (DEFINE localDefinition)* bindingVariableDefinition* nextStatement
+   ;
+
+//@ insert-after queryWithLocalDefinitions
+bindingVariableDefinition
+   : valueVariableDefinition
+   ;
+
+valueVariableDefinition
+   : VALUE variable ((TYPED | COLONCOLON)? type)? EQ expression
+   ;
+
+// §14.7, Cor1 CR2: explicit VALUE items use the same definitions as a
+// procedure body, but the LET statement returns their names as columns.
+//@ replace letClause
+letClause
+   : LET letVariableDefinition (COMMA letVariableDefinition)*
+   ;
+
+//@ insert-after letClause
+letVariableDefinition
+   : valueVariableDefinition
+   | letItem
+   ;

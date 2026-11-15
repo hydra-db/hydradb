@@ -1,9 +1,14 @@
 use super::*;
 
+#[cfg(feature = "datafusion-cypher-engine")]
+pub mod datafusion_cypher;
+
 #[cfg(feature = "opencypher")]
 mod degree_procedure;
 #[cfg(feature = "experimental-cypher-engine")]
 mod experimental_cypher;
+#[cfg(feature = "opencypher")]
+mod gds_procedure;
 #[cfg(feature = "opencypher")]
 mod graph_plan;
 mod lifecycle;
@@ -19,7 +24,7 @@ pub(crate) mod write_pipeline;
 pub(crate) mod xlog;
 
 #[cfg(feature = "experimental-cypher-engine")]
-pub(crate) use experimental_cypher::{
-    PlannerStatisticsCache, PlannerStatisticsHintFailure, PlannerStatisticsHints,
-};
+pub(crate) use experimental_cypher::{PlannerStatisticsCache, PlannerStatisticsHintFailure, PlannerStatisticsHints};
 pub(crate) use query::QueryBudget;
+#[cfg(feature = "opencypher")]
+pub(crate) use write::{RelationshipMetadataUpdate, WriteBackOutcome};

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::gds_procedure::{is_gds_call, parse_gds_procedure, GdsProcedure};
 use crate::QueryFailureReason;
 use crate::{GraphError, QueryColumn, QueryFloat, Result, VertexId, VertexPropertyValue};
 
@@ -77,12 +78,13 @@ struct ParsedNativePathCall {
     projections: Vec<NativePathProjection>,
 }
 
-/// Every `CALL algo.*` procedure the engine answers natively, outside both
-/// Cypher planners.
+/// Every `CALL algo.*` and `gds.*` call the engine answers natively, outside
+/// both Cypher planners.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum NativeProcedure {
     Path(Box<NativePathProcedure>),
     Degree(NativeDegreeProcedure),
+    Gds(GdsProcedure),
 }
 
 impl NativeProcedure {
@@ -90,6 +92,7 @@ impl NativeProcedure {
         match self {
             Self::Path(procedure) => procedure.kind.procedure_name(),
             Self::Degree(_) => NATIVE_DEGREE_PROCEDURE_NAME,
+            Self::Gds(procedure) => procedure.call.procedure_name(),
         }
     }
 }
@@ -174,37 +177,41 @@ impl NativeDegreeProcedure {
     }
 }
 
+/// Whether the query is a `CALL algo.*` or a `gds.*` call, which neither
+/// Cypher planner sees.
 pub(crate) fn is_native_path_procedure(query: &str) -> bool {
-    let query = query.trim_start();
-    query
-        .get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CALL"))
-        && query[4..]
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("algo.")
+    is_algo_procedure(query) || is_gds_call(query)
 }
 
-/// Parse any natively executed `CALL algo.*` procedure. `None` means the
-/// query is not one, and belongs to a Cypher planner.
+fn is_algo_procedure(query: &str) -> bool {
+    let query = query.trim_start();
+    query.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("CALL"))
+        && query[4..].trim_start().to_ascii_lowercase().starts_with("algo.")
+}
+
+/// Parse any natively executed `CALL algo.*` procedure or `gds.*` call.
+/// `None` means the query is not one, and belongs to a Cypher planner.
 pub(crate) fn parse_native_procedure(
     query: &str,
     parameters: &BTreeMap<String, VertexPropertyValue>,
     max_traversal_hops: u8,
 ) -> Result<Option<NativeProcedure>> {
+    if is_gds_call(query) {
+        return parse_gds_procedure(query, parameters).map(|procedure| Some(NativeProcedure::Gds(procedure)));
+    }
     if let Some(degree) = parse_native_degree_procedure(query, parameters)? {
         return Ok(Some(NativeProcedure::Degree(degree)));
     }
-    Ok(
-        parse_native_path_procedure(query, parameters, max_traversal_hops)?
-            .map(|procedure| NativeProcedure::Path(Box::new(procedure))),
-    )
+    Ok(parse_native_path_procedure(query, parameters, max_traversal_hops)?.map(|procedure| NativeProcedure::Path(Box::new(procedure))))
 }
 
 /// The result columns of a native procedure, known before execution so Bolt
 /// can send them with the RUN response.
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_native_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
+    if is_gds_call(query) {
+        return parse_gds_procedure(query, &BTreeMap::new()).map(|procedure| Some(procedure.columns()));
+    }
     if let Some(parsed) = parse_native_degree_call(query)? {
         return Ok(Some(
             parsed
@@ -225,11 +232,7 @@ pub(crate) fn parse_native_path_procedure(
     let Some(parsed) = parse_native_path_call(query)? else {
         return Ok(None);
     };
-    let ParsedNativePathCall {
-        kind,
-        config,
-        projections,
-    } = parsed;
+    let ParsedNativePathCall { kind, config, projections } = parsed;
 
     let (source, target, source_selector, target_selector, pairwise) = match kind {
         NativePathProcedureKind::SinglePair => {
@@ -257,30 +260,25 @@ pub(crate) fn parse_native_path_procedure(
             (0, None, Some(source_selector), target_selector, pairwise)
         }
     };
-    let rel_types =
-        config_string_list(&config, "relTypes")?.ok_or_else(|| GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Procedure,
-            dialect: "OpenCypher",
-            feature: "native path procedures require a non-empty relTypes list".to_string(),
-        })?;
+    let rel_types = config_string_list(&config, "relTypes")?.ok_or_else(|| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Procedure,
+        dialect: "OpenCypher",
+        feature: "native path procedures require a non-empty relTypes list".to_string(),
+    })?;
     if rel_types.is_empty() {
         return path_parse_error("native path procedures require a non-empty relTypes list");
     }
     for edge_type in &rel_types {
         crate::validate_component("edge_type", edge_type)?;
     }
-    let direction_value =
-        config_string(&config, "relDirection", parameters)?.map(|value| value.to_ascii_lowercase());
+    let direction_value = config_string(&config, "relDirection", parameters)?.map(|value| value.to_ascii_lowercase());
     let direction = match direction_value.as_deref() {
         None | Some("outgoing") => NativePathDirection::Outgoing,
         Some("incoming") => NativePathDirection::Incoming,
         Some("both") => NativePathDirection::Both,
-        Some(_) => {
-            return path_parse_error("relDirection must be 'incoming', 'outgoing', or 'both'")
-        }
+        Some(_) => return path_parse_error("relDirection must be 'incoming', 'outgoing', or 'both'"),
     };
-    let max_len =
-        config_u64(&config, "maxLen", parameters)?.unwrap_or(u64::from(max_traversal_hops));
+    let max_len = config_u64(&config, "maxLen", parameters)?.unwrap_or(u64::from(max_traversal_hops));
     if max_len > u64::from(max_traversal_hops) {
         return Err(GraphError::AdmissionRejected {
             operation: "native_path_max_len",
@@ -296,19 +294,12 @@ pub(crate) fn parse_native_path_procedure(
     let weight_property = config_string(&config, "weightProp", parameters)?;
     let cost_property = config_string(&config, "costProp", parameters)?;
     let max_cost = config_number(&config, "maxCost", parameters)?.map(QueryFloat);
-    let fair_relationship_variants =
-        config_bool(&config, "fairRelationshipVariants")?.unwrap_or(false);
+    let fair_relationship_variants = config_bool(&config, "fairRelationshipVariants")?.unwrap_or(false);
     if fair_relationship_variants && (kind != NativePathProcedureKind::MultiSource || !pairwise) {
-        return path_parse_error(
-            "fairRelationshipVariants is only supported by pairwise algo.MSpaths",
-        );
+        return path_parse_error("fairRelationshipVariants is only supported by pairwise algo.MSpaths");
     }
-    if fair_relationship_variants
-        && (weight_property.is_some() || cost_property.is_some() || max_cost.is_some())
-    {
-        return path_parse_error(
-            "fairRelationshipVariants requires an unweighted pairwise algo.MSpaths query",
-        );
+    if fair_relationship_variants && (weight_property.is_some() || cost_property.is_some() || max_cost.is_some()) {
+        return path_parse_error("fairRelationshipVariants requires an unweighted pairwise algo.MSpaths query");
     }
     let known = [
         "sourceNode",
@@ -344,19 +335,11 @@ pub(crate) fn parse_native_path_procedure(
         "fairRelationshipVariants",
     ];
     if kind != NativePathProcedureKind::MultiSource {
-        if let Some(option) = multi_source_options
-            .iter()
-            .find(|option| config.contains_key(**option))
-        {
+        if let Some(option) = multi_source_options.iter().find(|option| config.contains_key(**option)) {
             return path_parse_error(format!("{option} is only supported by algo.MSpaths"));
         }
-    } else if let Some(option) = ["sourceNode", "targetNode"]
-        .iter()
-        .find(|option| config.contains_key(**option))
-    {
-        return path_parse_error(format!(
-            "{option} is not supported by algo.MSpaths; use indexed selectors"
-        ));
+    } else if let Some(option) = ["sourceNode", "targetNode"].iter().find(|option| config.contains_key(**option)) {
+        return path_parse_error(format!("{option} is not supported by algo.MSpaths; use indexed selectors"));
     }
     Ok(Some(NativePathProcedure {
         kind,
@@ -380,17 +363,11 @@ pub(crate) fn parse_native_path_procedure(
 
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_native_path_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
-    Ok(parse_native_path_call(query)?.map(|parsed| {
-        parsed
-            .projections
-            .into_iter()
-            .map(NativePathProjection::column)
-            .collect()
-    }))
+    Ok(parse_native_path_call(query)?.map(|parsed| parsed.projections.into_iter().map(NativePathProjection::column).collect()))
 }
 
 fn parse_native_path_call(query: &str) -> Result<Option<ParsedNativePathCall>> {
-    if !is_native_path_procedure(query) {
+    if !is_algo_procedure(query) {
         return Ok(None);
     }
     let mut parser = Parser::new(query)?;
@@ -421,11 +398,7 @@ fn parse_native_path_call(query: &str) -> Result<Option<ParsedNativePathCall>> {
             return path_parse_error("RETURN may only reference yielded path columns");
         }
     }
-    Ok(Some(ParsedNativePathCall {
-        kind,
-        config,
-        projections,
-    }))
+    Ok(Some(ParsedNativePathCall { kind, config, projections }))
 }
 
 struct ParsedNativeDegreeCall {
@@ -433,33 +406,17 @@ struct ParsedNativeDegreeCall {
     projections: Vec<NativeDegreeProjection>,
 }
 
-fn parse_native_degree_procedure(
-    query: &str,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<Option<NativeDegreeProcedure>> {
-    let Some(ParsedNativeDegreeCall {
-        config,
-        projections,
-    }) = parse_native_degree_call(query)?
-    else {
+fn parse_native_degree_procedure(query: &str, parameters: &BTreeMap<String, VertexPropertyValue>) -> Result<Option<NativeDegreeProcedure>> {
+    let Some(ParsedNativeDegreeCall { config, projections }) = parse_native_degree_call(query)? else {
         return Ok(None);
     };
-    let known = [
-        "label",
-        "neighborLabel",
-        "relTypes",
-        "relDirection",
-        "minDegree",
-        "limit",
-    ];
+    let known = ["label", "neighborLabel", "relTypes", "relDirection", "minDegree", "limit"];
     if let Some(unknown) = config.keys().find(|key| !known.contains(&key.as_str())) {
         return path_parse_error(format!("unknown algo.degree option {unknown}"));
     }
-    let label = config_string(&config, "label", parameters)?.ok_or_else(|| {
-        GraphError::MissingQueryParameter {
-            dialect: "OpenCypher",
-            name: "label".to_string(),
-        }
+    let label = config_string(&config, "label", parameters)?.ok_or_else(|| GraphError::MissingQueryParameter {
+        dialect: "OpenCypher",
+        name: "label".to_string(),
     })?;
     crate::validate_component("label", &label)?;
     let neighbor_label = config_string(&config, "neighborLabel", parameters)?;
@@ -484,11 +441,7 @@ fn parse_native_degree_procedure(
         Some("outgoing") => NativeDegreeDirection::Outgoing,
         Some("incoming") => NativeDegreeDirection::Incoming,
         Some("undirected") => NativeDegreeDirection::Undirected,
-        Some(_) => {
-            return path_parse_error(
-                "relDirection must be 'incoming', 'outgoing', 'both', or 'undirected'",
-            )
-        }
+        Some(_) => return path_parse_error("relDirection must be 'incoming', 'outgoing', 'both', or 'undirected'"),
     };
     let min_degree = config_u64(&config, "minDegree", parameters)?.unwrap_or(0);
     let limit = config_u64(&config, "limit", parameters)?;
@@ -507,7 +460,7 @@ fn parse_native_degree_procedure(
 }
 
 fn parse_native_degree_call(query: &str) -> Result<Option<ParsedNativeDegreeCall>> {
-    if !is_native_path_procedure(query) {
+    if !is_algo_procedure(query) {
         return Ok(None);
     }
     let mut parser = Parser::new(query)?;
@@ -540,9 +493,7 @@ fn parse_native_degree_call(query: &str) -> Result<Option<ParsedNativeDegreeCall
     loop {
         let variable = parser.identifier()?;
         if !yielded.contains(&variable) {
-            return path_parse_error(format!(
-                "RETURN may only reference yielded algo.degree columns, not {variable}"
-            ));
+            return path_parse_error(format!("RETURN may only reference yielded algo.degree columns, not {variable}"));
         }
         let (value, default_column) = if parser.optional(Token::Dot) {
             if variable != "node" {
@@ -562,10 +513,7 @@ fn parse_native_degree_call(query: &str) -> Result<Option<ParsedNativeDegreeCall
         } else {
             default_column
         };
-        if projections
-            .iter()
-            .any(|projection| projection.column == column)
-        {
+        if projections.iter().any(|projection| projection.column == column) {
             return path_parse_error(format!("duplicate algo.degree result column {column}"));
         }
         projections.push(NativeDegreeProjection { value, column });
@@ -575,21 +523,13 @@ fn parse_native_degree_call(query: &str) -> Result<Option<ParsedNativeDegreeCall
     }
     parser.optional(Token::Semicolon);
     parser.end()?;
-    Ok(Some(ParsedNativeDegreeCall {
-        config,
-        projections,
-    }))
+    Ok(Some(ParsedNativeDegreeCall { config, projections }))
 }
 
-fn required_selector(
-    config: &BTreeMap<String, ConfigValue>,
-    prefix: &str,
-) -> Result<NativePathNodeSelector> {
-    optional_selector_parts(config, prefix, None)?.ok_or_else(|| {
-        GraphError::MissingQueryParameter {
-            dialect: "OpenCypher",
-            name: format!("{prefix}Values"),
-        }
+fn required_selector(config: &BTreeMap<String, ConfigValue>, prefix: &str) -> Result<NativePathNodeSelector> {
+    optional_selector_parts(config, prefix, None)?.ok_or_else(|| GraphError::MissingQueryParameter {
+        dialect: "OpenCypher",
+        name: format!("{prefix}Values"),
     })
 }
 
@@ -611,9 +551,7 @@ fn optional_selector_parts(
         let label_key = format!("{prefix}Label");
         let property_key = format!("{prefix}Property");
         if config.contains_key(&label_key) || config.contains_key(&property_key) {
-            return path_parse_error(format!(
-                "{values_key} is required when {prefix}Label or {prefix}Property is set"
-            ));
+            return path_parse_error(format!("{values_key} is required when {prefix}Label or {prefix}Property is set"));
         }
         return Ok(None);
     };
@@ -639,17 +577,10 @@ fn optional_selector_parts(
         })?;
     crate::validate_component("label", &label)?;
     crate::validate_component("property", &property)?;
-    Ok(Some(NativePathNodeSelector {
-        label,
-        property,
-        values,
-    }))
+    Ok(Some(NativePathNodeSelector { label, property, values }))
 }
 
-fn config_literal_string(
-    config: &BTreeMap<String, ConfigValue>,
-    key: &str,
-) -> Result<Option<String>> {
+fn config_literal_string(config: &BTreeMap<String, ConfigValue>, key: &str) -> Result<Option<String>> {
     match config.get(key) {
         None | Some(ConfigValue::Null) => Ok(None),
         Some(ConfigValue::String(value)) => Ok(Some(value.clone())),
@@ -660,12 +591,8 @@ fn config_literal_string(
 fn config_bool(config: &BTreeMap<String, ConfigValue>, key: &str) -> Result<Option<bool>> {
     match config.get(key) {
         None | Some(ConfigValue::Null) => Ok(None),
-        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("true") => {
-            Ok(Some(true))
-        }
-        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("false") => {
-            Ok(Some(false))
-        }
+        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
         Some(_) => path_parse_error(format!("{key} must be true or false")),
     }
 }
@@ -708,9 +635,7 @@ fn optional_vertex(
                 return Ok(Some(*value));
             }
             Some(VertexPropertyValue::SignedInteger(value)) => *value,
-            Some(_) => {
-                return path_parse_error(format!("{key} must resolve to an integer node id"))
-            }
+            Some(_) => return path_parse_error(format!("{key} must resolve to an integer node id")),
             None => {
                 return Err(GraphError::MissingQueryParameter {
                     dialect: "OpenCypher",
@@ -720,13 +645,11 @@ fn optional_vertex(
         },
         _ => return path_parse_error(format!("{key} must be an integer node id")),
     };
-    u64::try_from(value)
-        .map(Some)
-        .map_err(|_| GraphError::UnsupportedQuery {
-            reason: QueryFailureReason::Procedure,
-            dialect: "OpenCypher",
-            feature: format!("{key} must be a non-negative integer node id"),
-        })
+    u64::try_from(value).map(Some).map_err(|_| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Procedure,
+        dialect: "OpenCypher",
+        feature: format!("{key} must be a non-negative integer node id"),
+    })
 }
 
 fn config_string(
@@ -749,10 +672,7 @@ fn config_string(
     }
 }
 
-fn config_string_list(
-    config: &BTreeMap<String, ConfigValue>,
-    key: &str,
-) -> Result<Option<Vec<String>>> {
+fn config_string_list(config: &BTreeMap<String, ConfigValue>, key: &str) -> Result<Option<Vec<String>>> {
     match config.get(key) {
         None | Some(ConfigValue::Null) => Ok(None),
         Some(ConfigValue::List(values)) => values
@@ -777,9 +697,7 @@ fn config_u64(
         Some(ConfigValue::Integer(value)) => non_negative_u64(*value, key).map(Some),
         Some(ConfigValue::Parameter(parameter)) => match parameters.get(parameter) {
             Some(VertexPropertyValue::Integer(value)) => Ok(Some(*value)),
-            Some(VertexPropertyValue::SignedInteger(value)) => {
-                non_negative_u64(*value, key).map(Some)
-            }
+            Some(VertexPropertyValue::SignedInteger(value)) => non_negative_u64(*value, key).map(Some),
             Some(_) => path_parse_error(format!("{key} parameter must be an integer")),
             None => Err(GraphError::MissingQueryParameter {
                 dialect: "OpenCypher",
@@ -828,8 +746,10 @@ fn config_number(
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Token {
+pub(super) enum Token {
     Identifier(String),
+    /// A name in backticks, never a keyword; a doubled backtick inside is one.
+    QuotedIdentifier(String),
     Parameter(String),
     String(String),
     Integer(i64),
@@ -972,14 +892,10 @@ impl Parser {
     }
 
     fn next(&mut self) -> Result<Token> {
-        let token =
-            self.tokens
-                .get(self.offset)
-                .cloned()
-                .ok_or_else(|| GraphError::QueryParse {
-                    dialect: "OpenCypher",
-                    reason: "unexpected end of query".to_string(),
-                })?;
+        let token = self.tokens.get(self.offset).cloned().ok_or_else(|| GraphError::QueryParse {
+            dialect: "OpenCypher",
+            reason: "unexpected end of query".to_string(),
+        })?;
         self.offset += 1;
         Ok(token)
     }
@@ -993,7 +909,7 @@ impl Parser {
     }
 }
 
-fn lex(query: &str) -> Result<Vec<Token>> {
+pub(super) fn lex(query: &str) -> Result<Vec<Token>> {
     let chars = query.char_indices().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut cursor = 0;
@@ -1049,6 +965,26 @@ fn lex(query: &str) -> Result<Vec<Token>> {
             tokens.push(Token::String(value));
             continue;
         }
+        if ch == '`' {
+            let mut value = String::new();
+            cursor += 1;
+            loop {
+                let Some((_, current)) = chars.get(cursor).copied() else {
+                    return path_parse_error("unterminated quoted name");
+                };
+                cursor += 1;
+                if current != '`' {
+                    value.push(current);
+                } else if chars.get(cursor).is_some_and(|(_, next)| *next == '`') {
+                    cursor += 1;
+                    value.push('`');
+                } else {
+                    break;
+                }
+            }
+            tokens.push(Token::QuotedIdentifier(value));
+            continue;
+        }
         if ch == '$' {
             let start = byte + 1;
             cursor += 1;
@@ -1100,15 +1036,8 @@ fn lex(query: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-fn consume_identifier(
-    query: &str,
-    chars: &[(usize, char)],
-    cursor: &mut usize,
-    start: usize,
-) -> Result<usize> {
-    while *cursor < chars.len()
-        && (chars[*cursor].1.is_ascii_alphanumeric() || chars[*cursor].1 == '_')
-    {
+fn consume_identifier(query: &str, chars: &[(usize, char)], cursor: &mut usize, start: usize) -> Result<usize> {
+    while *cursor < chars.len() && (chars[*cursor].1.is_ascii_alphanumeric() || chars[*cursor].1 == '_') {
         *cursor += 1;
     }
     let end = chars.get(*cursor).map_or(query.len(), |(byte, _)| *byte);

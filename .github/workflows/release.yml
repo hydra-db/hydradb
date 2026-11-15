@@ -1,0 +1,108 @@
+# A binaries-only release workflow, without a crates.io half: this workspace
+# is `publish = false`, so there is no validate/publish-to-crates job. A release
+# here is Linux server binaries (graph-node + graph-indexer) plus auto-generated
+# notes, attached to a GitHub Release. Container images ship separately via
+# container.yml.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  GRAPH_USAGE_REPORT_ENABLED: "false"
+  # OpenCypher's async futures exceed the 2 MiB default thread stack; the native
+  # FFI build needs the same headroom CI uses. BINDGEN_EXTRA_CLANG_ARGS and
+  # LIBRARY_PATH are Homebrew/macOS-only and not needed on the Linux runner.
+  RUST_MIN_STACK: 33554432
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  validate:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          package_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          test "v${package_version}" = "${GITHUB_REF_NAME}" \
+            || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v${package_version}"; exit 1; }
+
+  build:
+    needs: validate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-release
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake \
+            pkg-config libcypher-parser-dev libgraphblas-dev
+      - name: LAGraph
+        uses: ./.github/actions/lagraph
+      - name: Verify native dependencies
+        run: |
+          pkg-config --exists cypher-parser
+          ldconfig -p | grep -q libgraphblas
+      - name: Build release binaries
+        # `.git` exists here — unlike inside the image build — so the build
+        # script could resolve these itself. They are passed anyway because a
+        # tag build is checked out detached, where `git rev-parse --abbrev-ref`
+        # answers the literal string `HEAD`; `ref_name` is the tag, which is
+        # what a release binary should report.
+        env:
+          GIT_SHA: ${{ github.sha }}
+          GIT_BRANCH: ${{ github.ref_name }}
+        run: |
+          cargo build --release --locked --target "${TARGET}" \
+            --bin graph-node --bin graph-indexer \
+            --features server-runtime,indexer-runtime,experimental-cypher-engine,datafusion-cypher-engine,otlp
+      - name: Package binaries
+        run: |
+          archive="hydradb-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir "${archive}"
+          cp "target/${TARGET}/release/graph-node" "${archive}/"
+          cp "target/${TARGET}/release/graph-indexer" "${archive}/"
+          cp README.md LICENSE "${archive}/"
+          tar -czf "${archive}.tar.gz" "${archive}"
+          sha256sum "${archive}.tar.gz" > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydradb-x86_64-unknown-linux-gnu
+          path: |
+            hydradb-*.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: hydradb-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --title "HydraDB ${GITHUB_REF_NAME}"
+          --generate-notes

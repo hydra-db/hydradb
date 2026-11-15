@@ -1,0 +1,10 @@
+[package]
+name = "hydradb-cypher-date"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The one Cypher date-string parser every HydraDB engine and storage path shares"
+publish = false
+
+[dependencies]
+chrono = { workspace = true }

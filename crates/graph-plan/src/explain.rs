@@ -1,8 +1,7 @@
 use std::fmt::Write;
 
 use crate::{
-    BoundValue, GraphPhysicalPlan, PhysicalBinaryOperator, PhysicalExpression, PhysicalProjection,
-    ScalarValue, Symbol, ValueOrigin,
+    BoundValue, GraphPhysicalPlan, PhysicalBinaryOperator, PhysicalExpression, PhysicalProjection, ScalarValue, Symbol, ValueOrigin,
 };
 
 pub fn explain_physical_plan(plan: &GraphPhysicalPlan) -> String {
@@ -33,11 +32,7 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             property,
             values,
         } => {
-            let values = values
-                .iter()
-                .map(render_value)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values = values.iter().map(render_value).collect::<Vec<_>>().join(", ");
             let _ = writeln!(
                 output,
                 "{indent}VertexPropertyMultiSeek(binding={binding}, labels={}, property={property}, values=[{values}])",
@@ -45,28 +40,17 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             );
         }
         GraphPhysicalPlan::VertexLabelScan { binding, label } => {
-            let _ = writeln!(
-                output,
-                "{indent}VertexLabelScan(binding={binding}, label={label})"
-            );
+            let _ = writeln!(output, "{indent}VertexLabelScan(binding={binding}, label={label})");
         }
         GraphPhysicalPlan::AllVertexScan { binding } => {
             let _ = writeln!(output, "{indent}AllVertexScan(binding={binding})");
         }
         GraphPhysicalPlan::Filter { input, predicate } => {
-            let _ = writeln!(
-                output,
-                "{indent}FilterExec(predicate={})",
-                render_expression(predicate)
-            );
+            let _ = writeln!(output, "{indent}FilterExec(predicate={})", render_expression(predicate));
             render_plan(input, depth + 1, output);
         }
         GraphPhysicalPlan::Project { input, items } => {
-            let items = items
-                .iter()
-                .map(render_projection)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let items = items.iter().map(render_projection).collect::<Vec<_>>().join(", ");
             let _ = writeln!(output, "{indent}ProjectExec(items=[{items}])");
             render_plan(input, depth + 1, output);
         }
@@ -86,20 +70,12 @@ fn render_expression(expression: &PhysicalExpression) -> String {
         PhysicalExpression::Binding(binding) => binding.to_string(),
         PhysicalExpression::Property { binding, property } => format!("{binding}.{property}"),
         PhysicalExpression::Value(value) => render_value(value),
-        PhysicalExpression::Binary {
-            left,
-            operator,
-            right,
-        } => {
+        PhysicalExpression::Binary { left, operator, right } => {
             let operator = match operator {
                 PhysicalBinaryOperator::Equal => "=",
                 PhysicalBinaryOperator::Or => "OR",
             };
-            format!(
-                "({} {operator} {})",
-                render_expression(left),
-                render_expression(right)
-            )
+            format!("({} {operator} {})", render_expression(left), render_expression(right))
         }
     }
 }
@@ -118,12 +94,5 @@ fn render_value(value: &BoundValue) -> String {
 }
 
 fn render_symbols(symbols: &[Symbol]) -> String {
-    format!(
-        "[{}]",
-        symbols
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    format!("[{}]", symbols.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
 }

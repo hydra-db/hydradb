@@ -11,7 +11,7 @@
 //! after a crash is harmless.
 //!
 //! The design and its verification live in the cost note
-//! (the incremental build-cost analysis, §11) and the benchmark
+//! (the incremental build cost analysis, §11) and the benchmark
 //! record (the xlog incremental-index benchmark).
 
 use super::*;
@@ -40,10 +40,7 @@ pub(crate) enum XlogDelta {
     CoverageGap { low_water: StorageSequence },
 }
 
-pub(crate) fn parse_xlog_entry_key(
-    prefix: &str,
-    key: &str,
-) -> Result<(StorageSequence, VertexId, VertexId)> {
+pub(crate) fn parse_xlog_entry_key(prefix: &str, key: &str) -> Result<(StorageSequence, VertexId, VertexId)> {
     let corrupt = |reason: &str| GraphError::CorruptValue {
         key: key.to_string(),
         reason: reason.to_string(),
@@ -94,10 +91,7 @@ impl GraphShard {
         edge_type: &str,
     ) -> Result<XlogDelta> {
         let low_key = keys::xlog_low_water(cell_id, edge_type);
-        let low_water = match snapshot
-            .get_with_options(low_key.as_bytes(), &remote_read_options())
-            .await?
-        {
+        let low_water = match snapshot.get_with_options(low_key.as_bytes(), &remote_read_options()).await? {
             Some(value) => decode_u64(&low_key, &value)?,
             None => return Ok(XlogDelta::Uninitialized),
         };
@@ -143,7 +137,7 @@ impl GraphShard {
     pub async fn gc_topology_changelog(&self, cell_id: &str, edge_type: &str) -> Result<u64> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        if self.db.writer().is_err() {
+        if self.storage.writer().is_err() {
             return Ok(0);
         }
         let Some(generation) = self.current_graph_index(cell_id, edge_type).await? else {
@@ -155,10 +149,7 @@ impl GraphShard {
     /// GC against a generation the caller already holds — the builder calls
     /// this with the manifest it just published, so retention is one build
     /// cycle wherever the builder holds the writer.
-    pub(crate) async fn gc_topology_changelog_to(
-        &self,
-        generation: &crate::GraphIndexGeneration,
-    ) -> Result<u64> {
+    pub(crate) async fn gc_topology_changelog_to(&self, generation: &crate::GraphIndexGeneration) -> Result<u64> {
         let cell_id = generation.cell_id.as_str();
         let edge_type = generation.edge_type.as_str();
         self.ensure_write_authority(cell_id, "gc_topology_changelog")?;
@@ -181,12 +172,8 @@ impl GraphShard {
                 let repaired = self.current_epoch(cell_id).await?;
                 let mut batch = GraphWriteBatch::new();
                 batch.put(low_key.as_bytes(), encode_u64(repaired));
-                self.write_graph_batch_strict_with_cell_lock(
-                    cell_id,
-                    "gc_topology_changelog",
-                    batch,
-                )
-                .await?;
+                self.write_graph_batch_strict_with_cell_lock(cell_id, "gc_topology_changelog", batch)
+                    .await?;
                 tracing::info!(
                     cell_id,
                     edge_type,
@@ -205,7 +192,7 @@ impl GraphShard {
 
         let prefix = keys::xlog_type_prefix(cell_id, edge_type);
         let mut iter = self
-            .db
+            .storage
             .scan_prefix_with_options(
                 prefix.as_bytes(),
                 Some(format!("{low_water:020}").into_bytes()),
@@ -240,11 +227,7 @@ impl GraphShard {
         // floor stays *at* that sequence (still retained), not past it; the
         // next pass resumes there. An uncapped pass covered everything
         // through `gc_through`.
-        let next_low = if capped {
-            last_sequence
-        } else {
-            gc_through.saturating_add(1)
-        };
+        let next_low = if capped { last_sequence } else { gc_through.saturating_add(1) };
         let mut batch = GraphWriteBatch::new();
         for key in &dead_keys {
             batch.delete(key.as_bytes());
@@ -255,14 +238,7 @@ impl GraphShard {
         let deleted = dead_keys.len() as u64;
         self.write_graph_batch_strict_with_cell_lock(cell_id, "gc_topology_changelog", batch)
             .await?;
-        tracing::debug!(
-            cell_id,
-            edge_type,
-            deleted,
-            next_low,
-            capped,
-            "xlog GC advanced the low-water mark"
-        );
+        tracing::debug!(cell_id, edge_type, deleted, next_low, capped, "xlog GC advanced the low-water mark");
         Ok(deleted)
     }
 }

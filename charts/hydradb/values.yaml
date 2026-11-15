@@ -2,9 +2,8 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  # Published by .github/workflows/container.yml on v* tags. An empty tag
-  # resolves to Chart.appVersion. Internal EKS staging still overrides this
-  # in examples/values-eks.yaml.
+  # Published by .github/workflows/container.yml. An empty tag resolves to
+  # Chart.appVersion.
   repository: ghcr.io/hydra-db/hydradb
   tag: ""
   digest: ""
@@ -49,6 +48,12 @@ tls:
   public:
     enabled: true
     secretName: ""
+    # The CA buddy WAL followers trust for their peers' certificates
+    # (runtime.buddyWal). By default it is the `ca.crt` in the public TLS
+    # secret, which cert-manager writes for a CA issuer. Name a Secret here to
+    # take its `ca.crt` instead, as a secret supplied without cert-manager
+    # usually carries only `tls.crt` and `tls.key`.
+    peerCaSecretName: ""
     additionalDnsNames: []
     trustBundle:
       enabled: false
@@ -115,10 +120,21 @@ node:
 indexer:
   enabled: true
   replicaCount: 1
+  # Retry delay after a failed scheduler pass.
   intervalMs: 5000
-  # Poll durable post-write scope hints independently of the fair full sweep.
-  # This controls changed-graph discovery latency, not build frequency.
-  dirtyPollIntervalMs: 250
+  # Least time one rotation of the fair sweep over every registered scope
+  # takes; its cycles are spread evenly across it. Changed scopes arrive through
+  # write hints, so the sweep is only the recovery path for a lost hint. Each
+  # scope visit is a few object-store LIST/GET requests.
+  fullSweepIntervalMs: 3600000
+  # Backstop poll for durable post-write scope hints when no wake arrives.
+  # Graph nodes wake the indexer after each hint, so this bounds the delay of a
+  # lost wake, not normal discovery latency.
+  dirtyPollIntervalMs: 60000
+  # Minimum spacing between change passes, and between planner statistics
+  # request listings. Wakes inside it coalesce into the next pass, so a write
+  # burst cannot list hints or statistics requests faster than this.
+  changeMinIntervalMs: 250
   retainPreviousGenerations: 1
   # "full" preserves the pre-incremental behavior. Set "incremental" after
   # validating the workload; unavailable or oversized WAL tails still fall
@@ -145,6 +161,10 @@ indexer:
   # Decline an incremental build when its immutable WAL span is larger than
   # this and use the full snapshot build instead.
   maxWalTailFiles: 4096
+  # The most edges one relationship type's index generation may hold. A type
+  # above it gets no generation, and its build is retried at a backoff that
+  # grows to fullSweepIntervalMs without costing readiness.
+  maxArtifactBuildEdges: 10000000
   # Concurrent immutable WAL object reads and snapshot edge resolutions used
   # by one incremental build.
   walTailFetchConcurrency: 16
@@ -187,20 +207,31 @@ service:
 
 runtime:
   rustLog: info,hydradb=info
+  # Buddy WAL (GRAPH_BUDDY_WAL): each node publishes its writers' durable
+  # frontiers and follows its peers' over the public HTTPS listener, so a
+  # replica catches up from the owner instead of polling object storage. On,
+  # it also opens 8443 between graph-node pods in the NetworkPolicy; off, no
+  # ingress on 8443 exists beyond networkPolicy.clientIngressFrom, and
+  # GRAPH_BUDDY_WAL is not rendered at all (the node defaults to off).
+  buddyWal: false
   maxOpenScopes: 8
   # One process-wide SlateDB RAM cache shared by every open reader and writer.
   # This is separate from node.cache.memoryLimitBytes, which budgets the
   # disposable on-disk object-store cache. Set to 0 to disable RAM admission.
   slatedbCacheBytes: 671088640
-  # Process-wide limit for file handles retained by SlateDB's disposable disk
-  # caches. It must provide at least one handle for each possible scope/cell
-  # reader and writer; the runtime partitions this value across those handles.
+  # File handles the node's one on-disk object-store cache may keep open. Every
+  # scope reads through that single cache, with node.cache.memoryLimitBytes as
+  # its one budget, so neither is divided per scope.
   dataCacheMaxOpenFiles: 512
-  # Parallel immutable WAL reads used to establish or refresh a cold SlateDB
-  # reader. This bounds object-store fan-out independently for each open scope.
-  readerWalReplayConcurrency: 16
   maxConcurrentQueries: 256
   maxQueryScanEdges: 1000000
+  # The most edges one relationship type may hold when the node reads its
+  # adjacency from edge records rather than an index generation; the
+  # indexer's limit is indexer.maxArtifactBuildEdges.
+  maxArtifactBuildEdges: 10000000
+  # Rows one query may return, the gds.*.stream calls included: one per
+  # projected vertex.
+  maxQueryResultVertices: 100000
   maxQueryRuntimeMs: 30000
   maxServerCursors: 1024
   maxCursorBufferBytes: 67108864
@@ -227,12 +258,68 @@ runtime:
   maxRelationshipRowsBytes: 8388608
   maxSourceRelationshipRowsBytes: 8388608
   maxRelationshipPropertyRowsBytes: 16777216
+  maxGdsProjectedGraphBytes: 268435456
   maxConcurrentHydrations: 2
   maxConcurrentMatrixCompilations: 1
   indexDiscoveryIntervalMs: 5000
   # Durable S3 CAS ownership window. Nodes renew every one third of this value.
   writerLeaseMs: 30000
   trimMemoryAfterHydration: true
+
+# The turbolay proxy: one Bolt and HTTPS endpoint in front of every graph-node,
+# with pooling and owner routing. Off by default; clients use it once their
+# TURBOLAY_URI points at the proxy service.
+proxy:
+  enabled: false
+  replicaCount: 3
+  image:
+    repository: ghcr.io/hydra-db/hydradb-proxy
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # The env's read policy, the same knob graph-node reads. Behind the proxy the
+  # nodes' own setting does nothing, since the proxy answers ROUTE.
+  readRouting: fleet
+  # Concurrent units per graph-node across all proxy replicas; each replica
+  # holds nodeBudget / replicas.
+  nodeBudget: 256
+  routeTtlSeconds: 10
+  # Advertise only the service in ROUTE, for callers that cannot reach pod IPs.
+  # Always on with tls.public.enabled: drivers check the certificate against
+  # every routed address, and pod IPs are not on it.
+  advertiseService: false
+  # Plaintext listeners the nodes open for the proxy when it is enabled. The
+  # proxy terminates client TLS, and only proxy pods can reach these.
+  internalPorts:
+    bolt: 7688
+    http: 8444
+  rustLog: info
+  terminationGracePeriodSeconds: 30
+  preStopSleepSeconds: 5
+  # Destinations for the EndpointSlice watch (the Kubernetes API). Empty allows
+  # any destination on 443/6443 for proxy pods only.
+  apiServerEgressTo: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  extraEnv: []
+  resources:
+    requests:
+      cpu: "1"
+      memory: 256Mi
+    limits:
+      cpu: "4"
+      memory: 1Gi
+  service:
+    # Defaults to <fullname>-proxy, i.e. turbolay-<env>-proxy.
+    name: ""
+    type: ClusterIP
+    annotations: {}
+    loadBalancerSourceRanges: []
+    bolt:
+      port: 7687
+    https:
+      port: 443
 
 podDisruptionBudget:
   enabled: true
@@ -252,7 +339,7 @@ networkPolicy:
   httpsEgressTo: []
   monitoringNamespaceSelector:
     matchLabels:
-      graph.usecortex.io/monitoring-access: "true"
+      graph.hydradb.io/monitoring-access: "true"
   additionalEgress: []
 
 serviceMonitor:
@@ -269,3 +356,7 @@ tests:
     pullPolicy: IfNotPresent
 
 extraObjects: []
+
+usageReport:
+  # Sends the anonymous usage report described in crates/usage-report/README.md.
+  enabled: true

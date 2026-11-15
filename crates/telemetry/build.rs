@@ -128,12 +128,7 @@ fn build_time() -> String {
     let seconds = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|since| since.as_secs())
-        })
+        .or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs()))
         .unwrap_or(0);
     format_rfc3339(Duration::from_secs(seconds).as_secs())
 }
@@ -150,16 +145,11 @@ fn format_rfc3339(secs: u64) -> String {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
 
     format!(

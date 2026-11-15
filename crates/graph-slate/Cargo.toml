@@ -1,0 +1,50 @@
+[package]
+name = "hydradb-graph-slate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "SlateDB graph persistence and provider implementation"
+publish = false
+
+[features]
+default = []
+opencypher = []
+experimental-cypher-engine = ["opencypher"]
+datafusion-cypher-engine = ["opencypher", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema", "dep:hydradb-graph-provider", "dep:hydradb-graph-types"]
+json-properties = ["dep:serde_json"]
+query-transport = ["opencypher", "dep:serde", "json-properties", "hydradb-scope/serde"]
+client-api = ["query-transport"]
+test-support = []
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+hydradb-cypher-date = { path = "../cypher-date" }
+futures = { workspace = true }
+foyer = { workspace = true }
+slatedb = { workspace = true }
+slatedb-common = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hydradb-cypher-ast = { path = "../cypher-ast" }
+hydradb-placement = { path = "../placement" }
+hydradb-buddy-wal = { path = "../buddy-wal" }
+hydradb-scope = { path = "../scope" }
+hydradb-protocol = { path = "../protocol", default-features = false }
+hydradb-graph-provider = { path = "../graph-provider", optional = true }
+hydradb-graph-types = { path = "../graph-types", optional = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+ulid = { workspace = true }
+slatedb-common = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }

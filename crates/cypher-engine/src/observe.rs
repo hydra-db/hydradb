@@ -28,6 +28,8 @@ pub struct OperatorProfile {
     pub parent: Option<usize>,
     /// [`GraphPhysicalPlan::operator_name`]: a closed vocabulary.
     pub operator: &'static str,
+    /// Provider-selected access strategy; separate from the physical operator name.
+    pub access: Option<&'static str>,
     pub invocations: u64,
     /// Actual unbound all-vertex scans, excluding correlated seed reuse.
     pub full_scans: u64,
@@ -107,13 +109,9 @@ pub struct ExecutionProfile {
 }
 
 impl ExecutionProfile {
-    /// Fill [`OperatorProfile::estimated_rows`] from `statistics`. Separate
-    /// from execution so a backend pays for it only when it will use it.
-    pub fn attach_estimates(
-        &mut self,
-        plan: &GraphPhysicalPlan,
-        statistics: &dyn StatisticsProvider,
-    ) {
+    /// Attach prepared scan estimates and derive relational estimates from
+    /// `statistics`. A later statistics refresh cannot rewrite a scan decision.
+    pub fn attach_estimates(&mut self, plan: &GraphPhysicalPlan, statistics: &dyn StatisticsProvider) {
         let estimates = crate::plan::estimate_operator_rows(plan, statistics);
         for (operator, estimate) in self.operators.iter_mut().zip(estimates) {
             operator.estimated_rows = estimate;
@@ -121,12 +119,10 @@ impl ExecutionProfile {
     }
 
     /// Whether an `AllVertexScan` actually ran. Narrower than
-    /// [`GraphPhysicalPlan::contains_full_scan`]: a range probe's fallback
+    /// [`GraphPhysicalPlan::may_scan_inventory`]: a range probe's fallback
     /// can hold a scan that a successful probe never executes.
     pub fn ran_full_scan(&self) -> bool {
-        self.operators
-            .iter()
-            .any(|operator| operator.full_scans > 0)
+        self.operators.iter().any(|operator| operator.full_scans > 0)
     }
 
     /// The operator with the most own time, which is where a slow query's
@@ -155,6 +151,34 @@ impl ExecutionProfile {
     }
 }
 
+/// The concurrent branch of one execution a hook belongs to, and the branch
+/// that started it. Lane 0 is the execution itself. A branch run side by side
+/// with others keeps its own operator stack, so its operators nest under their
+/// own parents rather than under whichever sibling started last.
+#[derive(Clone, Copy, Debug)]
+struct Lane {
+    id: usize,
+    parent: usize,
+}
+
+tokio::task_local! {
+    static LANE: Lane;
+}
+
+static NEXT_LANE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn current_lane() -> Lane {
+    LANE.try_with(|lane| *lane).unwrap_or(Lane { id: 0, parent: 0 })
+}
+
+/// Run `future` as a new concurrent branch of the current execution: profiler
+/// hooks made while it is polled are kept on the branch's own operator stack.
+pub(crate) async fn in_new_lane<F: std::future::Future>(future: F) -> F::Output {
+    let parent = current_lane().id;
+    let id = NEXT_LANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LANE.scope(Lane { id, parent }, future).await
+}
+
 struct Frame {
     id: usize,
     started: Instant,
@@ -172,7 +196,7 @@ struct Frame {
 pub struct OperatorProfiler {
     ids: HashMap<usize, usize>,
     operators: Vec<OperatorProfile>,
-    stack: Vec<Frame>,
+    stacks: HashMap<usize, Vec<Frame>>,
 }
 
 impl OperatorProfiler {
@@ -180,7 +204,7 @@ impl OperatorProfiler {
         let mut profiler = Self {
             ids: HashMap::new(),
             operators: Vec::new(),
-            stack: Vec::new(),
+            stacks: HashMap::new(),
         };
         profiler.register(plan, None);
         profiler
@@ -193,6 +217,10 @@ impl OperatorProfiler {
             id,
             parent,
             operator: plan.operator_name(),
+            access: match plan {
+                GraphPhysicalPlan::VertexScan { scan } => Some(scan.access_kind()),
+                _ => None,
+            },
             ..OperatorProfile::default()
         });
         for child in plan.children() {
@@ -204,7 +232,7 @@ impl OperatorProfiler {
         let Some(&id) = self.ids.get(&(std::ptr::from_ref(plan) as usize)) else {
             return;
         };
-        self.stack.push(Frame {
+        self.stacks.entry(current_lane().id).or_default().push(Frame {
             id,
             started: Instant::now(),
             children_elapsed: Duration::ZERO,
@@ -215,10 +243,19 @@ impl OperatorProfiler {
 
     pub fn operator_finished(&mut self, plan: &GraphPhysicalPlan, rows_out: usize) {
         let known = self.ids.get(&(std::ptr::from_ref(plan) as usize)).copied();
-        if known.is_none() || self.stack.last().map(|frame| frame.id) != known {
+        let lane = current_lane();
+        let Some(stack) = self.stacks.get_mut(&lane.id) else {
+            return;
+        };
+        if known.is_none() || stack.last().map(|frame| frame.id) != known {
             return;
         }
-        let frame = self.stack.pop().expect("checked above");
+        let frame = stack.pop().expect("checked above");
+        // A concurrent lane ends with its root; each `UNION` run starts fresh
+        // lanes, so an emptied one would otherwise stay for the whole query.
+        if stack.is_empty() && lane.id != 0 {
+            self.stacks.remove(&lane.id);
+        }
         let elapsed = frame.started.elapsed();
         let rows_out = rows_out as u64;
         let operator = &mut self.operators[frame.id];
@@ -227,18 +264,20 @@ impl OperatorProfiler {
         operator.rows_out += rows_out;
         operator.elapsed += elapsed;
         operator.self_elapsed += elapsed.saturating_sub(frame.children_elapsed);
-        operator.peak_retained_rows = operator
-            .peak_retained_rows
-            .max(frame.peak_retained_rows)
-            .max(rows_out);
-        if let Some(parent) = self.stack.last_mut() {
+        operator.peak_retained_rows = operator.peak_retained_rows.max(frame.peak_retained_rows).max(rows_out);
+        // A branch's root reports to the operator that started the branch.
+        // Branches overlap, so their summed time can exceed the parent's wall
+        // time; its self time then saturates at zero rather than going wrong.
+        let own_parent = self.stacks.get(&lane.id).is_some_and(|stack| !stack.is_empty());
+        let parent_lane = if own_parent || lane.id == 0 { lane.id } else { lane.parent };
+        if let Some(parent) = self.stacks.get_mut(&parent_lane).and_then(|stack| stack.last_mut()) {
             parent.children_elapsed += elapsed;
             parent.rows_in += rows_out;
         }
     }
 
     fn current(&mut self) -> Option<&mut OperatorProfile> {
-        let id = self.stack.last()?.id;
+        let id = self.stacks.get(&current_lane().id)?.last()?.id;
         Some(&mut self.operators[id])
     }
 
@@ -272,14 +311,12 @@ impl OperatorProfiler {
     }
 
     pub fn record_retained_rows(&mut self, rows: usize) {
-        if let Some(frame) = self.stack.last_mut() {
+        if let Some(frame) = self.stacks.get_mut(&current_lane().id).and_then(|stack| stack.last_mut()) {
             frame.peak_retained_rows = frame.peak_retained_rows.max(rows as u64);
         }
     }
 
     pub fn finish(self) -> ExecutionProfile {
-        ExecutionProfile {
-            operators: self.operators,
-        }
+        ExecutionProfile { operators: self.operators }
     }
 }

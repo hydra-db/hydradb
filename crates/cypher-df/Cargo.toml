@@ -1,0 +1,23 @@
+[package]
+name = "hydradb-cypher-df"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Cypher binding and DataFusion execution over the graph IR"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+hydradb-cypher-ast = { path = "../cypher-ast" }
+hydradb-cypher-parser-antlr = { path = "../cypher-parser-antlr" }
+hydradb-graph-plan = { path = "../graph-plan" }
+hydradb-graph-types = { path = "../graph-types" }
+hydradb-graph-provider = { path = "../graph-provider" }
+hydradb-graph-datafusion = { path = "../graph-datafusion" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

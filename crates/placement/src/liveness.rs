@@ -49,9 +49,9 @@
 //! every peer withdrew (decision 4 deletes the heartbeat on unready and on
 //! SIGTERM), and it must never touch the grace state.
 //!
-//! Ported from `sleet/src/root.rs` (`youngest_per_node`, `node_view`) and
-//! `sleet/src/daemon.rs` (`owned_assignments`, where self-always-live lives),
-//! with sleet's per-node service list dropped — every HydraDB node serves
+//! Adapted from a proven liveness implementation (`youngest_per_node`,
+//! `node_view`, and `owned_assignments`, where self-always-live lives), with
+//! its per-node service list dropped — every HydraDB node serves
 //! every cell today, and §3's extension point puts that in the object *name*
 //! when it stops being true.
 
@@ -242,9 +242,7 @@ impl LiveView {
     #[must_use]
     pub fn candidates(&self) -> Option<Vec<&str>> {
         match self {
-            Self::Fresh(nodes) | Self::Grace(nodes) => {
-                Some(nodes.iter().map(|n| n.node_id.as_str()).collect())
-            }
+            Self::Fresh(nodes) | Self::Grace(nodes) => Some(nodes.iter().map(|n| n.node_id.as_str()).collect()),
             Self::Shed => None,
         }
     }
@@ -287,11 +285,7 @@ impl LiveNodeSet {
     /// alone and therefore own everything". It is bounded regardless — if LIST
     /// keeps failing, grace expires one `heartbeat_timeout` in and the node
     /// sheds.
-    pub fn new<I, S>(
-        local_node_id: impl Into<String>,
-        members: I,
-        heartbeat_timeout: Duration,
-    ) -> Self
+    pub fn new<I, S>(local_node_id: impl Into<String>, members: I, heartbeat_timeout: Duration) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -371,9 +365,7 @@ impl LiveNodeSet {
         // and a node that is not in its own config is still the one running.
         // The real age is kept when an object exists so a skewed clock or a
         // slow PUT is visible in status; it just never changes the decision.
-        let self_age = youngest
-            .get(self.local_node_id.as_str())
-            .map_or(Duration::ZERO, |entry| entry.age);
+        let self_age = youngest.get(self.local_node_id.as_str()).map_or(Duration::ZERO, |entry| entry.age);
         live.insert(
             self.local_node_id.clone(),
             NodeView {

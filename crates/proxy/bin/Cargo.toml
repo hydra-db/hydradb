@@ -1,0 +1,48 @@
+[package]
+name = "turbolay-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "The turbolay proxy: one Bolt and HTTP endpoint in front of every graph-node"
+publish = false
+
+# Wiring only: config, the pingora server, the admin endpoint and TLS. Every
+# decision lives in the crates below it.
+[dependencies]
+async-trait = { workspace = true }
+bytesize = { workspace = true }
+clap = { workspace = true }
+form_urlencoded = { workspace = true }
+hydradb-scope = { path = "../../scope" }
+http = { workspace = true }
+# Global allocator. pingora's HTTP path allocates per request, which the
+# system allocator makes a large share of the proxy's CPU under HTTP load.
+mimalloc = { workspace = true }
+nix = { workspace = true }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+prometheus = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+turbolay-proxy-bolt = { path = "../bolt" }
+turbolay-proxy-core = { path = "../core" }
+turbolay-proxy-http = { path = "../http" }
+turbolay-proxy-k8s = { path = "../k8s", optional = true }
+turbolay-proxy-topology = { path = "../topology" }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "process"] }
+
+[features]
+default = []
+# The EndpointSlice replica source. On in the image; off for local builds,
+# which use the static or file source and so never compile kube.
+k8s = ["dep:turbolay-proxy-k8s"]
+# Downstream TLS for HTTP through BoringSSL. On in the image.
+boringssl = ["turbolay-proxy-http/boringssl"]

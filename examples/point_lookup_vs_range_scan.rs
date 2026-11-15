@@ -1,5 +1,5 @@
-//! Measures the read cost of the two index key shapes on the same SlateDB
-//! instance the graph runs on.
+//! Measures the read cost of two candidate index key shapes,
+//! on the same SlateDB instance the graph runs on.
 //!
 //! Today every property index is sorted and answered by a prefix scan:
 //!
@@ -41,10 +41,7 @@ use slatedb::{Db, WriteBatch};
 const CELL: &str = "bench-cell";
 const PROPERTY: &str = "app_external_id";
 fn arg(index: usize, default: usize) -> usize {
-    std::env::args()
-        .nth(index)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    std::env::args().nth(index).and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 fn sorted_key(value: &str, vertex_id: u64) -> String {
@@ -78,21 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let separated = std::env::args().nth(5).as_deref() == Some("separated");
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let run_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let db = Db::builder(format!("bench/point-lookup-{run_id}"), store)
-        .build()
-        .await?;
+    let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+    let db = Db::builder(format!("bench/point-lookup-{run_id}"), store).build().await?;
 
     println!(
         "writing {values} values x {ids_per_value} id(s) in both key shapes, \
          {keys_per_sst} keys per SST, families {} ...",
-        if separated {
-            "separated"
-        } else {
-            "interleaved"
-        }
+        if separated { "separated" } else { "interleaved" }
     );
     let started = Instant::now();
     let mut batch = WriteBatch::new();
@@ -110,10 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for slot in 0..ids_per_value {
                 let vertex_id = (index * ids_per_value + slot) as u64;
                 if families.contains(&"sorted") {
-                    batch.put(
-                        sorted_key(&value, vertex_id).as_bytes(),
-                        vertex_id.to_be_bytes(),
-                    );
+                    batch.put(sorted_key(&value, vertex_id).as_bytes(), vertex_id.to_be_bytes());
                     buffered += 1;
                 }
                 packed.extend_from_slice(&vertex_id.to_be_bytes());
@@ -123,8 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buffered += 1;
             }
             if buffered >= keys_per_sst {
-                db.write(std::mem::replace(&mut batch, WriteBatch::new()))
-                    .await?;
+                db.write(std::mem::replace(&mut batch, WriteBatch::new())).await?;
                 // Force the memtable to L0 per chunk: a read served from memory,
                 // or from one giant SST, measures nothing about filters.
                 db.flush_with_options(FlushOptions {
@@ -144,10 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         ssts += 1;
     }
-    println!(
-        "wrote in {} ms across {ssts} flushed SST(s)\n",
-        started.elapsed().as_millis()
-    );
+    println!("wrote in {} ms across {ssts} flushed SST(s)\n", started.elapsed().as_millis());
 
     // Probe values spread across the keyspace so neither shape benefits from
     // one hot block being resident for every iteration.

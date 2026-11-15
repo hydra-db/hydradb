@@ -1,0 +1,14 @@
+[package]
+name = "hydradb-pg-graph-query"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+publish = false
+
+[dependencies]
+hydradb-pg-graph-core = { path = "../pg-graph-core" }
+hydradb-pg-graph-csr = { path = "../pg-graph-csr" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

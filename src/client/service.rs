@@ -1,8 +1,12 @@
 mod memory_estimates;
-use crate::core::memory_diagnostics::{
-    request_estimated_bytes, MemoryDiagnosticGuard, MemoryStage, REQUEST_ESTIMATED_BYTES,
-};
+#[cfg(feature = "query-telemetry")]
+use super::failure_reporting::FailureObservation;
+#[cfg(not(feature = "query-telemetry"))]
+struct FailureObservation;
+use crate::core::memory_diagnostics::{request_estimated_bytes, MemoryDiagnosticGuard, MemoryStage, REQUEST_ESTIMATED_BYTES};
 use crate::{QueryFailureReason, QueryFailureStage};
+#[cfg(feature = "query-telemetry")]
+use hydradb_query_telemetry::QueryFailureReporter;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -14,32 +18,29 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures::FutureExt;
+use hydradb_scope::database::DatabaseName;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::query::coordination::{
-    QueryCellClient, QueryTransportAction, QueryTransportAuthPolicy,
-    QueryTransportConnectionIdentity, QueryTransportNamespaceQuotas, QueryTransportPrincipal,
-    QueryTransportScopeAuthorizer, QueryTransportSecret, QueryTransportServerConfig,
+    QueryCellClient, QueryTransportAction, QueryTransportAuthPolicy, QueryTransportConnectionIdentity, QueryTransportNamespaceQuotas,
+    QueryTransportPrincipal, QueryTransportScopeAuthorizer, QueryTransportSecret, QueryTransportServerConfig,
 };
 #[cfg(feature = "experimental-cypher-engine")]
 use crate::query::experimental_cypher::{experimental_query_columns, prepare_experimental_cypher};
+use crate::query::gds_procedure::{is_gds_call, parse_gds_procedure_with_query_parameters};
 use crate::query::opencypher::{
-    classify_opencypher_query_access, opencypher_query_fingerprint,
-    parse_opencypher_mutation_query_with_list_parameters,
-    parse_opencypher_row_query_with_list_parameters, parse_opencypher_unwind_batch,
-    OpenCypherQueryAccess, ParsedUnwindBatchKind, ParsedUnwindConstraintValue,
-    ParsedUnwindVertexConstraints,
+    classify_opencypher_query_access, opencypher_query_fingerprint, parse_opencypher_mutation_query_with_list_parameters,
+    parse_opencypher_row_query_with_list_parameters, parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
+    ParsedUnwindConstraintValue, ParsedUnwindVertexConstraints,
 };
 use crate::query::path_procedure::parse_native_procedure_columns;
 use crate::{
-    encode_scope_namespace_id, validate_component, AtomicDurationHistogram, CypherEngineMode,
-    DurationHistogramSnapshot, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId,
-    NamespacePath, QueryBatchEdge, QueryBatchIsolatedVertex, QueryBatchMergePolicy,
-    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
-    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
-    QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence, VertexMetadata,
-    VertexPropertyValue,
+    validate_component, AtomicDurationHistogram, CypherEngineMode, DurationHistogramSnapshot, EdgeMetadata, GraphError, GraphId,
+    GraphScope, MutationAtomicityPolicy, NamespaceId, NamespacePath, QueryBatchEdge, QueryBatchIsolatedVertex, QueryBatchMergePolicy,
+    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
+    QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence,
+    VertexMetadata, VertexPropertyValue,
 };
 use tracing::Instrument as _;
 
@@ -50,6 +51,13 @@ const DEFAULT_MAX_QUERY_RUNTIME_MS: u64 = 30_000;
 const DEFAULT_MAX_SERVER_CURSORS: usize = 1024;
 const DEFAULT_MAX_CURSOR_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_CURSOR_TTL_MS: u64 = 60_000;
+
+#[cfg(not(feature = "datafusion-cypher-engine"))]
+type DataFusionParameterBundle = (
+    QueryTransportAction,
+    BTreeMap<String, VertexPropertyValue>,
+    BTreeMap<String, Vec<VertexPropertyValue>>,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientQueryTarget {
@@ -69,62 +77,30 @@ pub trait ClientDatabaseResolver: Send + Sync {
     fn resolve_database(&self, database: Option<&str>) -> Result<ClientQueryTarget>;
 }
 
-const SCOPED_DATABASE_VERSION: &str = "scope1";
-
+/// Resolves the Bolt database name to a scope under one root target. The name
+/// format and its parse live in `hydradb_scope::database`, shared with the
+/// turbolay proxy so both resolve a name to the same scope.
 #[derive(Clone)]
 pub struct HierarchicalClientDatabaseResolver {
-    base_database: String,
+    base_database: DatabaseName,
     root_target: ClientQueryTarget,
 }
 
 impl HierarchicalClientDatabaseResolver {
     pub fn new(base_database: impl Into<String>, root_target: ClientQueryTarget) -> Result<Self> {
-        let base_database = validate_database_name(base_database.into())?;
         Ok(Self {
-            base_database,
+            base_database: database_name(&base_database.into())?,
             root_target,
         })
     }
 
-    pub fn scoped_database_name(
-        &self,
-        tenant_id: &str,
-        sub_tenant_id: Option<&str>,
-    ) -> Result<String> {
-        let tenant = encode_database_scope_id("tenant_id", tenant_id)?;
-        let sub_tenant = sub_tenant_id
-            .filter(|value| !value.is_empty())
-            .map(|value| encode_database_scope_id("sub_tenant_id", value))
-            .transpose()?
-            .unwrap_or_else(|| "_".to_string());
-        validate_database_name(format!(
-            "{}.{}.{tenant}.{sub_tenant}",
-            self.base_database, SCOPED_DATABASE_VERSION
-        ))
+    pub fn scoped_database_name(&self, tenant_id: &str, sub_tenant_id: Option<&str>) -> Result<String> {
+        Ok(hydradb_scope::database::scoped_database_name(&self.base_database, tenant_id, sub_tenant_id)?.to_string())
     }
 
-    fn scoped_target(&self, database: &str) -> Result<ClientQueryTarget> {
-        let prefix = format!("{}.{}.", self.base_database, SCOPED_DATABASE_VERSION);
-        let encoded = database
-            .strip_prefix(&prefix)
-            .ok_or_else(|| unknown_graph_database(database))?;
-        let (tenant, sub_tenant) = encoded
-            .split_once('.')
-            .filter(|(_, sub_tenant)| !sub_tenant.contains('.'))
-            .ok_or_else(|| unknown_graph_database(database))?;
-        let tenant = canonical_database_component(database, tenant)?;
-        let mut namespace = self
-            .root_target
-            .scope
-            .namespace
-            .child(NamespaceId::new(tenant)?)?;
-        if sub_tenant != "_" {
-            namespace = namespace.child(NamespaceId::new(canonical_database_component(
-                database, sub_tenant,
-            )?)?)?;
-        }
+    fn scoped_target(&self, database: &DatabaseName) -> Result<ClientQueryTarget> {
         ClientQueryTarget::new(
-            GraphScope::new(namespace, self.root_target.scope.graph_id.clone()),
+            crate::graph_scope_for_database(&self.base_database, &self.root_target.scope, database)?,
             self.root_target.cell_id.clone(),
         )
     }
@@ -132,34 +108,15 @@ impl HierarchicalClientDatabaseResolver {
 
 impl ClientDatabaseResolver for HierarchicalClientDatabaseResolver {
     fn resolve_database(&self, database: Option<&str>) -> Result<ClientQueryTarget> {
-        let database = database.unwrap_or(&self.base_database);
-        let database = validate_database_name(database.to_string())?;
+        let Some(database) = database else {
+            return Ok(self.root_target.clone());
+        };
+        let database = database_name(database)?;
         if database == self.base_database {
             return Ok(self.root_target.clone());
         }
         self.scoped_target(&database)
     }
-}
-
-fn encode_database_scope_id(component: &'static str, value: &str) -> Result<String> {
-    encode_scope_namespace_id(component, value).map(|encoded| encoded.to_string())
-}
-
-fn canonical_database_component(database: &str, encoded: &str) -> Result<String> {
-    if encoded.is_empty() {
-        return Err(unknown_graph_database(database));
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| unknown_graph_database(database))?;
-    let value = String::from_utf8(bytes).map_err(|_| unknown_graph_database(database))?;
-    if value.is_empty()
-        || value.chars().any(char::is_control)
-        || URL_SAFE_NO_PAD.encode(value.as_bytes()) != encoded
-    {
-        return Err(unknown_graph_database(database));
-    }
-    Ok(encoded.to_string())
 }
 
 fn unknown_graph_database(database: &str) -> GraphError {
@@ -175,9 +132,10 @@ fn unknown_graph_database(database: &str) -> GraphError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeTenant {
     /// The segment verbatim — URL-safe unpadded base64, as
-    /// [`encode_database_scope_id`] wrote it. This is the spelling that also
-    /// appears in the `scope` metric label and in the object-store prefix, so
-    /// it is what joins a log line to a metric series or to an S3 path.
+    /// [`hydradb_scope::database::scoped_database_name`] wrote it. This is the
+    /// spelling that also appears in the `scope` metric label and in the
+    /// object-store prefix, so it is what joins a log line to a metric series
+    /// or to an S3 path.
     pub scope_id: String,
     /// The decoded identity: the tenant id the rest of the platform knows, or
     /// the sub-tenant's own name. Falls back to [`Self::scope_id`] unchanged
@@ -227,38 +185,12 @@ impl ScopeTenant {
     }
 }
 
-/// Decode a scope segment written by [`encode_database_scope_id`].
-///
-/// `None` — never a panic, never an error — for anything else.
-///
-/// The round-trip check is the canonicality test
-/// [`canonical_database_component`] applies on the resolution path, and it is
-/// necessary but *not* sufficient here. That function is deciding whether a
-/// segment came from the encoder, having already been told by the database
-/// prefix that it should have; this one is deciding the same question with no
-/// such promise, and short literals answer it wrongly. `acme` is canonical
-/// base64 for two well-formed UTF-8 code points, so a round-trip check alone
-/// reports the namespace `acme` as a tenant named `iʮ` — a nonsense value in
-/// the warehouse's `tenant_id` column, which is strictly worse than leaving the
-/// segment as it was found.
-///
-/// So the decoded value must additionally be printable ASCII: the same rule
-/// [`sanitize_caller_metadata`] applies to every other caller-supplied string
-/// that becomes a log field. It rejects `acme` and accepts every id and
-/// sub-tenant name the platform issues. The cost is a genuinely non-ASCII
-/// sub-tenant name — a mailbox label in Japanese — reported by its base64
-/// spelling instead; nothing is lost, since that spelling is what
-/// `hydradb.sub_tenant.scope_id` carries in every case anyway.
+/// Decode a scope segment for the tenancy span fields. The rule, printable
+/// ASCII on top of canonical base64, is [`hydradb_scope::database::decode_scope_id`];
+/// it is the same rule [`sanitize_caller_metadata`] applies to every other
+/// caller-supplied string that becomes a log field.
 fn decode_scope_id(encoded: &str) -> Option<String> {
-    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
-    let value = String::from_utf8(bytes).ok()?;
-    if value.is_empty()
-        || !value.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ')
-        || URL_SAFE_NO_PAD.encode(value.as_bytes()) != encoded
-    {
-        return None;
-    }
-    Some(value)
+    hydradb_scope::database::decode_scope_id(encoded)
 }
 
 /// Record the tenancy of `scope` on `span`.
@@ -287,8 +219,8 @@ pub(crate) fn record_scope_tenancy(span: &tracing::Span, scope: &GraphScope) {
 
 #[derive(Clone, Default)]
 pub struct StaticClientDatabaseResolver {
-    targets: BTreeMap<String, ClientQueryTarget>,
-    default_database: Option<String>,
+    targets: BTreeMap<DatabaseName, ClientQueryTarget>,
+    default_database: Option<DatabaseName>,
 }
 
 impl StaticClientDatabaseResolver {
@@ -297,63 +229,48 @@ impl StaticClientDatabaseResolver {
     }
 
     pub fn insert(&mut self, database: impl Into<String>, target: ClientQueryTarget) -> Result<()> {
-        let database = validate_database_name(database.into())?;
-        self.targets.insert(database, target);
+        self.targets.insert(database_name(&database.into())?, target);
         Ok(())
     }
 
-    pub fn with_database(
-        mut self,
-        database: impl Into<String>,
-        target: ClientQueryTarget,
-    ) -> Result<Self> {
+    pub fn with_database(mut self, database: impl Into<String>, target: ClientQueryTarget) -> Result<Self> {
         self.insert(database, target)?;
         Ok(self)
     }
 
     pub fn with_default_database(mut self, database: impl Into<String>) -> Result<Self> {
-        let database = validate_database_name(database.into())?;
-        self.default_database = Some(database);
+        self.default_database = Some(database_name(&database.into())?);
         Ok(self)
     }
 
     pub fn single(database: impl Into<String>, target: ClientQueryTarget) -> Result<Self> {
-        let database = validate_database_name(database.into())?;
-        Self::new()
-            .with_database(database.clone(), target)?
-            .with_default_database(database)
+        let database = database_name(&database.into())?;
+        let mut resolver = Self::new();
+        resolver.targets.insert(database.clone(), target);
+        resolver.default_database = Some(database);
+        Ok(resolver)
     }
 }
 
 impl ClientDatabaseResolver for StaticClientDatabaseResolver {
     fn resolve_database(&self, database: Option<&str>) -> Result<ClientQueryTarget> {
         let database = match database {
-            Some(database) => validate_database_name(database.to_string())?,
-            None => self
-                .default_database
-                .clone()
-                .ok_or_else(|| GraphError::UnsupportedQuery {
-                    reason: QueryFailureReason::InvalidRequest,
-                    dialect: "ClientProtocol",
-                    feature: "no default graph database is configured".to_string(),
-                })?,
+            Some(database) => database_name(database)?,
+            None => self.default_database.clone().ok_or_else(|| GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "ClientProtocol",
+                feature: "no default graph database is configured".to_string(),
+            })?,
         };
         self.targets
             .get(&database)
             .cloned()
-            .ok_or_else(|| unknown_graph_database(&database))
+            .ok_or_else(|| unknown_graph_database(database.as_str()))
     }
 }
 
-fn validate_database_name(database: String) -> Result<String> {
-    let database = database.trim().to_string();
-    if database.is_empty() || database.len() > 255 || database.chars().any(char::is_control) {
-        return Err(GraphError::InvalidKeyComponent {
-            component: "database",
-            value: database,
-        });
-    }
-    Ok(database)
+fn database_name(database: &str) -> Result<DatabaseName> {
+    Ok(DatabaseName::parse(database)?)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,22 +313,13 @@ impl FromStr for ClientBookmark {
         if parts.len() != 6 || parts[0] != "sgk" || parts[1] != "1" {
             return Err(invalid_bookmark("unsupported bookmark format"));
         }
-        let namespace = String::from_utf8(hex_decode(parts[2])?)
-            .map_err(|_| invalid_bookmark("namespace is not UTF-8"))?;
-        let graph_id = String::from_utf8(hex_decode(parts[3])?)
-            .map_err(|_| invalid_bookmark("graph id is not UTF-8"))?;
-        let cell_id = String::from_utf8(hex_decode(parts[4])?)
-            .map_err(|_| invalid_bookmark("cell id is not UTF-8"))?;
+        let namespace = String::from_utf8(hex_decode(parts[2])?).map_err(|_| invalid_bookmark("namespace is not UTF-8"))?;
+        let graph_id = String::from_utf8(hex_decode(parts[3])?).map_err(|_| invalid_bookmark("graph id is not UTF-8"))?;
+        let cell_id = String::from_utf8(hex_decode(parts[4])?).map_err(|_| invalid_bookmark("cell id is not UTF-8"))?;
         let epoch = parts[5]
             .parse::<StorageSequence>()
             .map_err(|_| invalid_bookmark("epoch is not an unsigned integer"))?;
-        let namespace = NamespacePath::new(
-            namespace
-                .split('/')
-                .map(|segment| NamespaceId::new(segment.to_string()))
-                .collect::<Result<Vec<_>>>()?,
-        )?;
-        let scope = GraphScope::new(namespace, GraphId::new(graph_id)?);
+        let scope = GraphScope::new(NamespacePath::parse(&namespace)?, GraphId::new(graph_id)?);
         Ok(Self::new(ClientQueryTarget::new(scope, cell_id)?, epoch))
     }
 }
@@ -464,10 +372,7 @@ fn hex_nibble(byte: u8) -> Result<u8> {
 pub enum ClientQueryCredentials {
     None,
     Bearer(String),
-    Basic {
-        principal: String,
-        credentials: String,
-    },
+    Basic { principal: String, credentials: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,6 +406,8 @@ impl ClientMutationIdempotencyKey {
 
 #[derive(Clone, Debug)]
 pub struct ClientQueryRequest {
+    #[cfg(feature = "query-telemetry")]
+    pub(crate) protocol: &'static str,
     pub target: ClientQueryTarget,
     /// Ephemeral request handle used for cancellation, cursor ownership, and
     /// response correlation. It is not a durable mutation identity.
@@ -550,10 +457,7 @@ pub fn sanitize_caller_metadata(value: &str) -> Option<String> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "query-transport", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "query-transport", serde(rename_all = "snake_case"))]
 pub enum ClientReadConsistency {
     #[default]
@@ -562,12 +466,10 @@ pub enum ClientReadConsistency {
 }
 
 impl ClientQueryRequest {
-    pub fn new(
-        target: ClientQueryTarget,
-        query_id: impl Into<String>,
-        query: impl Into<String>,
-    ) -> Self {
+    pub fn new(target: ClientQueryTarget, query_id: impl Into<String>, query: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "query-telemetry")]
+            protocol: "service",
             target,
             query_id: query_id.into(),
             query: query.into(),
@@ -582,10 +484,7 @@ impl ClientQueryRequest {
         }
     }
 
-    pub fn with_parameters(
-        mut self,
-        parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
-    ) -> Self {
+    pub fn with_parameters(mut self, parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>) -> Self {
         self.parameters.extend(
             parameters
                 .into_iter()
@@ -594,10 +493,7 @@ impl ClientQueryRequest {
         self
     }
 
-    pub fn with_query_parameters(
-        mut self,
-        parameters: impl IntoIterator<Item = (String, QueryParameterValue)>,
-    ) -> Self {
+    pub fn with_query_parameters(mut self, parameters: impl IntoIterator<Item = (String, QueryParameterValue)>) -> Self {
         self.parameters.extend(parameters);
         self
     }
@@ -629,30 +525,18 @@ impl ClientQueryRequest {
 
     /// Attach a caller-owned retry identity. The service binds this value to
     /// the authenticated principal before using it for durable deduplication.
-    pub fn with_mutation_idempotency_key(
-        mut self,
-        mutation_idempotency_key: impl Into<String>,
-    ) -> Self {
-        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::CallerSupplied(
-            mutation_idempotency_key.into(),
-        ));
+    pub fn with_mutation_idempotency_key(mut self, mutation_idempotency_key: impl Into<String>) -> Self {
+        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::CallerSupplied(mutation_idempotency_key.into()));
         self
     }
 
-    pub(crate) fn with_server_generated_mutation_idempotency_key(
-        mut self,
-        mutation_idempotency_key: impl Into<String>,
-    ) -> Self {
-        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::ServerGenerated(
-            mutation_idempotency_key.into(),
-        ));
+    pub(crate) fn with_server_generated_mutation_idempotency_key(mut self, mutation_idempotency_key: impl Into<String>) -> Self {
+        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::ServerGenerated(mutation_idempotency_key.into()));
         self
     }
 
     pub(crate) fn mutation_idempotency_key(&self) -> Option<&str> {
-        self.mutation_idempotency_key
-            .as_ref()
-            .map(ClientMutationIdempotencyKey::value)
+        self.mutation_idempotency_key.as_ref().map(ClientMutationIdempotencyKey::value)
     }
 
     /// Attach the caller's correlation id. Invalid values are dropped rather
@@ -689,10 +573,7 @@ pub struct ClientQueryPage {
 /// The scalar map every engine has always taken, paired with the list sidecar
 /// that `IN` reads. Bound parameters travel as this pair from the transport
 /// door to the query context.
-type BoundQueryParameters = (
-    BTreeMap<String, VertexPropertyValue>,
-    BTreeMap<String, Vec<VertexPropertyValue>>,
-);
+type BoundQueryParameters = (BTreeMap<String, VertexPropertyValue>, BTreeMap<String, Vec<VertexPropertyValue>>);
 
 #[derive(Debug)]
 pub(crate) struct PreparedClientQuery {
@@ -711,6 +592,9 @@ pub(crate) struct PreparedClientQuery {
     /// runtime override flip the engine between a statement's parse and its
     /// execution. Every later stage reads this field, never the service.
     pub(crate) cypher_engine: CypherEngineMode,
+    /// The atomicity policy resolved when this statement was prepared, so a
+    /// runtime override cannot change it between RUN and PULL.
+    pub(crate) mutation_atomicity_policy: MutationAtomicityPolicy,
 }
 
 impl Clone for PreparedClientQuery {
@@ -720,16 +604,10 @@ impl Clone for PreparedClientQuery {
         let list_parameters = self.list_parameters.clone();
         let batch_operation = self.batch_operation.clone();
         let estimated_bytes = memory_estimates::request(&request)
-            .saturating_add(memory_estimates::bound(
-                &scalar_parameters,
-                &list_parameters,
-            ))
+            .saturating_add(memory_estimates::bound(&scalar_parameters, &list_parameters))
             .saturating_add(memory_estimates::batch(&batch_operation));
         Self {
-            memory_diagnostic: MemoryDiagnosticGuard::new(
-                MemoryStage::ClientPrepared,
-                estimated_bytes,
-            ),
+            memory_diagnostic: MemoryDiagnosticGuard::new(MemoryStage::ClientPrepared, estimated_bytes),
             request,
             action: self.action,
             columns: self.columns.clone(),
@@ -737,12 +615,17 @@ impl Clone for PreparedClientQuery {
             list_parameters,
             batch_operation,
             cypher_engine: self.cypher_engine,
+            mutation_atomicity_policy: self.mutation_atomicity_policy,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct ClientQueryServiceConfig {
+    #[cfg(feature = "query-telemetry")]
+    pub failure_reporter: Option<QueryFailureReporter>,
+    #[cfg(feature = "query-telemetry")]
+    pub node_id: String,
     pub auth_policy: QueryTransportAuthPolicy,
     pub scope_authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
     pub namespace_quotas: QueryTransportNamespaceQuotas,
@@ -755,6 +638,7 @@ pub struct ClientQueryServiceConfig {
     pub max_cursor_buffer_bytes: u64,
     pub cursor_ttl_ms: u64,
     pub cypher_engine: CypherEngineMode,
+    pub mutation_atomicity_policy: MutationAtomicityPolicy,
 }
 
 impl Default for ClientQueryServiceConfig {
@@ -766,6 +650,10 @@ impl Default for ClientQueryServiceConfig {
 impl ClientQueryServiceConfig {
     pub fn from_query_transport(config: &QueryTransportServerConfig) -> Self {
         Self {
+            #[cfg(feature = "query-telemetry")]
+            failure_reporter: None,
+            #[cfg(feature = "query-telemetry")]
+            node_id: "embedded".to_string(),
             auth_policy: config.auth_policy.clone(),
             scope_authorizer: Arc::clone(&config.scope_authorizer),
             namespace_quotas: config.namespace_quotas.clone(),
@@ -778,6 +666,7 @@ impl ClientQueryServiceConfig {
             max_cursor_buffer_bytes: DEFAULT_MAX_CURSOR_BUFFER_BYTES,
             cursor_ttl_ms: DEFAULT_CURSOR_TTL_MS,
             cypher_engine: CypherEngineMode::Legacy,
+            mutation_atomicity_policy: MutationAtomicityPolicy::LegacyChunked,
         }
     }
 
@@ -789,15 +678,19 @@ impl ClientQueryServiceConfig {
         self
     }
 
+    #[cfg(feature = "query-telemetry")]
+    pub fn with_failure_reporter(mut self, node_id: impl Into<String>, reporter: QueryFailureReporter) -> Self {
+        self.node_id = node_id.into();
+        self.failure_reporter = Some(reporter);
+        self
+    }
+
     pub fn with_auth_policy(mut self, auth_policy: QueryTransportAuthPolicy) -> Self {
         self.auth_policy = auth_policy;
         self
     }
 
-    pub fn with_scope_authorizer(
-        mut self,
-        authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
-    ) -> Self {
+    pub fn with_scope_authorizer(mut self, authorizer: Arc<dyn QueryTransportScopeAuthorizer>) -> Self {
         self.scope_authorizer = authorizer;
         self
     }
@@ -832,12 +725,7 @@ impl ClientQueryServiceConfig {
         self
     }
 
-    pub fn with_server_cursor_limits(
-        mut self,
-        max_server_cursors: usize,
-        max_cursor_buffer_bytes: u64,
-        cursor_ttl_ms: u64,
-    ) -> Self {
+    pub fn with_server_cursor_limits(mut self, max_server_cursors: usize, max_cursor_buffer_bytes: u64, cursor_ttl_ms: u64) -> Self {
         self.max_server_cursors = max_server_cursors;
         self.max_cursor_buffer_bytes = max_cursor_buffer_bytes;
         self.cursor_ttl_ms = cursor_ttl_ms;
@@ -846,6 +734,11 @@ impl ClientQueryServiceConfig {
 
     pub fn with_cypher_engine(mut self, cypher_engine: CypherEngineMode) -> Self {
         self.cypher_engine = cypher_engine;
+        self
+    }
+
+    pub fn with_mutation_atomicity_policy(mut self, policy: MutationAtomicityPolicy) -> Self {
+        self.mutation_atomicity_policy = policy;
         self
     }
 
@@ -895,8 +788,8 @@ pub struct ClientQueryMetricsSnapshot {
     ///
     /// One field per engine, for the reason
     /// [`Self::read_latency_legacy`] gives: the comparison this family exists
-    /// for is legacy against experimental, and a single population labelled at
-    /// export time would hand its whole history to whichever engine a scrape
+    /// for is per-engine, and a single population labelled at export time
+    /// would hand its whole history to whichever engine a scrape
     /// happens to find effective. A statement that was admitted carries its
     /// own engine here; one rejected before admission — HTTP's `read_epoch`
     /// check, a malformed request — is counted against the engine effective
@@ -905,6 +798,8 @@ pub struct ClientQueryMetricsSnapshot {
     pub queries_failed_by_reason_legacy: crate::QueryFailureCountsSnapshot,
     /// [`Self::queries_failed_by_reason_legacy`] for the experimental engine.
     pub queries_failed_by_reason_experimental: crate::QueryFailureCountsSnapshot,
+    /// Query failure reasons for statements selected for DataFusion.
+    pub queries_failed_by_reason_datafusion: crate::QueryFailureCountsSnapshot,
     pub rows_returned: u64,
     pub auth_failures: u64,
     pub scope_denials: u64,
@@ -918,7 +813,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// of them is alertable without it: "forty waits polled" is a fleet at rest
     /// or a fleet on fire depending on whether forty-one waits happened or four
     /// hundred thousand did. Change 4 of
-    /// the cell-affine read-routing design asks for the pair
+    /// the cell-affine read routing design asks for the pair
     /// for exactly this reason.
     ///
     /// It restates [`Self::bookmark_wait_latency`]'s `count()`, and does so
@@ -939,7 +834,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// window where it should, and it goes and stays non-zero if reads drift
     /// back onto non-owners — which is the regression this exists to make
     /// visible without re-deriving
-    /// the read-path timeout findings.
+    /// it from prepare-duration averages.
     pub bookmark_waits_polled: u64,
     /// Waits that ran out of `max_bookmark_wait_ms` and returned
     /// `SnapshotAhead`.
@@ -979,17 +874,17 @@ pub struct ClientQueryMetricsSnapshot {
     pub serialize_duration_us: u64,
     /// Rows serialized onto a client protocol.
     pub serialized_rows: u64,
-    /// Total microseconds across the four latency histograms below.
+    /// Total microseconds across the six latency histograms below.
     ///
     /// Retained so nothing that read the old sum has to change. It is derived
     /// rather than stored: every execution is recorded into exactly one of the
-    /// four histograms, so their sums add up to the previous value exactly.
+    /// six histograms, so their sums add up to the previous value exactly.
     pub execution_duration_us: u64,
     /// End-to-end execution of a read, from the authorization check to the
     /// assembled first page — including the server-cursor start.
     ///
     /// One histogram per engine rather than one labelled at export time. The
-    /// kill switch means a process can serve both engines in its lifetime, and
+    /// kill switch means a process can serve multiple engines in its lifetime, and
     /// a single population relabelled on a flip would hand the whole history
     /// to whichever engine happens to be effective at the next scrape — with
     /// the engine comparison these families exist for as the first casualty.
@@ -998,11 +893,15 @@ pub struct ClientQueryMetricsSnapshot {
     pub read_latency_legacy: DurationHistogramSnapshot,
     /// [`Self::read_latency_legacy`] for statements the experimental engine ran.
     pub read_latency_experimental: DurationHistogramSnapshot,
+    /// [`Self::read_latency_legacy`] for statements the DataFusion engine ran.
+    pub read_latency_datafusion: DurationHistogramSnapshot,
     /// End-to-end execution of a mutation, which is a different distribution
     /// entirely: it carries a commit, and it can never be served from a cursor.
     pub write_latency_legacy: DurationHistogramSnapshot,
     /// [`Self::write_latency_legacy`] for statements the experimental engine ran.
     pub write_latency_experimental: DurationHistogramSnapshot,
+    /// [`Self::write_latency_legacy`] for statements the DataFusion engine ran.
+    pub write_latency_datafusion: DurationHistogramSnapshot,
     /// How long the causal-consistency bookmark wait took, per wait.
     ///
     /// Read-your-writes latency, and the plan's headline ask. It hid inside
@@ -1044,8 +943,10 @@ crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
     histograms {
         read_latency_legacy,
         read_latency_experimental,
+        read_latency_datafusion,
         write_latency_legacy,
         write_latency_experimental,
+        write_latency_datafusion,
         bookmark_wait_latency,
     }
     class_counters {
@@ -1054,6 +955,7 @@ crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
     failure_counters {
         queries_failed_by_reason_legacy,
         queries_failed_by_reason_experimental,
+        queries_failed_by_reason_datafusion,
     }
 });
 
@@ -1065,6 +967,7 @@ struct ClientQueryMetrics {
     queries_failed_by_class: crate::core::metrics::ErrorClassCounters,
     queries_failed_by_reason_legacy: crate::core::metrics::QueryFailureCounters,
     queries_failed_by_reason_experimental: crate::core::metrics::QueryFailureCounters,
+    queries_failed_by_reason_datafusion: crate::core::metrics::QueryFailureCounters,
     rows_returned: AtomicU64,
     auth_failures: AtomicU64,
     scope_denials: AtomicU64,
@@ -1097,27 +1000,58 @@ struct ClientQueryMetrics {
     // `ClientQueryMetricsSnapshot::read_latency_legacy`.
     read_latency_legacy: AtomicDurationHistogram,
     read_latency_experimental: AtomicDurationHistogram,
+    read_latency_datafusion: AtomicDurationHistogram,
     write_latency_legacy: AtomicDurationHistogram,
     write_latency_experimental: AtomicDurationHistogram,
+    write_latency_datafusion: AtomicDurationHistogram,
+    // When this process's first query completed and first query failed, Unix
+    // milliseconds, 0 until it happens. A failure counts whether it happened
+    // while the statement was prepared or executed. For the usage report's "did a new
+    // install get going" signal; not part of the snapshot, since a timestamp
+    // is neither a counter nor a histogram and no export would know what to
+    // do with it. Set once each: after that, `record_result` pays one relaxed
+    // load per request.
+    first_completed_unix_ms: AtomicU64,
+    first_failed_unix_ms: AtomicU64,
+}
+
+/// When a process's first query completed and first query failed, Unix
+/// milliseconds; `None` until it happens. See
+/// [`ClientQueryService::first_query_outcomes`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FirstQueryOutcomes {
+    pub completed_unix_ms: Option<u64>,
+    pub failed_unix_ms: Option<u64>,
+}
+
+/// Record `now` in `slot` if nothing is recorded there yet. The load first, so
+/// every request after the first costs a relaxed read and no write.
+fn record_first(slot: &AtomicU64) {
+    if slot.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1));
+    let _ = slot.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 impl ClientQueryMetrics {
     fn snapshot(&self) -> ClientQueryMetricsSnapshot {
         let read_latency_legacy = self.read_latency_legacy.snapshot();
         let read_latency_experimental = self.read_latency_experimental.snapshot();
+        let read_latency_datafusion = self.read_latency_datafusion.snapshot();
         let write_latency_legacy = self.write_latency_legacy.snapshot();
         let write_latency_experimental = self.write_latency_experimental.snapshot();
+        let write_latency_datafusion = self.write_latency_datafusion.snapshot();
         ClientQueryMetricsSnapshot {
             queries_started: self.queries_started.load(Ordering::Relaxed),
             queries_completed: self.queries_completed.load(Ordering::Relaxed),
             queries_failed: self.queries_failed.load(Ordering::Relaxed),
-            queries_failed_by_class: crate::core::metrics::load_class_counters(
-                &self.queries_failed_by_class,
-            ),
+            queries_failed_by_class: crate::core::metrics::load_class_counters(&self.queries_failed_by_class),
             queries_failed_by_reason_legacy: self.queries_failed_by_reason_legacy.snapshot(),
-            queries_failed_by_reason_experimental: self
-                .queries_failed_by_reason_experimental
-                .snapshot(),
+            queries_failed_by_reason_experimental: self.queries_failed_by_reason_experimental.snapshot(),
+            queries_failed_by_reason_datafusion: self.queries_failed_by_reason_datafusion.snapshot(),
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             auth_failures: self.auth_failures.load(Ordering::Relaxed),
             scope_denials: self.scope_denials.load(Ordering::Relaxed),
@@ -1128,27 +1062,27 @@ impl ClientQueryMetrics {
             bookmark_waits: self.bookmark_waits.load(Ordering::Relaxed),
             bookmark_waits_polled: self.bookmark_waits_polled.load(Ordering::Relaxed),
             bookmark_waits_declined: self.bookmark_waits_declined.load(Ordering::Relaxed),
-            bookmark_waits_on_cell_writer: self
-                .bookmark_waits_on_cell_writer
-                .load(Ordering::Relaxed),
-            bookmark_waits_off_cell_writer: self
-                .bookmark_waits_off_cell_writer
-                .load(Ordering::Relaxed),
+            bookmark_waits_on_cell_writer: self.bookmark_waits_on_cell_writer.load(Ordering::Relaxed),
+            bookmark_waits_off_cell_writer: self.bookmark_waits_off_cell_writer.load(Ordering::Relaxed),
             admission_wait_us: self.admission_wait_us.load(Ordering::Relaxed),
             serialize_duration_us: self.serialize_duration_us.load(Ordering::Relaxed),
             serialized_rows: self.serialized_rows.load(Ordering::Relaxed),
             execution_duration_us: [
                 &read_latency_legacy,
                 &read_latency_experimental,
+                &read_latency_datafusion,
                 &write_latency_legacy,
                 &write_latency_experimental,
+                &write_latency_datafusion,
             ]
             .into_iter()
             .fold(0, |total, histogram| total.saturating_add(histogram.sum_us)),
             read_latency_legacy,
             read_latency_experimental,
+            read_latency_datafusion,
             write_latency_legacy,
             write_latency_experimental,
+            write_latency_datafusion,
             bookmark_wait_latency: self.bookmark_wait_latency.snapshot(),
         }
     }
@@ -1163,12 +1097,7 @@ impl ClientQueryMetrics {
     /// `wait` is `None` when the client that served the request cannot see
     /// which branch the shard took; that case increments the denominator and
     /// the latency and nothing else, which is the honest shape.
-    fn record_bookmark_wait(
-        &self,
-        elapsed: Duration,
-        wait: Option<crate::BookmarkWait>,
-        declined: bool,
-    ) {
+    fn record_bookmark_wait(&self, elapsed: Duration, wait: Option<crate::BookmarkWait>, declined: bool) {
         self.bookmark_waits.fetch_add(1, Ordering::Relaxed);
         self.bookmark_wait_latency.record(elapsed);
         if declined {
@@ -1217,11 +1146,21 @@ impl ClientQueryMetrics {
         match error {
             None => {
                 self.queries_completed.fetch_add(1, Ordering::Relaxed);
+                record_first(&self.first_completed_unix_ms);
             }
             Some(error) => {
                 self.queries_failed.fetch_add(1, Ordering::Relaxed);
                 self.queries_failed_by_class[error.class_index()].fetch_add(1, Ordering::Relaxed);
+                record_first(&self.first_failed_unix_ms);
             }
+        }
+    }
+
+    fn first_query_outcomes(&self) -> FirstQueryOutcomes {
+        let read = |slot: &AtomicU64| Some(slot.load(Ordering::Relaxed)).filter(|ms| *ms != 0);
+        FirstQueryOutcomes {
+            completed_unix_ms: read(&self.first_completed_unix_ms),
+            failed_unix_ms: read(&self.first_failed_unix_ms),
         }
     }
 
@@ -1238,31 +1177,22 @@ impl ClientQueryMetrics {
     /// a statement that outlives a kill-switch flip is an observation of the
     /// engine that ran it, and filing it under the new one would corrupt the
     /// comparison in the direction that matters.
-    fn record_execution(
-        &self,
-        action: QueryTransportAction,
-        elapsed: Duration,
-        engine: CypherEngineMode,
-    ) {
+    fn record_execution(&self, action: QueryTransportAction, elapsed: Duration, engine: CypherEngineMode) {
         match (action, engine) {
-            (QueryTransportAction::Write, CypherEngineMode::Legacy) => {
-                self.write_latency_legacy.record(elapsed)
+            (QueryTransportAction::Write, CypherEngineMode::Legacy) => self.write_latency_legacy.record(elapsed),
+            (QueryTransportAction::Write, CypherEngineMode::Experimental) => self.write_latency_experimental.record(elapsed),
+            #[cfg(feature = "datafusion-cypher-engine")]
+            (QueryTransportAction::Write, CypherEngineMode::DataFusion) => self.write_latency_datafusion.record(elapsed),
+            (QueryTransportAction::Read | QueryTransportAction::Cancel | QueryTransportAction::Admin, CypherEngineMode::Legacy) => {
+                self.read_latency_legacy.record(elapsed)
             }
-            (QueryTransportAction::Write, CypherEngineMode::Experimental) => {
-                self.write_latency_experimental.record(elapsed)
+            (QueryTransportAction::Read | QueryTransportAction::Cancel | QueryTransportAction::Admin, CypherEngineMode::Experimental) => {
+                self.read_latency_experimental.record(elapsed)
             }
-            (
-                QueryTransportAction::Read
-                | QueryTransportAction::Cancel
-                | QueryTransportAction::Admin,
-                CypherEngineMode::Legacy,
-            ) => self.read_latency_legacy.record(elapsed),
-            (
-                QueryTransportAction::Read
-                | QueryTransportAction::Cancel
-                | QueryTransportAction::Admin,
-                CypherEngineMode::Experimental,
-            ) => self.read_latency_experimental.record(elapsed),
+            #[cfg(feature = "datafusion-cypher-engine")]
+            (QueryTransportAction::Read | QueryTransportAction::Cancel | QueryTransportAction::Admin, CypherEngineMode::DataFusion) => {
+                self.read_latency_datafusion.record(elapsed)
+            }
         }
     }
 }
@@ -1288,12 +1218,7 @@ struct ClientQueryDropGuard {
 }
 
 impl ClientQueryDropGuard {
-    fn new(
-        inner: Arc<ClientQueryServiceInner>,
-        key: ClientQueryKey,
-        generation: u64,
-        cancellation_token: QueryCancellationToken,
-    ) -> Self {
+    fn new(inner: Arc<ClientQueryServiceInner>, key: ClientQueryKey, generation: u64, cancellation_token: QueryCancellationToken) -> Self {
         Self {
             inner,
             key,
@@ -1320,10 +1245,7 @@ impl Drop for ClientQueryDropGuard {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let mut active_queries = inner.active_queries.lock().await;
-                if active_queries
-                    .get(&key)
-                    .is_some_and(|active| active.generation == generation)
-                {
+                if active_queries.get(&key).is_some_and(|active| active.generation == generation) {
                     active_queries.remove(&key);
                 }
             });
@@ -1345,6 +1267,8 @@ struct ClientQueryServiceInner {
     /// Runtime override of `config.cypher_engine`, encoded by
     /// [`encode_engine_override`]. Read once per statement.
     cypher_engine_override: AtomicU8,
+    /// Runtime override of the configured mutation atomicity policy.
+    mutation_atomicity_override: AtomicU8,
 }
 
 /// Which Cypher engine a node runs and why, as one consistent reading.
@@ -1363,15 +1287,34 @@ impl CypherEngineSelection {
     }
 }
 
+/// Configured and effective mutation atomicity for the next statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MutationAtomicitySelection {
+    /// `GRAPH_CYPHER_MUTATION_ATOMICITY` at startup.
+    pub configured: MutationAtomicityPolicy,
+    /// The in-memory operator override, when set.
+    pub override_policy: Option<MutationAtomicityPolicy>,
+}
+
+impl MutationAtomicitySelection {
+    pub fn effective(&self) -> MutationAtomicityPolicy {
+        self.override_policy.unwrap_or(self.configured)
+    }
+}
+
 const ENGINE_OVERRIDE_NONE: u8 = 0;
 const ENGINE_OVERRIDE_LEGACY: u8 = 1;
 const ENGINE_OVERRIDE_EXPERIMENTAL: u8 = 2;
+#[cfg(feature = "datafusion-cypher-engine")]
+const ENGINE_OVERRIDE_DATAFUSION: u8 = 3;
 
 fn encode_engine_override(mode: Option<CypherEngineMode>) -> u8 {
     match mode {
         None => ENGINE_OVERRIDE_NONE,
         Some(CypherEngineMode::Legacy) => ENGINE_OVERRIDE_LEGACY,
         Some(CypherEngineMode::Experimental) => ENGINE_OVERRIDE_EXPERIMENTAL,
+        #[cfg(feature = "datafusion-cypher-engine")]
+        Some(CypherEngineMode::DataFusion) => ENGINE_OVERRIDE_DATAFUSION,
     }
 }
 
@@ -1379,6 +1322,28 @@ fn decode_engine_override(value: u8) -> Option<CypherEngineMode> {
     match value {
         ENGINE_OVERRIDE_LEGACY => Some(CypherEngineMode::Legacy),
         ENGINE_OVERRIDE_EXPERIMENTAL => Some(CypherEngineMode::Experimental),
+        #[cfg(feature = "datafusion-cypher-engine")]
+        ENGINE_OVERRIDE_DATAFUSION => Some(CypherEngineMode::DataFusion),
+        _ => None,
+    }
+}
+
+const MUTATION_ATOMICITY_OVERRIDE_NONE: u8 = 0;
+const MUTATION_ATOMICITY_OVERRIDE_LEGACY_CHUNKED: u8 = 1;
+const MUTATION_ATOMICITY_OVERRIDE_STATEMENT: u8 = 2;
+
+fn encode_mutation_atomicity_override(policy: Option<MutationAtomicityPolicy>) -> u8 {
+    match policy {
+        None => MUTATION_ATOMICITY_OVERRIDE_NONE,
+        Some(MutationAtomicityPolicy::LegacyChunked) => MUTATION_ATOMICITY_OVERRIDE_LEGACY_CHUNKED,
+        Some(MutationAtomicityPolicy::Statement) => MUTATION_ATOMICITY_OVERRIDE_STATEMENT,
+    }
+}
+
+fn decode_mutation_atomicity_override(value: u8) -> Option<MutationAtomicityPolicy> {
+    match value {
+        MUTATION_ATOMICITY_OVERRIDE_LEGACY_CHUNKED => Some(MutationAtomicityPolicy::LegacyChunked),
+        MUTATION_ATOMICITY_OVERRIDE_STATEMENT => Some(MutationAtomicityPolicy::Statement),
         _ => None,
     }
 }
@@ -1421,12 +1386,18 @@ impl ClientQueryService {
                 next_cursor_id: AtomicU64::new(1),
                 cursor_buffer_bytes: AtomicU64::new(0),
                 cypher_engine_override: AtomicU8::new(ENGINE_OVERRIDE_NONE),
+                mutation_atomicity_override: AtomicU8::new(MUTATION_ATOMICITY_OVERRIDE_NONE),
             }),
         })
     }
 
     pub fn metrics(&self) -> ClientQueryMetricsSnapshot {
         self.inner.metrics.snapshot()
+    }
+
+    /// When this service's first query completed and first query failed.
+    pub fn first_query_outcomes(&self) -> FirstQueryOutcomes {
+        self.inner.metrics.first_query_outcomes()
     }
 
     /// The Cypher engine a statement admitted now would run through: the
@@ -1439,8 +1410,7 @@ impl ClientQueryService {
     /// cumulative histogram carries over, so `rate()` over the new label value
     /// counts only statements finished after the flip.
     pub fn cypher_engine(&self) -> CypherEngineMode {
-        decode_engine_override(self.inner.cypher_engine_override.load(Ordering::SeqCst))
-            .unwrap_or(self.inner.config.cypher_engine)
+        decode_engine_override(self.inner.cypher_engine_override.load(Ordering::SeqCst)).unwrap_or(self.inner.config.cypher_engine)
     }
 
     /// The engine `GRAPH_CYPHER_ENGINE` configured at startup.
@@ -1454,10 +1424,41 @@ impl ClientQueryService {
     pub fn cypher_engine_selection(&self) -> CypherEngineSelection {
         CypherEngineSelection {
             configured: self.inner.config.cypher_engine,
-            override_mode: decode_engine_override(
-                self.inner.cypher_engine_override.load(Ordering::SeqCst),
-            ),
+            override_mode: decode_engine_override(self.inner.cypher_engine_override.load(Ordering::SeqCst)),
         }
+    }
+
+    /// The mutation atomicity policy a statement admitted now will use.
+    pub fn mutation_atomicity_policy(&self) -> MutationAtomicityPolicy {
+        self.mutation_atomicity_selection().effective()
+    }
+
+    /// Configured policy and runtime override read as one selection.
+    pub fn mutation_atomicity_selection(&self) -> MutationAtomicitySelection {
+        MutationAtomicitySelection {
+            configured: self.inner.config.mutation_atomicity_policy,
+            override_policy: decode_mutation_atomicity_override(self.inner.mutation_atomicity_override.load(Ordering::SeqCst)),
+        }
+    }
+
+    /// Change the mutation policy used for statements admitted from now on,
+    /// or clear the override to return to the startup configuration.
+    pub fn set_mutation_atomicity_override(
+        &self,
+        policy: Option<MutationAtomicityPolicy>,
+    ) -> (Option<MutationAtomicityPolicy>, MutationAtomicitySelection) {
+        let previous = decode_mutation_atomicity_override(
+            self.inner
+                .mutation_atomicity_override
+                .swap(encode_mutation_atomicity_override(policy), Ordering::SeqCst),
+        );
+        (
+            previous,
+            MutationAtomicitySelection {
+                configured: self.inner.config.mutation_atomicity_policy,
+                override_policy: policy,
+            },
+        )
     }
 
     /// Kill switch: route statements admitted from now on through `mode`, or
@@ -1466,19 +1467,14 @@ impl ClientQueryService {
     ///
     /// Statements already prepared or executing keep the engine they resolved
     /// at admission; see [`PreparedClientQuery::cypher_engine`]. A binary built
-    /// without `experimental-cypher-engine` refuses `Experimental` here rather
+    /// without the matching engine feature refuses that engine here rather
     /// than accepting it and failing every query afterwards.
     ///
     /// Returns the override this call replaced and the selection it installed.
     /// The selection is built from `mode`, not re-read, so it describes this
     /// call's update even when another flip lands straight after it.
-    pub fn set_cypher_engine_override(
-        &self,
-        mode: Option<CypherEngineMode>,
-    ) -> Result<(Option<CypherEngineMode>, CypherEngineSelection)> {
-        if mode == Some(CypherEngineMode::Experimental)
-            && !cfg!(feature = "experimental-cypher-engine")
-        {
+    pub fn set_cypher_engine_override(&self, mode: Option<CypherEngineMode>) -> Result<(Option<CypherEngineMode>, CypherEngineSelection)> {
+        if mode == Some(CypherEngineMode::Experimental) && !cfg!(feature = "experimental-cypher-engine") {
             return Err(experimental_engine_not_compiled());
         }
         let previous = decode_engine_override(
@@ -1499,26 +1495,12 @@ impl ClientQueryService {
     /// writer. Called by the Bolt and HTTP layers, which own the encoding; the
     /// `query.serialize` span beside each call carries the same numbers for one
     /// request.
-    #[cfg_attr(
-        not(any(feature = "bolt-server", feature = "http-api")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(feature = "bolt-server", feature = "http-api")), allow(dead_code))]
     pub(crate) fn record_serialization(&self, elapsed: std::time::Duration, rows: usize) {
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.inner
-            .metrics
-            .serialize_duration_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
-        self.inner
-            .metrics
-            .serialized_rows
-            .fetch_add(rows as u64, Ordering::Relaxed);
-        tracing::info_span!(
-            "query.serialize",
-            hydradb.query.rows_serialized = rows as u64,
-            elapsed_us,
-        )
-        .in_scope(|| {});
+        self.inner.metrics.serialize_duration_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.inner.metrics.serialized_rows.fetch_add(rows as u64, Ordering::Relaxed);
+        tracing::info_span!("query.serialize", hydradb.query.rows_serialized = rows as u64, elapsed_us,).in_scope(|| {});
     }
 
     pub fn max_page_size(&self) -> usize {
@@ -1549,12 +1531,7 @@ impl ClientQueryService {
         self.inner.active_queries.lock().await.len()
     }
 
-    pub fn authorize_action(
-        &self,
-        session: &ClientQuerySession,
-        scope: &GraphScope,
-        action: QueryTransportAction,
-    ) -> Result<()> {
+    pub fn authorize_action(&self, session: &ClientQuerySession, scope: &GraphScope, action: QueryTransportAction) -> Result<()> {
         self.authorize_scope(session, scope, action)
     }
 
@@ -1565,22 +1542,19 @@ impl ClientQueryService {
         actions: &[QueryTransportAction],
         action_label: &'static str,
     ) -> Result<()> {
-        if actions.iter().copied().any(|action| {
-            self.inner
+        if actions
+            .iter()
+            .copied()
+            .any(|action| self.inner.config.scope_authorizer.authorize(&session.principal, scope, action))
+            || self
+                .inner
                 .config
                 .scope_authorizer
-                .authorize(&session.principal, scope, action)
-        }) || self.inner.config.scope_authorizer.authorize(
-            &session.principal,
-            scope,
-            QueryTransportAction::Admin,
-        ) {
+                .authorize(&session.principal, scope, QueryTransportAction::Admin)
+        {
             return Ok(());
         }
-        self.inner
-            .metrics
-            .scope_denials
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.metrics.scope_denials.fetch_add(1, Ordering::Relaxed);
         Err(GraphError::GraphScopeAccessDenied {
             principal: session.principal.error_label().to_string(),
             action: action_label,
@@ -1598,9 +1572,9 @@ impl ClientQueryService {
     ///
     /// # What is measured here, and why it is measured here
     ///
-    /// Until change 4 of the cell-affine read-routing design
+    /// Until change 4 of the cell-affine read routing design
     /// this span was the *only* record of the wait, and a span is a sample: the
-    /// 17-38s waits in the read-path timeout findings were
+    /// 17-38s waits seen on the read path were
     /// found by inferring them out of `graph_client_prepare_duration`, an
     /// average over every prepare. The three instruments below turn that
     /// inference into a measurement — a duration histogram, a count of the
@@ -1643,11 +1617,7 @@ impl ClientQueryService {
             let (current_sequence, wait) = match self
                 .inner
                 .client
-                .wait_for_storage_sequence_observed(
-                    &bookmark.target.scope,
-                    &bookmark.target.cell_id,
-                    bookmark.epoch,
-                )
+                .wait_for_storage_sequence_observed(&bookmark.target.scope, &bookmark.target.cell_id, bookmark.epoch)
                 .await
             {
                 Ok(observed) => observed,
@@ -1696,9 +1666,7 @@ impl ClientQueryService {
             // `SnapshotAhead` leaves nothing behind to record it from.
             span.record("polled", true);
         }
-        self.inner
-            .metrics
-            .record_bookmark_wait(elapsed, wait, declined);
+        self.inner.metrics.record_bookmark_wait(elapsed, wait, declined);
         if let Some(wait) = wait.filter(|wait| wait.entered_poll_loop()) {
             // INFO, and the level is a judgement rather than a default.
             //
@@ -1754,47 +1722,26 @@ impl ClientQueryService {
         let bearer_token = match credentials {
             ClientQueryCredentials::None => None,
             ClientQueryCredentials::Bearer(token) => Some(token.as_str()),
-            ClientQueryCredentials::Basic {
-                principal,
-                credentials,
-            } => {
+            ClientQueryCredentials::Basic { principal, credentials } => {
                 if principal.trim().is_empty() {
                     return Err(authentication_error());
                 }
                 Some(credentials.as_str())
             }
         };
-        let Some(principal) = self
-            .inner
-            .config
-            .auth_policy
-            .authenticate_client(bearer_token, identity)
-        else {
-            self.inner
-                .metrics
-                .auth_failures
-                .fetch_add(1, Ordering::Relaxed);
+        let Some(principal) = self.inner.config.auth_policy.authenticate_client(bearer_token, identity) else {
+            self.inner.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
             return Err(authentication_error());
         };
         Ok(ClientQuerySession { principal })
     }
 
-    pub async fn execute_rows(
-        &self,
-        session: &ClientQuerySession,
-        request: ClientQueryRequest,
-    ) -> Result<ClientQueryResult> {
+    pub async fn execute_rows(&self, session: &ClientQuerySession, request: ClientQueryRequest) -> Result<ClientQueryResult> {
         let span = client_root_span(&request, None);
-        let result = self
-            .execute_rows_inner(session, request)
-            .instrument(span.clone())
-            .await;
+        let result = self.execute_rows_inner(session, request).instrument(span.clone()).await;
         match &result {
             Ok(response) => {
-                span.record(
-                    "hydradb.query.rows_returned",
-                    response.result.rows.len() as u64,
-                );
+                span.record("hydradb.query.rows_returned", response.result.rows.len() as u64);
                 if let Some(read_epoch) = response.read_epoch {
                     span.record("hydradb.read_epoch", read_epoch);
                 }
@@ -1806,18 +1753,17 @@ impl ClientQueryService {
 
     /// This entry point has no separate prepare step -- it parses inside
     /// execution -- so every failure it returns counts as `execute`.
-    async fn execute_rows_inner(
-        &self,
-        session: &ClientQuerySession,
-        request: ClientQueryRequest,
-    ) -> Result<ClientQueryResult> {
+    async fn execute_rows_inner(&self, session: &ClientQuerySession, request: ClientQueryRequest) -> Result<ClientQueryResult> {
         // Resolved here rather than inside the body, so the failure and the
         // execution it belongs to agree on one engine even across a flip.
         let cypher_engine = self.cypher_engine();
+        let observation = self.observe_failure(&request, cypher_engine, None, false);
+        let failure_request = request.clone();
+        let mutation_atomicity_policy = self.mutation_atomicity_policy();
         let result = self
-            .execute_rows_body(session, request, cypher_engine)
+            .execute_rows_body(session, request, cypher_engine, mutation_atomicity_policy)
             .await;
-        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine);
+        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine, &failure_request, observation);
         result
     }
 
@@ -1826,6 +1772,7 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         mut request: ClientQueryRequest,
         cypher_engine: CypherEngineMode,
+        mutation_atomicity_policy: MutationAtomicityPolicy,
     ) -> Result<ClientQueryResult> {
         if request.read_epoch.is_some() {
             return Err(GraphError::UnsupportedQuery {
@@ -1834,11 +1781,9 @@ impl ClientQueryService {
                 feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads".to_string(),
             });
         }
-        let preparing = MemoryDiagnosticGuard::new(
-            MemoryStage::ClientPrepare,
-            memory_estimates::request(&request),
-        );
+        let preparing = MemoryDiagnosticGuard::new(MemoryStage::ClientPrepare, memory_estimates::request(&request));
         self.validate_request(&request, None)?;
+        bind_gds_call_parameters(&mut request)?;
         // `cypher_engine` was resolved once by the caller, before anything
         // read it: a kill-switch flip while this statement is in flight must
         // not change the engine under it, nor under the failure it may leave.
@@ -1847,30 +1792,53 @@ impl ClientQueryService {
         // of "29999 ms; limit is 29999 ms" is only legible next to the budget
         // it was measured against.
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
-        let action = self.authorize_query(session, &request, cypher_engine)?;
-        let (batch_operation, (scalar_parameters, list_parameters)) =
-            self.prepare_transport_parameters(&request)?;
-        if batch_operation.as_ref().is_some_and(|operation| {
-            operation.is_write() != (action == QueryTransportAction::Write)
-        }) {
+        #[cfg(feature = "datafusion-cypher-engine")]
+        let datafusion_parameters = if cypher_engine == CypherEngineMode::DataFusion {
+            let (scalar_parameters, list_parameters) = split_query_parameters(&request.parameters)?;
+            let prepared = self
+                .prepare_datafusion_query_admitted(
+                    session,
+                    &request,
+                    &scalar_parameters,
+                    &list_parameters,
+                    runtime_limit_ms,
+                    mutation_atomicity_policy,
+                )
+                .await?;
+            let action = match prepared.effect {
+                crate::query::coordination::PreparedCypherEffect::Read => QueryTransportAction::Read,
+                crate::query::coordination::PreparedCypherEffect::Write => QueryTransportAction::Write,
+            };
+            self.authorize_scope(session, &request.target.scope, action)?;
+            Some((action, scalar_parameters, list_parameters))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        let datafusion_parameters: Option<DataFusionParameterBundle> = None;
+
+        let (action, batch_operation, scalar_parameters, list_parameters) =
+            if let Some((action, scalar_parameters, list_parameters)) = datafusion_parameters {
+                (action, None, scalar_parameters, list_parameters)
+            } else {
+                let action = self.authorize_query(session, &request, cypher_engine, mutation_atomicity_policy)?;
+                let (batch_operation, (scalar_parameters, list_parameters)) = self.prepare_transport_parameters(&request)?;
+                (action, batch_operation, scalar_parameters, list_parameters)
+            };
+        if batch_operation
+            .as_ref()
+            .is_some_and(|operation| operation.is_write() != (action == QueryTransportAction::Write))
+        {
             return Err(GraphError::CorruptValue {
                 key: "client/query/unwind_access".to_string(),
-                reason: "UNWIND batch access classification does not match its operation"
-                    .to_string(),
+                reason: "UNWIND batch access classification does not match its operation".to_string(),
             });
         }
         if let Some(operation) = &batch_operation {
-            enforce_limit(
-                "client_query_batch_items",
-                operation.len(),
-                self.inner.config.max_parameters,
-            )?;
+            enforce_limit("client_query_batch_items", operation.len(), self.inner.config.max_parameters)?;
         }
         let estimated_bytes = memory_estimates::request(&request)
-            .saturating_add(memory_estimates::bound(
-                &scalar_parameters,
-                &list_parameters,
-            ))
+            .saturating_add(memory_estimates::bound(&scalar_parameters, &list_parameters))
             .saturating_add(memory_estimates::batch(&batch_operation));
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
@@ -1882,10 +1850,15 @@ impl ClientQueryService {
                 &cancellation_token,
                 runtime_limit_ms,
                 estimated_bytes,
+                action == QueryTransportAction::Write,
                 async {
+                    #[cfg(feature = "datafusion-cypher-engine")]
+                    if cypher_engine != CypherEngineMode::DataFusion {
+                        self.validate_bookmark(&request).await?;
+                    }
+                    #[cfg(not(feature = "datafusion-cypher-engine"))]
                     self.validate_bookmark(&request).await?;
-                    self.refresh_strong_read(&request, action, &cancellation_token)
-                        .await?;
+                    self.refresh_strong_read(&request, action, &cancellation_token).await?;
                     let _context_memory = MemoryDiagnosticGuard::new(
                         MemoryStage::ClientContextParameters,
                         memory_estimates::bound(&scalar_parameters, &list_parameters),
@@ -1897,31 +1870,41 @@ impl ClientQueryService {
                         list_parameters.clone(),
                         cancellation_token.clone(),
                     )
-                    .with_cypher_engine(cypher_engine);
+                    .with_cypher_engine(cypher_engine)
+                    .with_mutation_atomicity_policy(mutation_atomicity_policy);
                     if action == QueryTransportAction::Read {
                         context.read_epoch = None;
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
                     }
-                    let result = match batch_operation {
-                        Some(operation) => {
-                            self.inner.client.execute_batch(context, operation).await?
+                    #[cfg(feature = "datafusion-cypher-engine")]
+                    let replayed_result = if action == QueryTransportAction::Write {
+                        self.inner
+                            .client
+                            .resolve_datafusion_statement_receipt(context.clone(), &request.query)
+                            .await?
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "datafusion-cypher-engine"))]
+                    let replayed_result: Option<QueryResultSet> = None;
+                    let result = if let Some(result) = replayed_result {
+                        result
+                    } else {
+                        if action == QueryTransportAction::Write
+                            && mutation_atomicity_policy == MutationAtomicityPolicy::Statement
+                            && !datafusion_supports_statement_atomicity(cypher_engine)
+                        {
+                            return Err(statement_atomicity_not_supported());
                         }
-                        None => {
-                            self.inner
-                                .client
-                                .execute_cypher_rows(context, &request.query)
-                                .await?
+                        match batch_operation {
+                            Some(operation) => self.inner.client.execute_batch(context, operation).await?,
+                            None => self.inner.client.execute_cypher_rows(context, &request.query).await?,
                         }
                     };
-                    let _result_memory = MemoryDiagnosticGuard::new(
-                        MemoryStage::ClientResultBuffer,
-                        result.estimated_resident_bytes(),
-                    );
+                    let _result_memory = MemoryDiagnosticGuard::new(MemoryStage::ClientResultBuffer, result.estimated_resident_bytes());
                     let read_epoch = result_read_epoch(&result, action)?;
                     let storage_sequence = result_storage_sequence(&result, action)?;
-                    let bookmark = self
-                        .bookmark_after(&request, action, storage_sequence)
-                        .await?;
+                    let bookmark = self.bookmark_after(&request, action, storage_sequence).await?;
                     Ok(ClientQueryResult {
                         query_id: request.query_id.clone(),
                         result,
@@ -1933,10 +1916,7 @@ impl ClientQueryService {
             .await;
         self.record_result_metrics(
             action,
-            result
-                .as_ref()
-                .map(|response| response.result.rows.len())
-                .unwrap_or(0),
+            result.as_ref().map(|response| response.result.rows.len()).unwrap_or(0),
             result.as_ref().err(),
         );
         result
@@ -1956,10 +1936,7 @@ impl ClientQueryService {
             .await;
         match &result {
             Ok(response) => {
-                span.record(
-                    "hydradb.query.rows_returned",
-                    response.page.rows.len() as u64,
-                );
+                span.record("hydradb.query.rows_returned", response.page.rows.len() as u64);
                 if let Some(read_epoch) = response.read_epoch {
                     span.record("hydradb.read_epoch", read_epoch);
                 }
@@ -1986,14 +1963,12 @@ impl ClientQueryService {
             // wrappers sees it; count it where it is raised, against the
             // engine that would have taken it.
             self.record_request_failure(QueryFailureStage::Prepare, &error, self.cypher_engine());
+            self.report_rejected_page(&request, QueryFailureStage::Prepare, &error, Some(page_size), false);
             return Err(error);
         }
-        let prepared = self
-            .prepare_page_request(session, request, page_size)
-            .await?;
+        let prepared = self.prepare_page_request(session, request, page_size, cursor.is_some()).await?;
         // Already inside this request's root span, so go straight to the body.
-        self.execute_prepared_page_inner(session, prepared, cursor, page_size)
-            .await
+        self.execute_prepared_page_inner(session, prepared, cursor, page_size).await
     }
 
     /// The Bolt execution boundary: RUN prepares, each PULL lands here.
@@ -2022,8 +1997,7 @@ impl ClientQueryService {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
-        self.execute_prepared_page_inner(session, prepared, cursor, page_size)
-            .await
+        self.execute_prepared_page_inner(session, prepared, cursor, page_size).await
     }
 
     async fn execute_prepared_page_inner(
@@ -2036,10 +2010,10 @@ impl ClientQueryService {
         // The statement's own engine, from its admission, not the node's
         // current one: a flip between RUN and PULL must not move its failure.
         let cypher_engine = prepared.cypher_engine;
-        let result = self
-            .execute_prepared_page_body(session, prepared, cursor, page_size)
-            .await;
-        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine);
+        let observation = self.observe_failure(&prepared.request, cypher_engine, Some(page_size), cursor.is_some());
+        let failure_request = prepared.request.clone();
+        let result = self.execute_prepared_page_body(session, prepared, cursor, page_size).await;
+        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine, &failure_request, observation);
         result
     }
 
@@ -2060,6 +2034,7 @@ impl ClientQueryService {
             list_parameters,
             batch_operation,
             cypher_engine,
+            mutation_atomicity_policy,
         } = prepared;
         // Grants can change while a Bolt cursor is open. The parsed query and
         // access classification are reusable, but authorization is not.
@@ -2075,10 +2050,7 @@ impl ClientQueryService {
             .max_runtime_ms
             .expect("prepared client queries have a normalized runtime limit");
         let estimated_bytes = memory_estimates::request(&request)
-            .saturating_add(memory_estimates::bound(
-                &scalar_parameters,
-                &list_parameters,
-            ))
+            .saturating_add(memory_estimates::bound(&scalar_parameters, &list_parameters))
             .saturating_add(memory_estimates::batch(&batch_operation));
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
@@ -2090,11 +2062,10 @@ impl ClientQueryService {
                 &cancellation_token,
                 runtime_limit_ms,
                 estimated_bytes,
+                action == QueryTransportAction::Write,
                 async {
                     if let Some(cursor) = cursor {
-                        return self
-                            .continue_server_cursor(session, &request, cursor, page_size)
-                            .await;
+                        return self.continue_server_cursor(session, &request, cursor, page_size).await;
                     }
                     let _context_memory = MemoryDiagnosticGuard::new(
                         MemoryStage::ClientContextParameters,
@@ -2107,7 +2078,8 @@ impl ClientQueryService {
                         list_parameters.clone(),
                         cancellation_token.clone(),
                     )
-                    .with_cypher_engine(cypher_engine);
+                    .with_cypher_engine(cypher_engine)
+                    .with_mutation_atomicity_policy(mutation_atomicity_policy);
                     context.max_runtime_ms = request.max_runtime_ms;
                     context.cancellation_token = Some(cancellation_token.clone());
                     if action == QueryTransportAction::Read {
@@ -2116,41 +2088,46 @@ impl ClientQueryService {
                         // one SlateDB DbSnapshot for this complete result.
                         context.read_epoch = None;
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
-                        self.refresh_strong_read(&request, action, &cancellation_token)
-                            .await?;
+                        self.refresh_strong_read(&request, action, &cancellation_token).await?;
                         let result = match batch_operation {
-                            Some(operation) => {
-                                self.inner.client.execute_batch(context, operation).await?
-                            }
-                            None => {
-                                self.inner
-                                    .client
-                                    .execute_cypher_rows(context, &request.query)
-                                    .await?
-                            }
+                            Some(operation) => self.inner.client.execute_batch(context, operation).await?,
+                            None => self.inner.client.execute_cypher_rows(context, &request.query).await?,
                         };
-                        let _result_memory = MemoryDiagnosticGuard::new(
-                            MemoryStage::ClientResultBuffer,
-                            result.estimated_resident_bytes(),
-                        );
+                        let _result_memory = MemoryDiagnosticGuard::new(MemoryStage::ClientResultBuffer, result.estimated_resident_bytes());
                         let read_epoch = result_read_epoch(&result, action)?;
                         let storage_sequence = result_storage_sequence(&result, action)?;
-                        let bookmark = self
-                            .bookmark_after(&request, action, storage_sequence)
-                            .await?;
+                        let bookmark = self.bookmark_after(&request, action, storage_sequence).await?;
                         return self
-                            .start_server_cursor(
-                                session, &request, result, read_epoch, bookmark, page_size,
-                            )
+                            .start_server_cursor(session, &request, result, read_epoch, bookmark, page_size)
                             .await;
                     }
+                    #[cfg(feature = "datafusion-cypher-engine")]
+                    let replayed_result = self
+                        .inner
+                        .client
+                        .resolve_datafusion_statement_receipt(context.clone(), &request.query)
+                        .await?;
+                    #[cfg(not(feature = "datafusion-cypher-engine"))]
+                    let replayed_result: Option<QueryResultSet> = None;
+                    if let Some(result) = replayed_result {
+                        let read_epoch = result_read_epoch(&result, action)?;
+                        let storage_sequence = result_storage_sequence(&result, action)?;
+                        let bookmark = self.bookmark_after(&request, action, storage_sequence).await?;
+                        return Ok(ClientQueryPage {
+                            query_id: request.query_id.clone(),
+                            page: QueryResultPage::new(result.columns, result.rows, None),
+                            read_epoch,
+                            bookmark,
+                        });
+                    }
+                    if action == QueryTransportAction::Write
+                        && mutation_atomicity_policy == MutationAtomicityPolicy::Statement
+                        && !datafusion_supports_statement_atomicity(cypher_engine)
+                    {
+                        return Err(statement_atomicity_not_supported());
+                    }
                     let page = match batch_operation {
-                        Some(operation) => {
-                            self.inner
-                                .client
-                                .execute_batch_page(context, operation, None, page_size)
-                                .await?
-                        }
+                        Some(operation) => self.inner.client.execute_batch_page(context, operation, None, page_size).await?,
                         None => {
                             self.inner
                                 .client
@@ -2170,10 +2147,7 @@ impl ClientQueryService {
             .await;
         self.record_result_metrics(
             action,
-            result
-                .as_ref()
-                .map(|response| response.page.rows.len())
-                .unwrap_or(0),
+            result.as_ref().map(|response| response.page.rows.len()).unwrap_or(0),
             result.as_ref().err(),
         );
         self.inner
@@ -2191,16 +2165,20 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         request: ClientQueryRequest,
         page_size: usize,
+        cursor_continuation: bool,
     ) -> Result<PreparedClientQuery> {
         // One load, for the statement and for the failure it may leave: the
         // body admits on this engine and a failure inside it is counted
         // against the same one, so a flip between the two cannot file a
         // prepare failure against an engine that never saw the statement.
         let cypher_engine = self.cypher_engine();
+        let observation = self.observe_failure(&request, cypher_engine, Some(page_size), cursor_continuation);
+        let failure_request = request.clone();
+        let mutation_atomicity_policy = self.mutation_atomicity_policy();
         let result = self
-            .prepare_page_request_body(session, request, page_size, cypher_engine)
+            .prepare_page_request_body(session, request, page_size, cypher_engine, mutation_atomicity_policy)
             .await;
-        self.record_failure(QueryFailureStage::Prepare, &result, cypher_engine);
+        self.record_failure(QueryFailureStage::Prepare, &result, cypher_engine, &failure_request, observation);
         result
     }
 
@@ -2210,140 +2188,172 @@ impl ClientQueryService {
         mut request: ClientQueryRequest,
         page_size: usize,
         cypher_engine: CypherEngineMode,
+        mutation_atomicity_policy: MutationAtomicityPolicy,
     ) -> Result<PreparedClientQuery> {
-        let _preparing = MemoryDiagnosticGuard::new(
-            MemoryStage::ClientPrepare,
-            memory_estimates::request(&request),
-        );
+        let _preparing = MemoryDiagnosticGuard::new(MemoryStage::ClientPrepare, memory_estimates::request(&request));
         let prepare_started = std::time::Instant::now();
-        self.inner
-            .metrics
-            .prepare_requests
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.metrics.prepare_requests.fetch_add(1, Ordering::Relaxed);
         self.validate_request(&request, Some(page_size))?;
+        bind_gds_call_parameters(&mut request)?;
         // `cypher_engine` was resolved once by the caller at RUN and is
         // carried on the prepared statement from here, so every PULL of this
         // statement uses it whatever the kill switch says later.
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
-        let action = self.authorize_query(session, &request, cypher_engine)?;
+        let (batch_operation, (scalar_parameters, list_parameters)) = {
+            #[cfg(feature = "datafusion-cypher-engine")]
+            if cypher_engine == CypherEngineMode::DataFusion {
+                (None, split_query_parameters(&request.parameters)?)
+            } else {
+                self.prepare_transport_parameters(&request)?
+            }
+            #[cfg(not(feature = "datafusion-cypher-engine"))]
+            {
+                self.prepare_transport_parameters(&request)?
+            }
+        };
+
+        #[cfg(feature = "datafusion-cypher-engine")]
+        let datafusion_prepared = if cypher_engine == CypherEngineMode::DataFusion {
+            let prepared = self
+                .prepare_datafusion_query_admitted(
+                    session,
+                    &request,
+                    &scalar_parameters,
+                    &list_parameters,
+                    runtime_limit_ms,
+                    mutation_atomicity_policy,
+                )
+                .await?;
+            let action = match prepared.effect {
+                crate::PreparedCypherEffect::Read => QueryTransportAction::Read,
+                crate::PreparedCypherEffect::Write => QueryTransportAction::Write,
+            };
+            self.authorize_scope(session, &request.target.scope, action)?;
+            Some((action, prepared.columns))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "datafusion-cypher-engine")]
+        let action = if let Some((action, _)) = &datafusion_prepared {
+            *action
+        } else {
+            self.authorize_query(session, &request, cypher_engine, mutation_atomicity_policy)?
+        };
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        let action = self.authorize_query(session, &request, cypher_engine, mutation_atomicity_policy)?;
+
+        // Bookmark waits can open scoped readers too. Never perform them until
+        // the statement's required grant has been checked.
+        #[cfg(feature = "datafusion-cypher-engine")]
+        if cypher_engine != CypherEngineMode::DataFusion {
+            self.validate_bookmark(&request).await?;
+        }
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
         self.validate_bookmark(&request).await?;
 
-        let (batch_operation, (scalar_parameters, list_parameters)) =
-            self.prepare_transport_parameters(&request)?;
-
-        let columns = if let Some(operation) = &batch_operation {
-            batch_operation_columns(operation)
-        } else if cypher_engine == CypherEngineMode::Experimental {
-            #[cfg(feature = "experimental-cypher-engine")]
-            {
-                match action {
-                    QueryTransportAction::Read => {
-                        match parse_native_procedure_columns(&request.query)? {
+        let legacy_columns = || -> Result<Vec<QueryColumn>> {
+            Ok(if let Some(operation) = &batch_operation {
+                batch_operation_columns(operation)
+            } else if cypher_engine == CypherEngineMode::Experimental {
+                #[cfg(feature = "experimental-cypher-engine")]
+                {
+                    match action {
+                        QueryTransportAction::Read => match parse_native_procedure_columns(&request.query)? {
                             Some(columns) => columns,
-                            None => experimental_query_columns(
-                                &request.query,
-                                &scalar_parameters,
-                                &list_parameters,
-                            )?,
+                            None => experimental_query_columns(&request.query, &scalar_parameters, &list_parameters)?,
+                        },
+                        // A native catalog write, `gds.graph.project` or drop.
+                        QueryTransportAction::Write => match parse_native_procedure_columns(&request.query)? {
+                            Some(columns) => columns,
+                            None => {
+                                let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
+                                    &request.query,
+                                    &scalar_parameters,
+                                    &list_parameters,
+                                )?
+                                else {
+                                    return Err(GraphError::UnsupportedQuery {
+                                        reason: QueryFailureReason::Mutation,
+                                        dialect: "ClientProtocol",
+                                        feature: "write query is not executable by the mutation engine".to_string(),
+                                    });
+                                };
+                                // A mutation with a trailing RETURN has to declare its column
+                                // before execution: Bolt sends the field names in the RUN
+                                // response, ahead of any record.
+                                mutation.returning.map(|returning| vec![returning.column]).unwrap_or_default()
+                            }
+                        },
+                        QueryTransportAction::Cancel | QueryTransportAction::Admin => {
+                            unreachable!("query access classification only returns read or write")
                         }
                     }
-                    QueryTransportAction::Write => {
-                        let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
-                            &request.query,
-                            &scalar_parameters,
-                            &list_parameters,
-                        )?
-                        else {
-                            return Err(GraphError::UnsupportedQuery {
-                                reason: QueryFailureReason::Mutation,
-                                dialect: "ClientProtocol",
-                                feature: "write query is not executable by the mutation engine"
-                                    .to_string(),
-                            });
-                        };
-                        // A mutation with a trailing RETURN has to declare its column
-                        // before execution: Bolt sends the field names in the RUN
-                        // response, ahead of any record.
-                        mutation
-                            .returning
-                            .map(|returning| vec![returning.column])
-                            .unwrap_or_default()
-                    }
+                }
+                #[cfg(not(feature = "experimental-cypher-engine"))]
+                {
+                    return Err(experimental_engine_not_compiled());
+                }
+            } else {
+                match action {
+                    QueryTransportAction::Read => match parse_native_procedure_columns(&request.query)? {
+                        Some(columns) => columns,
+                        None => {
+                            parse_opencypher_row_query_with_list_parameters(&request.query, &scalar_parameters, &list_parameters)?.columns
+                        }
+                    },
+                    // A native catalog write, `gds.graph.project` or drop.
+                    QueryTransportAction::Write => match parse_native_procedure_columns(&request.query)? {
+                        Some(columns) => columns,
+                        None => {
+                            let Some(mutation) =
+                                parse_opencypher_mutation_query_with_list_parameters(&request.query, &scalar_parameters, &list_parameters)?
+                            else {
+                                return Err(GraphError::UnsupportedQuery {
+                                    reason: QueryFailureReason::Mutation,
+                                    dialect: "ClientProtocol",
+                                    feature: "write query is not executable by the mutation engine".to_string(),
+                                });
+                            };
+                            // A mutation with a trailing RETURN has to declare its column
+                            // before execution: Bolt sends the field names in the RUN
+                            // response, ahead of any record.
+                            mutation.returning.map(|returning| vec![returning.column]).unwrap_or_default()
+                        }
+                    },
                     QueryTransportAction::Cancel | QueryTransportAction::Admin => {
                         unreachable!("query access classification only returns read or write")
                     }
                 }
-            }
-            #[cfg(not(feature = "experimental-cypher-engine"))]
-            {
-                return Err(experimental_engine_not_compiled());
-            }
-        } else {
-            match action {
-                QueryTransportAction::Read => match parse_native_procedure_columns(&request.query)?
-                {
-                    Some(columns) => columns,
-                    None => {
-                        parse_opencypher_row_query_with_list_parameters(
-                            &request.query,
-                            &scalar_parameters,
-                            &list_parameters,
-                        )?
-                        .columns
-                    }
-                },
-                QueryTransportAction::Write => {
-                    let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
-                        &request.query,
-                        &scalar_parameters,
-                        &list_parameters,
-                    )?
-                    else {
-                        return Err(GraphError::UnsupportedQuery {
-                            reason: QueryFailureReason::Mutation,
-                            dialect: "ClientProtocol",
-                            feature: "write query is not executable by the mutation engine"
-                                .to_string(),
-                        });
-                    };
-                    // A mutation with a trailing RETURN has to declare its column
-                    // before execution: Bolt sends the field names in the RUN
-                    // response, ahead of any record.
-                    mutation
-                        .returning
-                        .map(|returning| vec![returning.column])
-                        .unwrap_or_default()
-                }
-                QueryTransportAction::Cancel | QueryTransportAction::Admin => {
-                    unreachable!("query access classification only returns read or write")
-                }
-            }
+            })
         };
-        if batch_operation.as_ref().is_some_and(|operation| {
-            operation.is_write() != (action == QueryTransportAction::Write)
-        }) {
+        #[cfg(feature = "datafusion-cypher-engine")]
+        let columns = if let Some((_, columns)) = datafusion_prepared {
+            columns
+        } else {
+            legacy_columns()?
+        };
+        #[cfg(not(feature = "datafusion-cypher-engine"))]
+        let columns = legacy_columns()?;
+
+        if batch_operation
+            .as_ref()
+            .is_some_and(|operation| operation.is_write() != (action == QueryTransportAction::Write))
+        {
             return Err(GraphError::CorruptValue {
                 key: "client/query/unwind_access".to_string(),
-                reason: "UNWIND batch access classification does not match its operation"
-                    .to_string(),
+                reason: "UNWIND batch access classification does not match its operation".to_string(),
             });
         }
         if let Some(operation) = &batch_operation {
-            enforce_limit(
-                "client_query_batch_items",
-                operation.len(),
-                self.inner.config.max_parameters,
-            )?;
+            enforce_limit("client_query_batch_items", operation.len(), self.inner.config.max_parameters)?;
         }
         let prepared = PreparedClientQuery {
             memory_diagnostic: MemoryDiagnosticGuard::new(
                 MemoryStage::ClientPrepared,
                 memory_estimates::request(&request)
-                    .saturating_add(memory_estimates::bound(
-                        &scalar_parameters,
-                        &list_parameters,
-                    ))
+                    .saturating_add(memory_estimates::bound(&scalar_parameters, &list_parameters))
                     .saturating_add(memory_estimates::batch(&batch_operation)),
             ),
             request,
@@ -2353,13 +2363,10 @@ impl ClientQueryService {
             list_parameters,
             batch_operation,
             cypher_engine,
+            mutation_atomicity_policy,
         };
         self.inner.metrics.prepare_duration_us.fetch_add(
-            prepare_started
-                .elapsed()
-                .as_micros()
-                .try_into()
-                .unwrap_or(u64::MAX),
+            prepare_started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         Ok(prepared)
@@ -2391,13 +2398,14 @@ impl ClientQueryService {
             rows,
             read_epoch: _,
             storage_sequence: _,
+            statuses,
         } = result;
         let mut remaining = VecDeque::from(rows);
         let page_rows = take_cursor_rows(&mut remaining, page_size);
         if remaining.is_empty() {
             return Ok(ClientQueryPage {
                 query_id: request.query_id.clone(),
-                page: QueryResultPage::new(columns, page_rows, None),
+                page: QueryResultPage::new(columns, page_rows, None).with_statuses(statuses),
                 read_epoch,
                 bookmark,
             });
@@ -2431,12 +2439,10 @@ impl ClientQueryService {
             resident_bytes,
         };
         cursors.insert(cursor_id, cursor);
-        self.inner
-            .cursor_buffer_bytes
-            .store(next_bytes, Ordering::Relaxed);
+        self.inner.cursor_buffer_bytes.store(next_bytes, Ordering::Relaxed);
         Ok(ClientQueryPage {
             query_id: request.query_id.clone(),
-            page: QueryResultPage::new(columns, page_rows, Some(QueryCursorToken::new(cursor_id))),
+            page: QueryResultPage::new(columns, page_rows, Some(QueryCursorToken::new(cursor_id))).with_statuses(statuses),
             read_epoch,
             bookmark,
         })
@@ -2477,23 +2483,18 @@ impl ClientQueryService {
         let previous_bytes = cursor.resident_bytes;
         let page_rows = take_cursor_rows(&mut cursor.rows, page_size);
         cursor.resident_bytes = query_rows_resident_bytes(&cursor.rows);
-        cursor.memory_diagnostic.set_bytes(
-            cursor
-                .resident_bytes
-                .saturating_add(cursor.diagnostic_request_bytes),
-        );
+        cursor
+            .memory_diagnostic
+            .set_bytes(cursor.resident_bytes.saturating_add(cursor.diagnostic_request_bytes));
         let released_bytes = previous_bytes.saturating_sub(cursor.resident_bytes);
-        self.inner
-            .cursor_buffer_bytes
-            .fetch_sub(released_bytes, Ordering::Relaxed);
+        self.inner.cursor_buffer_bytes.fetch_sub(released_bytes, Ordering::Relaxed);
         let columns = cursor.columns.clone();
         let read_epoch = cursor.read_epoch;
         let bookmark = cursor.bookmark.clone();
         let next_cursor = if cursor.rows.is_empty() {
             None
         } else {
-            cursor.expires_at =
-                Instant::now() + Duration::from_millis(self.inner.config.cursor_ttl_ms);
+            cursor.expires_at = Instant::now() + Duration::from_millis(self.inner.config.cursor_ttl_ms);
             cursors.insert(token.offset, cursor);
             Some(token)
         };
@@ -2516,9 +2517,7 @@ impl ClientQueryService {
             retain
         });
         if released_bytes > 0 {
-            self.inner
-                .cursor_buffer_bytes
-                .fetch_sub(released_bytes, Ordering::Relaxed);
+            self.inner.cursor_buffer_bytes.fetch_sub(released_bytes, Ordering::Relaxed);
         }
     }
 
@@ -2544,18 +2543,11 @@ impl ClientQueryService {
         let cursor = cursors
             .remove(&token.offset)
             .expect("cursor ownership was checked while holding the cursor lock");
-        self.inner
-            .cursor_buffer_bytes
-            .fetch_sub(cursor.resident_bytes, Ordering::Relaxed);
+        self.inner.cursor_buffer_bytes.fetch_sub(cursor.resident_bytes, Ordering::Relaxed);
         true
     }
 
-    pub async fn cancel(
-        &self,
-        session: &ClientQuerySession,
-        scope: &GraphScope,
-        query_id: &str,
-    ) -> Result<()> {
+    pub async fn cancel(&self, session: &ClientQuerySession, scope: &GraphScope, query_id: &str) -> Result<()> {
         validate_component("query_id", query_id)?;
         self.authorize_scope(session, scope, QueryTransportAction::Cancel)?;
         let key = ClientQueryKey {
@@ -2572,18 +2564,11 @@ impl ClientQueryService {
             });
         };
         active.cancellation_token.cancel();
-        self.inner
-            .metrics
-            .cancellations
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn validate_request(
-        &self,
-        request: &ClientQueryRequest,
-        page_size: Option<usize>,
-    ) -> Result<()> {
+    fn validate_request(&self, request: &ClientQueryRequest, page_size: Option<usize>) -> Result<()> {
         validate_component("cell_id", &request.target.cell_id)?;
         validate_component("query_id", &request.query_id)?;
         if let Some(mutation_idempotency_key) = request.mutation_idempotency_key() {
@@ -2595,11 +2580,7 @@ impl ClientQueryService {
                 reason: "query cannot be empty".to_string(),
             });
         }
-        enforce_limit(
-            "client_query_bytes",
-            request.query.len(),
-            self.inner.config.max_query_bytes,
-        )?;
+        enforce_limit("client_query_bytes", request.query.len(), self.inner.config.max_query_bytes)?;
         enforce_limit(
             "client_query_parameters",
             request.parameters.len(),
@@ -2613,11 +2594,7 @@ impl ClientQueryService {
                     feature: "page size must be greater than zero".to_string(),
                 });
             }
-            enforce_limit(
-                "client_query_page_size",
-                page_size,
-                self.inner.config.max_page_size,
-            )?;
+            enforce_limit("client_query_page_size", page_size, self.inner.config.max_page_size)?;
         }
         Ok(())
     }
@@ -2627,6 +2604,7 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         request: &ClientQueryRequest,
         cypher_engine: CypherEngineMode,
+        _mutation_atomicity_policy: MutationAtomicityPolicy,
     ) -> Result<QueryTransportAction> {
         let action = if cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "experimental-cypher-engine")]
@@ -2651,11 +2629,7 @@ impl ClientQueryService {
                         match split_query_parameters(&request.parameters) {
                             Ok((parameters, lists)) => {
                                 if parse_native_procedure_columns(&request.query)?.is_none() {
-                                    if let Err(error) = prepare_experimental_cypher(
-                                        &request.query,
-                                        &parameters,
-                                        &lists,
-                                    ) {
+                                    if let Err(error) = prepare_experimental_cypher(&request.query, &parameters, &lists) {
                                         refusal_stands(error)?;
                                     }
                                 }
@@ -2681,15 +2655,12 @@ impl ClientQueryService {
         Ok(action)
     }
 
-    fn prepare_transport_parameters(
-        &self,
-        request: &ClientQueryRequest,
-    ) -> Result<(Option<QueryBatchOperation>, BoundQueryParameters)> {
+    fn prepare_transport_parameters(&self, request: &ClientQueryRequest) -> Result<(Option<QueryBatchOperation>, BoundQueryParameters)> {
         match parse_opencypher_unwind_batch(&request.query)? {
             // An UNWIND batch consumes its list itself, so nothing reaches the
             // sidecar on that path.
             Some(parsed) => Ok((
-                Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                Some(resolve_unwind_batch(&request.query, parsed, &request.parameters)?),
                 (BTreeMap::new(), BTreeMap::new()),
             )),
             None => {
@@ -2699,18 +2670,68 @@ impl ClientQueryService {
         }
     }
 
+    #[cfg(feature = "datafusion-cypher-engine")]
+    async fn prepare_datafusion_query_admitted(
+        &self,
+        session: &ClientQuerySession,
+        request: &ClientQueryRequest,
+        scalar_parameters: &BTreeMap<String, VertexPropertyValue>,
+        list_parameters: &BTreeMap<String, Vec<VertexPropertyValue>>,
+        runtime_limit_ms: u64,
+        mutation_atomicity_policy: MutationAtomicityPolicy,
+    ) -> Result<crate::query::coordination::PreparedCypherQuery> {
+        // Classify syntax without opening the scoped cluster. A read grant
+        // must not permit a denied write to open storage or wait on bookmarks.
+        // Unknown effects conservatively require the write grant, just as the
+        // DataFusion template does. Keep the prepared-effect check as defense
+        // in depth against any later classification drift.
+        let effect = hydradb_cypher_df::classify_query(&request.query).map_err(|error| GraphError::QueryParse {
+            dialect: "DataFusionCypher",
+            reason: error.to_string(),
+        })?;
+        let action = if effect.may_write() {
+            QueryTransportAction::Write
+        } else {
+            QueryTransportAction::Read
+        };
+        self.authorize_scope(session, &request.target.scope, action)?;
+
+        let key = client_query_key(session, request);
+        let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
+        let estimated_bytes =
+            memory_estimates::request(request).saturating_add(memory_estimates::bound(scalar_parameters, list_parameters));
+        let context = query_context(
+            session,
+            request,
+            scalar_parameters.clone(),
+            list_parameters.clone(),
+            cancellation_token.clone(),
+        )
+        .with_cypher_engine(CypherEngineMode::DataFusion)
+        .with_mutation_atomicity_policy(mutation_atomicity_policy);
+
+        self.run_query_with_timeout(
+            &key,
+            generation,
+            &cancellation_token,
+            runtime_limit_ms,
+            estimated_bytes,
+            false,
+            async {
+                self.validate_bookmark(request).await?;
+                self.inner.client.prepare_datafusion_cypher(context, &request.query).await
+            },
+        )
+        .await
+    }
+
     fn normalize_runtime_limit(&self, request: &mut ClientQueryRequest) -> Result<u64> {
         let requested = self.effective_runtime_limit_ms(request.max_runtime_ms)?;
         request.max_runtime_ms = Some(requested);
         Ok(requested)
     }
 
-    fn authorize_scope(
-        &self,
-        session: &ClientQuerySession,
-        scope: &GraphScope,
-        action: QueryTransportAction,
-    ) -> Result<()> {
+    fn authorize_scope(&self, session: &ClientQuerySession, scope: &GraphScope, action: QueryTransportAction) -> Result<()> {
         self.authorize_any_action(session, scope, &[action], action.as_str())
     }
 
@@ -2838,21 +2859,14 @@ impl ClientQueryService {
         key: &ClientQueryKey,
         generation: u64,
         cancellation_token: &QueryCancellationToken,
+        is_write: bool,
         execute: F,
     ) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
-        let mut drop_guard = ClientQueryDropGuard::new(
-            Arc::clone(&self.inner),
-            key.clone(),
-            generation,
-            cancellation_token.clone(),
-        );
-        self.inner
-            .metrics
-            .queries_started
-            .fetch_add(1, Ordering::Relaxed);
+        let mut drop_guard = ClientQueryDropGuard::new(Arc::clone(&self.inner), key.clone(), generation, cancellation_token.clone());
+        self.inner.metrics.queries_started.fetch_add(1, Ordering::Relaxed);
         let result = AssertUnwindSafe(async {
             // Admission is the only phase that can consume the whole runtime
             // budget without the query having started, so it gets its own span:
@@ -2866,9 +2880,7 @@ impl ClientQueryService {
             );
             let admission_started = std::time::Instant::now();
             let permits = async {
-                let namespace_permits = self
-                    .acquire_namespace_permits(&key.scope.namespace, cancellation_token)
-                    .await?;
+                let namespace_permits = self.acquire_namespace_permits(&key.scope.namespace, cancellation_token).await?;
                 let query_permit = self.acquire_query_permit(cancellation_token).await?;
                 Ok((namespace_permits, query_permit))
             }
@@ -2885,8 +2897,7 @@ impl ClientQueryService {
                     return Err(err);
                 }
             };
-            let _execution =
-                MemoryDiagnosticGuard::new(MemoryStage::ClientExecute, request_estimated_bytes());
+            let _execution = MemoryDiagnosticGuard::new(MemoryStage::ClientExecute, request_estimated_bytes());
             execute.await
         })
         .catch_unwind()
@@ -2899,24 +2910,26 @@ impl ClientQueryService {
         });
         let cancelled = {
             let mut active_queries = self.inner.active_queries.lock().await;
-            let cancelled = active_queries.get(key).is_some_and(|active| {
-                active.generation == generation && active.cancellation_token.is_cancelled()
-            });
-            if active_queries
+            let cancelled = active_queries
                 .get(key)
-                .is_some_and(|active| active.generation == generation)
-            {
+                .is_some_and(|active| active.generation == generation && active.cancellation_token.is_cancelled());
+            if active_queries.get(key).is_some_and(|active| active.generation == generation) {
                 active_queries.remove(key);
             }
             cancelled
         };
         drop_guard.disarm();
-        if cancelled {
+        // A write that completed has happened: once a statement passes its
+        // commit point it finishes regardless of cancellation, and reporting
+        // it as cancelled would tell the caller a committed write failed. A
+        // read that outran its cancellation still reports the cancellation.
+        if cancelled && !(is_write && result.is_ok()) {
             return Err(client_query_cancelled());
         }
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_query_with_timeout<T, F>(
         &self,
         key: &ClientQueryKey,
@@ -2924,6 +2937,7 @@ impl ClientQueryService {
         cancellation_token: &QueryCancellationToken,
         runtime_limit_ms: u64,
         estimated_bytes: u64,
+        is_write: bool,
         execute: F,
     ) -> Result<T>
     where
@@ -2931,7 +2945,7 @@ impl ClientQueryService {
     {
         let query = cancellation_token.scope(REQUEST_ESTIMATED_BYTES.scope(
             estimated_bytes,
-            self.run_query(key, generation, cancellation_token, execute),
+            self.run_query(key, generation, cancellation_token, is_write, execute),
         ));
         tokio::pin!(query);
         tokio::select! {
@@ -2941,27 +2955,24 @@ impl ClientQueryService {
                 // started. Signal cooperative cancellation, then keep the query
                 // and namespace permits until the executor has actually stopped.
                 cancellation_token.cancel();
-                let _ = query.await;
-                Err(client_query_runtime_exceeded(runtime_limit_ms))
+                // A write that finished anyway reports what it did: past its
+                // commit point it is applied, and answering a timeout would
+                // report a committed write as failed. A read past its limit
+                // fails explicitly rather than returning late rows.
+                match query.await {
+                    Ok(result) if is_write => Ok(result),
+                    _ => Err(client_query_runtime_exceeded(runtime_limit_ms)),
+                }
             }
         }
     }
 
-    async fn acquire_query_permit(
-        &self,
-        cancellation_token: &QueryCancellationToken,
-    ) -> Result<OwnedSemaphorePermit> {
+    async fn acquire_query_permit(&self, cancellation_token: &QueryCancellationToken) -> Result<OwnedSemaphorePermit> {
         match Arc::clone(&self.inner.query_gate).try_acquire_owned() {
             Ok(permit) => Ok(permit),
             Err(_) => {
-                self.inner
-                    .metrics
-                    .backpressure_waits
-                    .fetch_add(1, Ordering::Relaxed);
-                let _waiting = MemoryDiagnosticGuard::new(
-                    MemoryStage::ClientQueryWait,
-                    request_estimated_bytes(),
-                );
+                self.inner.metrics.backpressure_waits.fetch_add(1, Ordering::Relaxed);
+                let _waiting = MemoryDiagnosticGuard::new(MemoryStage::ClientQueryWait, request_estimated_bytes());
                 tokio::select! {
                     permit = Arc::clone(&self.inner.query_gate).acquire_owned() => {
                         permit.map_err(|err| GraphError::CorruptValue {
@@ -2988,14 +2999,8 @@ impl ClientQueryService {
             let permit = match Arc::clone(gate).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    self.inner
-                        .metrics
-                        .backpressure_waits
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _waiting = MemoryDiagnosticGuard::new(
-                        MemoryStage::ClientNamespaceWait,
-                        request_estimated_bytes(),
-                    );
+                    self.inner.metrics.backpressure_waits.fetch_add(1, Ordering::Relaxed);
+                    let _waiting = MemoryDiagnosticGuard::new(MemoryStage::ClientNamespaceWait, request_estimated_bytes());
                     tokio::select! {
                         permit = Arc::clone(gate).acquire_owned() => {
                             permit.map_err(|err| GraphError::CorruptValue {
@@ -3012,6 +3017,59 @@ impl ClientQueryService {
         Ok(permits)
     }
 
+    fn observe_failure(
+        &self,
+        request: &ClientQueryRequest,
+        engine: CypherEngineMode,
+        page_size: Option<usize>,
+        cursor: bool,
+    ) -> Option<FailureObservation> {
+        #[cfg(feature = "query-telemetry")]
+        return self.inner.config.failure_reporter.as_ref().map(|_| {
+            FailureObservation::new(
+                engine,
+                self.configured_cypher_engine(),
+                self.effective_runtime_limit_ms(request.max_runtime_ms).ok(),
+                page_size,
+                cursor,
+            )
+        });
+        #[cfg(not(feature = "query-telemetry"))]
+        {
+            let _ = (request, engine, page_size, cursor);
+            None
+        }
+    }
+
+    pub(crate) fn report_rejected_page(
+        &self,
+        request: &ClientQueryRequest,
+        stage: QueryFailureStage,
+        error: &GraphError,
+        page_size: Option<usize>,
+        cursor: bool,
+    ) {
+        let observation = self.observe_failure(request, self.cypher_engine(), page_size, cursor);
+        self.report_failure(request, stage, error, observation);
+    }
+
+    fn report_failure(
+        &self,
+        request: &ClientQueryRequest,
+        stage: QueryFailureStage,
+        error: &GraphError,
+        observation: Option<FailureObservation>,
+    ) {
+        #[cfg(feature = "query-telemetry")]
+        if let (Some(reporter), Some(observation)) = (&self.inner.config.failure_reporter, observation) {
+            reporter.report(FailureObservation::retained_bytes(request, &self.inner.config.node_id), || {
+                observation.failed(request, &self.inner.config.node_id, stage, error)
+            });
+        }
+        #[cfg(not(feature = "query-telemetry"))]
+        let _ = (request, stage, error, observation);
+    }
+
     /// Count one finished request.
     ///
     /// Takes the error rather than a `succeeded: bool` because both callers hold
@@ -3024,9 +3082,12 @@ impl ClientQueryService {
         stage: QueryFailureStage,
         result: &Result<T>,
         engine: CypherEngineMode,
+        request: &ClientQueryRequest,
+        observation: Option<FailureObservation>,
     ) {
         if let Err(error) = result {
             self.record_request_failure(stage, error, engine);
+            self.report_failure(request, stage, error, observation);
         }
     }
 
@@ -3039,27 +3100,22 @@ impl ClientQueryService {
     /// otherwise the engine effective at the moment of the rejection. Either
     /// way it is fixed here, at the point of recording, so a later kill-switch
     /// flip cannot move a failure between engines.
-    pub(crate) fn record_request_failure(
-        &self,
-        stage: QueryFailureStage,
-        error: &GraphError,
-        engine: CypherEngineMode,
-    ) {
+    pub(crate) fn record_request_failure(&self, stage: QueryFailureStage, error: &GraphError, engine: CypherEngineMode) {
+        // Here as well as in `record_result`: a statement refused while it is
+        // prepared -- unparseable, or using a feature the engine lacks -- never
+        // reaches `record_result`, and it is the failure a new install is most
+        // likely to hit first.
+        record_first(&self.inner.metrics.first_failed_unix_ms);
         match engine {
             CypherEngineMode::Legacy => &self.inner.metrics.queries_failed_by_reason_legacy,
-            CypherEngineMode::Experimental => {
-                &self.inner.metrics.queries_failed_by_reason_experimental
-            }
+            CypherEngineMode::Experimental => &self.inner.metrics.queries_failed_by_reason_experimental,
+            #[cfg(feature = "datafusion-cypher-engine")]
+            CypherEngineMode::DataFusion => &self.inner.metrics.queries_failed_by_reason_datafusion,
         }
         .record(stage, error);
     }
 
-    fn record_result_metrics(
-        &self,
-        _action: QueryTransportAction,
-        rows: usize,
-        error: Option<&GraphError>,
-    ) {
+    fn record_result_metrics(&self, _action: QueryTransportAction, rows: usize, error: Option<&GraphError>) {
         self.inner.metrics.record_result(rows, error);
     }
 }
@@ -3097,20 +3153,14 @@ fn record_span_error(span: &tracing::Span, err: &GraphError) {
 /// Bolt opens this once at RUN and keeps it for the whole statement rather than
 /// per PULL — see [`Self::execute_prepared_page`]. HTTP opens it per call,
 /// which for a non-paging transport is the same thing.
-pub(crate) fn client_root_span(
-    request: &ClientQueryRequest,
-    action: Option<QueryTransportAction>,
-) -> tracing::Span {
+pub(crate) fn client_root_span(request: &ClientQueryRequest, action: Option<QueryTransportAction>) -> tracing::Span {
     let mutation = match action {
         Some(action) => action == QueryTransportAction::Write,
         // Cheap: classification runs through the same thread-local parse cache
         // the request is about to use anyway, so this is a cache lookup and the
         // authorization path below re-reads the same entry. A parse failure is
         // not decided here — it surfaces with its real error a few lines later.
-        None => matches!(
-            classify_opencypher_query_access(&request.query),
-            Ok(OpenCypherQueryAccess::Write)
-        ),
+        None => matches!(classify_opencypher_query_access(&request.query), Ok(OpenCypherQueryAccess::Write)),
     };
     let fingerprint = opencypher_query_fingerprint(&request.query);
     macro_rules! root_span {
@@ -3190,41 +3240,49 @@ fn take_cursor_rows(rows: &mut VecDeque<QueryRow>, page_size: usize) -> Vec<Quer
 }
 
 fn query_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
-    rows.iter().fold(0_u64, |total, row| {
-        total.saturating_add(row.estimated_resident_bytes())
+    rows.iter()
+        .fold(0_u64, |total, row| total.saturating_add(row.estimated_resident_bytes()))
+}
+
+fn result_read_epoch(result: &QueryResultSet, action: QueryTransportAction) -> Result<Option<StorageSequence>> {
+    if action != QueryTransportAction::Read {
+        return Ok(None);
+    }
+    result.read_epoch.map(Some).ok_or_else(|| GraphError::CorruptValue {
+        key: "client/query/read_epoch".to_string(),
+        reason: "read query result did not report its storage snapshot epoch".to_string(),
     })
 }
 
-fn result_read_epoch(
-    result: &QueryResultSet,
-    action: QueryTransportAction,
-) -> Result<Option<StorageSequence>> {
+fn result_storage_sequence(result: &QueryResultSet, action: QueryTransportAction) -> Result<Option<StorageSequence>> {
     if action != QueryTransportAction::Read {
         return Ok(None);
     }
-    result
-        .read_epoch
-        .map(Some)
-        .ok_or_else(|| GraphError::CorruptValue {
-            key: "client/query/read_epoch".to_string(),
-            reason: "read query result did not report its storage snapshot epoch".to_string(),
-        })
+    result.storage_sequence.map(Some).ok_or_else(|| GraphError::CorruptValue {
+        key: "client/query/storage_sequence".to_string(),
+        reason: "read query result did not report its SlateDB snapshot sequence".to_string(),
+    })
 }
 
-fn result_storage_sequence(
-    result: &QueryResultSet,
-    action: QueryTransportAction,
-) -> Result<Option<StorageSequence>> {
-    if action != QueryTransportAction::Read {
-        return Ok(None);
+fn statement_atomicity_not_supported() -> GraphError {
+    GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Mutation,
+        dialect: "ClientProtocol",
+        feature: "statement atomicity is not supported by the selected Cypher engine".to_string(),
     }
-    result
-        .storage_sequence
-        .map(Some)
-        .ok_or_else(|| GraphError::CorruptValue {
-            key: "client/query/storage_sequence".to_string(),
-            reason: "read query result did not report its SlateDB snapshot sequence".to_string(),
-        })
+}
+
+fn datafusion_supports_statement_atomicity(engine: CypherEngineMode) -> bool {
+    #[cfg(feature = "datafusion-cypher-engine")]
+    {
+        engine == CypherEngineMode::DataFusion
+    }
+
+    #[cfg(not(feature = "datafusion-cypher-engine"))]
+    {
+        let _ = engine;
+        false
+    }
 }
 
 fn experimental_engine_not_compiled() -> GraphError {
@@ -3244,16 +3302,16 @@ fn query_context(
 ) -> QueryContext {
     let mutation_idempotency_key = match request.mutation_idempotency_key.as_ref() {
         Some(ClientMutationIdempotencyKey::ServerGenerated(value)) => value.clone(),
-        Some(ClientMutationIdempotencyKey::CallerSupplied(value)) => {
-            principal_scoped_mutation_idempotency_key(session.principal(), value)
-        }
+        Some(ClientMutationIdempotencyKey::CallerSupplied(value)) => principal_scoped_mutation_idempotency_key(session.principal(), value),
         None => request.query_id.clone(),
     };
     let mut context = QueryContext::new(&request.target.cell_id, mutation_idempotency_key)
         .in_scope(request.target.scope.clone())
+        .with_idempotency_principal(session.principal.as_str())
         .with_parameters(parameters)
         .with_list_parameters(list_parameters)
-        .with_cancellation_token(cancellation_token);
+        .with_cancellation_token(cancellation_token)
+        .as_session_user(session.principal().as_str());
     if let Some(read_epoch) = request.read_epoch {
         context = context.at_epoch(read_epoch);
     }
@@ -3266,19 +3324,13 @@ fn query_context(
     context
 }
 
-fn principal_scoped_mutation_idempotency_key(
-    principal: &QueryTransportPrincipal,
-    caller_key: &str,
-) -> String {
+fn principal_scoped_mutation_idempotency_key(principal: &QueryTransportPrincipal, caller_key: &str) -> String {
     // QueryTransportPrincipal already contains only a one-way bearer-token hash
     // or an mTLS certificate fingerprint. Hash it once more so the durable key
     // reveals neither principal kind nor identifier while remaining stable on
     // every node and after process restarts.
     let principal_digest = Sha256::digest(principal.as_str().as_bytes());
-    format!(
-        "principal-v1-{}-{caller_key}",
-        URL_SAFE_NO_PAD.encode(principal_digest)
-    )
+    format!("principal-v1-{}-{caller_key}", URL_SAFE_NO_PAD.encode(principal_digest))
 }
 
 /// Split bound parameters into the scalar map every engine has always taken and
@@ -3289,9 +3341,22 @@ fn principal_scoped_mutation_idempotency_key(
 /// rejection happened here, before the query text was looked at. A list holding
 /// anything but scalars, and a map, are still refused with the message they
 /// always had, because those remain UNWIND-only inputs.
-fn split_query_parameters(
-    parameters: &BTreeMap<String, QueryParameterValue>,
-) -> Result<BoundQueryParameters> {
+/// A `gds.*` call passes its configuration as map parameters, which no
+/// `QueryContext` carries. Rather than widen the context and the transport
+/// for one procedure family, the call is parsed here with its parameters and
+/// replaced by its printed literal form, which every later reader, on this
+/// node or the owner, parses to the same procedure. Parsing to the typed call
+/// first means no text substitution ever looks inside a string.
+fn bind_gds_call_parameters(request: &mut ClientQueryRequest) -> Result<()> {
+    if request.parameters.is_empty() || !is_gds_call(&request.query) {
+        return Ok(());
+    }
+    request.query = parse_gds_procedure_with_query_parameters(&request.query, &request.parameters)?.to_cypher();
+    request.parameters.clear();
+    Ok(())
+}
+
+fn split_query_parameters(parameters: &BTreeMap<String, QueryParameterValue>) -> Result<BoundQueryParameters> {
     let composite = |name: &str| GraphError::UnsupportedQuery {
         reason: QueryFailureReason::Parameter,
         dialect: "ClientProtocol",
@@ -3322,6 +3387,7 @@ fn split_query_parameters(
 }
 
 fn resolve_unwind_batch(
+    query: &str,
     parsed: crate::query::opencypher::ParsedUnwindBatch,
     parameters: &BTreeMap<String, QueryParameterValue>,
 ) -> Result<QueryBatchOperation> {
@@ -3340,6 +3406,26 @@ fn resolve_unwind_batch(
         });
     };
     match parsed.kind {
+        ParsedUnwindBatchKind::MatchMutation { alias } => {
+            let rows = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| unwind_row_scalar_map(row, index))
+                .collect::<Result<Vec<_>>>()?;
+            // The other parameters are the body's own; the row list is consumed
+            // here, and a list of maps is not a scalar the body could name.
+            let mut others = parameters.clone();
+            others.remove(&parsed.parameter);
+            others.remove(&format!("${}", parsed.parameter));
+            let (parameters, list_parameters) = split_query_parameters(&others)?;
+            Ok(QueryBatchOperation::MatchMutation {
+                query: query.to_string(),
+                alias,
+                rows,
+                parameters,
+                list_parameters,
+            })
+        }
         ParsedUnwindBatchKind::OutNeighbors {
             edge_type,
             source_field,
@@ -3385,10 +3471,7 @@ fn resolve_unwind_batch(
             edges.retain(|edge| seen.insert(*edge));
             Ok(QueryBatchOperation::DeleteEdges { edge_type, edges })
         }
-        ParsedUnwindBatchKind::DeleteVertices {
-            vertex_field,
-            detach,
-        } => {
+        ParsedUnwindBatchKind::DeleteVertices { vertex_field, detach } => {
             let mut vertices = rows
                 .iter()
                 .enumerate()
@@ -3403,12 +3486,7 @@ fn resolve_unwind_batch(
             path_node_constraints,
             deleted_column,
         } => {
-            let candidates = unwind_isolated_candidates(
-                rows,
-                &vertex_field,
-                &path_node_constraints,
-                parameters,
-            )?;
+            let candidates = unwind_isolated_candidates(rows, &vertex_field, &path_node_constraints, parameters)?;
             Ok(QueryBatchOperation::DeleteIsolatedVertices {
                 candidates,
                 deleted_column,
@@ -3440,18 +3518,11 @@ fn resolve_unwind_batch(
                     feature: format!("UNWIND parameter ${isolated_parameter} must be a list"),
                 });
             };
-            let mut isolated_candidates = unwind_isolated_candidates(
-                isolated_rows,
-                &isolated_vertex_field,
-                &isolated_path_node_constraints,
-                parameters,
-            )?;
+            let mut isolated_candidates =
+                unwind_isolated_candidates(isolated_rows, &isolated_vertex_field, &isolated_path_node_constraints, parameters)?;
             detach_vertices.sort_unstable();
             detach_vertices.dedup();
-            let detach_set = detach_vertices
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>();
+            let detach_set = detach_vertices.iter().copied().collect::<std::collections::BTreeSet<_>>();
             isolated_candidates.retain(|candidate| !detach_set.contains(&candidate.vertex));
             Ok(QueryBatchOperation::DeleteVerticesAndIsolatedCandidates {
                 detach_vertices,
@@ -3481,8 +3552,7 @@ fn resolve_unwind_batch(
             label,
             vertex_field,
             property_fields,
-            update_if_newer_by,
-            create_only_properties,
+            merge_policy,
         } => {
             let vertices = rows
                 .iter()
@@ -3490,9 +3560,7 @@ fn resolve_unwind_batch(
                 .map(|(index, row)| {
                     let mut metadata = VertexMetadata::default().with_label(label.clone());
                     for (property, field) in &property_fields {
-                        metadata
-                            .properties
-                            .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                        metadata.properties.insert(property.clone(), unwind_row_scalar(row, index, field)?);
                     }
                     Ok(QueryBatchVertex {
                         vertex: unwind_row_vertex_id(row, index, &vertex_field)?,
@@ -3500,14 +3568,8 @@ fn resolve_unwind_batch(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(match update_if_newer_by {
-                Some(update_if_newer_by) => QueryBatchOperation::GuardedUpsertVertices {
-                    vertices,
-                    merge_policy: QueryBatchMergePolicy {
-                        update_if_newer_by,
-                        create_only_properties,
-                    },
-                },
+            Ok(match merge_policy {
+                Some(merge_policy) => QueryBatchOperation::GuardedUpsertVertices { vertices, merge_policy },
                 None => QueryBatchOperation::UpsertVertices { vertices },
             })
         }
@@ -3519,36 +3581,30 @@ fn resolve_unwind_batch(
             property_fields,
             source_label,
             destination_label,
-        } => Ok(
-            QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
-                edge_type,
-                relationships: rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| {
-                        let mut metadata = EdgeMetadata::default();
-                        for (property, field) in &property_fields {
-                            metadata
-                                .properties
-                                .insert(property.clone(), unwind_row_scalar(row, index, field)?);
-                        }
-                        let relationship_id =
-                            unwind_row_vertex_id(row, index, &relationship_id_field)?;
-                        metadata.properties.insert(
-                            "id".to_string(),
-                            VertexPropertyValue::Integer(relationship_id),
-                        );
-                        Ok(QueryBatchRelationship {
-                            src: unwind_row_vertex_id(row, index, &source_field)?,
-                            dst: unwind_row_vertex_id(row, index, &destination_field)?,
-                            metadata,
-                        })
+        } => Ok(QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
+            edge_type,
+            relationships: rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut metadata = EdgeMetadata::default();
+                    for (property, field) in &property_fields {
+                        metadata.properties.insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                    }
+                    let relationship_id = unwind_row_vertex_id(row, index, &relationship_id_field)?;
+                    metadata
+                        .properties
+                        .insert("id".to_string(), VertexPropertyValue::Integer(relationship_id));
+                    Ok(QueryBatchRelationship {
+                        src: unwind_row_vertex_id(row, index, &source_field)?,
+                        dst: unwind_row_vertex_id(row, index, &destination_field)?,
+                        metadata,
                     })
-                    .collect::<Result<Vec<_>>>()?,
-                source_label,
-                destination_label,
-            },
-        ),
+                })
+                .collect::<Result<Vec<_>>>()?,
+            source_label,
+            destination_label,
+        }),
         ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
             edge_type,
             source_field,
@@ -3557,8 +3613,7 @@ fn resolve_unwind_batch(
             property_fields,
             source_label,
             destination_label,
-            update_if_newer_by,
-            create_only_properties,
+            merge_policy,
         } => {
             let relationships = rows
                 .iter()
@@ -3566,9 +3621,7 @@ fn resolve_unwind_batch(
                 .map(|(index, row)| {
                     let mut metadata = EdgeMetadata::default();
                     for (property, field) in &property_fields {
-                        metadata
-                            .properties
-                            .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                        metadata.properties.insert(property.clone(), unwind_row_scalar(row, index, field)?);
                     }
                     Ok(QueryBatchRelationshipMerge {
                         src: unwind_row_vertex_id(row, index, &source_field)?,
@@ -3578,19 +3631,14 @@ fn resolve_unwind_batch(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(match update_if_newer_by {
-                Some(update_if_newer_by) => {
-                    QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
-                        edge_type,
-                        relationships,
-                        source_label,
-                        destination_label,
-                        merge_policy: QueryBatchMergePolicy {
-                            update_if_newer_by,
-                            create_only_properties,
-                        },
-                    }
-                }
+            Ok(match merge_policy {
+                Some(merge_policy) => QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
+                    edge_type,
+                    relationships,
+                    source_label,
+                    destination_label,
+                    merge_policy,
+                },
                 None => QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
                     edge_type,
                     relationships,
@@ -3602,11 +3650,7 @@ fn resolve_unwind_batch(
     }
 }
 
-fn unwind_batch_edges(
-    rows: &[QueryParameterValue],
-    source_field: &str,
-    destination_field: &str,
-) -> Result<Vec<QueryBatchEdge>> {
+fn unwind_batch_edges(rows: &[QueryParameterValue], source_field: &str, destination_field: &str) -> Result<Vec<QueryBatchEdge>> {
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
@@ -3618,11 +3662,7 @@ fn unwind_batch_edges(
         .collect()
 }
 
-fn unwind_row_vertex_id(
-    row: &QueryParameterValue,
-    index: usize,
-    field: &str,
-) -> Result<crate::VertexId> {
+fn unwind_row_vertex_id(row: &QueryParameterValue, index: usize, field: &str) -> Result<crate::VertexId> {
     let QueryParameterValue::Map(row) = row else {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Unwind,
@@ -3637,12 +3677,8 @@ fn unwind_row_vertex_id(
     })?;
     match value {
         QueryParameterValue::Scalar(VertexPropertyValue::Integer(value)) => Ok(*value),
-        QueryParameterValue::Scalar(VertexPropertyValue::SignedInteger(value)) if *value >= 0 => {
-            Ok(*value as u64)
-        }
-        QueryParameterValue::Scalar(_)
-        | QueryParameterValue::List(_)
-        | QueryParameterValue::Map(_) => Err(GraphError::UnsupportedQuery {
+        QueryParameterValue::Scalar(VertexPropertyValue::SignedInteger(value)) if *value >= 0 => Ok(*value as u64),
+        QueryParameterValue::Scalar(_) | QueryParameterValue::List(_) | QueryParameterValue::Map(_) => Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND row {index} field {field} must be a non-negative integer"),
@@ -3650,11 +3686,28 @@ fn unwind_row_vertex_id(
     }
 }
 
-fn unwind_row_scalar(
-    row: &QueryParameterValue,
-    index: usize,
-    field: &str,
-) -> Result<VertexPropertyValue> {
+/// Every field of one `UNWIND ... MATCH ... SET` row, each a scalar.
+fn unwind_row_scalar_map(row: &QueryParameterValue, index: usize) -> Result<BTreeMap<String, VertexPropertyValue>> {
+    let QueryParameterValue::Map(row) = row else {
+        return Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} must be a map"),
+        });
+    };
+    row.iter()
+        .map(|(field, value)| match value {
+            QueryParameterValue::Scalar(value) => Ok((field.clone(), value.clone())),
+            QueryParameterValue::List(_) | QueryParameterValue::Map(_) => Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Unwind,
+                dialect: "OpenCypher",
+                feature: format!("UNWIND row {index} field {field} must be a scalar"),
+            }),
+        })
+        .collect()
+}
+
+fn unwind_row_scalar(row: &QueryParameterValue, index: usize, field: &str) -> Result<VertexPropertyValue> {
     let QueryParameterValue::Map(row) = row else {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Unwind,
@@ -3664,13 +3717,11 @@ fn unwind_row_scalar(
     };
     match row.get(field) {
         Some(QueryParameterValue::Scalar(value)) => Ok(value.clone()),
-        Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => {
-            Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::Unwind,
-                dialect: "OpenCypher",
-                feature: format!("UNWIND row {index} field {field} must be scalar"),
-            })
-        }
+        Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} field {field} must be scalar"),
+        }),
         None => Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
@@ -3696,18 +3747,13 @@ fn unwind_isolated_candidates(
             let value = match value {
                 ParsedUnwindConstraintValue::Literal(value) => value.clone(),
                 ParsedUnwindConstraintValue::Parameter(name) => {
-                    match parameters
-                        .get(name)
-                        .or_else(|| parameters.get(&format!("${name}")))
-                    {
+                    match parameters.get(name).or_else(|| parameters.get(&format!("${name}"))) {
                         Some(QueryParameterValue::Scalar(value)) => value.clone(),
                         Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => {
                             return Err(GraphError::UnsupportedQuery {
                                 reason: QueryFailureReason::Unwind,
                                 dialect: "OpenCypher",
-                                feature: format!(
-                                    "isolated vertex constraint parameter ${name} must be scalar"
-                                ),
+                                feature: format!("isolated vertex constraint parameter ${name} must be scalar"),
                             });
                         }
                         None => {
@@ -3718,9 +3764,7 @@ fn unwind_isolated_candidates(
                         }
                     }
                 }
-                ParsedUnwindConstraintValue::RowField(field) => {
-                    unwind_row_scalar(row, index, field)?
-                }
+                ParsedUnwindConstraintValue::RowField(field) => unwind_row_scalar(row, index, field)?,
             };
             metadata.properties.insert(property.clone(), value);
         }
@@ -3729,9 +3773,7 @@ fn unwind_isolated_candidates(
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::Unwind,
                     dialect: "OpenCypher",
-                    feature: format!(
-                        "UNWIND rows for vertex {vertex} use conflicting isolation constraints"
-                    ),
+                    feature: format!("UNWIND rows for vertex {vertex} use conflicting isolation constraints"),
                 });
             }
         }
@@ -3747,6 +3789,7 @@ fn unwind_isolated_candidates(
 
 fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> {
     match operation {
+        QueryBatchOperation::MatchMutation { .. } => Vec::new(),
         QueryBatchOperation::OutNeighbors {
             source_column,
             destination_column,
