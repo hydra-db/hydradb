@@ -206,8 +206,6 @@ graph-node itself refuses BEGIN.
 
 ## Query Execution
 
-for the datafusion partition, arrow batch and mutation-owner model, see [cypher execution model](docs/architecture/cypher-execution-model.md)
-
 ### Common Pipeline
 
 ```mermaid

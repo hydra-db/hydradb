@@ -1,4 +1,4 @@
-//! The anonymous usage report (ENG-3474): GraphNode's half.
+//! The anonymous usage report: GraphNode's half.
 //!
 //! `hydradb_usage_report` holds what the sender and receiver agree on; this
 //! module gathers the node's inputs and sends.
@@ -13,7 +13,7 @@
 //! **Nothing customer-named leaves the node.** Scope and cell names key the
 //! per-shard totals in memory, so a closed scope can be differenced correctly,
 //! and are dropped when operator totals are summed by operator name. Only
-//! counter, class, reason, engine and operator names — vocabularies Turbolay
+//! counter, class, reason, engine and operator names — vocabularies HydraDB
 //! defines — reach the report.
 //!
 //! **Totals are only marked sent once the receiver accepts them.** A report

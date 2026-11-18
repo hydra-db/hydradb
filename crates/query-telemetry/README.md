@@ -1,9 +1,8 @@
 # Failed-query telemetry
 
 GraphNode reports failed queries to an independent Axum receiver. The receiver
-buffers reports and batch inserts them into ClickHouse. MCP uses GraphNode's
-HTTP query API, so reporting also works for MCP without a second exporter.
-Bolt and direct client-service queries use the same reporting path.
+buffers reports and batch inserts them into ClickHouse. Bolt, HTTP and direct
+client-service queries use the same reporting path.
 
 ## Run the receiver
 
@@ -81,19 +80,16 @@ and sum those. Each route accepts only its own report format.
 ## Enable or disable GraphNode reporting
 
 Reporting requires the optional `query-telemetry` Cargo feature and is disabled at runtime by default.
-To enable it for a local MCP stack:
+To enable it, set these variables in GraphNode's environment and restart:
 
 ```sh
 export GRAPH_QUERY_TELEMETRY_ENABLED=true
 export GRAPH_QUERY_TELEMETRY_URL=http://127.0.0.1:18500/v1/query-failures
 # If the receiver requires authentication:
 # export GRAPH_QUERY_TELEMETRY_TOKEN_FILE=/path/to/telemetry-token
-just mcp-local-query-telemetry /tmp/hydradb-mcp
 ```
 
-These variables belong to GraphNode. The MCP local launcher passes them through
-to its child node. For an existing node, set them in that node's environment.
-For an MCP client configuration, put them in the launcher's `env` map.
+These variables belong to GraphNode. Set them in the node's environment.
 
 To turn reporting off, restart GraphNode with:
 
@@ -120,9 +116,9 @@ Each failing stage emits one event; successful queries emit none.
 
 HTTP callers can send `X-HydraDB-Correlation-Id` and `X-HydraDB-Caller-Step`.
 Bolt callers use the existing `hydradb.correlation_id` and `hydradb.caller.step`
-transaction metadata. MCP labels requests `mcp.execute_query`.
+transaction metadata.
 Connection failures, malformed HTTP/Bolt messages, authentication failures,
-MCP argument validation and client disconnections before a service error are
+argument validation and client disconnections before a service error are
 outside the query-reporting boundary.
 
 ## Buffering and retries
@@ -178,12 +174,12 @@ LIMIT 20;
 
 ## Verify
 
-`just clippy-query-telemetry` checks the standalone crate. To verify real MCP
+`just clippy-query-telemetry` checks the standalone crate. To verify real
 failures, batches, insert retry, authentication, shutdown, the node's own usage
 report and disabled reporting against a disposable ClickHouse database:
 
 ```sh
-just build-mcp-query-telemetry build-query-telemetry
+just build-query-telemetry
 CLICKHOUSE_URL=http://127.0.0.1:8123 just smoke-query-telemetry
 ```
 

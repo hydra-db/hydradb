@@ -166,9 +166,8 @@ async fn an_optional_match_composes_with_aggregation() {
 }
 
 /// A `UNION` runs its arms side by side on forked reads, and returns exactly
-/// what running them one after another returns. The shape is a
-/// chunk-candidate source read: one arm per chunk, each a point lookup and a
-/// one-hop expansion.
+/// what running them one after another returns. The shape is a chunk-candidate
+/// source read: one arm per chunk, each a point lookup and a one-hop expansion.
 mod concurrent_union_arms {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -419,6 +418,7 @@ mod concurrent_union_arms {
         let prepared = PreparedQuery {
             ast: Arc::new(Document::new(CypherDialect::Neo4j(CypherVersion::V25), Vec::new())),
             logical: Arc::new(GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: Symbol::from("e"),
                 labels: Vec::new(),
             }),
@@ -463,6 +463,7 @@ mod concurrent_union_arms {
         let prepared = PreparedQuery {
             ast: Arc::new(Document::new(CypherDialect::Neo4j(CypherVersion::V25), Vec::new())),
             logical: Arc::new(GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: Symbol::from("e"),
                 labels: Vec::new(),
             }),

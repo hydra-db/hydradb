@@ -1,6 +1,6 @@
 //! Canonical key/value encoder for offline graph images.
 //!
-//! The encoder owns Turbolay's storage format while the caller owns external
+//! The encoder owns HydraDB's storage format while the caller owns external
 //! sorting and SlateDB publication. It deliberately emits only durable graph
 //! state; request idempotency receipts and topology changelog entries describe
 //! online history and do not belong in a snapshot image. The edge-type catalog

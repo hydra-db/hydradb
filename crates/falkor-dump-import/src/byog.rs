@@ -54,7 +54,7 @@ pub fn resolve_byog_graph(mut graph: GraphDump) -> Result<GraphResolution> {
             .any(|(_, value)| matches!(value, falkordb_rdb::PropertyValue::Null))
     }) {
         return Err(fail(
-            "BYOG contains explicit null property records that Turbolay cannot store losslessly",
+            "BYOG contains explicit null property records that HydraDB cannot store losslessly",
         ));
     }
     let mut seen = BTreeSet::new();

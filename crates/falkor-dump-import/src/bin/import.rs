@@ -23,7 +23,7 @@ use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode};
 // v2 switched offline scopes to the canonical client namespace encoding. Keep
 // its receipts separate so --resume can never accept an image written at the
 // obsolete raw-identifier path.
-// v3: identities follow Turbolay's writers and non-finite floats are refused, so
+// v3: identities follow HydraDB's writers and non-finite floats are refused, so
 // a v2 receipt, attempt marker or image is never resumed.
 // v4: every image is sealed past storage sequence 0 (GraphShard::seal_offline_image),
 // so a v3 image, which the first edge write would damage, is never resumed.
@@ -570,12 +570,12 @@ fn property_value(name: &str, value: &PropertyValue) -> Option<hydradb::Result<V
         PropertyValue::Null => return None,
         PropertyValue::Bool(value) => VertexPropertyValue::Bool(*value),
         PropertyValue::Integer(value) => VertexPropertyValue::from_i64(*value),
-        // Turbolay stores a NaN or an infinity, but its query engine refuses every
+        // HydraDB stores a NaN or an infinity, but its query engine refuses every
         // row that returns one, so the property would be unreadable after cutover.
         PropertyValue::Float(value) if !value.is_finite() => {
             return Some(Err(hydradb::GraphError::CorruptValue {
                 key: format!("property/{name}"),
-                reason: format!("non-finite FalkorDB float {value} cannot be returned by Turbolay queries"),
+                reason: format!("non-finite FalkorDB float {value} cannot be returned by HydraDB queries"),
             }))
         }
         PropertyValue::Float(value) => VertexPropertyValue::Float(QueryFloat(*value)),
@@ -583,13 +583,13 @@ fn property_value(name: &str, value: &PropertyValue) -> Option<hydradb::Result<V
         PropertyValue::Array(_) | PropertyValue::Point { .. } | PropertyValue::VectorF32(_) | PropertyValue::Map(_) => {
             return Some(Err(hydradb::GraphError::CorruptValue {
                 key: format!("property/{name}"),
-                reason: "FalkorDB composite value has no lossless Turbolay property representation".into(),
+                reason: "FalkorDB composite value has no lossless HydraDB property representation".into(),
             }))
         }
         PropertyValue::DateTime(_) | PropertyValue::Date(_) | PropertyValue::Time(_) | PropertyValue::Duration(_) => {
             return Some(Err(hydradb::GraphError::CorruptValue {
                 key: format!("property/{name}"),
-                reason: "temporal FalkorDB values have no lossless Turbolay property representation".into(),
+                reason: "temporal FalkorDB values have no lossless HydraDB property representation".into(),
             }))
         }
     }))

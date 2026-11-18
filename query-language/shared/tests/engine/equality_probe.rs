@@ -103,6 +103,7 @@ fn project(input: GraphPhysicalPlan) -> PreparedQuery {
     PreparedQuery {
         ast: Arc::new(Document::new(CypherDialect::OpenCypher, Vec::new())),
         logical: Arc::new(GraphLogicalPlan::NodeScan {
+            lookup_ids: None,
             binding: Symbol::new("e"),
             labels: vec![Symbol::new("Entity")],
         }),

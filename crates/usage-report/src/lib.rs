@@ -1,4 +1,4 @@
-//! The anonymous usage report a Turbolay install sends (ENG-3474).
+//! The anonymous usage report a HydraDB install sends.
 //!
 //! This crate holds what the sender and the receiver must agree on, and
 //! nothing that needs a runtime: no I/O, no clock, no environment. GraphNode

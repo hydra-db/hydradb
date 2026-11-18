@@ -516,7 +516,12 @@ impl GraphShard {
         let source_seekable = row_node_is_bound_or_seekable(&edge.src, bound) || endpoint_access_is_indexed(&source.access);
         let destination_seekable = row_node_is_bound_or_seekable(&edge.dst, bound) || endpoint_access_is_indexed(&destination.access);
 
-        if row_node_is_bound_or_seekable(&edge.src, bound) && row_node_is_bound_or_seekable(&edge.dst, bound) {
+        // A bound directed relationship fixes both endpoints at execution
+        // (`constrain_row_pattern`), named or not, so it is a check between
+        // them, never an expansion from one.
+        let relationship_bound =
+            edge.direction == EdgeDirection::Outbound && matches!(edge.binding.as_ref(), Some(binding) if bound.contains(binding));
+        if relationship_bound || (row_node_is_bound_or_seekable(&edge.src, bound) && row_node_is_bound_or_seekable(&edge.dst, bound)) {
             return Ok(AccessEstimate::new(
                 RowQueryAccess::ExpandInto {
                     edge_type: edge.edge_type.clone(),
@@ -942,7 +947,7 @@ impl RowQueryPlanSummary {
 /// `VertexLabelScan`, hydrates every vertex carrying the label and filters
 /// afterwards. On 13,008 `:Source` vertices that is ~800x the indexed form with
 /// no object store in the path — `examples/where_vs_inline_bench.rs` measures
-/// it, and the vertex-equality predicate pushdown design
+/// it, and `docs/plans/2026-08-20-vertex-equality-predicate-pushdown.md`
 /// records the numbers.
 ///
 /// The rewrite is exact rather than an approximation. Both forms end in

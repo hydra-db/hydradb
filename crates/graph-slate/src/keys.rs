@@ -484,6 +484,27 @@ pub fn relationship_property_index_prefix(cell_id: &str, edge_type: &str, proper
     format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/")
 }
 
+/// The entries of one source's `edge_type` relationships whose `property`
+/// is `encoded_value`. The key orders the source right after the value, so
+/// this prefix answers "which of this vertex's relationships have the value"
+/// without reading its other relationships.
+#[cfg(feature = "opencypher")]
+pub fn relationship_property_index_source_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    src: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/")
+}
+
+/// The structural-edge counterpart of [`relationship_property_index_source_prefix`].
+#[cfg(feature = "opencypher")]
+pub fn edge_property_index_source_prefix(cell_id: &str, edge_type: &str, property: &str, encoded_value: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/")
+}
+
 #[cfg(feature = "opencypher")]
 pub fn relationship_property_index_property_prefix(cell_id: &str, edge_type: &str, property: &str) -> String {
     format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/")

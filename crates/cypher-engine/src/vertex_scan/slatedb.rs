@@ -168,6 +168,7 @@ fn plan_ranked_node_scan(
     // worse than today.
     let fallback = || {
         let request = VertexScanRequest {
+            lookup_ids: None,
             binding: binding.clone(),
             labels: labels.to_vec(),
             predicates: vec![predicate.clone()],
@@ -446,6 +447,9 @@ fn vertex_id(value: &BoundValue) -> Option<u64> {
 }
 
 pub(super) fn prepare_access(request: &VertexScanRequest, statistics: &dyn StatisticsProvider) -> VertexAccess {
+    if let Some(values) = &request.lookup_ids {
+        return VertexAccess::IdPoints { values: values.clone() };
+    }
     if let Some(ordered) = ordered_access(request) {
         return VertexAccess::OrderedProperty(Box::new(ordered));
     }
@@ -465,9 +469,65 @@ pub(super) fn prepare_access(request: &VertexScanRequest, statistics: &dyn Stati
             }
         }
     }
-    match request.predicates.first() {
+    let access = match request.predicates.first() {
         Some(predicate) => legacy_node_scan_access(&request.binding, &request.labels, predicate, statistics),
         None => fallback_scan(&request.binding, &request.labels, statistics),
+    };
+    if statistics.ranks_access_candidates() {
+        return bounded_presence_scan(request, access, statistics);
+    }
+    access
+}
+
+/// Walk a bounded range before the `property-presence` plan it would
+/// otherwise run, when ranking statistics know the property.
+///
+/// Statistics measure numeric domains only, so a string range is never a
+/// ranked candidate (`a_string_bound_is_not_a_range_candidate`) and the plan
+/// falls through to here. When that plan is `property-presence` -- read every
+/// entry the property holds, then filter -- and the predicates bound the same
+/// property, the range names the slice of the index it needs: the
+/// chunk-existence probe `c.chunk_id >= $lo AND c.chunk_id < $hi LIMIT 1`
+/// read every `chunk_id` entry and failed the candidate cap on a large
+/// tenant. The walk reads at most the range read limit and declines to that
+/// exact presence plan when the range is wider, so nothing reads more than it
+/// did. Every other plan, a property statistics do not know, and planning
+/// without statistics are untouched. The estimate is the property's entry
+/// count held under the read limit; the share inside the range is unknown.
+fn bounded_presence_scan(request: &VertexScanRequest, access: VertexAccess, statistics: &dyn StatisticsProvider) -> VertexAccess {
+    let VertexAccess::PropertyPresence { property } = &access else {
+        return access;
+    };
+    let Some(entries) = statistics
+        .property_statistics(&request.labels, property)
+        .and_then(|stats| stats.non_null_count)
+    else {
+        return access;
+    };
+    let Some(predicate) = fold_conjuncts(request.predicates.clone()) else {
+        return access;
+    };
+    // The presence plan hands every entry to the filter, which evaluates
+    // each conjunct eagerly; narrowing first would skip rows a fallible
+    // conjunct (`1 / 0 = 0`) raises on, turning an error into an answer.
+    // Only an all-total predicate is narrowed, as for every other rewrite
+    // that shrinks a filter's input.
+    if !crate::plan::total_condition(&predicate) {
+        return access;
+    }
+    let mut window = OrderedWindowPredicate::default();
+    let mut residual = Vec::new();
+    collect_ordered_window_predicate(&predicate, &request.binding, property, &mut window, &mut residual);
+    if window.lower.is_none() && window.upper.is_none() {
+        return access;
+    }
+    VertexAccess::Range {
+        property: property.clone(),
+        lower: window.lower,
+        upper: window.upper,
+        estimated_rows: entries.min(RANGE_SEEK_MAX_READ_LIMIT),
+        read_limit: range_read_limit(RANGE_SEEK_MAX_READ_LIMIT),
+        fallback: Box::new(PreparedVertexScan::new(request.clone(), access, statistics)),
     }
 }
 

@@ -16,6 +16,9 @@ impl PreparedVertexScan {
             self.binding(),
             render_symbols(self.labels())
         );
+        if self.request().lookup_ids.is_some() {
+            let _ = write!(output, ", occurrences=preserved");
+        }
         match &self.plan {
             VertexAccess::IdPoint { value } => {
                 let _ = write!(output, ", value={}", render_value(value));

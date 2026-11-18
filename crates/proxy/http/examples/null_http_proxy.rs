@@ -1,10 +1,10 @@
-//! The null HTTP proxy: pingora with none of turbolay's logic.
+//! The null HTTP proxy: pingora with none of HydraDB's logic.
 //!
 //! Requests go to a fixed list of upstreams in turn, over h2c, exactly as
 //! `turbolay-proxy` talks to a node, but with no scope parsing, routing,
 //! admission, owner cache or retry policy. It is the yardstick for "what HTTP
 //! proxying costs on this machine": the gap between it and `turbolay-proxy` is
-//! what the turbolay logic costs.
+//! what the HydraDB logic costs.
 //!
 //! `NULL_LISTEN` (default 127.0.0.1:37030), `NULL_TARGETS` (comma list),
 //! `NULL_THREADS`, `NULL_MAX_H2_STREAMS`.
@@ -42,7 +42,7 @@ impl ProxyHttp for NullProxy {
         let target = self.targets[self.next.fetch_add(1, Ordering::Relaxed) % self.targets.len()];
         let mut peer = HttpPeer::new(target, false, String::new());
         // The same peer options turbolay-proxy sets, so the only difference
-        // left between the two is the turbolay logic.
+        // left between the two is the HydraDB logic.
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(3));
         peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
         peer.options.set_http_version(2, 2);

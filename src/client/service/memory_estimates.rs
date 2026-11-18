@@ -85,6 +85,19 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
     use QueryBatchOperation::*;
     let Some(value) = value else { return 0 };
     (match value {
+        ReplaceOwnedRelationshipSet { request } => {
+            request.edge_type.capacity()
+                + request.owner_property.capacity()
+                + request.owner.capacity()
+                + request.operation_id.capacity()
+                + request.content_hash.capacity()
+                + metadata(&request.source_constraints)
+                + properties(&request.properties.properties)
+                + vec_bytes(&request.targets)
+                + request.targets.iter().map(|target| metadata(&target.constraints)).sum::<usize>()
+                + request.mutation_bytes()
+                + crate::query::owned_relationships::MAX_OWNED_MUTATION_BYTES
+        }
         MatchMutation {
             query,
             alias,
@@ -107,6 +120,15 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
                     .sum::<usize>()
         }
         OutNeighbors { edge_type, sources, .. } => edge_type.capacity() + vec_bytes(sources),
+        LabeledOutNeighbors {
+            edge_type,
+            sources,
+            source_labels,
+            destination_labels,
+            ..
+        } => {
+            edge_type.capacity() + vec_bytes(sources) + source_labels.iter().chain(destination_labels).map(String::capacity).sum::<usize>()
+        }
         CreateEdges { edge_type, edges } | DeleteEdges { edge_type, edges } => edge_type.capacity() + vec_bytes(edges),
         DeleteVertices { vertices, .. } => vec_bytes(vertices),
         DeleteIsolatedVertices { candidates, .. } => {
@@ -176,6 +198,23 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
                 + source_label.capacity()
                 + destination_label.capacity()
                 + policy(merge_policy)
+        }
+        ConstrainedMergeRelationshipsBetweenLabeledVertices {
+            edge_type,
+            relationships,
+            merge_policy,
+        } => {
+            edge_type.capacity()
+                + vec_bytes(relationships)
+                + relationships
+                    .iter()
+                    .map(|row| {
+                        properties(&row.relationship.metadata.properties)
+                            + metadata(&row.source_constraints)
+                            + metadata(&row.destination_constraints)
+                    })
+                    .sum::<usize>()
+                + merge_policy.as_ref().map_or(0, policy)
         }
     }) as u64
 }

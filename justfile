@@ -26,26 +26,6 @@ default:
 help:
     @just --list
 
-# Build the node, indexer, and stdio MCP launcher together.
-build-mcp:
-    cargo build --locked -p hydradb -p hydradb-mcp --features server-runtime,indexer-runtime --bin graph-node --bin graph-indexer --bin hydradb-mcp
-
-# Run the local node, indexer, and MCP server. Data survives restarts.
-mcp-local data_dir="/tmp/turbolay-mcp": build-mcp
-    "{{target_directory}}/debug/hydradb-mcp" --local {{quote(data_dir)}}
-
-
-# Lint the MCP adapter and local launcher.
-clippy-mcp:
-    cargo clippy --locked --all-targets -p hydradb-mcp -- -D warnings
-
-# Build the node with optional failed-query reporting.
-build-mcp-query-telemetry:
-    cargo build --locked -p hydradb -p hydradb-mcp --features server-runtime,indexer-runtime,query-telemetry --bin graph-node --bin graph-indexer --bin hydradb-mcp
-
-mcp-local-query-telemetry data_dir="/tmp/turbolay-mcp": build-mcp-query-telemetry
-    "{{target_directory}}/debug/hydradb-mcp" --local {{quote(data_dir)}}
-
 clippy-query-telemetry-runtime:
     cargo clippy --locked --all-targets --features server-runtime,indexer-runtime,query-telemetry -- -D warnings
 
@@ -458,7 +438,7 @@ native-check:
 # would pay for the same compile twice, once through rustc and once through
 # clippy-driver, for no extra coverage.
 # Run the local CI-equivalent check set.
-ci: clippy-usage-report test-usage-report test-usage-report-node test-neo4j-oracle native-check fmt-check clippy clippy-graph-slate clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime clippy-mcp clippy-query-telemetry clippy-query-telemetry-runtime test-query-telemetry test-placement test-scope test-proxy test-telemetry test-cypher test-graph-plan test-cypher-engine check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer test-node-otlp
+ci: clippy-usage-report test-usage-report test-usage-report-node test-neo4j-oracle native-check fmt-check clippy clippy-graph-slate clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime clippy-query-telemetry clippy-query-telemetry-runtime test-query-telemetry test-placement test-scope test-proxy test-telemetry test-cypher test-graph-plan test-cypher-engine check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer test-node-otlp
 
 
 

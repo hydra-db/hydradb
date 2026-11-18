@@ -34,6 +34,7 @@ impl GraphPhysicalPlan {
             Self::RelationshipPropertyRangeProbe { .. } => "RelationshipPropertyRangeProbe",
             Self::RelationshipTypeProbe { .. } => "RelationshipTypeProbe",
             Self::Expand { .. } => "ExpandExec",
+            Self::BoundRelationship { .. } => "BoundRelationshipExec",
             Self::VariableExpand { .. } => "VariableExpandExec",
             // The two join behaviours are separate operators to telemetry for
             // the same reason `EXPLAIN` names them apart: a regression in
@@ -68,6 +69,7 @@ impl GraphPhysicalPlan {
             Self::RelationshipPropertyRangeProbe { fallback, .. } | Self::RelationshipTypeProbe { fallback, .. } => vec![fallback],
             Self::Unwind { input, .. }
             | Self::Expand { input, .. }
+            | Self::BoundRelationship { input, .. }
             | Self::Filter { input, .. }
             | Self::Sort { input, .. }
             | Self::Skip { input, .. }
@@ -135,6 +137,13 @@ impl GraphPhysicalPlan {
                 if let Some(relationship) = relationship {
                     into.insert(relationship.clone());
                 }
+                into.insert(to.clone());
+            }
+            Self::BoundRelationship {
+                from, relationship, to, ..
+            } => {
+                into.insert(from.clone());
+                into.insert(relationship.clone());
                 into.insert(to.clone());
             }
             Self::VariableExpand {

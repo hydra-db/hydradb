@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::QueryFailureReason;
 use crate::{
@@ -83,6 +83,46 @@ pub struct QueryBatchRelationshipMerge {
     pub metadata: EdgeMetadata,
 }
 
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchConstrainedRelationshipMerge {
+    pub relationship: QueryBatchRelationshipMerge,
+    pub source_constraints: VertexMetadata,
+    pub destination_constraints: VertexMetadata,
+}
+
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRelationshipTarget {
+    pub vertex: VertexId,
+    pub constraints: VertexMetadata,
+}
+
+#[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRelationshipSetRequest {
+    pub source: VertexId,
+    pub source_constraints: VertexMetadata,
+    pub edge_type: String,
+    pub owner_property: String,
+    pub owner: String,
+    pub properties: EdgeMetadata,
+    pub version: i64,
+    pub operation_id: String,
+    pub content_hash: String,
+    pub complete: bool,
+    pub targets: Vec<OwnedRelationshipTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRelationshipSetResult {
+    pub applied: bool,
+    pub version: i64,
+    pub created: u64,
+    pub deleted: u64,
+    pub storage_sequence: StorageSequence,
+}
+
 /// How an upsert row lands on a vertex or relationship that already exists:
 /// the `MERGE … ON CREATE SET … ON MATCH SET …` of the writer.
 ///
@@ -148,6 +188,9 @@ impl QueryBatchMergePolicy {
 #[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryBatchOperation {
+    ReplaceOwnedRelationshipSet {
+        request: OwnedRelationshipSetRequest,
+    },
     /// `UNWIND $rows AS <alias> MATCH ... [WHERE ...] (SET | REMOVE)+`, run on
     /// the writer as one statement: `query` is lowered once per row with
     /// `<alias>.<field>` bound to that row, and every row's update commits
@@ -165,6 +208,19 @@ pub enum QueryBatchOperation {
     OutNeighbors {
         edge_type: String,
         sources: Vec<VertexId>,
+        source_column: QueryColumn,
+        destination_column: QueryColumn,
+    },
+    /// [`Self::OutNeighbors`] for `(a:L {id: row.f})-[:T]->(b:M)`: a source
+    /// without every one of `source_labels` has no rows, and a destination
+    /// without every one of `destination_labels` is dropped. A variant of its
+    /// own rather than optional fields on `OutNeighbors`, so a node that
+    /// predates it fails to decode it instead of returning unfiltered rows.
+    LabeledOutNeighbors {
+        edge_type: String,
+        sources: Vec<VertexId>,
+        source_labels: BTreeSet<String>,
+        destination_labels: BTreeSet<String>,
         source_column: QueryColumn,
         destination_column: QueryColumn,
     },
@@ -226,13 +282,19 @@ pub enum QueryBatchOperation {
         destination_label: String,
         merge_policy: QueryBatchMergePolicy,
     },
+    ConstrainedMergeRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchConstrainedRelationshipMerge>,
+        merge_policy: Option<QueryBatchMergePolicy>,
+    },
 }
 
 impl QueryBatchOperation {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Self::MatchMutation { .. }
+            Self::ReplaceOwnedRelationshipSet { .. }
+                | Self::MatchMutation { .. }
                 | Self::CreateEdges { .. }
                 | Self::CreateEdgesBetweenLabeledVertices { .. }
                 | Self::DeleteEdges { .. }
@@ -245,13 +307,15 @@ impl QueryBatchOperation {
                 | Self::CreateRelationshipsBetweenLabeledVertices { .. }
                 | Self::MergeRelationshipsBetweenLabeledVertices { .. }
                 | Self::GuardedMergeRelationshipsBetweenLabeledVertices { .. }
+                | Self::ConstrainedMergeRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
     pub fn len(&self) -> usize {
         match self {
+            Self::ReplaceOwnedRelationshipSet { request } => request.targets.len().saturating_add(1),
             Self::MatchMutation { rows, .. } => rows.len(),
-            Self::OutNeighbors { sources, .. } => sources.len(),
+            Self::OutNeighbors { sources, .. } | Self::LabeledOutNeighbors { sources, .. } => sources.len(),
             Self::CreateEdges { edges, .. } | Self::CreateEdgesBetweenLabeledVertices { edges, .. } | Self::DeleteEdges { edges, .. } => {
                 edges.len()
             }
@@ -267,6 +331,7 @@ impl QueryBatchOperation {
             Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => relationships.len(),
             Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. }
             | Self::GuardedMergeRelationshipsBetweenLabeledVertices { relationships, .. } => relationships.len(),
+            Self::ConstrainedMergeRelationshipsBetweenLabeledVertices { relationships, .. } => relationships.len(),
         }
     }
 
@@ -463,7 +528,7 @@ impl QueryContext {
         self
     }
 
-    #[cfg(feature = "client-api")]
+    #[cfg(any(feature = "client-api", test))]
     #[cfg(feature = "opencypher")]
     pub(crate) fn with_refreshed_reader(mut self) -> Self {
         self.refreshed_reader = true;

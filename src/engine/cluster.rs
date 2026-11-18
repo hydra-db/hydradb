@@ -9,7 +9,7 @@ use tracing::Instrument as _;
 
 /// Stamp a failure onto the span that raised it.
 ///
-/// §6 of the telemetry crate design: a `fencing` error seen
+/// §6 of `docs/plans/2026-07-26-otel-telemetry-crate.md`: a `fencing` error seen
 /// at `client.mutate` says a write failed, and the same error on
 /// `placement.resolve` says why. So each site records its own class rather than
 /// letting an outer span report one it did not produce.
@@ -558,7 +558,7 @@ impl RoutedGraphCluster {
     /// > A node must not promote itself for a cell it does not own, unless the
     /// > computed owner is not live.
     ///
-    /// Touch point (b) of the rendezvous placement design.
+    /// Touch point (b) of `docs/plans/2026-07-25-rendezvous-placement.md`.
     /// Before this existed, any node opened the SlateDB writer on demand, which
     /// fenced whoever held it; the fenced node's next write took it straight
     /// back, and three nodes traded one cell's epoch forever. Rendezvous decides
@@ -757,7 +757,7 @@ impl RoutedGraphCluster {
     /// the next incident's logs.
     ///
     /// Option 3a of decision 3 in
-    /// the rendezvous placement design, and the only place the
+    /// `docs/plans/2026-07-25-rendezvous-placement.md`, and the only place the
     /// record is written. Three properties are load-bearing, and each is
     /// deliberate rather than incidental:
     ///
@@ -1809,12 +1809,14 @@ impl ScopedRoutedGraphCluster {
     }
 
     pub(crate) async fn cluster_for_scope_write_wait(&self, scope: &GraphScope, cell_id: &str) -> Result<Arc<RoutedGraphCluster>> {
-        let cluster = self.cluster_for_scope_wait(scope).await?;
-        cluster.ensure_local_writer(cell_id).await?;
-        cluster
-            .scope_registration
-            .get_or_try_init(|| self.scope_directory.register(scope))
-            .await?;
+        use crate::core::stage_watch::watched;
+        let cluster = watched("scope_open", self.cluster_for_scope_wait(scope)).await?;
+        watched("local_writer", cluster.ensure_local_writer(cell_id)).await?;
+        watched(
+            "scope_registration",
+            cluster.scope_registration.get_or_try_init(|| self.scope_directory.register(scope)),
+        )
+        .await?;
         Ok(cluster)
     }
 

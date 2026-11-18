@@ -126,7 +126,8 @@ pub use locality::{
 };
 pub use offline_image::{OfflineGraphImageEncoder, OfflineImageRow};
 pub use query::algebra::{
-    CypherEngineMode, LogicalQueryPlan, MutationAtomicityPolicy, PhysicalQueryPlan, QueryBatchEdge, QueryBatchIsolatedVertex,
+    CypherEngineMode, LogicalQueryPlan, MutationAtomicityPolicy, OwnedRelationshipSetRequest, OwnedRelationshipSetResult,
+    OwnedRelationshipTarget, PhysicalQueryPlan, QueryBatchConstrainedRelationshipMerge, QueryBatchEdge, QueryBatchIsolatedVertex,
     QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
     QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue, QueryPath,
     QueryPathNode, QueryPathRelationship, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow, QueryStatement, QueryValue,

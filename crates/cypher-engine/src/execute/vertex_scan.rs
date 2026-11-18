@@ -32,17 +32,32 @@ pub(super) fn execute<'a>(
                 merge_seed_rows(rows, seed)
             }
             VertexAccess::IdPoints { values } => {
-                if let Some(row) = bound_seed_row(seed, binding, labels) {
-                    return Ok(row);
+                if scan.request().lookup_ids.is_none() {
+                    if let Some(row) = bound_seed_row(seed, binding, labels) {
+                        return Ok(row);
+                    }
+                    // Membership candidates were already normalized by the provider.
+                    // Keep the existing batched request for ordinary IN/OR scans.
+                    let ids = values.iter().map(vertex_id_value).collect::<EngineResult<Vec<_>>>()?;
+                    let rows = scan_vertex_point_rows(read, binding, labels, ids, row_limit).await?;
+                    return merge_seed_rows(rows, seed);
                 }
-                let ids = values
-                    .iter()
-                    .map(vertex_id_value)
-                    .collect::<EngineResult<BTreeSet<_>>>()?
-                    .into_iter()
-                    .collect();
-                let rows = scan_vertex_point_rows(read, binding, labels, ids, row_limit).await?;
-                merge_seed_rows(rows, seed)
+                if seed.is_some_and(|row| row.is_null(binding)) {
+                    return Ok(Vec::new());
+                }
+                read.check_intermediate_rows("cypher_vertex_lookup_ids", values.len())?;
+                let mut rows = Vec::new();
+                for value in values {
+                    read.checkpoint("cypher_vertex_lookup_id")?;
+                    let id = vertex_id_value(value)?;
+                    let found = scan_vertex_point_rows(read, binding, labels, vec![id], None).await?;
+                    rows.extend(merge_seed_rows(found, seed)?);
+                    read.check_intermediate_rows("cypher_point_scan_intermediate_rows", rows.len())?;
+                    if row_limit.is_some_and(|limit| rows.len() >= limit) {
+                        break;
+                    }
+                }
+                Ok(rows)
             }
             VertexAccess::PropertyPoints { property, points } => {
                 if let Some(row) = bound_seed_row(seed, binding, labels) {
@@ -185,15 +200,35 @@ pub(super) fn execute<'a>(
                 let mut examined = 0usize;
                 let mut probed = false;
                 let mut seed_walk: Option<SeedWalk> = None;
+                // A foreign tie key must drain its complete boundary group.
+                // Keep that path's early selective-seed probe: prefiltering
+                // could fill the first page and delay the probe until after
+                // the whole tie. Native index-order windows can stop early.
+                let mut equalities = if drains_ties {
+                    Vec::new()
+                } else {
+                    residual
+                        .as_ref()
+                        .map(|predicate| equality_candidates(predicate, binding))
+                        .unwrap_or_default()
+                };
+                // Only an active backend prefilter changes accounting. Numeric,
+                // mixed-type or oversized hints alone must keep the old path.
+                if !read.supports_ordered_equality_prefilter(&equalities) {
+                    equalities.clear();
+                }
                 loop {
                     request.required = page;
                     // A seed walk's pages are bounded by what it has left, and
-                    // the backend leaves their entries off the query's
-                    // candidate tally: this walk is bounded by its own
-                    // allowance and gives way to the seed past it, rather
-                    // than failing on a tally it would otherwise exhaust.
+                    // the unfiltered backend retains its separate walk allowance.
+                    // Filtered walks still charge all qualifying records to the
+                    // shared candidate tally, including seed hydration.
                     request.max_index_entries = seed_walk.as_ref().map(|walk| walk.remaining.max(1));
-                    let scanned = scan_ordered_vertices(read, request.clone()).await?;
+                    let scanned = if equalities.is_empty() {
+                        scan_ordered_vertices(read, request.clone()).await?
+                    } else {
+                        read.scan_vertices_by_property_ordered_filtered(&request, &equalities).await?
+                    };
                     let exhausted = scanned.exhausted;
                     request.after = scanned.last.clone();
                     let produced = scanned.vertices.len();
@@ -253,11 +288,14 @@ pub(super) fn execute<'a>(
                         }
                         read.check_intermediate_rows("cypher_ordered_scan_intermediate_rows", rows.len())?;
                     }
-                    examined = examined.saturating_add(produced);
+                    // Prefiltered pages can inspect entries without hydrating
+                    // any record. Count that work for the adaptive probe too.
+                    let inspected = scanned.index_entries.map_or(produced, |n| usize::try_from(n).unwrap_or(usize::MAX));
+                    examined = examined.saturating_add(inspected);
                     // A bounded page of a seed walk can end with nothing in
                     // the seed and the index not spent, so only the index
                     // running out ends that walk here.
-                    if exhausted || (produced == 0 && seed_walk.is_none()) {
+                    if exhausted || (produced == 0 && inspected == 0 && seed_walk.is_none()) {
                         break;
                     }
                     let window_full = rows.len() >= target;
@@ -275,7 +313,18 @@ pub(super) fn execute<'a>(
                     if let (Some(walk), Some(residual)) = (seed_walk.as_ref(), residual.as_ref()) {
                         if walk.remaining == 0 {
                             read.checkpoint("cypher_ordered_scan_seed_sort")?;
-                            let answer = ordered_seed_rows(read, binding, labels, residual, &request, &walk.ids, items, target).await?;
+                            let answer = ordered_seed_rows(
+                                read,
+                                binding,
+                                labels,
+                                residual,
+                                &request,
+                                &walk.ids,
+                                items,
+                                target,
+                                !equalities.is_empty(),
+                            )
+                            .await?;
                             return merge_seed_rows(answer, seed);
                         }
                     }
@@ -302,7 +351,12 @@ pub(super) fn execute<'a>(
                             let candidates = equality_candidates(residual, binding);
                             if !candidates.is_empty() {
                                 read.checkpoint("cypher_ordered_scan_probe")?;
-                                if let Some(ids) = read.probe_selective_equality(&candidates).await? {
+                                let probed = if equalities.is_empty() {
+                                    read.probe_selective_equality(&candidates).await?
+                                } else {
+                                    read.probe_selective_equality_with_scan_budget(&candidates).await?
+                                };
+                                if let Some(ids) = probed {
                                     // A small seed is cheapest loaded whole and
                                     // sorted. A large one is not: keep walking
                                     // in order and let the backend skip every
@@ -332,8 +386,18 @@ pub(super) fn execute<'a>(
                                         let mut ids = ids;
                                         ids.sort_unstable();
                                         ids.dedup();
-                                        let answer =
-                                            ordered_seed_rows(read, binding, labels, residual, &request, &ids, items, target).await?;
+                                        let answer = ordered_seed_rows(
+                                            read,
+                                            binding,
+                                            labels,
+                                            residual,
+                                            &request,
+                                            &ids,
+                                            items,
+                                            target,
+                                            !equalities.is_empty(),
+                                        )
+                                        .await?;
                                         return merge_seed_rows(answer, seed);
                                     }
                                 }
@@ -925,7 +989,7 @@ async fn guarded_rows(
 /// of the rows the whole predicate accepts, which is what makes a probe result
 /// usable as the complete candidate set. One side of a disjunct is not, unless
 /// both sides restrict the same property, in which case their union still is.
-fn equality_candidates(predicate: &PhysicalExpression, binding: &Symbol) -> Vec<PropertyEqualityCandidate> {
+pub(super) fn equality_candidates(predicate: &PhysicalExpression, binding: &Symbol) -> Vec<PropertyEqualityCandidate> {
     let mut candidates = Vec::new();
     collect_equality_candidates(predicate, binding, &mut candidates);
     candidates.dedup();
@@ -1123,9 +1187,13 @@ async fn ordered_seed_rows(
     ids: &[VertexId],
     items: &[PhysicalSort],
     target: usize,
+    charge_candidates: bool,
 ) -> EngineResult<Vec<BindingRow>> {
     let mut kept = Vec::new();
     for batch in ids.chunks(ORDERED_SEED_SORT_BATCH) {
+        if charge_candidates {
+            read.charge_ordered_filtered_candidates(batch.len())?;
+        }
         let hydrated = hydrate_rows(read, binding, labels, batch.to_vec(), None, Some(residual)).await?;
         // Hydration applied the labels and the residual; the window bounds
         // the scan would have enforced are still owed.

@@ -225,7 +225,7 @@ async fn native_values_survive_scalar_not_equal_filters() {
     );
 }
 
-/// ENG-3254: `'x' IN n.tags` tests membership in a stored list. The list is
+/// `'x' IN n.tags` tests membership in a stored list. The list is
 /// known only per row, so it is evaluated as a filter rather than planned as a
 /// property seek, and a literal right side still plans a multi-seek.
 #[tokio::test]
@@ -303,7 +303,7 @@ async fn membership_in_a_stored_list_property_filters_each_row() {
     }
 }
 
-/// ENG-3254: `list[index]` on literals, stored list properties, parameters
+/// `list[index]` on literals, stored list properties, parameters
 /// and WITH aliases. Out-of-range indexes are null; a non-list target or a
 /// non-integer index is an error.
 #[tokio::test]
@@ -520,6 +520,7 @@ async fn unlabeled_match_executes_all_vertex_scan() {
             context: Default::default(),
             operation: hydradb_cypher_ast::operation::RETURN,
             input: Box::new(GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: binding.clone(),
                 labels: Vec::new(),
             }),
@@ -1287,9 +1288,8 @@ async fn with_narrows_the_scope_to_what_it_projects() {
         .expect("a WITH boundary lets the next MATCH rebind a dropped name");
 }
 
-/// A `get_chunk_ids_by_sub_tenant`-shaped query: a trailing `WITH c LIMIT $n`
-/// that also drops `s`. It used to fail with "expected exactly one typed query
-/// statement".
+/// A trailing `WITH c LIMIT $n` that also drops `s`. Without this handling it
+/// fails with "expected exactly one typed query statement".
 #[tokio::test]
 async fn trailing_with_limit_bounds_the_return() {
     let engine = CypherEngine::new(MemoryStorage::with_graph(

@@ -236,9 +236,9 @@ async fn a_traversal_attributes_storage_hydration_and_edges_to_its_operators() {
 }
 
 #[tokio::test]
-async fn a_correlated_input_is_counted_once_per_outer_row() {
-    let (profile, rows, _) = profile("MATCH (a:Person) MATCH (a)-[:KNOWS]->(b) RETURN a.entity_id AS a, b.entity_id AS b").await;
-    assert_eq!(rows, 4);
+async fn an_independent_join_counts_the_right_input_once_per_outer_row() {
+    let (profile, rows, _) = profile("MATCH (a:Person) MATCH (b:Person) RETURN a.entity_id AS a, b.entity_id AS b").await;
+    assert_eq!(rows, 36);
     assert_consistent(&profile, rows);
     let join = by_name(&profile, "NaturalJoinExec");
     let left = profile
@@ -284,7 +284,8 @@ async fn an_attached_estimate_names_the_operator_that_missed() {
 
 #[tokio::test]
 async fn correlated_seed_reuse_is_not_reported_as_a_full_scan() {
-    let (profile, rows, _) = profile("MATCH (a:Person {entity_id: 'p1'}) MATCH (a)-[:KNOWS]->(b:Person) RETURN b.entity_id AS id").await;
+    let (profile, rows, _) =
+        profile("MATCH (a:Person {entity_id: 'p1'}) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) RETURN b.entity_id AS id").await;
     assert_eq!(rows, 2);
     assert!(profile
         .operators
@@ -298,4 +299,16 @@ async fn an_unbound_scan_is_reported_as_a_full_scan() {
     let (profile, rows, _) = profile("MATCH (a) RETURN a.entity_id AS id").await;
     assert!(rows > 0);
     assert!(profile.ran_full_scan());
+}
+
+#[tokio::test]
+async fn a_linear_connected_input_profiles_the_single_batched_expansion() {
+    let (profile, rows, _) = profile("MATCH (a:Person) MATCH (a)-[:KNOWS]->(b) RETURN a.entity_id AS a,b.entity_id AS b").await;
+    assert_eq!(rows, 4);
+    assert_consistent(&profile, rows);
+    assert!(profile.operators.iter().all(|operator| operator.operator != "NaturalJoinExec"));
+    let expand = by_name(&profile, "ExpandExec");
+    assert_eq!(expand.invocations, 1);
+    assert_eq!(expand.rows_in, 6);
+    assert_eq!(expand.rows_out, 4);
 }

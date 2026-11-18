@@ -8,7 +8,7 @@
 //!
 //! A 421 naming an owner in `x-graph-owner` is retried at that owner before
 //! any byte goes downstream, from pingora's retry buffer. pingora skips
-//! retries for POST by default, and every turbolay query is a POST, so
+//! retries for POST by default, and every HydraDB query is a POST, so
 //! [`ProxyHttp::error_while_proxy`] and [`ProxyHttp::fail_to_connect`] are
 //! overridden to ask the core's retry policy instead.
 

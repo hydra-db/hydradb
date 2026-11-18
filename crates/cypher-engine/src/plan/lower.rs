@@ -300,6 +300,32 @@ fn relationship_ids_in_plan(
                 relationships,
             )
         }
+        GraphLogicalPlan::BoundRelationship {
+            input,
+            from,
+            source_labels,
+            relationship,
+            relationship_types,
+            direction,
+            to,
+            target_labels,
+        } => {
+            let (input, mut relationships) = relationship_ids_in_plan(*input, outer, id_properties);
+            relationships.visible.insert(relationship.clone());
+            (
+                GraphLogicalPlan::BoundRelationship {
+                    input: Box::new(input),
+                    from,
+                    source_labels,
+                    relationship,
+                    relationship_types,
+                    direction,
+                    to,
+                    target_labels,
+                },
+                relationships,
+            )
+        }
         // `rs` of `[rs:R*1..3]` is a list of relationships, not one; `rs.id`
         // reads nothing either way.
         GraphLogicalPlan::VariableExpand {
@@ -4788,15 +4814,29 @@ fn lower_path(
     };
     let first_scan = lower_node_scan(first, synthesized)?;
     let GraphLogicalPlan::NodeScan {
-        binding: first_binding, ..
+        binding: first_binding,
+        labels: first_labels,
+        ..
     } = &first_scan
     else {
         unreachable!("node lowering returns a scan")
     };
     let mut from = first_binding.clone();
     parts.push(PathPart::Node(from.clone()));
-    let mut plan = apply_pattern_properties(first_scan, &from, first.properties.as_ref(), PatternElementKind::Node)?;
-    plan = apply_label_expression(plan, &from, first.label_expression.as_ref());
+    // A path whose first hop reuses a bound relationship starts from that
+    // relationship, not from a scan of its first node: the relationship
+    // already names the node, so the hop binds it (see
+    // `GraphLogicalPlan::BoundRelationship`) and the node's own map, label
+    // expression and WHERE filter the hop's rows instead of the scan's.
+    let start_on_relationship = starts_on_bound_relationship(elements, bound, incoming);
+    let mut source_labels = Vec::new();
+    let mut plan = if start_on_relationship {
+        source_labels = first_labels.clone();
+        GraphLogicalPlan::SingleRow
+    } else {
+        let plan = apply_pattern_properties(first_scan, &from, first.properties.as_ref(), PatternElementKind::Node)?;
+        apply_label_expression(plan, &from, first.label_expression.as_ref())
+    };
     // Names this path has bound so far, on top of the incoming row and earlier
     // patterns. An element's WHERE is applied as soon as everything it
     // reads is in here, so a selective one narrows the rows before the next
@@ -4806,7 +4846,9 @@ fn lower_path(
     available.extend(path_values.iter().cloned());
     available.insert(from.clone());
     let mut deferred = Vec::new();
-    plan = apply_element_predicate(plan, first.predicate.as_ref(), &available, &mut deferred)?;
+    if !start_on_relationship {
+        plan = apply_element_predicate(plan, first.predicate.as_ref(), &available, &mut deferred)?;
+    }
     let mut remaining = &elements[1..];
 
     loop {
@@ -4814,6 +4856,7 @@ fn lower_path(
         // a hop of no edge.
         if let [PatternElement::Node(target), tail @ ..] = remaining {
             let GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: written_to,
                 labels: target_labels,
             } = lower_node_scan(target, synthesized)?
@@ -4875,6 +4918,7 @@ fn lower_path(
             ));
         }
         let GraphLogicalPlan::NodeScan {
+            lookup_ids: None,
             binding: written_to,
             labels: target_labels,
         } = lower_node_scan(target, synthesized)?
@@ -5016,6 +5060,27 @@ fn lower_path(
                     .as_ref()
                     .map(|iteration| lower_iteration(&iteration.primary, &available, visible, values, record, table_columns, synthesized))
                     .transpose()?,
+            }
+        } else if let Some(relationship) = relationship_binding.clone().filter(|binding| bound.contains(binding)) {
+            // The relationship is already bound, so it is checked between its
+            // own endpoints rather than found again among `from`'s.
+            let first_hop = std::mem::take(&mut source_labels);
+            let hop = GraphLogicalPlan::BoundRelationship {
+                input: Box::new(plan),
+                from: from.clone(),
+                source_labels: first_hop,
+                relationship,
+                relationship_types,
+                direction,
+                to: to.clone(),
+                target_labels,
+            };
+            if start_on_relationship && parts.len() == first_part + 1 {
+                let hop = apply_pattern_properties(hop, &from, first.properties.as_ref(), PatternElementKind::Node)?;
+                let hop = apply_label_expression(hop, &from, first.label_expression.as_ref());
+                apply_element_predicate(hop, first.predicate.as_ref(), &available, &mut deferred)?
+            } else {
+                hop
             }
         } else {
             GraphLogicalPlan::Expand {
@@ -5397,6 +5462,33 @@ fn anchor_on_bound_binding(path: &PathPattern, bound: &BTreeSet<Symbol>) -> Opti
     ])
 }
 
+/// Whether a path's first hop reuses a relationship an earlier pattern or
+/// clause bound, with its first node bound by neither, so that the hop rather
+/// than a scan should bind that node.
+///
+/// Starting from the relationship moves the first node's inline map and WHERE
+/// after the hop, which changes what they read and when they run. A map
+/// reading the hop's far end would read a node where the written order reads
+/// none. A map or WHERE that can fail would not run at all for a row the hop
+/// rejects, so a query the written order fails on would answer empty instead
+/// (`(x:Hub {name: 1 / 0})-[r:OTHER]->()` over a reused `r` of another type).
+/// Such a path starts with its scan as written; only a total map, and no
+/// WHERE, moves.
+fn starts_on_bound_relationship(elements: &[PatternElement], bound: &BTreeSet<Symbol>, incoming: &BTreeSet<Symbol>) -> bool {
+    let [PatternElement::Node(first), PatternElement::Relationship(relationship), PatternElement::Node(target), ..] = elements else {
+        return false;
+    };
+    let name = |variable: Option<&Identifier>| variable.map(|variable| Symbol::from(variable.as_str()));
+    let reused = relationship.length.is_none() && name(relationship.variable.as_ref()).is_some_and(|binding| bound.contains(&binding));
+    let first_unbound = name(first.variable.as_ref()).is_none_or(|binding| !bound.contains(&binding) && !incoming.contains(&binding));
+    let far_end: BTreeSet<Symbol> = name(target.variable.as_ref()).into_iter().collect();
+    reused
+        && first_unbound
+        && first.predicate.is_none()
+        && map_is_total(first.properties.as_ref())
+        && !reads_any(first.properties.as_ref(), &far_end)
+}
+
 /// Whether every value in an inline property map can only evaluate to a value
 /// or null, never to an error. The planner's `total_value` draws the same line
 /// one stage later: the leaves qualify, and every compound value expression is
@@ -5493,6 +5585,7 @@ fn lower_node_scan(node: &NodePattern, synthesized: &mut BTreeSet<Symbol>) -> Gr
     Ok(GraphLogicalPlan::NodeScan {
         binding,
         labels: node.labels.iter().map(|label| Symbol::from(label.as_str())).collect(),
+        lookup_ids: None,
     })
 }
 

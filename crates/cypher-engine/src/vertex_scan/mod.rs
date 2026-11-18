@@ -28,6 +28,8 @@ pub struct VertexWindow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexScanRequest {
+    /// Explicit lookup occurrences. Unlike an IN predicate, order and duplicates are retained.
+    pub lookup_ids: Option<Vec<BoundValue>>,
     pub binding: Symbol,
     pub labels: Vec<Symbol>,
     /// Predicates admitted by the engine without crossing an evaluation barrier.
@@ -41,6 +43,7 @@ pub struct VertexScanRequest {
 impl VertexScanRequest {
     pub fn new(binding: Symbol, labels: Vec<Symbol>) -> Self {
         Self {
+            lookup_ids: None,
             binding,
             labels,
             predicates: Vec::new(),

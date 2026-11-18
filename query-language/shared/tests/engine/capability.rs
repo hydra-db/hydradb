@@ -8,7 +8,7 @@
 //!
 //! The unsupported plans here are built by hand because lowering cannot yet
 //! produce them: a nested `Project` needs `WITH`, and a binding-level `Union`
-//! needs UNION below an arm boundary. Both arrive in later changes, and
+//! needs UNION below an arm boundary. Both arrive in later the design PRs, and
 //! these tests are what will stop them arriving by accident.
 
 mod common;
@@ -73,6 +73,7 @@ fn prepared(physical: GraphPhysicalPlan) -> PreparedQuery {
     PreparedQuery {
         ast: document(),
         logical: Arc::new(GraphLogicalPlan::NodeScan {
+            lookup_ids: None,
             binding: Symbol::from("e"),
             labels: Vec::new(),
         }),

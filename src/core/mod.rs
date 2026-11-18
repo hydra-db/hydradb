@@ -11,6 +11,9 @@ pub(crate) mod metrics;
 pub(crate) mod model;
 pub(crate) mod namespace;
 pub(crate) mod snapshot;
+// Every caller is on the OpenCypher write path.
+#[cfg(feature = "opencypher")]
+pub(crate) mod stage_watch;
 pub(crate) mod state;
 pub(crate) mod trace_context;
 pub(crate) mod write_batch;

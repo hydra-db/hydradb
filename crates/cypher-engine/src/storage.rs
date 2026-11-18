@@ -98,6 +98,27 @@ pub trait GraphRead: Send {
     /// until the window and its boundary tie are decided.
     async fn scan_vertices_by_property_ordered(&mut self, request: &OrderedPropertyScanRequest) -> StorageResult<OrderedPropertyScanPage>;
 
+    /// Optional index-membership prefilter for conjunctive equality predicates.
+    /// Each candidate is a necessary condition, with OR semantics across its
+    /// values. A backend may ignore these hints; the executor still evaluates
+    /// the complete residual on every returned record. Rejections must use the
+    /// same consistent read view as the ordered walk and must never omit a match.
+    async fn scan_vertices_by_property_ordered_filtered(
+        &mut self,
+        request: &OrderedPropertyScanRequest,
+        _equalities: &[PropertyEqualityCandidate],
+    ) -> StorageResult<OrderedPropertyScanPage> {
+        match self
+            .scan_vertex_storage(&VertexStorageScanRequest::OrderedProperty(Box::new(request.clone())))
+            .await?
+        {
+            VertexStorageScanPage::Ordered(page) => Ok(page),
+            _ => Err(crate::StorageError::new(
+                "ordered vertex storage scan returned an incompatible page",
+            )),
+        }
+    }
+
     /// [`Self::scan_vertices_by_property_ordered`] without the records: the
     /// same entries, each as the vertex id and the walked property's value.
     /// The engine asks for this when nothing in the plan reads the vertex
@@ -229,6 +250,31 @@ pub trait GraphRead: Send {
             relationships.extend(self.seek_relationships_by_property(relationship_type, property, value).await?);
         }
         Ok(relationships)
+    }
+
+    /// The `relationship_type` relationships leaving any of `sources` whose
+    /// `property` is Cypher-equal to any of `values`, read from the
+    /// relationship property indexes by source instead of from the sources'
+    /// whole adjacency.
+    ///
+    /// An expansion filtered on an indexed relationship property uses it in
+    /// place of [`Self::expand_relationships`]: on a hub entity with 217,574
+    /// relationships the adjacency read took 87 s to keep a handful. The
+    /// result is the complete set of such relationships at the read, and the
+    /// caller still applies the full predicate.
+    ///
+    /// It is optional and all-or-nothing for the hop: `None` -- the default --
+    /// means the backend cannot answer within the work the expansion would be
+    /// allowed, has charged nothing, and the caller expands every source as
+    /// before. A backend never answers for some sources and declines others.
+    async fn seek_outgoing_relationships_by_property_values(
+        &mut self,
+        _relationship_type: &str,
+        _sources: &[VertexId],
+        _property: &str,
+        _values: &[ScalarValue],
+    ) -> StorageResult<Option<Vec<RelationshipRecord>>> {
+        Ok(None)
     }
 
     /// Probe a numeric lower-bound relationship index with bounded work.
@@ -367,6 +413,14 @@ pub trait GraphRead: Send {
     /// vertex at most once while the map has room.
     async fn hydrate_vertices(&mut self, vertex_ids: &[VertexId]) -> StorageResult<Vec<VertexRecord>>;
 
+    /// Hydrate a transient batch without admitting its records to a per-query
+    /// identity cache. Filtered streaming hops discard most targets; retaining
+    /// them in a wrapper would defeat their bounded working set. The snapshot
+    /// and record semantics are identical to `hydrate_vertices`.
+    async fn hydrate_vertices_transient(&mut self, vertex_ids: &[VertexId]) -> StorageResult<Vec<VertexRecord>> {
+        self.hydrate_vertices(vertex_ids).await
+    }
+
     /// Rank equality candidates by a bounded index probe and return the
     /// vertices of the most selective one, or `None` to keep the planned
     /// access path.
@@ -392,6 +446,29 @@ pub trait GraphRead: Send {
     /// asked for.
     async fn probe_selective_equality(&mut self, _candidates: &[PropertyEqualityCandidate]) -> StorageResult<Option<Vec<VertexId>>> {
         Ok(None)
+    }
+
+    /// Whether these hints activate an ordered membership prefilter. The
+    /// backend owns eligibility (types, alternatives and conjunct limits).
+    /// Unsupported hints must retain ordinary probe/seed admission behavior.
+    fn supports_ordered_equality_prefilter(&self, _candidates: &[PropertyEqualityCandidate]) -> bool {
+        false
+    }
+
+    /// Probe on behalf of a filtered ordered window. Backends enforcing scan
+    /// admission must charge actual probe entries (including overflow reads)
+    /// to the same query-wide work tally as the preceding ordered pages.
+    async fn probe_selective_equality_with_scan_budget(
+        &mut self,
+        candidates: &[PropertyEqualityCandidate],
+    ) -> StorageResult<Option<Vec<VertexId>>> {
+        self.probe_selective_equality(candidates).await
+    }
+
+    /// Admit records before a filtered ordered window hydrates a probe seed.
+    /// A bounded seed is not a separate candidate allowance.
+    fn charge_ordered_filtered_candidates(&self, _count: usize) -> StorageResult<()> {
+        self.checkpoint("cypher_ordered_filtered_seed_candidates")
     }
 
     // ---- Operator observation (Workstream 11) ----------------------------

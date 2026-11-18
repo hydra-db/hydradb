@@ -138,7 +138,7 @@ async fn execute_experimental_cypher_rows_inner(
     //     point lookups planning needed, and nothing more. It never executes,
     //     so it issues no scan.
     //
-    // The capability check asks for the answer "after lowering and planning, before storage
+    // the design asks for the answer "after lowering and planning, before storage
     // execution begins", which is what the second tier is: planning needs
     // statistics, and statistics are point lookups. Both tiers are pinned by
     // tests below, because "no storage request" read alone would over-claim the
@@ -146,7 +146,7 @@ async fn execute_experimental_cypher_rows_inner(
     let capability = logical.capability();
     if let Some(kind) = capability.unsupported_kind() {
         // The token, not the query text: bounded cardinality, no literals.
-        // Turning this into a counter is separate work; a span field costs
+        // the design owns turning this into a counter; a span field costs
         // nothing until somebody is looking.
         tracing::debug!(
             hydradb.query.experimental.unsupported = kind,
@@ -635,6 +635,14 @@ impl GraphRead for HydraDbCypherRead<'_> {
     }
 
     async fn scan_vertices_by_property_ordered(&mut self, request: &OrderedPropertyScanRequest) -> StorageResult<OrderedPropertyScanPage> {
+        self.scan_vertices_by_property_ordered_filtered(request, &[]).await
+    }
+
+    async fn scan_vertices_by_property_ordered_filtered(
+        &mut self,
+        request: &OrderedPropertyScanRequest,
+        equalities: &[PropertyEqualityCandidate],
+    ) -> StorageResult<OrderedPropertyScanPage> {
         traced_operator(
             "scan_vertices_by_property_ordered",
             operator_span("scan_vertices_by_property_ordered"),
@@ -643,8 +651,13 @@ impl GraphRead for HydraDbCypherRead<'_> {
                 let page = storage_result(
                     SlateGraphStore::scope_snapshot(
                         Arc::clone(&self.snapshot),
-                        self.shard
-                            .scan_ordered_vertex_property_page_at(self.cell_id, request, self.read_epoch, &self.budget),
+                        self.shard.scan_ordered_vertex_property_filtered_page_at(
+                            self.cell_id,
+                            request,
+                            equalities,
+                            self.read_epoch,
+                            &self.budget,
+                        ),
                     )
                     .await,
                 )?;
@@ -944,8 +957,10 @@ impl GraphRead for HydraDbCypherRead<'_> {
             async {
                 let value = scalar_to_property(value)?;
                 let pending = self
-                    .seeked_relationship_variants(relationship_type, property, std::slice::from_ref(&value))
-                    .await?;
+                    .seeked_relationship_variants(relationship_type, property, std::slice::from_ref(&value), SeekScope::Cell)
+                    .await?
+                    .ok_or_else(cell_seek_declined)?
+                    .pending;
                 self.seeked_relationship_records(relationship_type, pending)
             },
             |result| result.as_ref().map_or(0, Vec::len),
@@ -967,10 +982,76 @@ impl GraphRead for HydraDbCypherRead<'_> {
             operator_span("seek_relationships_by_property_values"),
             async {
                 let values = values.iter().map(scalar_to_property).collect::<StorageResult<Vec<_>>>()?;
-                let pending = self.seeked_relationship_variants(relationship_type, property, &values).await?;
+                let pending = self
+                    .seeked_relationship_variants(relationship_type, property, &values, SeekScope::Cell)
+                    .await?
+                    .ok_or_else(cell_seek_declined)?
+                    .pending;
                 self.seeked_relationship_records(relationship_type, pending)
             },
             |result| result.as_ref().map_or(0, Vec::len),
+        )
+        .await
+    }
+
+    async fn seek_outgoing_relationships_by_property_values(
+        &mut self,
+        relationship_type: &str,
+        sources: &[VertexId],
+        property: &str,
+        values: &[ScalarValue],
+    ) -> StorageResult<Option<Vec<EngineRelationshipRecord>>> {
+        traced_operator(
+            "seek_outgoing_relationships_by_property_values",
+            operator_span("seek_outgoing_relationships_by_property_values"),
+            async {
+                // The seek answers only for values the property indexes hold.
+                // A list or date is never indexed, and a decimal or an integer
+                // past the stored range has no key at all, yet each can still
+                // equal a stored value under Cypher's comparison: decline, and
+                // the hop expands and lets the Filter compare.
+                let Some(values) = values
+                    .iter()
+                    .map(|value| scalar_to_property(value).ok().filter(VertexPropertyValue::is_scalar_indexable))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Ok(None);
+                };
+                // Bounded by what the query has left, not by a fresh
+                // allowance: the seek may only do work the expansion that
+                // replaces it would have been allowed.
+                let index_limit = self.shard.limits.max_query_index_candidates as u64;
+                let scope = SeekScope::Sources {
+                    sources,
+                    max_index_entries: index_limit.saturating_sub(self.budget.scanned_index_candidates()) as usize,
+                    max_variants: self.shard.limits.max_query_intermediate_rows,
+                };
+                let Some(SeekedVariants { pending, index_entries }) = self
+                    .seeked_relationship_variants(relationship_type, property, &values, scope)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                // Commit the whole seek's charges together, or none: the index
+                // entries it read, and one scanned edge per endpoint pair, as
+                // the expansion charges its adjacency (parallel relationships
+                // count as rows, not scanned edges). If either would pass its
+                // allowance the seek declines with both tallies unchanged, and
+                // the expansion that runs instead is charged as ever.
+                let pairs = pending
+                    .iter()
+                    .map(|(_, source, target, _)| (*source, *target))
+                    .collect::<BTreeSet<_>>();
+                if !self.budget.try_add_scanned_index_candidates(index_entries as u64, index_limit) {
+                    return Ok(None);
+                }
+                if !self.try_charge_scanned_edges(pairs.len(), self.shard.limits.max_query_scan_edges) {
+                    self.budget.release_scanned_index_candidates(index_entries as u64);
+                    return Ok(None);
+                }
+                self.seeked_relationship_records(relationship_type, pending).map(Some)
+            },
+            |result| result.as_ref().ok().and_then(Option::as_ref).map_or(0, Vec::len),
         )
         .await
     }
@@ -1261,9 +1342,31 @@ impl GraphRead for HydraDbCypherRead<'_> {
 
     async fn probe_selective_equality(&mut self, candidates: &[PropertyEqualityCandidate]) -> StorageResult<Option<Vec<VertexId>>> {
         let started = std::time::Instant::now();
-        let probed = self.probe_selective_equality_traced(candidates).await;
+        let probed = self.probe_selective_equality_traced(candidates, false).await;
         observability::record_probe(elapsed_us(started), matches!(probed, Ok(Some(_))));
         probed
+    }
+
+    fn supports_ordered_equality_prefilter(&self, candidates: &[PropertyEqualityCandidate]) -> bool {
+        ordered_walk::ordered_string_memberships(candidates).next().is_some()
+    }
+
+    async fn probe_selective_equality_with_scan_budget(
+        &mut self,
+        candidates: &[PropertyEqualityCandidate],
+    ) -> StorageResult<Option<Vec<VertexId>>> {
+        let started = std::time::Instant::now();
+        let probed = self.probe_selective_equality_traced(candidates, true).await;
+        observability::record_probe(elapsed_us(started), matches!(probed, Ok(Some(_))));
+        probed
+    }
+
+    fn charge_ordered_filtered_candidates(&self, count: usize) -> StorageResult<()> {
+        storage_result(self.shard.charge_query_index_candidates(
+            "experimental_ordered_filtered_seed_candidates",
+            &self.budget,
+            count as u64,
+        ))
     }
 
     async fn hydrate_vertices(&mut self, vertex_ids: &[VertexId]) -> StorageResult<Vec<EngineVertexRecord>> {
@@ -1311,6 +1414,36 @@ impl GraphRead for HydraDbCypherRead<'_> {
         )
         .await
     }
+}
+
+/// What a relationship equality seek kept, and how many index entries an
+/// optional seek read and has not charged.
+struct SeekedVariants {
+    pending: Vec<(Option<RelationshipId>, VertexId, VertexId, EdgeMetadata)>,
+    index_entries: usize,
+}
+
+/// A cell-wide seek has no allowance to decline on; reaching this is a bug.
+fn cell_seek_declined() -> StorageError {
+    StorageError::new("a cell-wide relationship seek declined; it has no allowance to decline on")
+}
+
+/// Where a relationship equality seek looks, and what it may spend.
+#[derive(Clone, Copy)]
+enum SeekScope<'a> {
+    /// Every relationship in the cell holding the value: a required read, so
+    /// its limits fail the query and it charges as it reads.
+    Cell,
+    /// The relationships leaving `sources`, for an optional access path an
+    /// anchored expansion can always replace. It declines (`None`) once its
+    /// index walk would read more than `max_index_entries` entries or it would
+    /// hold more than `max_variants` relationship variants, and charges
+    /// nothing itself: the caller commits the whole seek's charges at once.
+    Sources {
+        sources: &'a [VertexId],
+        max_index_entries: usize,
+        max_variants: usize,
+    },
 }
 
 impl HydraDbCypherRead<'_> {
@@ -1587,36 +1720,85 @@ impl HydraDbCypherRead<'_> {
         relationship_type: &str,
         property: &str,
         values: &[VertexPropertyValue],
-    ) -> StorageResult<Vec<(Option<RelationshipId>, VertexId, VertexId, EdgeMetadata)>> {
+        scope: SeekScope<'_>,
+    ) -> StorageResult<Option<SeekedVariants>> {
         // Compared through the stored encoding, so `1` and `1.0` stay equal.
         let wanted = values.iter().map(property_to_scalar).collect::<Vec<_>>();
         let shard = self.shard;
         let cell_id = self.cell_id;
         let read_epoch = self.read_epoch;
         let budget = &self.budget;
-        let several = values.len() > 1;
-        let index_reads = stream::iter(values.iter().cloned())
-            .map(|value| async move {
-                let entries = shard
-                    .scan_relationship_property_entries_at(cell_id, relationship_type, property, &value, budget)
-                    .await?;
-                if several {
-                    // Each value's own read is bounded where it is made; their
-                    // union is not, so it is charged to the query's shared
-                    // tally as the vertex multi-seek charges its.
-                    let pairs = entries
-                        .structural_pairs
-                        .iter()
-                        .copied()
-                        .chain(entries.identified.iter().map(|(src, dst, ..)| (*src, *dst)))
-                        .collect::<BTreeSet<_>>();
-                    shard.charge_query_index_candidates("cypher_relationship_in_list_index_candidates", budget, pairs.len() as u64)?;
+        let mut index_entries = 0_usize;
+        let per_value = match scope {
+            SeekScope::Cell => {
+                let several = values.len() > 1;
+                let index_reads = stream::iter(values.iter().cloned())
+                    .map(|value| async move {
+                        let entries = shard
+                            .scan_relationship_property_entries_at(cell_id, relationship_type, property, &value, budget)
+                            .await?;
+                        if several {
+                            // Each value's own read is bounded where it is made; their
+                            // union is not, so it is charged to the query's shared
+                            // tally as the vertex multi-seek charges its.
+                            let pairs = entries
+                                .structural_pairs
+                                .iter()
+                                .copied()
+                                .chain(entries.identified.iter().map(|(src, dst, ..)| (*src, *dst)))
+                                .collect::<BTreeSet<_>>();
+                            shard.charge_query_index_candidates(
+                                "cypher_relationship_in_list_index_candidates",
+                                budget,
+                                pairs.len() as u64,
+                            )?;
+                        }
+                        Ok(entries)
+                    })
+                    .buffer_unordered(MULTI_SEEK_CONCURRENCY)
+                    .try_collect::<Vec<_>>();
+                storage_result(SlateGraphStore::scope_snapshot(Arc::clone(&self.snapshot), index_reads).await)?
+            }
+            SeekScope::Sources {
+                sources,
+                max_index_entries,
+                ..
+            } => {
+                // One bounded walk across every source and value: the
+                // allowance is the whole seek's, and it charges nothing here.
+                // Each (source, value) probe is at least one index lookup, so
+                // the probes are bounded by the same allowance as the entries
+                // they read: a seek that would make more probes than the
+                // query has index entries left declines before making any.
+                // Empty probes are not kept, and nothing is reserved for the
+                // source-value product (Mira on #522).
+                if sources.len().saturating_mul(values.len()) > max_index_entries {
+                    return Ok(None);
                 }
-                Ok(entries)
-            })
-            .buffer_unordered(MULTI_SEEK_CONCURRENCY)
-            .try_collect::<Vec<_>>();
-        let per_value = storage_result(SlateGraphStore::scope_snapshot(Arc::clone(&self.snapshot), index_reads).await)?;
+                let mut per_value = Vec::new();
+                for &source in sources {
+                    for value in values {
+                        let walk = shard.try_scan_source_relationship_property_entries_at(super::query::SourceRelationshipEqualityProbe {
+                            cell_id,
+                            edge_type: relationship_type,
+                            property,
+                            value,
+                            source,
+                            budget,
+                            max_entries: max_index_entries.saturating_sub(index_entries),
+                        });
+                        let Some(entries) = storage_result(SlateGraphStore::scope_snapshot(Arc::clone(&self.snapshot), walk).await)? else {
+                            return Ok(None);
+                        };
+                        index_entries += entries.entries_read;
+                        if !entries.structural_pairs.is_empty() || !entries.identified.is_empty() {
+                            per_value.push(entries);
+                        }
+                    }
+                }
+                per_value
+            }
+        };
         let structural_pairs = per_value
             .iter()
             .flat_map(|entries| entries.structural_pairs.iter().copied())
@@ -1633,17 +1815,38 @@ impl HydraDbCypherRead<'_> {
             .into_iter()
             .collect::<Vec<_>>();
 
-        let pair_reads = stream::iter(structural_pairs)
-            .map(|(source, target)| async move {
-                budget.check("experimental_cypher_relationship_property_seek")?;
-                let variants = shard
-                    .native_path_relationships_at(cell_id, relationship_type, source, target, read_epoch, budget)
-                    .await?;
-                Ok((source, target, variants))
-            })
-            .buffered(RELATIONSHIP_EXPAND_CONCURRENCY)
-            .try_collect::<Vec<_>>();
-        let pairs = storage_result(SlateGraphStore::scope_snapshot(Arc::clone(&self.snapshot), pair_reads).await)?;
+        // A structural pair's variants are every relationship on it, read
+        // before each is checked against the value. The optional source seek
+        // counts them as they arrive and declines once they would pass the
+        // allowance an expansion's rows have, rather than holding them all.
+        let max_variants = match scope {
+            SeekScope::Cell => None,
+            SeekScope::Sources { max_variants, .. } => Some(max_variants),
+        };
+        let pair_reads = async {
+            let mut reads = stream::iter(structural_pairs)
+                .map(|(source, target)| async move {
+                    budget.check("experimental_cypher_relationship_property_seek")?;
+                    let variants = shard
+                        .native_path_relationships_at(cell_id, relationship_type, source, target, read_epoch, budget)
+                        .await?;
+                    Ok::<_, crate::GraphError>((source, target, variants))
+                })
+                .buffered(RELATIONSHIP_EXPAND_CONCURRENCY);
+            let mut pairs = Vec::new();
+            let mut held = 0_usize;
+            while let Some(pair) = reads.try_next().await? {
+                held = held.saturating_add(pair.2.len());
+                if max_variants.is_some_and(|max| held > max) {
+                    return Ok(None);
+                }
+                pairs.push(pair);
+            }
+            Ok(Some(pairs))
+        };
+        let Some(pairs) = storage_result(SlateGraphStore::scope_snapshot(Arc::clone(&self.snapshot), pair_reads).await)? else {
+            return Ok(None);
+        };
         let identified_metadata = if identified.is_empty() {
             Vec::new()
         } else {
@@ -1692,7 +1895,7 @@ impl HydraDbCypherRead<'_> {
         }
         // The pair-by-pair read's order: by endpoints, then relationship id.
         pending.sort_by_key(|(id, source, target, _)| (*source, *target, *id));
-        Ok(pending)
+        Ok(Some(SeekedVariants { pending, index_entries }))
     }
 
     /// Engine records for the relationships a property seek kept, giving each
@@ -1731,7 +1934,11 @@ impl HydraDbCypherRead<'_> {
 
     /// The runtime equality probe, under its operator span. Wrapped by the
     /// trait method, which times it for the request's access-path record.
-    async fn probe_selective_equality_traced(&self, candidates: &[PropertyEqualityCandidate]) -> StorageResult<Option<Vec<VertexId>>> {
+    async fn probe_selective_equality_traced(
+        &self,
+        candidates: &[PropertyEqualityCandidate],
+        charge_scan_work: bool,
+    ) -> StorageResult<Option<Vec<VertexId>>> {
         traced_operator(
             "probe_selective_equality",
             operator_span("probe_selective_equality"),
@@ -1785,33 +1992,19 @@ impl HydraDbCypherRead<'_> {
                 // walks still race, so a narrower property still wins when
                 // there is one.
                 //
-                // These reads are deliberately not charged to
-                // `scanned_index_candidates`, so a query can spend this
-                // allowance and then the ordered walk's. Reviewers read that as
-                // a leak; it is parity. Legacy's ordered path escalates to the
-                // same ceiling (`NodeEqualityProbe::Ordered(
-                // self.limits.max_query_index_candidates)` in
-                // `super::query::GraphShard::try_execute_ordered_string_vertex_rows_query`)
-                // and has no query-wide tally to charge at all --
-                // `scanned_index_candidates` is this engine's own addition, and
-                // the ordered walk is its only caller. Charging the probe would
-                // make this route stricter than the one it has to match and
-                // would fail queries legacy serves, which the parity requirement rules out.
-                //
-                // The real gap is that an overflowed probe discards its work and
-                // falls back to the planned walk with no signal, so a decline
-                // after eight entries and one after the whole allowance look
-                // identical from outside. The fix for that is a counter, not
-                // enforcement, and it is not in this change.
+                // Unfiltered probes retain their independently bounded allowance
+                // for compatibility. Filtered native-order windows additionally
+                // charge both passes to the ordered scan's shared work budget,
+                // including losing/overflowed probes; no transition resets it.
                 let wide = self.shard.limits.max_query_index_candidates.min(ceiling);
-                let mut probed = self.probe_pass(&encoded, narrow).await?;
+                let mut probed = self.probe_pass(&encoded, narrow, charge_scan_work).await?;
                 // Every candidate exhausted its first-pass slice. That is as
                 // likely to be a thin slice as a broad property, so buy one
                 // wider pass before handing the planned path back — unless a
                 // configured ceiling has already collapsed the two, in which
                 // case the second pass would re-walk the same bound.
                 if probed.is_none() && wide > narrow {
-                    probed = self.probe_pass(&encoded, wide).await?;
+                    probed = self.probe_pass(&encoded, wide, charge_scan_work).await?;
                 }
                 Ok(probed.map(|(_, vertices)| vertices))
             },
@@ -1827,12 +2020,18 @@ impl HydraDbCypherRead<'_> {
         &self,
         encoded: &[(String, Vec<String>)],
         max_probe_entries: usize,
+        charge_scan_work: bool,
     ) -> StorageResult<Option<(usize, Vec<VertexId>)>> {
         storage_result(
             SlateGraphStore::scope_snapshot(
                 Arc::clone(&self.snapshot),
-                self.shard
-                    .probe_property_index_candidates(self.cell_id, encoded, max_probe_entries, &self.budget),
+                self.shard.probe_property_index_candidates_accounted(
+                    self.cell_id,
+                    encoded,
+                    max_probe_entries,
+                    &self.budget,
+                    charge_scan_work,
+                ),
             )
             .await,
         )

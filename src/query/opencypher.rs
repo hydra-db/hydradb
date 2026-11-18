@@ -19,6 +19,7 @@ use ast_kind::AstKind;
 type AstNode = sys::cypher_astnode_t;
 
 const PARSED_CYPHER_THREAD_CACHE_CAPACITY: usize = 32;
+
 const MAX_TOP_LEVEL_UNION_ARMS: usize = 256;
 #[cfg(feature = "client-api")]
 const UPDATE_IF_NEWER_MARKER: &str = "__hydradb_update_if_newer_by";
@@ -143,9 +144,14 @@ pub(crate) enum ParsedUnwindBatchKind {
     MatchMutation {
         alias: String,
     },
+    /// `UNWIND $rows AS <alias> MATCH (a {id: <alias>.<field>})-[:T]->(b)
+    /// RETURN <alias>.<field>, b.id`. Labels on either node are kept here and
+    /// filter the rows: an empty set means the node pattern had none.
     OutNeighbors {
         edge_type: String,
         source_field: String,
+        source_labels: BTreeSet<String>,
+        destination_labels: BTreeSet<String>,
         source_column: QueryColumn,
         destination_column: QueryColumn,
     },
@@ -211,6 +217,8 @@ pub(crate) enum ParsedUnwindBatchKind {
         source_label: String,
         destination_label: String,
         merge_policy: Option<QueryBatchMergePolicy>,
+        source_property_fields: BTreeMap<String, String>,
+        destination_property_fields: BTreeMap<String, String>,
     },
 }
 
@@ -585,6 +593,24 @@ pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<Parsed
     parsed
 }
 
+/// Why an `UNWIND` query is not one of the batch shapes, for a caller about to
+/// refuse the list of rows it carries. [`parse_opencypher_unwind_batch`] drops
+/// this reason on the experimental engine so a generic read can reach the
+/// engine; when the rows then have no consumer, the reason is the useful part
+/// of the refusal. `None` for a query that does not start with `UNWIND` or
+/// that the batch lowering does not refuse.
+#[cfg(feature = "client-api")]
+pub(crate) fn unwind_batch_refusal_reason(query: &str) -> Option<String> {
+    if starts_with_non_unwind_clause(query) {
+        return None;
+    }
+    match with_parsed_cypher(query, ParsedCypher::lower_unwind_batch) {
+        Err(GraphError::UnsupportedQuery { feature, .. }) => Some(feature),
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
+    }
+}
+
 #[cfg(feature = "client-api")]
 fn starts_with_non_unwind_clause(query: &str) -> bool {
     const NON_UNWIND_CLAUSES: &[&str] = &["CALL", "CREATE", "MATCH", "MERGE", "OPTIONAL", "REMOVE", "RETURN", "SET", "WITH"];
@@ -613,6 +639,9 @@ fn starts_with_non_unwind_clause(query: &str) -> bool {
 /// so a write it cannot read stays the parse error it was, and the legacy
 /// engine, which still parses with libcypher, refuses such a read as before.
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    if super::owned_relationships::is_owned_relationship_set_call(query)? {
+        return Ok(OpenCypherQueryAccess::Write);
+    }
     let classified = classify_with_libcypher(query);
     #[cfg(feature = "experimental-cypher-engine")]
     if matches!(classified, Err(GraphError::QueryParse { .. } | GraphError::UnsupportedQuery { .. }))
@@ -1213,9 +1242,9 @@ impl ParsedCypher {
     //     misleading about why.
     //
     // That second mode is why this was expensive to find: it does not look like
-    // a size problem from any log. A client's entity-snippet lookup was
-    // rewritten twice against that error message and stayed broken, because
-    // both rewrites landed above 1 KiB.
+    // a size problem from any log. A client query above 1 KiB can be rewritten
+    // repeatedly against that error message and stay broken, because the size
+    // threshold, not the query shape, is what triggers it.
     //
     // `cypher_fparse` uses the sibling callback `source_from_stream`, which
     // pulls one character at a time with `getc` and so has no read pointer to
@@ -1432,6 +1461,7 @@ impl ParsedCypher {
                 }
                 let pattern = checked_node(sys::cypher_ast_create_get_pattern(second))?;
                 let edge = unwind_edge_template(pattern, &alias, true)?;
+                edge.refuse_labels()?;
                 return Ok(Some(ParsedUnwindBatch {
                     parameter,
                     kind: ParsedUnwindBatchKind::CreateEdges {
@@ -1486,6 +1516,12 @@ impl ParsedCypher {
                 }
                 let create_pattern = checked_node(sys::cypher_ast_create_get_pattern(third))?;
                 let template = unwind_bound_edge_create_template(&match_patterns, create_pattern, &alias)?;
+                if !template.source_property_fields.is_empty() || !template.destination_property_fields.is_empty() {
+                    return unsupported(
+                        QueryFailureReason::Unwind,
+                        "endpoint property constraints require relationship MERGE",
+                    );
+                }
                 if let Some(relationship_id_field) = template.relationship_id_field {
                     return Ok(Some(ParsedUnwindBatch {
                         parameter,
@@ -1544,6 +1580,8 @@ impl ParsedCypher {
                         source_label: template.source_label,
                         destination_label: template.destination_label,
                         merge_policy: template.merge_policy,
+                        source_property_fields: template.source_property_fields,
+                        destination_property_fields: template.destination_property_fields,
                     },
                 }));
             }
@@ -1594,6 +1632,7 @@ impl ParsedCypher {
                     }));
                 }
                 let edge = unwind_edge_template(pattern, &alias, true)?;
+                edge.refuse_labels()?;
                 let relationship_binding = edge
                     .relationship_binding
                     .ok_or_else(|| unsupported_value(QueryFailureReason::Unwind, "UNWIND DELETE requires a named relationship"))?;
@@ -1667,6 +1706,8 @@ impl ParsedCypher {
                 kind: ParsedUnwindBatchKind::OutNeighbors {
                     edge_type: edge.edge_type,
                     source_field: edge.source_field.clone(),
+                    source_labels: edge.source_labels,
+                    destination_labels: edge.destination_labels,
                     source_column: QueryColumn::new(projection_column_name(
                         source_projection,
                         format!("{}.{}", alias, edge.source_field),
@@ -1977,6 +2018,8 @@ struct UnwindBoundEdgeCreateTemplate {
     relationship_binding: Option<String>,
     property_fields: BTreeMap<String, String>,
     merge_policy: Option<QueryBatchMergePolicy>,
+    source_property_fields: BTreeMap<String, String>,
+    destination_property_fields: BTreeMap<String, String>,
 }
 
 #[cfg(feature = "client-api")]
@@ -2318,7 +2361,7 @@ fn unwind_bound_edge_path_template(
                 format!("UNWIND MATCH {operation} requires exactly two endpoint nodes"),
             );
         }
-        let mut endpoints = BTreeMap::<String, (String, String)>::new();
+        let mut endpoints = BTreeMap::<String, (String, String, BTreeMap<String, String>)>::new();
         for path in endpoint_paths {
             ensure_instance(path, AstKind::PatternPath, "UNWIND MATCH endpoint")?;
             if sys::cypher_ast_pattern_path_nelements(path) != 1 {
@@ -2335,8 +2378,8 @@ fn unwind_bound_edge_path_template(
                     format!("UNWIND MATCH {operation} endpoints require bindings"),
                 )
             })?;
-            let (field, label) = unwind_labeled_node_id_field(node, unwind_alias)?;
-            if endpoints.insert(binding.clone(), (field, label)).is_some() {
+            let endpoint = unwind_labeled_node_id_field(node, unwind_alias)?;
+            if endpoints.insert(binding.clone(), endpoint).is_some() {
                 return unsupported(
                     QueryFailureReason::Unwind,
                     format!("UNWIND MATCH {operation} repeats endpoint binding {binding}"),
@@ -2422,6 +2465,8 @@ fn unwind_bound_edge_path_template(
                 relationship_binding,
                 property_fields,
                 merge_policy: None,
+                source_property_fields: left_endpoint.2.clone(),
+                destination_property_fields: right_endpoint.2.clone(),
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindBoundEdgeCreateTemplate {
                 edge_type,
@@ -2433,6 +2478,8 @@ fn unwind_bound_edge_path_template(
                 relationship_binding,
                 property_fields,
                 merge_policy: None,
+                source_property_fields: right_endpoint.2.clone(),
+                destination_property_fields: left_endpoint.2.clone(),
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => unsupported(
                 QueryFailureReason::Unwind,
@@ -2443,7 +2490,7 @@ fn unwind_bound_edge_path_template(
 }
 
 #[cfg(feature = "client-api")]
-fn unwind_labeled_node_id_field(node: *const AstNode, unwind_alias: &str) -> Result<(String, String)> {
+fn unwind_labeled_node_id_field(node: *const AstNode, unwind_alias: &str) -> Result<(String, String, BTreeMap<String, String>)> {
     unsafe {
         if sys::cypher_ast_node_pattern_nlabels(node) != 1 {
             return unsupported(
@@ -2454,30 +2501,11 @@ fn unwind_labeled_node_id_field(node: *const AstNode, unwind_alias: &str) -> Res
         let label = label_name(checked_node(sys::cypher_ast_node_pattern_get_label(node, 0))?)?;
         let properties = checked_node(sys::cypher_ast_node_pattern_get_properties(node))?;
         ensure_instance(properties, AstKind::Map, "UNWIND MATCH endpoint properties")?;
-        if sys::cypher_ast_map_nentries(properties) != 1 {
-            return unsupported(
-                QueryFailureReason::Unwind,
-                "UNWIND MATCH CREATE endpoints support only the id property",
-            );
-        }
-        let key = prop_name(checked_node(sys::cypher_ast_map_get_key(properties, 0))?)?;
-        if key != "id" {
-            return unsupported(QueryFailureReason::Unwind, "UNWIND MATCH CREATE endpoint property must be id");
-        }
-        let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
-        let Some((binding, field)) = property_expression_binding(value)? else {
-            return unsupported(
-                QueryFailureReason::Unwind,
-                "UNWIND MATCH CREATE endpoint id must read from the row map",
-            );
-        };
-        if binding != unwind_alias {
-            return unsupported(
-                QueryFailureReason::Unwind,
-                "UNWIND MATCH CREATE endpoint references the wrong row alias",
-            );
-        }
-        Ok((field, label))
+        let mut fields = unwind_row_property_fields(properties, unwind_alias, "MATCH endpoint")?;
+        let field = fields
+            .remove("id")
+            .ok_or_else(|| unsupported_value(QueryFailureReason::Unwind, "UNWIND MATCH endpoint requires id"))?;
+        Ok((field, label, fields))
     }
 }
 
@@ -4284,6 +4312,20 @@ struct UnwindEdgeTemplate {
     destination_field: Option<String>,
     destination_binding: Option<String>,
     relationship_binding: Option<String>,
+    /// Labels on the source and destination node patterns. Only the batch
+    /// read filters by them; the batch writes refuse them.
+    source_labels: BTreeSet<String>,
+    destination_labels: BTreeSet<String>,
+}
+
+#[cfg(feature = "client-api")]
+impl UnwindEdgeTemplate {
+    fn refuse_labels(&self) -> Result<()> {
+        if self.source_labels.is_empty() && self.destination_labels.is_empty() {
+            return Ok(());
+        }
+        unsupported(QueryFailureReason::Unwind, "UNWIND batch node patterns do not support labels")
+    }
 }
 
 #[cfg(feature = "client-api")]
@@ -4315,8 +4357,10 @@ fn unwind_edge_template(pattern: *const AstNode, unwind_alias: &str, require_des
         }
         let edge_type = reltype_name(checked_node(sys::cypher_ast_rel_pattern_get_reltype(relationship, 0))?)?;
         let relationship_binding = rel_identifier(relationship)?;
-        let left_field = unwind_node_id_field(left, unwind_alias, true)?;
-        let right_field = unwind_node_id_field(right, unwind_alias, require_destination_field)?;
+        let left_field = unwind_node_id_field_ignoring_labels(left, unwind_alias, true)?;
+        let right_field = unwind_node_id_field_ignoring_labels(right, unwind_alias, require_destination_field)?;
+        let left_labels = unwind_node_labels(left)?;
+        let right_labels = unwind_node_labels(right)?;
         let left_binding = node_identifier(left)?;
         let right_binding = node_identifier(right)?;
         match sys::cypher_ast_rel_pattern_get_direction(relationship) {
@@ -4327,6 +4371,8 @@ fn unwind_edge_template(pattern: *const AstNode, unwind_alias: &str, require_des
                 destination_field: right_field,
                 destination_binding: right_binding,
                 relationship_binding,
+                source_labels: left_labels,
+                destination_labels: right_labels,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindEdgeTemplate {
                 edge_type,
@@ -4335,6 +4381,8 @@ fn unwind_edge_template(pattern: *const AstNode, unwind_alias: &str, require_des
                 destination_field: left_field,
                 destination_binding: left_binding,
                 relationship_binding,
+                source_labels: right_labels,
+                destination_labels: left_labels,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
                 unsupported(QueryFailureReason::Unwind, "UNWIND batch does not support undirected relationships")
@@ -4349,6 +4397,29 @@ fn unwind_node_id_field(node: *const AstNode, unwind_alias: &str, required: bool
         if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
             return unsupported(QueryFailureReason::Unwind, "UNWIND batch node patterns do not support labels");
         }
+    }
+    unwind_node_id_field_ignoring_labels(node, unwind_alias, required)
+}
+
+/// The labels written on an UNWIND batch node pattern.
+#[cfg(feature = "client-api")]
+fn unwind_node_labels(node: *const AstNode) -> Result<BTreeSet<String>> {
+    unsafe {
+        let mut labels = BTreeSet::new();
+        for index in 0..sys::cypher_ast_node_pattern_nlabels(node) {
+            let label = label_name(checked_node(sys::cypher_ast_node_pattern_get_label(node, index))?)?;
+            validate_component("label", &label)?;
+            labels.insert(label);
+        }
+        Ok(labels)
+    }
+}
+
+/// [`unwind_node_id_field`] without the label check, for a caller that reads
+/// the labels itself.
+#[cfg(feature = "client-api")]
+fn unwind_node_id_field_ignoring_labels(node: *const AstNode, unwind_alias: &str, required: bool) -> Result<Option<String>> {
+    unsafe {
         let properties = sys::cypher_ast_node_pattern_get_properties(node);
         if properties.is_null() {
             if required {

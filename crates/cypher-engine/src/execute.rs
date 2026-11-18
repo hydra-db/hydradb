@@ -271,6 +271,11 @@ struct ExpandSpec<'a> {
     direction: PatternDirection,
     to: &'a Symbol,
     target_labels: &'a [Symbol],
+    /// An equality the enclosing Filter puts on the relationship's property,
+    /// when it has one: the hop may then read only the relationships holding
+    /// the value instead of the inputs' whole adjacency. A narrowing hint,
+    /// never a filter: the Filter still runs over every row.
+    relationship_equality: Option<&'a crate::PropertyEqualityCandidate>,
 }
 
 struct ResidualPredicate<'a> {
@@ -2890,9 +2895,39 @@ fn dispatch_binding_plan<'a>(
                         direction: *direction,
                         to,
                         target_labels,
+                        relationship_equality: None,
                     },
                     row_limit,
                     &[],
+                )
+                .await
+            }
+            GraphPhysicalPlan::BoundRelationship {
+                input,
+                from,
+                source_labels,
+                relationship,
+                relationship_types,
+                direction,
+                to,
+                target_labels,
+            } => {
+                // As for Expand: an input row can yield no row, so the window
+                // bounds the output, not the input.
+                let rows = execute_binding_plan_in_context(read, input, None, seed, fixed).await?;
+                bound_relationship_rows(
+                    &mut **read,
+                    rows,
+                    BoundRelationshipSpec {
+                        from,
+                        source_labels,
+                        relationship,
+                        relationship_types,
+                        direction: *direction,
+                        to,
+                        target_labels,
+                    },
+                    row_limit,
                 )
                 .await
             }
@@ -3234,13 +3269,7 @@ fn dispatch_binding_plan<'a>(
                 predicate,
             } => {
                 // A false predicate skips the table, not its fixed record.
-                if matches!(
-                    predicate,
-                    PhysicalExpression::Value(BoundValue {
-                        value: ScalarValue::Boolean(false),
-                        ..
-                    })
-                ) {
+                if is_constant_false(predicate) {
                     initialize_fixed_record(read, input, seed, fixed).await?;
                     return Ok(Vec::new());
                 }
@@ -3283,6 +3312,91 @@ fn dispatch_binding_plan<'a>(
                             read.operator_finished(operator, rows_out);
                         }
                         return rows;
+                    }
+                }
+                // Without LIMIT, a filtered one-hop expansion must still visit
+                // every relationship, but rejected bindings need not coexist.
+                // Keep the finite-window path above unchanged; only fold Filters
+                // over a plain hop here, not over OPTIONAL, sorting or aggregation.
+                if row_limit.is_none() {
+                    let mut folded = Vec::new();
+                    let mut residuals = vec![ResidualPredicate {
+                        expression: predicate,
+                        operation: *operation,
+                    }];
+                    let mut below: &GraphPhysicalPlan = input;
+                    while let GraphPhysicalPlan::Filter {
+                        operation,
+                        input,
+                        predicate,
+                    } = below
+                    {
+                        // A folded inner Filter keeps its own shortcut: a
+                        // constant false rejects every row before the hop
+                        // reads anything, as it does unfolded (Mira on #522).
+                        if is_constant_false(predicate) {
+                            initialize_fixed_record(read, input, seed, fixed).await?;
+                            return Ok(Vec::new());
+                        }
+                        folded.push(below);
+                        residuals.push(ResidualPredicate {
+                            expression: predicate,
+                            operation: *operation,
+                        });
+                        below = input;
+                    }
+                    if let GraphPhysicalPlan::Expand {
+                        input: anchor,
+                        from,
+                        relationship,
+                        relationship_types,
+                        direction,
+                        to,
+                        target_labels,
+                    } = below
+                    {
+                        residuals.reverse();
+                        // An equality any folded Filter puts on the
+                        // relationship's property lets the hop read only the
+                        // relationships holding the value (seek_outgoing_by_
+                        // equality); every Filter still runs over each row.
+                        let equality = relationship.as_ref().and_then(|relationship| {
+                            residuals.iter().find_map(|residual| {
+                                vertex_scan::equality_candidates(residual.expression, relationship)
+                                    .into_iter()
+                                    .next()
+                            })
+                        });
+                        for operator in &folded {
+                            read.operator_started(operator);
+                        }
+                        read.operator_started(below);
+                        let result = async {
+                            let rows = execute_binding_plan_in_context(read, anchor, None, seed, fixed).await?;
+                            expand_rows(
+                                &mut **read,
+                                rows,
+                                ExpandSpec {
+                                    from,
+                                    relationship: relationship.as_ref(),
+                                    relationship_types,
+                                    direction: *direction,
+                                    to,
+                                    target_labels,
+                                    relationship_equality: equality.as_ref(),
+                                },
+                                None,
+                                &residuals,
+                            )
+                            .await
+                        }
+                        .await;
+                        let count = result.as_ref().map_or(0, Vec::len);
+                        read.operator_finished(below, count);
+                        for operator in folded.iter().rev() {
+                            read.operator_finished(operator, count);
+                        }
+                        return result;
                     }
                 }
                 if let GraphPhysicalPlan::VertexScan { scan } = input.as_ref() {
@@ -3470,6 +3584,7 @@ async fn windowed_hop_dispatch<'a>(
                 direction: *direction,
                 to,
                 target_labels,
+                relationship_equality: None,
             };
             expand_rows(&mut **read, rows, spec, Some(limit), residuals).await
         }
@@ -4329,8 +4444,25 @@ async fn expand_rows(
     if input_vertex_ids.is_empty() {
         return Ok(Vec::new());
     }
-    if let Some(limit) = row_limit {
-        if let Some(expanded) = expand_rows_windowed(read, &rows, &spec, limit, residuals).await? {
+    // A relationship equality on an outgoing hop is read from the property
+    // index first: it returns only the relationships holding the value, which
+    // the path below turns into rows a batch of targets at a time
+    // (`emit_in_target_batches`), applying `residuals` and the window. Only
+    // when storage declines does the hop list the whole adjacency, windowed
+    // or batched.
+    let directions = spec.direction.storage_directions();
+    let mut seeked = if directions.len() == 1 && matches!(directions.first(), Some(ExpandDirection::Outgoing)) {
+        let request = ExpandRequest {
+            input_vertex_ids: input_vertex_ids.iter().copied().collect(),
+            direction: ExpandDirection::Outgoing,
+            relationship_types: spec.relationship_types.iter().map(ToString::to_string).collect(),
+        };
+        seek_outgoing_by_equality(read, &spec, &request).await?
+    } else {
+        None
+    };
+    if seeked.is_none() && (row_limit.is_some() || !residuals.is_empty()) {
+        if let Some(expanded) = expand_rows_windowed(read, &rows, &spec, row_limit, residuals).await? {
             return Ok(expanded);
         }
     }
@@ -4349,7 +4481,10 @@ async fn expand_rows(
             direction: storage_direction,
             relationship_types: spec.relationship_types.iter().map(ToString::to_string).collect(),
         };
-        let returned = read.expand_relationships(&request).await?;
+        let returned = match seeked.take() {
+            Some(seeked) => seeked,
+            None => read.expand_relationships(&request).await?,
+        };
         let relationships = canonical_relationships(read, returned)?;
         for relationship in relationships.into_values() {
             read.checkpoint("cypher_expand_relationships")?;
@@ -4385,6 +4520,14 @@ async fn expand_rows(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    if !residuals.is_empty() {
+        // A filtered hop -- seeked, or one whose backend cannot list
+        // neighbours -- hydrates its targets a batch at a time and lets the
+        // rejected go, as `expand_rows_windowed` does: holding every target
+        // of a broad match at once is the memory growth the batches bound.
+        let transient = target_ids.len() > FILTERED_EXPAND_BATCH_TARGETS;
+        return emit_in_target_batches(read, rows, &spec, &by_input, transient, row_limit, residuals).await;
+    }
     let mut hydrated = read.hydrate_vertices(&target_ids).await?;
     hydrated.sort_by_key(|vertex| vertex.id);
     hydrated.dedup_by_key(|vertex| vertex.id);
@@ -4415,6 +4558,239 @@ async fn expand_rows(
         }
     }
     Ok(expanded)
+}
+
+/// The names [`bound_relationship_rows`] reads: those of
+/// [`GraphPhysicalPlan::BoundRelationship`].
+struct BoundRelationshipSpec<'a> {
+    from: &'a Symbol,
+    source_labels: &'a [Symbol],
+    relationship: &'a Symbol,
+    relationship_types: &'a [Symbol],
+    direction: PatternDirection,
+    to: &'a Symbol,
+    target_labels: &'a [Symbol],
+}
+
+/// A hop over a relationship each row already binds: ExpandInto, not an
+/// expansion. The relationship names its endpoints, so no adjacency is read
+/// and an endpoint's degree costs nothing; only an endpoint the row has not
+/// bound yet is hydrated, all rows' at once.
+///
+/// A row yields nothing when the relationship is not of the hop's types or
+/// its endpoints do not fit the hop's direction and the row's bindings: the
+/// pattern's matches over that one relationship, as an expansion followed by
+/// an identity check finds them. An undirected hop reads it either way round,
+/// so with neither endpoint bound it yields both, and a self-loop once. A
+/// name an OPTIONAL bound to null matches nothing, as in [`expand_rows`].
+async fn bound_relationship_rows(
+    read: &mut dyn GraphRead,
+    rows: Vec<BindingRow>,
+    spec: BoundRelationshipSpec<'_>,
+    row_limit: Option<usize>,
+) -> EngineResult<Vec<BindingRow>> {
+    if row_limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let has_labels = |vertex: &VertexRecord, labels: &[Symbol]| labels.iter().all(|label| vertex.labels.contains(label.as_str()));
+    // Whether a row's binding for one end admits `id`: equal to it when the
+    // row binds the end, and anything when it does not (hydrated below).
+    let admits = |row: &BindingRow, end: &Symbol, labels: &[Symbol], id: VertexId| match row.vertices.get(end) {
+        Some(vertex) => vertex.id == id && has_labels(vertex, labels),
+        None => true,
+    };
+    let mut candidates = Vec::new();
+    let mut unbound = BTreeSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        read.checkpoint("cypher_bound_relationship_inputs")?;
+        if row.is_null(spec.relationship) || row.is_null(spec.from) || row.is_null(spec.to) {
+            continue;
+        }
+        let Some(relationship) = row.relationships.get(spec.relationship) else {
+            return Err(unsupported(
+                QueryFailureReason::Pattern,
+                format!("{} is not bound to a relationship", spec.relationship),
+            ));
+        };
+        if !spec.relationship_types.is_empty()
+            && !spec
+                .relationship_types
+                .iter()
+                .any(|relationship_type| relationship_type.as_str() == relationship.relationship_type)
+        {
+            continue;
+        }
+        let (source, target) = (relationship.source, relationship.target);
+        let orientations: &[(VertexId, VertexId)] = match spec.direction {
+            PatternDirection::Outgoing => &[(source, target)],
+            PatternDirection::Incoming => &[(target, source)],
+            PatternDirection::Undirected if source == target => &[(source, target)],
+            PatternDirection::Undirected => &[(source, target), (target, source)],
+        };
+        for &(from_id, to_id) in orientations {
+            if !admits(row, spec.from, spec.source_labels, from_id) || !admits(row, spec.to, spec.target_labels, to_id) {
+                continue;
+            }
+            if !row.vertices.contains_key(spec.from) {
+                unbound.insert(from_id);
+            }
+            if !row.vertices.contains_key(spec.to) {
+                unbound.insert(to_id);
+            }
+            candidates.push((index, from_id, to_id));
+        }
+    }
+    let hydrated = if unbound.is_empty() {
+        BTreeMap::new()
+    } else {
+        read.hydrate_vertices(&unbound.into_iter().collect::<Vec<_>>())
+            .await?
+            .into_iter()
+            .map(|vertex| (vertex.id, vertex))
+            .collect::<BTreeMap<_, _>>()
+    };
+    // Binds `end` to the hydrated `id` where the row has not bound it; false
+    // when that node is gone or lacks the end's labels.
+    let bind = |row: &mut BindingRow, end: &Symbol, labels: &[Symbol], id: VertexId| {
+        if row.vertices.contains_key(end) {
+            return true;
+        }
+        match hydrated.get(&id) {
+            Some(vertex) if has_labels(vertex, labels) => {
+                row.vertices.insert(end.clone(), vertex.clone());
+                true
+            }
+            _ => false,
+        }
+    };
+    let mut matched = Vec::new();
+    for (index, from_id, to_id) in candidates {
+        read.checkpoint("cypher_bound_relationship_rows")?;
+        let mut row = rows[index].clone();
+        if !bind(&mut row, spec.from, spec.source_labels, from_id) || !bind(&mut row, spec.to, spec.target_labels, to_id) {
+            continue;
+        }
+        matched.push(row);
+        read.check_intermediate_rows("cypher_bound_relationship_rows", matched.len())?;
+        if row_limit.is_some_and(|limit| matched.len() >= limit) {
+            break;
+        }
+    }
+    Ok(matched)
+}
+
+/// [`expand_rows`]' rows for a filtered hop, hydrating at most
+/// `FILTERED_EXPAND_BATCH_TARGETS` targets at a time: each input row's
+/// relationships, already sorted by target and identity, are taken a batch of
+/// distinct targets at a time, hydrated, turned into rows that must pass
+/// `residuals`, and released. The rows and their order are the eager path's.
+/// `transient` keeps a large hop's discarded targets out of the query's
+/// identity map.
+async fn emit_in_target_batches(
+    read: &mut dyn GraphRead,
+    rows: Vec<BindingRow>,
+    spec: &ExpandSpec<'_>,
+    by_input: &BTreeMap<VertexId, Vec<(VertexId, RelationshipRecord)>>,
+    transient: bool,
+    row_limit: Option<usize>,
+    residuals: &[ResidualPredicate<'_>],
+) -> EngineResult<Vec<BindingRow>> {
+    let mut expanded = Vec::new();
+    for row in rows {
+        read.checkpoint("cypher_expand_output_rows")?;
+        let Some(input) = row.vertices.get(spec.from).map(|vertex| vertex.id) else {
+            continue;
+        };
+        let relationships = by_input.get(&input).map(Vec::as_slice).unwrap_or_default();
+        let mut start = 0;
+        while start < relationships.len() {
+            // The batch ends where its distinct targets would pass the bound;
+            // a target's parallel relationships stay in one batch.
+            let mut end = start;
+            let mut distinct = 0_usize;
+            while end < relationships.len() {
+                if end == start || relationships[end].0 != relationships[end - 1].0 {
+                    if distinct == FILTERED_EXPAND_BATCH_TARGETS {
+                        break;
+                    }
+                    distinct += 1;
+                }
+                end += 1;
+            }
+            let batch = &relationships[start..end];
+            start = end;
+            let ids = batch
+                .iter()
+                .map(|(target, _)| *target)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let hydrated = if transient {
+                read.hydrate_vertices_transient(&ids).await?
+            } else {
+                read.hydrate_vertices(&ids).await?
+            };
+            let targets = hydrated.into_iter().map(|vertex| (vertex.id, vertex)).collect::<BTreeMap<_, _>>();
+            for (target_id, relationship) in batch {
+                read.checkpoint("cypher_expand_output_rows")?;
+                let Some(target) = targets.get(target_id) else {
+                    continue;
+                };
+                let Some(result) = expanded_row(&row, spec, target, relationship) else {
+                    continue;
+                };
+                if !residuals_hold(&result, residuals)? {
+                    continue;
+                }
+                expanded.push(result);
+                read.check_intermediate_rows("cypher_expand_intermediate_rows", expanded.len())?;
+                if row_limit.is_some_and(|limit| expanded.len() >= limit) {
+                    return Ok(expanded);
+                }
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+/// A Filter predicate that is the literal `false`: it rejects every row, so
+/// its input need not be read beyond its fixed record.
+fn is_constant_false(predicate: &PhysicalExpression) -> bool {
+    matches!(
+        predicate,
+        PhysicalExpression::Value(BoundValue {
+            value: ScalarValue::Boolean(false),
+            ..
+        })
+    )
+}
+
+/// The relationships an outgoing, single-type hop with a relationship
+/// equality reaches, read from the relationship property index for every
+/// input at once rather than from their whole adjacency; `None` when the hop
+/// has no such equality or the backend declines, and the caller expands as
+/// before. All-or-nothing: the backend answers for every input or charges
+/// nothing and declines, so a fallback never pays twice for the same source.
+/// Only outgoing: the index orders a relationship by its source.
+async fn seek_outgoing_by_equality(
+    read: &mut dyn GraphRead,
+    spec: &ExpandSpec<'_>,
+    request: &ExpandRequest,
+) -> EngineResult<Option<Vec<RelationshipRecord>>> {
+    let (Some(equality), ExpandDirection::Outgoing, [relationship_type]) =
+        (spec.relationship_equality, request.direction, request.relationship_types.as_slice())
+    else {
+        return Ok(None);
+    };
+    read.checkpoint("cypher_expand_equality_seek")?;
+    let Some(relationships) = read
+        .seek_outgoing_relationships_by_property_values(relationship_type, &request.input_vertex_ids, &equality.property, &equality.values)
+        .await?
+    else {
+        return Ok(None);
+    };
+    read.check_intermediate_rows("cypher_expand_relationship_rows", relationships.len())?;
+    Ok(Some(relationships))
 }
 
 /// `row` extended over `relationship` to `target`, or `None` when the hop's
@@ -4474,6 +4850,11 @@ struct NeighborGroup {
 /// input.
 const WINDOWED_EXPAND_MIN_LIST_INPUTS: usize = 64;
 
+// Bound the record/hydration working set of an unwindowed filtered hop by
+// target pairs. Parallel relationships on one pair still share the existing
+// relationship work cap; matching output retains the ordinary result limits.
+const FILTERED_EXPAND_BATCH_TARGETS: usize = 64;
+
 /// [`expand_rows`] under a `LIMIT`: the same rows in the same order, reading
 /// only the relationships and targets the window needs.
 ///
@@ -4484,8 +4865,11 @@ const WINDOWED_EXPAND_MIN_LIST_INPUTS: usize = 64;
 /// read target by target in output order: by input row, then by target, which
 /// is the order the eager hop sorts into. Each round reads the next `batch`
 /// targets, emits what it can, and stops once `limit` rows passed `residuals`.
-/// `batch` starts at the window and doubles every round, so a predicate that
-/// rejects most rows costs a logarithmic number of rounds, not one per row.
+/// With a finite window, `batch` starts at the window and doubles each round.
+/// With no window, all matching rows are returned, but records are read in
+/// fixed-size batches and released after filtering. The adjacency/identity
+/// bookkeeping and matching output still obey the existing query work caps;
+/// one target pair may contain multiple parallel relationships.
 ///
 /// `None` when the backend cannot list neighbours on their own; the caller
 /// then runs the eager hop.
@@ -4493,7 +4877,7 @@ async fn expand_rows_windowed(
     read: &mut dyn GraphRead,
     rows: &[BindingRow],
     spec: &ExpandSpec<'_>,
-    limit: usize,
+    limit: Option<usize>,
     residuals: &[ResidualPredicate<'_>],
 ) -> EngineResult<Option<Vec<BindingRow>>> {
     let storage_directions = spec.direction.storage_directions();
@@ -4510,13 +4894,24 @@ async fn expand_rows_windowed(
     let mut seen = BTreeSet::<(VertexId, RelationshipId)>::new();
     let mut targets = BTreeMap::<VertexId, Option<VertexRecord>>::new();
     let mut relationship_rows = 0_usize;
+    // Latched: once a hop has listed more targets than one batch, it stays
+    // transient. Re-summing every listed group per batch made a hop over N
+    // small inputs quadratic (Mira on #522); the latch sums at most one
+    // batch's worth of groups, then never again.
+    let mut transient_hydration = false;
+    // Unwindowed reads discard heavy records after each batch. Remember only
+    // identities across batches so repeated input bindings do not spend the
+    // unique-relationship allowance twice when their records are re-read.
+    let mut counted = BTreeSet::new();
     let mut output = Vec::new();
     let (mut row_index, mut group_index) = (0_usize, 0_usize);
-    let mut batch = limit.max(1);
+    let mut batch = limit.unwrap_or(FILTERED_EXPAND_BATCH_TARGETS).max(1);
     // A single ordered stream can resume by target id. Multiple inputs, types
     // or directions still use the merged listing below.
-    let mut paged =
-        rows.len() == 1 && storage_directions == [ExpandDirection::Outgoing] && spec.relationship_types.len() == 1 && limit <= 64;
+    let mut paged = rows.len() == 1
+        && storage_directions == [ExpandDirection::Outgoing]
+        && spec.relationship_types.len() == 1
+        && limit.is_none_or(|limit| limit <= 64);
     let mut after = None;
     while row_index < rows.len() {
         read.checkpoint("cypher_expand_window")?;
@@ -4665,9 +5060,11 @@ async fn expand_rows_windowed(
                     if !planned.contains_key(&(input, target)) || !seen.insert((input, relationship.id)) {
                         continue;
                     }
+                    if limit.is_some() || counted.insert((input, relationship.id)) {
+                        relationship_rows = relationship_rows.saturating_add(1);
+                        read.check_intermediate_rows("cypher_expand_relationship_rows", relationship_rows)?;
+                    }
                     read_now.entry((input, target)).or_default().push(relationship);
-                    relationship_rows = relationship_rows.saturating_add(1);
-                    read.check_intermediate_rows("cypher_expand_relationship_rows", relationship_rows)?;
                 }
             }
             let mut unhydrated = BTreeSet::new();
@@ -4681,7 +5078,18 @@ async fn expand_rows_windowed(
             }
             if !unhydrated.is_empty() {
                 let unhydrated = unhydrated.into_iter().collect::<Vec<_>>();
-                for vertex in read.hydrate_vertices(&unhydrated).await? {
+                // Small hops keep normal cross-operator hydration reuse.
+                // A multi-batch hop must not accumulate all of its discarded
+                // targets in the query's identity map behind our batch cache.
+                transient_hydration = transient_hydration
+                    || (limit.is_none()
+                        && (after.is_some() || groups.values().map(Vec::len).sum::<usize>() > FILTERED_EXPAND_BATCH_TARGETS));
+                let vertices = if transient_hydration {
+                    read.hydrate_vertices_transient(&unhydrated).await?
+                } else {
+                    read.hydrate_vertices(&unhydrated).await?
+                };
+                for vertex in vertices {
                     targets.entry(vertex.id).or_insert(Some(vertex));
                 }
                 for id in unhydrated {
@@ -4719,14 +5127,24 @@ async fn expand_rows_windowed(
                     }
                     output.push(result);
                     read.check_intermediate_rows("cypher_expand_intermediate_rows", output.len())?;
-                    if output.len() >= limit {
+                    if limit.is_some_and(|limit| output.len() >= limit) {
                         return Ok(Some(output));
                     }
                 }
             }
             group_index += 1;
         }
-        batch = batch.saturating_mul(2);
+        if limit.is_none() {
+            // The cursor has consumed this batch. Keeping these records would
+            // eventually retain the entire high-degree neighbourhood even when
+            // the predicate rejects every row. Repeated inputs may re-read the
+            // same immutable records, preserving their multiplicity and order.
+            fetched.clear();
+            targets.clear();
+            seen.clear();
+        } else {
+            batch = batch.saturating_mul(2);
+        }
     }
     Ok(Some(output))
 }

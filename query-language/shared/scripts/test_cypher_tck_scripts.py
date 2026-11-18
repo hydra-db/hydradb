@@ -39,7 +39,7 @@ class LedgerValidationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_current_ledger_passes(self) -> None:
-        self.assertEqual(ledger_script.validate(), (43, 455))
+        self.assertEqual(ledger_script.validate(), (43, 484))
 
     def test_missing_byog_record_fails(self) -> None:
         payload = json.loads(self.ledger.read_text(encoding="utf-8"))

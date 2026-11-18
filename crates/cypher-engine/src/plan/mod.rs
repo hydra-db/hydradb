@@ -9,6 +9,7 @@ mod lower;
 mod operator;
 mod physical;
 mod planner;
+pub(crate) mod rewrite;
 mod statistics;
 mod value;
 mod value_type;

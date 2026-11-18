@@ -1,7 +1,7 @@
 //! The usage report's shape, and the check the receiver runs on it.
 //!
 //! **What a report may hold.** Counts, durations, and names from vocabularies
-//! Turbolay defines: counter field names, error classes, failure reasons,
+//! HydraDB defines: counter field names, error classes, failure reasons,
 //! engines, physical operator names. Never query text, parameters, labels,
 //! relationship types, property names or values, scope, graph, cell or node
 //! names. [`validate`] enforces the shape of that rule at the receiver: every

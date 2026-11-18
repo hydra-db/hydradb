@@ -3,6 +3,9 @@ use futures::{stream, FutureExt as _, StreamExt as _, TryStreamExt as _};
 pub(crate) use hydradb_graph_slate::write::*;
 use tracing::Instrument as _;
 
+#[cfg(feature = "opencypher")]
+mod owned_relationships;
+
 /// Largest relationship import whose guarded reads are warmed before the
 /// writer permit. Matches the cached-read limit (`MAX_CACHED_REMOTE_ITEMS`), so
 /// a bulk import cannot sweep the block cache.
@@ -25,6 +28,12 @@ const VERTEX_DELETE_READ_CONCURRENCY: usize = 16;
 const METADATA_NOOP_PREFLIGHT_MAX_ITEMS: usize = 32;
 static DELETE_PREPARATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 const DELETE_PREPARATION_MAX_VERTICES: usize = 4096;
+/// Stale prepared discoveries a vertex delete tolerates before it discovers
+/// incident edges under the writer guard instead. A stale preparation means a
+/// committed write changed an edge of a vertex in this very delete; under
+/// sustained edge writes to those vertices, re-preparing outside the writer
+/// loses the same race on every attempt until `GRAPH_TXN_MAX_RETRIES`.
+const DELETE_STALE_PREPARATIONS_BEFORE_GUARDED: usize = 1;
 const DELETE_PREPARATION_BYTES: u64 = 8 * 1024 * 1024;
 const DELETE_APPLY_WARM_MAX_KEYS: usize = 1024;
 /// Reads a relationship delete may make warming its guarded reads before the
@@ -150,6 +159,16 @@ const RELATIONSHIP_DELETE_WARM_MAX_ROWS: usize = RELATIONSHIP_IMPORT_WARM_MAX_RO
 #[cfg(feature = "opencypher")]
 const RELATIONSHIP_DELETE_SURVIVOR_CONCURRENCY: usize = 16;
 
+fn is_stale_delete_preparation(error: &GraphError) -> bool {
+    matches!(
+        error,
+        GraphError::ConditionalWriteConflict {
+            operation: "validate_vertex_delete_preparation",
+            ..
+        }
+    )
+}
+
 async fn run_cancellable_delete_preparation<T>(preparation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     match crate::QueryCancellationToken::current() {
         Some(token) => tokio::select! {
@@ -167,7 +186,7 @@ async fn run_cancellable_delete_preparation<T>(preparation: impl std::future::Fu
 
 /// Stamp a failure onto the span that raised it.
 ///
-/// §6 of the telemetry crate design: the innermost span is
+/// §6 of `docs/plans/2026-07-26-otel-telemetry-crate.md`: the innermost span is
 /// the one that says *why*. A `contention` class on `storage.commit` is a
 /// conflicting transaction; the same class at the root is only "a write failed".
 fn record_error_class(error: &GraphError) {
@@ -217,6 +236,9 @@ fn write_txn_span(cell_id: &str, edge_type: Option<&str>) -> tracing::Span {
         hydradb.edge_type = tracing::field::Empty,
         hydradb.commit_epoch = tracing::field::Empty,
         hydradb.writer.retries = tracing::field::Empty,
+        // Set on a vertex delete whose prepared discovery went stale and that
+        // re-discovered its incident edges under the writer guard instead.
+        hydradb.delete.guarded_fallback = tracing::field::Empty,
         error.class = tracing::field::Empty,
         // Per-phase attribution for the relationship CREATE/MERGE path, the
         // transaction every Bolt `UNWIND` relationship write runs. Each field
@@ -363,6 +385,18 @@ fn vertex_matches_path_node_constraints(vertex_id: VertexId, metadata: &VertexMe
         })
 }
 
+#[cfg(feature = "opencypher")]
+fn vertex_matches_exact_node_constraints(vertex_id: VertexId, metadata: &VertexMetadata, constraints: &VertexMetadata) -> bool {
+    constraints.labels.iter().all(|label| metadata.labels.contains(label))
+        && constraints.properties.iter().all(|(property, expected)| {
+            if property == "id" {
+                expected == &VertexPropertyValue::Integer(vertex_id)
+            } else {
+                metadata.properties.get(property) == Some(expected)
+            }
+        })
+}
+
 fn delete_constraint_property_values_equal(left: &VertexPropertyValue, right: &VertexPropertyValue) -> bool {
     #[cfg(feature = "opencypher")]
     {
@@ -379,6 +413,8 @@ const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
 #[derive(Clone, Copy)]
 struct RelationshipImportOptions<'a> {
     endpoint_labels: Option<(&'a str, &'a str)>,
+    #[cfg(feature = "opencypher")]
+    endpoint_constraints: Option<(&'a VertexMetadata, &'a VertexMetadata)>,
     create_always: bool,
     update_existing_metadata: bool,
     merge_policy: Option<&'a QueryBatchMergePolicy>,
@@ -2170,7 +2206,7 @@ impl GraphShard {
         result
     }
 
-    #[cfg(feature = "opencypher")]
+    #[cfg(any(feature = "opencypher", test))]
     pub(crate) async fn delete_isolated_vertex_mutations_batch(
         &self,
         cell_id: &str,
@@ -2205,7 +2241,7 @@ impl GraphShard {
         .await
     }
 
-    #[cfg(feature = "opencypher")]
+    #[cfg(any(feature = "opencypher", test))]
     pub(crate) async fn delete_vertices_and_isolated_candidates_batch(
         &self,
         cell_id: &str,
@@ -2245,10 +2281,19 @@ impl GraphShard {
         self.run_write_pipeline(
             async {
                 let mut retries = WriteRetryCount::new();
+                let mut stale_preparations = 0;
                 for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                    // After a stale preparation, skip both the slot and the
+                    // out-of-writer discovery: the transaction discovers incident
+                    // edges from the writer's current state under the guard, which
+                    // no concurrent write can invalidate.
+                    let guarded = stale_preparations >= DELETE_STALE_PREPARATIONS_BEFORE_GUARDED;
                     // Bound both active S3 discovery and prepared results waiting for
                     // admission. No graph writer guard is held during this phase.
                     let preparation = async {
+                        if guarded {
+                            return Ok::<_, GraphError>((None, None));
+                        }
                         let mut preparation_slot = if self.writes_reverse_index() && deletions.len() <= DELETE_PREPARATION_MAX_VERTICES {
                             Some(
                                 DELETE_PREPARATION_SLOTS
@@ -2300,16 +2345,15 @@ impl GraphShard {
                         .await;
                     match finish_local_write(lock, result).await {
                         Err(err)
-                            if (is_retryable_write_conflict(&err)
-                                || matches!(
-                                    &err,
-                                    GraphError::ConditionalWriteConflict {
-                                        operation: "validate_vertex_delete_preparation",
-                                        ..
-                                    }
-                                ))
+                            if (is_retryable_write_conflict(&err) || is_stale_delete_preparation(&err))
                                 && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                         {
+                            if is_stale_delete_preparation(&err) {
+                                stale_preparations += 1;
+                                if stale_preparations == DELETE_STALE_PREPARATIONS_BEFORE_GUARDED {
+                                    tracing::Span::current().record("hydradb.delete.guarded_fallback", true);
+                                }
+                            }
                             self.operation_metrics.write_retries.fetch_add(1, Ordering::Relaxed);
                             retries.note_retry();
                             drop(_writer);
@@ -2828,7 +2872,7 @@ impl GraphShard {
         } else if write_reverse_index {
             let isolation_detach_set =
                 matches!(mode, VertexDeleteBatchMode::IsolatedOnly | VertexDeleteBatchMode::DetachAndIsolated).then_some(&detach_vertices);
-            self.indexed_vertex_delete_incidents_at(cell_id, &vertices, isolation_detach_set, current_epoch, lock)
+            self.indexed_vertex_delete_incidents_guarded(cell_id, &vertices, isolation_detach_set, lock)
                 .instrument(tracing::info_span!(
                     "write.delete_incident_discovery",
                     hydradb.delete.vertices = vertices.len(),
@@ -2838,8 +2882,7 @@ impl GraphShard {
                 ))
                 .await?
         } else {
-            self.full_scan_incident_edges_for_vertices_at(cell_id, &vertices, current_epoch, lock)
-                .await?
+            self.full_scan_incident_edges_for_vertices_guarded(cell_id, &vertices, lock).await?
         };
         if mode == VertexDeleteBatchMode::RejectConnected && !incident_edges.is_empty() {
             return Err(GraphError::UnsupportedQuery {
@@ -3076,15 +3119,14 @@ impl GraphShard {
         Ok(results.pop().expect("one requested vertex has one deletion result"))
     }
 
-    async fn indexed_vertex_delete_incidents_at(
+    async fn indexed_vertex_delete_incidents_guarded(
         &self,
         cell_id: &str,
         vertex_ids: &BTreeSet<VertexId>,
         isolation_detach_set: Option<&BTreeSet<VertexId>>,
-        read_epoch: StorageSequence,
         lock: &LocalWriteGuard,
     ) -> Result<BTreeSet<IncidentEdge>> {
-        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        let snapshot = self.guarded_writer_snapshot(cell_id, lock).await?;
         let discovery = self
             .indexed_vertex_delete_discovery(
                 &snapshot,
@@ -3244,14 +3286,13 @@ impl GraphShard {
         Ok(VertexDeleteDiscovery { edges, catalog })
     }
 
-    async fn full_scan_incident_edges_for_vertices_at(
+    async fn full_scan_incident_edges_for_vertices_guarded(
         &self,
         cell_id: &str,
         vertex_ids: &BTreeSet<VertexId>,
-        read_epoch: StorageSequence,
         lock: &LocalWriteGuard,
     ) -> Result<BTreeSet<IncidentEdge>> {
-        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        let snapshot = self.guarded_writer_snapshot(cell_id, lock).await?;
         let scan_options = slatedb::config::ScanOptions::default();
         let read_options = slatedb::config::ReadOptions::default();
         let mut edges = BTreeSet::new();
@@ -3305,7 +3346,7 @@ impl GraphShard {
             ensure_limit("delete_vertex_scan_segments", scanned, self.limits.max_query_scan_edges)?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
-            if segment.storage_sequence > read_epoch {
+            if segment.storage_sequence > snapshot.read_epoch {
                 continue;
             }
             for dst in segment.destinations {
@@ -3608,6 +3649,8 @@ impl GraphShard {
             idempotency_key,
             RelationshipImportOptions {
                 endpoint_labels: None,
+                #[cfg(feature = "opencypher")]
+                endpoint_constraints: None,
                 create_always: false,
                 update_existing_metadata: false,
                 merge_policy: None,
@@ -3784,6 +3827,7 @@ impl GraphShard {
                 idempotency_key,
                 RelationshipImportOptions {
                     endpoint_labels: Some((source_label, destination_label)),
+                    endpoint_constraints: None,
                     create_always: true,
                     update_existing_metadata: false,
                     merge_policy: None,
@@ -3821,6 +3865,7 @@ impl GraphShard {
                 idempotency_key,
                 RelationshipImportOptions {
                     endpoint_labels: Some((source_label, destination_label)),
+                    endpoint_constraints: None,
                     create_always: false,
                     update_existing_metadata: true,
                     merge_policy,
@@ -3836,6 +3881,55 @@ impl GraphShard {
         result
     }
 
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn merge_relationship_with_endpoint_constraints(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        row: crate::QueryBatchConstrainedRelationshipMerge,
+        idempotency_key: &str,
+        merge_policy: Option<&QueryBatchMergePolicy>,
+    ) -> Result<RelationshipImportResult> {
+        let source_label = row
+            .source_constraints
+            .labels
+            .first()
+            .ok_or_else(|| crate::query::owned_relationships::invalid("source label is required"))?;
+        let destination_label = row
+            .destination_constraints
+            .labels
+            .first()
+            .ok_or_else(|| crate::query::owned_relationships::invalid("destination label is required"))?;
+        let relationship = row.relationship;
+        let mut metadata = relationship.metadata;
+        metadata
+            .properties
+            .insert("id".into(), VertexPropertyValue::Integer(relationship.relationship_id));
+        self.import_relationships_batch_with_endpoint_labels(
+            cell_id,
+            edge_type,
+            vec![RelationshipMutation {
+                cell_id: cell_id.to_owned(),
+                edge_type: edge_type.to_owned(),
+                src: relationship.src,
+                dst: relationship.dst,
+                relationship_id: relationship.relationship_id,
+                metadata,
+            }],
+            idempotency_key,
+            RelationshipImportOptions {
+                endpoint_labels: Some((source_label, destination_label)),
+                endpoint_constraints: Some((&row.source_constraints, &row.destination_constraints)),
+                create_always: false,
+                update_existing_metadata: true,
+                merge_policy,
+                guarded_rows: None,
+                operation: "merge_relationship_with_endpoint_constraints",
+            },
+        )
+        .await
+    }
+
     async fn import_relationships_batch_with_endpoint_labels(
         &self,
         cell_id: &str,
@@ -3849,6 +3943,34 @@ impl GraphShard {
         validate_component("idempotency_key", idempotency_key)?;
         if let Some(policy) = options.merge_policy {
             policy.validate()?;
+        }
+        #[cfg(feature = "opencypher")]
+        if let Some((source, destination)) = options.endpoint_constraints {
+            ensure_limit(options.operation, relationships.len() as u64, 1)?;
+            let mut bytes = edge_type.len();
+            for constraints in [source, destination] {
+                if constraints.labels.len() != 1 || constraints.properties.len() > 16 {
+                    return Err(crate::query::owned_relationships::invalid(
+                        "each constrained endpoint requires one label and at most 16 properties",
+                    ));
+                }
+                validate_vertex_metadata(constraints)?;
+                bytes = bytes.saturating_add(constraints.labels.iter().map(String::len).sum::<usize>());
+                for (property, value) in &constraints.properties {
+                    bytes = bytes.saturating_add(property.len()).saturating_add(value.estimated_heap_bytes());
+                }
+            }
+            for relationship in &relationships {
+                if relationship.metadata.properties.len() > 16 {
+                    return Err(crate::query::owned_relationships::invalid(
+                        "constrained relationship metadata contains at most 16 properties",
+                    ));
+                }
+                for (property, value) in &relationship.metadata.properties {
+                    bytes = bytes.saturating_add(property.len()).saturating_add(value.estimated_heap_bytes());
+                }
+            }
+            ensure_limit(options.operation, bytes as u64, 1024 * 1024)?;
         }
         self.ensure_write_authority(cell_id, options.operation)?;
 
@@ -3903,6 +4025,20 @@ impl GraphShard {
             )
         });
         let fingerprint = ordered_fingerprint.unwrap_or_else(|| relationship_import_fingerprint(cell_id, edge_type, &relationships));
+        #[cfg(feature = "opencypher")]
+        let fingerprint = if let Some((source, destination)) = options.endpoint_constraints {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(fingerprint.to_be_bytes());
+            for constraints in [source, destination] {
+                let encoded = encode_vertex_metadata(constraints);
+                digest.update((encoded.len() as u64).to_be_bytes());
+                digest.update(encoded);
+            }
+            u64::from_be_bytes(digest.finalize()[..8].try_into().unwrap())
+        } else {
+            fingerprint
+        };
 
         let span = write_txn_span(cell_id, Some(edge_type));
         let result = self.run_write_pipeline(async {
@@ -4431,6 +4567,25 @@ impl GraphShard {
                     "skipped relationship rows whose MATCH endpoints were absent"
                 );
             }
+        }
+        #[cfg(feature = "opencypher")]
+        if let Some((source_constraints, destination_constraints)) = options.endpoint_constraints {
+            let mut matched = Vec::with_capacity(relationships.len());
+            for relationship in relationships {
+                let mut matches = true;
+                for (vertex, constraints) in [(relationship.src, source_constraints), (relationship.dst, destination_constraints)] {
+                    let key = keys::vertex(cell_id, vertex);
+                    let existing = decode_vertex_record(&key, read_txn_remote(&txn, &key).await?.as_ref())?;
+                    let (metadata, _) = overlaid_vertex_metadata_txn(&txn, cell_id, vertex, existing.as_ref()).await?;
+                    matches &= metadata
+                        .as_ref()
+                        .is_some_and(|metadata| vertex_matches_exact_node_constraints(vertex, metadata, constraints));
+                }
+                if matches {
+                    matched.push(relationship);
+                }
+            }
+            relationships = matched;
         }
         if options.endpoint_labels.is_some() {
             profile.endpoint_check = endpoint_check_started.elapsed();
