@@ -24,7 +24,7 @@ jobs:
   validate:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1.8.3
       - name: Verify tag matches Cargo.toml version
         run: |
           package_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
@@ -37,11 +37,11 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-gnu
     steps:
-      - uses: useblacksmith/checkout@v1
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1.8.3
+      - uses: dtolnay/rust-toolchain@92e73e19cbfb3981e63ef478a16f95f415e634d3 # 1.99.0
         with:
           targets: x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-release
       - name: Install native dependencies
@@ -77,7 +77,7 @@ jobs:
           cp README.md LICENSE "${archive}/"
           tar -czf "${archive}.tar.gz" "${archive}"
           sha256sum "${archive}.tar.gz" > SHA256SUMS
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hydradb-x86_64-unknown-linux-gnu
           path: |
@@ -91,8 +91,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: useblacksmith/checkout@v1
-      - uses: actions/download-artifact@v8
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1.8.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: hydradb-*
           path: dist
