@@ -18,6 +18,8 @@ mod path_procedure;
 mod query;
 #[cfg(feature = "opencypher")]
 mod query_optimizer;
+#[cfg(all(test, feature = "opencypher"))]
+mod relationship_uniqueness_tests;
 pub(crate) mod topology_tail;
 mod write;
 pub(crate) mod write_pipeline;

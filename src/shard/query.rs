@@ -10565,6 +10565,18 @@ fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<Opti
                 && (row.values.contains_key(binding) || row.relationships.contains_key(binding));
             Some(!bound != *negated)
         }
+        // A relationship id compares by identity, so two bindings to parallel
+        // relationships between the same pair are different. A binding that
+        // holds nothing has nothing to repeat.
+        RowPredicate::RelationshipsDistinct { bindings } => {
+            let mut seen = BTreeSet::new();
+            Some(
+                bindings
+                    .iter()
+                    .filter_map(|binding| row.relationships.get(binding))
+                    .all(|relationship| seen.insert(relationship)),
+            )
+        }
     })
 }
 
@@ -10590,7 +10602,8 @@ fn predicate_guarantees_string_property(predicate: &RowPredicate, binding: &str,
         | RowPredicate::In { .. }
         | RowPredicate::Not(_)
         | RowPredicate::IsNull { .. }
-        | RowPredicate::BindingIsNull { .. } => false,
+        | RowPredicate::BindingIsNull { .. }
+        | RowPredicate::RelationshipsDistinct { .. } => false,
     }
 }
 
@@ -10655,7 +10668,10 @@ fn string_property_lower_bound(predicate: &RowPredicate, binding: &str, property
         // values. Offering a bound here would let the planner pick the weaker
         // access path.
         RowPredicate::In { .. } => None,
-        RowPredicate::Not(_) | RowPredicate::IsNull { .. } | RowPredicate::BindingIsNull { .. } => None,
+        RowPredicate::Not(_)
+        | RowPredicate::IsNull { .. }
+        | RowPredicate::BindingIsNull { .. }
+        | RowPredicate::RelationshipsDistinct { .. } => None,
     }
 }
 
@@ -10815,7 +10831,8 @@ pub(super) fn row_predicate_property_equality_constraint(predicate: &RowPredicat
         | RowPredicate::In { .. }
         | RowPredicate::Not(_)
         | RowPredicate::IsNull { .. }
-        | RowPredicate::BindingIsNull { .. } => None,
+        | RowPredicate::BindingIsNull { .. }
+        | RowPredicate::RelationshipsDistinct { .. } => None,
     }
 }
 
@@ -10887,7 +10904,8 @@ fn row_predicate_node_id_values(predicate: &RowPredicate) -> Option<(String, Vec
         | RowPredicate::In { .. }
         | RowPredicate::Not(_)
         | RowPredicate::IsNull { .. }
-        | RowPredicate::BindingIsNull { .. } => None,
+        | RowPredicate::BindingIsNull { .. }
+        | RowPredicate::RelationshipsDistinct { .. } => None,
     }
 }
 
@@ -10973,6 +10991,7 @@ fn row_predicate_requires_scalar_indexed_property(predicate: &RowPredicate, bind
         RowPredicate::Not(_) => false,
         RowPredicate::IsNull { .. } => false,
         RowPredicate::BindingIsNull { .. } => false,
+        RowPredicate::RelationshipsDistinct { .. } => false,
     }
 }
 

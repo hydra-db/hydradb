@@ -427,6 +427,15 @@ pub enum RowPredicate {
         binding: String,
         negated: bool,
     },
+    /// The relationships bound to `bindings` are pairwise different
+    /// relationships. Never written by a user: lowering adds it to a MATCH
+    /// clause that names two or more relationships, because within one MATCH
+    /// Cypher binds each relationship at most once, across comma-separated
+    /// parts as well as along a path (#290). A binding that holds nothing, as
+    /// after an OPTIONAL MATCH that did not match, conflicts with nothing.
+    RelationshipsDistinct {
+        bindings: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1934,12 +1943,19 @@ impl ParsedCypher {
                     );
                 }
                 let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-                patterns.extend(lower_row_patterns(pattern, parameters)?);
+                let clause_patterns = lower_row_patterns(pattern, parameters)?;
+                patterns.extend(clause_patterns.iter().cloned());
                 let match_predicate = sys::cypher_ast_match_get_predicate(match_clause);
                 if !match_predicate.is_null() {
                     let lowered = lower_row_predicate(match_predicate, parameters, lists)?;
                     validate_binding_predicates(&lowered, &declared_row_bindings(&patterns))?;
                     predicate = Some(and_row_predicates(predicate, lowered));
+                }
+                // Per clause, before the clauses' patterns are flattened into
+                // one list: a later MATCH may rebind a relationship an earlier
+                // one bound, so uniqueness must not span clauses.
+                if let Some(uniqueness) = relationship_uniqueness(&clause_patterns) {
+                    predicate = Some(and_row_predicates(predicate, uniqueness));
                 }
             }
 
@@ -2706,6 +2722,7 @@ fn row_predicate_alias_reference(predicate: &RowPredicate, alias: &str) -> Optio
         }
         RowPredicate::Not(inner) => row_predicate_alias_reference(inner, alias),
         RowPredicate::BindingIsNull { binding, .. } => (binding == alias).then(|| alias.to_string()),
+        RowPredicate::RelationshipsDistinct { bindings } => bindings.iter().any(|binding| binding == alias).then(|| alias.to_string()),
     }
 }
 
@@ -3236,6 +3253,7 @@ fn lower_match_return_rows(
                 validate_binding_predicates(&lowered, &declared_row_bindings(&patterns))?;
                 Some(lowered)
             };
+            let group_predicate = with_relationship_uniqueness(group_predicate, &group_patterns);
             if let Some(group_predicate) = &group_predicate {
                 predicate = Some(and_row_predicates(predicate, group_predicate.clone()));
             }
@@ -4105,7 +4123,12 @@ fn validate_binding_predicates(predicate: &RowPredicate, declared: &BTreeSet<Str
             validate_binding_predicates(right, declared)
         }
         RowPredicate::Not(inner) => validate_binding_predicates(inner, declared),
-        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::In { .. } | RowPredicate::IsNull { .. } => Ok(()),
+        // Lowering writes this one from the bindings the patterns declare.
+        RowPredicate::Compare { .. }
+        | RowPredicate::StartsWith { .. }
+        | RowPredicate::In { .. }
+        | RowPredicate::IsNull { .. }
+        | RowPredicate::RelationshipsDistinct { .. } => Ok(()),
     }
 }
 
@@ -4113,6 +4136,34 @@ fn and_row_predicates(left: Option<RowPredicate>, right: RowPredicate) -> RowPre
     match left {
         Some(left) => RowPredicate::And(Box::new(left), Box::new(right)),
         None => right,
+    }
+}
+
+/// One MATCH clause's relationship-uniqueness check, or `None` when the clause
+/// names fewer than two relationships.
+///
+/// Only named fixed-length hops take part. A name written twice is one
+/// relationship on purpose, so names are deduplicated rather than compared
+/// with themselves. Anonymous hops carry no binding for a row to be checked
+/// against, and a variable-length hop binds a list of relationships, not one.
+fn relationship_uniqueness(patterns: &[RowPattern]) -> Option<RowPredicate> {
+    let bindings = patterns
+        .iter()
+        .filter_map(|pattern| match pattern {
+            RowPattern::Edge(edge) if edge.hop_range.is_none() => edge.binding.clone(),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    (bindings.len() >= 2).then(|| RowPredicate::RelationshipsDistinct {
+        bindings: bindings.into_iter().collect(),
+    })
+}
+
+/// `predicate` and the clause's relationship-uniqueness check, either or both.
+fn with_relationship_uniqueness(predicate: Option<RowPredicate>, patterns: &[RowPattern]) -> Option<RowPredicate> {
+    match relationship_uniqueness(patterns) {
+        Some(uniqueness) => Some(and_row_predicates(predicate, uniqueness)),
+        None => predicate,
     }
 }
 
