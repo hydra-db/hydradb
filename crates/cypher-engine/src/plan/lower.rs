@@ -3215,8 +3215,8 @@ fn check_sort_aggregates(query: &Query) -> GraphPlanResult<()> {
 /// §14.10 Syntax Rule 4 c) i) 2) A) III) and IV): after DISTINCT or an
 /// aggregation, a sort key reads only return items (and GROUP BY keys),
 /// outside its own aggregates. `items` are the RETURN's items with `*`
-/// expanded. A key that repeats a projected expression is also kept, as Cypher
-/// reads it.
+/// expanded. A key may compose projected property/computed expressions inside a
+/// larger expression, without making their input bindings readable.
 fn check_restricted_sort_keys(returned: &ReturnClause, items: &[Projection]) -> GraphPlanResult<()> {
     let aggregates = items.iter().any(|item| ast_contains_aggregate(&item.expression));
     let grouped = !returned.group_by.is_empty() || aggregates;
@@ -3236,12 +3236,19 @@ fn check_restricted_sort_keys(returned: &ReturnClause, items: &[Projection]) -> 
         references_outside_aggregates(key, &mut names);
         readable.extend(names.into_iter().map(Identifier::as_str));
     }
+    // A renamed variable inside a compound key must use its output name;
+    // matching an entire key to a RETURN item remains allowed below.
+    let projected: Vec<&Expression> = items
+        .iter()
+        .map(|item| &item.expression)
+        .filter(|expression| !matches!(expression, Expression::Identifier(_)))
+        .collect();
     for sort in &returned.order_by {
         if items.iter().any(|item| item.expression == sort.expression) {
             continue;
         }
         let mut names = Vec::new();
-        references_outside_aggregates(&sort.expression, &mut names);
+        references_outside_aggregates_and_items(&sort.expression, &projected, &mut names);
         if let Some(name) = names.into_iter().find(|name| !readable.contains(name.as_str())) {
             return Err(GraphPlanError::syntax(
                 QueryFailureReason::OrderWindow,
@@ -3254,6 +3261,15 @@ fn check_restricted_sort_keys(returned: &ReturnClause, items: &[Projection]) -> 
 
 /// The variables an expression reads, except inside an aggregate.
 fn references_outside_aggregates<'a>(expression: &'a Expression, names: &mut Vec<&'a Identifier>) {
+    references_outside_aggregates_and_items(expression, &[], names);
+}
+
+/// A complete projected expression is available as a value; its constituent
+/// input names need not remain in scope. Do not exempt just a part of it.
+fn references_outside_aggregates_and_items<'a>(expression: &'a Expression, items: &[&Expression], names: &mut Vec<&'a Identifier>) {
+    if items.contains(&expression) {
+        return;
+    }
     match expression {
         Expression::Identifier(name) => names.push(name),
         Expression::Function { name, .. } if matches!(name.as_slice(), [name] if AggregateFunction::from_name(name.as_str()).is_some()) => {
@@ -3261,15 +3277,25 @@ fn references_outside_aggregates<'a>(expression: &'a Expression, names: &mut Vec
         // The body's own names are not the row's.
         Expression::Let { bindings, body } => {
             for (_, value) in bindings {
-                references_outside_aggregates(value, names);
+                references_outside_aggregates_and_items(value, items, names);
             }
+            // A locally bound name no longer denotes the input read by a
+            // projected expression, even when the expression looks identical.
+            let body_items: Vec<&Expression> = items
+                .iter()
+                .copied()
+                .filter(|item| {
+                    expression_bindings(item)
+                        .is_some_and(|read| bindings.iter().all(|(name, _)| !read.contains(&Symbol::from(name.as_str()))))
+                })
+                .collect();
             let mut inner = Vec::new();
-            references_outside_aggregates(body, &mut inner);
+            references_outside_aggregates_and_items(body, &body_items, &mut inner);
             names.extend(inner.into_iter().filter(|name| bindings.iter().all(|(own, _)| own != *name)));
         }
         other => {
             for child in ast_children(other) {
-                references_outside_aggregates(child, names);
+                references_outside_aggregates_and_items(child, items, names);
             }
         }
     }
