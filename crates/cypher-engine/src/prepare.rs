@@ -111,7 +111,8 @@ impl LogicalQuery {
         self.plan_with_provider(&crate::SlateDbDataSource::new(statistics))
     }
 
-    pub fn plan_with_provider(self, provider: &crate::SlateDbDataSource<'_>) -> EngineResult<PreparedQuery> {
+    pub fn plan_with_provider(mut self, provider: &crate::SlateDbDataSource<'_>) -> EngineResult<PreparedQuery> {
+        self.logical = crate::plan::rewrite::rewrite(&self.logical, &self.planning);
         let mut physical = plan_physical_with_provider(&self.logical, &self.planning, provider)?;
         // Settled here and not in the planner, which plans fragment by
         // fragment: a seek only knows what reads its binding once the whole

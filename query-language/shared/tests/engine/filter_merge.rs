@@ -48,6 +48,7 @@ fn stacked(outer: LogicalExpression) -> GraphLogicalPlan {
         input: Box::new(GraphLogicalPlan::Filter {
             operation: hydradb_cypher_ast::operation::MATCH,
             input: Box::new(GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: Symbol::from("s"),
                 labels: vec![Symbol::from("Source")],
             }),

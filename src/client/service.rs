@@ -31,8 +31,8 @@ use crate::query::experimental_cypher::{experimental_query_columns, prepare_expe
 use crate::query::gds_procedure::{is_gds_call, parse_gds_procedure_with_query_parameters};
 use crate::query::opencypher::{
     classify_opencypher_query_access, opencypher_query_fingerprint, parse_opencypher_mutation_query_with_list_parameters,
-    parse_opencypher_row_query_with_list_parameters, parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
-    ParsedUnwindConstraintValue, ParsedUnwindVertexConstraints,
+    parse_opencypher_row_query_with_list_parameters, parse_opencypher_unwind_batch, unwind_batch_refusal_reason, OpenCypherQueryAccess,
+    ParsedUnwindBatchKind, ParsedUnwindConstraintValue, ParsedUnwindVertexConstraints,
 };
 use crate::query::path_procedure::parse_native_procedure_columns;
 use crate::{
@@ -813,7 +813,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// of them is alertable without it: "forty waits polled" is a fleet at rest
     /// or a fleet on fire depending on whether forty-one waits happened or four
     /// hundred thousand did. Change 4 of
-    /// the cell-affine read routing design asks for the pair
+    /// `docs/plans/2026-08-21-cell-affine-read-routing.md` asks for the pair
     /// for exactly this reason.
     ///
     /// It restates [`Self::bookmark_wait_latency`]'s `count()`, and does so
@@ -834,7 +834,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// window where it should, and it goes and stays non-zero if reads drift
     /// back onto non-owners — which is the regression this exists to make
     /// visible without re-deriving
-    /// it from prepare-duration averages.
+    /// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
     pub bookmark_waits_polled: u64,
     /// Waits that ran out of `max_bookmark_wait_ms` and returned
     /// `SnapshotAhead`.
@@ -1572,9 +1572,9 @@ impl ClientQueryService {
     ///
     /// # What is measured here, and why it is measured here
     ///
-    /// Until change 4 of the cell-affine read routing design
+    /// Until change 4 of `docs/plans/2026-08-21-cell-affine-read-routing.md`
     /// this span was the *only* record of the wait, and a span is a sample: the
-    /// 17-38s waits seen on the read path were
+    /// 17-38s waits in `docs/2026-08-21-read-path-30s-timeout-findings.md` were
     /// found by inferring them out of `graph_client_prepare_duration`, an
     /// average over every prepare. The three instruments below turn that
     /// inference into a measurement — a duration histogram, a count of the
@@ -1793,7 +1793,7 @@ impl ClientQueryService {
         // it was measured against.
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         #[cfg(feature = "datafusion-cypher-engine")]
-        let datafusion_parameters = if cypher_engine == CypherEngineMode::DataFusion {
+        let datafusion_parameters = if cypher_engine == CypherEngineMode::DataFusion && !native_mutation_batch_query(&request.query)? {
             let (scalar_parameters, list_parameters) = split_query_parameters(&request.parameters)?;
             let prepared = self
                 .prepare_datafusion_query_admitted(
@@ -1822,7 +1822,7 @@ impl ClientQueryService {
                 (action, None, scalar_parameters, list_parameters)
             } else {
                 let action = self.authorize_query(session, &request, cypher_engine, mutation_atomicity_policy)?;
-                let (batch_operation, (scalar_parameters, list_parameters)) = self.prepare_transport_parameters(&request)?;
+                let (batch_operation, (scalar_parameters, list_parameters)) = self.prepare_transport_parameters(&request, cypher_engine)?;
                 (action, batch_operation, scalar_parameters, list_parameters)
             };
         if batch_operation
@@ -1853,7 +1853,15 @@ impl ClientQueryService {
                 action == QueryTransportAction::Write,
                 async {
                     #[cfg(feature = "datafusion-cypher-engine")]
-                    if cypher_engine != CypherEngineMode::DataFusion {
+                    if cypher_engine != CypherEngineMode::DataFusion
+                        || matches!(
+                            &batch_operation,
+                            Some(
+                                QueryBatchOperation::ReplaceOwnedRelationshipSet { .. }
+                                    | QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices { .. }
+                            )
+                        )
+                    {
                         self.validate_bookmark(&request).await?;
                     }
                     #[cfg(not(feature = "datafusion-cypher-engine"))]
@@ -1893,6 +1901,13 @@ impl ClientQueryService {
                         if action == QueryTransportAction::Write
                             && mutation_atomicity_policy == MutationAtomicityPolicy::Statement
                             && !datafusion_supports_statement_atomicity(cypher_engine)
+                            && !matches!(
+                                &batch_operation,
+                                Some(
+                                    QueryBatchOperation::ReplaceOwnedRelationshipSet { .. }
+                                        | QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices { .. }
+                                )
+                            )
                         {
                             return Err(statement_atomicity_not_supported());
                         }
@@ -2102,11 +2117,13 @@ impl ClientQueryService {
                             .await;
                     }
                     #[cfg(feature = "datafusion-cypher-engine")]
-                    let replayed_result = self
-                        .inner
-                        .client
-                        .resolve_datafusion_statement_receipt(context.clone(), &request.query)
-                        .await?;
+                    let replayed_result = crate::core::stage_watch::watched(
+                        "statement_receipt",
+                        self.inner
+                            .client
+                            .resolve_datafusion_statement_receipt(context.clone(), &request.query),
+                    )
+                    .await?;
                     #[cfg(not(feature = "datafusion-cypher-engine"))]
                     let replayed_result: Option<QueryResultSet> = None;
                     if let Some(result) = replayed_result {
@@ -2123,16 +2140,30 @@ impl ClientQueryService {
                     if action == QueryTransportAction::Write
                         && mutation_atomicity_policy == MutationAtomicityPolicy::Statement
                         && !datafusion_supports_statement_atomicity(cypher_engine)
+                        && !matches!(
+                            &batch_operation,
+                            Some(
+                                QueryBatchOperation::ReplaceOwnedRelationshipSet { .. }
+                                    | QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices { .. }
+                            )
+                        )
                     {
                         return Err(statement_atomicity_not_supported());
                     }
                     let page = match batch_operation {
-                        Some(operation) => self.inner.client.execute_batch_page(context, operation, None, page_size).await?,
+                        Some(operation) => {
+                            crate::core::stage_watch::watched(
+                                "write_execute",
+                                self.inner.client.execute_batch_page(context, operation, None, page_size),
+                            )
+                            .await?
+                        }
                         None => {
-                            self.inner
-                                .client
-                                .execute_cypher_rows_page(context, &request.query, None, page_size)
-                                .await?
+                            crate::core::stage_watch::watched(
+                                "write_execute",
+                                self.inner.client.execute_cypher_rows_page(context, &request.query, None, page_size),
+                            )
+                            .await?
                         }
                     };
                     let bookmark = self.bookmark_after(&request, action, None).await?;
@@ -2202,19 +2233,19 @@ impl ClientQueryService {
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         let (batch_operation, (scalar_parameters, list_parameters)) = {
             #[cfg(feature = "datafusion-cypher-engine")]
-            if cypher_engine == CypherEngineMode::DataFusion {
+            if cypher_engine == CypherEngineMode::DataFusion && !native_mutation_batch_query(&request.query)? {
                 (None, split_query_parameters(&request.parameters)?)
             } else {
-                self.prepare_transport_parameters(&request)?
+                self.prepare_transport_parameters(&request, cypher_engine)?
             }
             #[cfg(not(feature = "datafusion-cypher-engine"))]
             {
-                self.prepare_transport_parameters(&request)?
+                self.prepare_transport_parameters(&request, cypher_engine)?
             }
         };
 
         #[cfg(feature = "datafusion-cypher-engine")]
-        let datafusion_prepared = if cypher_engine == CypherEngineMode::DataFusion {
+        let datafusion_prepared = if cypher_engine == CypherEngineMode::DataFusion && !native_mutation_batch_query(&request.query)? {
             let prepared = self
                 .prepare_datafusion_query_admitted(
                     session,
@@ -2247,7 +2278,7 @@ impl ClientQueryService {
         // Bookmark waits can open scoped readers too. Never perform them until
         // the statement's required grant has been checked.
         #[cfg(feature = "datafusion-cypher-engine")]
-        if cypher_engine != CypherEngineMode::DataFusion {
+        if cypher_engine != CypherEngineMode::DataFusion || native_mutation_batch_query(&request.query)? {
             self.validate_bookmark(&request).await?;
         }
         #[cfg(not(feature = "datafusion-cypher-engine"))]
@@ -2611,30 +2642,10 @@ impl ClientQueryService {
             {
                 match classify_opencypher_query_access(&request.query)? {
                     OpenCypherQueryAccess::Read => {
-                        // A read UNWIND batch is not this engine's to plan:
-                        // `prepare_transport_parameters` hands it to the batch
-                        // path a step later, as it does on the legacy engine.
-                        // It is refused here in two ways -- rows the sidecar
-                        // split will not take, and an empty list that splits
-                        // cleanly but leaves the planner an UNWIND it cannot
-                        // parse -- so both refusals ask the same question.
-                        // Asking only on a refusal keeps the batch parse off
-                        // every other read, which pays for it in prepare.
-                        let refusal_stands = |error: GraphError| -> Result<()> {
-                            match parse_opencypher_unwind_batch(&request.query)? {
-                                Some(_) => Ok(()),
-                                None => Err(error),
+                        if let Some((parameters, lists)) = experimental_read_parameters(request)? {
+                            if parse_native_procedure_columns(&request.query)?.is_none() {
+                                prepare_experimental_cypher(&request.query, &parameters, &lists)?;
                             }
-                        };
-                        match split_query_parameters(&request.parameters) {
-                            Ok((parameters, lists)) => {
-                                if parse_native_procedure_columns(&request.query)?.is_none() {
-                                    if let Err(error) = prepare_experimental_cypher(&request.query, &parameters, &lists) {
-                                        refusal_stands(error)?;
-                                    }
-                                }
-                            }
-                            Err(error) => refusal_stands(error)?,
                         }
                         QueryTransportAction::Read
                     }
@@ -2655,7 +2666,29 @@ impl ClientQueryService {
         Ok(action)
     }
 
-    fn prepare_transport_parameters(&self, request: &ClientQueryRequest) -> Result<(Option<QueryBatchOperation>, BoundQueryParameters)> {
+    fn prepare_transport_parameters(
+        &self,
+        request: &ClientQueryRequest,
+        cypher_engine: CypherEngineMode,
+    ) -> Result<(Option<QueryBatchOperation>, BoundQueryParameters)> {
+        if crate::query::owned_relationships::is_owned_relationship_set_call(&request.query)? {
+            return Ok((
+                Some(QueryBatchOperation::ReplaceOwnedRelationshipSet {
+                    request: crate::query::owned_relationships::resolve(&request.parameters)?,
+                }),
+                (BTreeMap::new(), BTreeMap::new()),
+            ));
+        }
+        #[cfg(feature = "experimental-cypher-engine")]
+        if cypher_engine == CypherEngineMode::Experimental
+            && classify_opencypher_query_access(&request.query)? == OpenCypherQueryAccess::Read
+        {
+            if let Some(parameters) = experimental_read_parameters(request)? {
+                return Ok((None, parameters));
+            }
+        }
+        #[cfg(not(feature = "experimental-cypher-engine"))]
+        let _ = cypher_engine;
         match parse_opencypher_unwind_batch(&request.query)? {
             // An UNWIND batch consumes its list itself, so nothing reaches the
             // sidecar on that path.
@@ -2664,7 +2697,7 @@ impl ClientQueryService {
                 (BTreeMap::new(), BTreeMap::new()),
             )),
             None => {
-                let (scalars, lists) = split_query_parameters(&request.parameters)?;
+                let (scalars, lists) = split_unwind_query_parameters(&request.query, &request.parameters)?;
                 Ok((None, (scalars, lists)))
             }
         }
@@ -3356,6 +3389,19 @@ fn bind_gds_call_parameters(request: &mut ClientQueryRequest) -> Result<()> {
     Ok(())
 }
 
+/// Scalar inputs stay experimental. Only a recognized legacy read batch may
+/// consume composite parameters; `None` selects that existing batch route.
+#[cfg(feature = "experimental-cypher-engine")]
+fn experimental_read_parameters(request: &ClientQueryRequest) -> Result<Option<BoundQueryParameters>> {
+    match split_unwind_query_parameters(&request.query, &request.parameters) {
+        Ok(parameters) => Ok(Some(parameters)),
+        Err(error) => match parse_opencypher_unwind_batch(&request.query) {
+            Ok(Some(parsed)) if matches!(parsed.kind, ParsedUnwindBatchKind::OutNeighbors { .. }) => Ok(None),
+            _ => Err(error),
+        },
+    }
+}
+
 fn split_query_parameters(parameters: &BTreeMap<String, QueryParameterValue>) -> Result<BoundQueryParameters> {
     let composite = |name: &str| GraphError::UnsupportedQuery {
         reason: QueryFailureReason::Parameter,
@@ -3384,6 +3430,34 @@ fn split_query_parameters(parameters: &BTreeMap<String, QueryParameterValue>) ->
         }
     }
     Ok((scalars, lists))
+}
+
+/// [`split_query_parameters`] for a query that missed the UNWIND batch path.
+///
+/// A list of rows has no consumer outside a batch, so it is still refused. But
+/// when the query is an `UNWIND`, the batch lowering's own refusal says why it
+/// is not a batch (a `WHERE`, an extra column, the id on the wrong node), which
+/// is what the caller can act on. Without it the refusal reads as if `$rows`
+/// were not an UNWIND input at all.
+///
+/// Only the message changes: the refusal keeps `QueryFailureReason::Parameter`,
+/// so it stays in the `unsupported_parameter` metric bucket it always had.
+fn split_unwind_query_parameters(query: &str, parameters: &BTreeMap<String, QueryParameterValue>) -> Result<BoundQueryParameters> {
+    split_query_parameters(parameters).map_err(|error| match error {
+        GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Parameter,
+            dialect,
+            feature,
+        } if feature.starts_with("composite parameter ") => GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Parameter,
+            dialect,
+            feature: match unwind_batch_refusal_reason(query) {
+                Some(batch) => format!("{feature}, and this UNWIND is not a supported batch shape: {batch}"),
+                None => feature,
+            },
+        },
+        error => error,
+    })
 }
 
 fn resolve_unwind_batch(
@@ -3429,18 +3503,36 @@ fn resolve_unwind_batch(
         ParsedUnwindBatchKind::OutNeighbors {
             edge_type,
             source_field,
+            source_labels,
+            destination_labels,
             source_column,
             destination_column,
-        } => Ok(QueryBatchOperation::OutNeighbors {
-            edge_type,
-            sources: rows
+        } => {
+            let sources = rows
                 .iter()
                 .enumerate()
                 .map(|(index, row)| unwind_row_vertex_id(row, index, &source_field))
-                .collect::<Result<Vec<_>>>()?,
-            source_column,
-            destination_column,
-        }),
+                .collect::<Result<Vec<_>>>()?;
+            // An unlabelled pattern keeps the operation it always had, so a
+            // mixed-version cluster serves it as before.
+            Ok(if source_labels.is_empty() && destination_labels.is_empty() {
+                QueryBatchOperation::OutNeighbors {
+                    edge_type,
+                    sources,
+                    source_column,
+                    destination_column,
+                }
+            } else {
+                QueryBatchOperation::LabeledOutNeighbors {
+                    edge_type,
+                    sources,
+                    source_labels,
+                    destination_labels,
+                    source_column,
+                    destination_column,
+                }
+            })
+        }
         ParsedUnwindBatchKind::CreateEdges {
             edge_type,
             source_field,
@@ -3614,7 +3706,17 @@ fn resolve_unwind_batch(
             source_label,
             destination_label,
             merge_policy,
+            source_property_fields,
+            destination_property_fields,
         } => {
+            let constrained = !source_property_fields.is_empty() || !destination_property_fields.is_empty();
+            if constrained && (rows.len() > 1 || source_property_fields.len() > 16 || destination_property_fields.len() > 16) {
+                return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Unwind,
+                    dialect: "OpenCypher",
+                    feature: "constrained relationship MERGE supports one row and at most 16 properties per endpoint".into(),
+                });
+            }
             let relationships = rows
                 .iter()
                 .enumerate()
@@ -3631,6 +3733,37 @@ fn resolve_unwind_batch(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            if constrained {
+                let relationships = relationships
+                    .into_iter()
+                    .zip(rows)
+                    .enumerate()
+                    .map(|(index, (relationship, row))| {
+                        let mut source_constraints = VertexMetadata::default().with_label(source_label.clone());
+                        let mut destination_constraints = VertexMetadata::default().with_label(destination_label.clone());
+                        for (fields, constraints) in [
+                            (&source_property_fields, &mut source_constraints),
+                            (&destination_property_fields, &mut destination_constraints),
+                        ] {
+                            for (property, field) in fields {
+                                constraints
+                                    .properties
+                                    .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                            }
+                        }
+                        Ok(crate::QueryBatchConstrainedRelationshipMerge {
+                            relationship,
+                            source_constraints,
+                            destination_constraints,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices {
+                    edge_type,
+                    relationships,
+                    merge_policy,
+                });
+            }
             Ok(match merge_policy {
                 Some(merge_policy) => QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
                     edge_type,
@@ -3787,10 +3920,39 @@ fn unwind_isolated_candidates(
         .collect())
 }
 
+#[cfg(feature = "datafusion-cypher-engine")]
+fn native_mutation_batch_query(query: &str) -> Result<bool> {
+    if crate::query::owned_relationships::is_owned_relationship_set_call(query)? {
+        return Ok(true);
+    }
+    if !query
+        .trim_start()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNWIND"))
+    {
+        return Ok(false);
+    }
+    Ok(match parse_opencypher_unwind_batch(query) {
+        Ok(Some(parsed)) => {
+            matches!(parsed.kind, ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices { source_property_fields, destination_property_fields, .. } if !source_property_fields.is_empty() || !destination_property_fields.is_empty())
+        }
+        _ => false,
+    })
+}
+
 fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> {
     match operation {
+        QueryBatchOperation::ReplaceOwnedRelationshipSet { .. } => ["applied", "version", "created", "deleted"]
+            .into_iter()
+            .map(QueryColumn::new)
+            .collect(),
         QueryBatchOperation::MatchMutation { .. } => Vec::new(),
         QueryBatchOperation::OutNeighbors {
+            source_column,
+            destination_column,
+            ..
+        }
+        | QueryBatchOperation::LabeledOutNeighbors {
             source_column,
             destination_column,
             ..
@@ -3804,7 +3966,8 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::GuardedUpsertVertices { .. }
         | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. }
         | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. }
-        | QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        | QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices { .. }
+        | QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
         QueryBatchOperation::DeleteIsolatedVertices { deleted_column, .. } => {
             vec![deleted_column.clone()]
         }

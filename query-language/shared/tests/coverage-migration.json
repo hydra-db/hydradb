@@ -2,7 +2,7 @@
   "schema_version": 1,
   "source_revision": "f0bd88219cb9dd8457f257fc63c45504b189b093",
   "target_count": 43,
-  "record_count": 455,
+  "record_count": 484,
   "allowed_dispositions": [
     "retained",
     "dual-covered",
@@ -806,7 +806,7 @@
       "assertion_contracts": [
         {
           "description": "a relationship an earlier pattern bound does not block anchoring",
-          "test_source": "fn a_relationship_an_earlier_pattern_bound_does_not_block_anchoring() {\n    let engine = CypherEngine::new(fixture());\n    // `r` is bound by the first pattern, so the second one's map reads it from\n    // the seed row whichever side of the expansion it runs on. Only a name\n    // *this* hop produces can read differently after the move, so a name\n    // already bound must not be mistaken for one.\n    let prepared = engine\n        .prepare(\n            \"MATCH (s:Source {source_id: $source_id})<-[r:HAS_CHUNK]-(x:Chunk) \\\n             MATCH (c:Chunk {chunk_id: r.kind})-[r:HAS_CHUNK]->(s) \\\n             RETURN c.chunk_id AS chunk_id\",\n            &parameters(\"src-1\"),\n        )\n        .expect(\"prepare\");\n\n    let explain = prepared.explain();\n    assert!(\n        explain.contains(\"ExpandExec(from=s, relationship=r, types=[HAS_CHUNK], direction=incoming, to=c,\"),\n        \"an already-bound relationship must not block the rewrite: {explain}\"\n    );\n    assert!(\n        !explain.contains(\"VertexPropertyScan(binding=c\"),\n        \"the Chunk scan is exactly what anchoring removes: {explain}\"\n    );\n}",
+          "test_source": "fn a_relationship_an_earlier_pattern_bound_does_not_block_anchoring() {\n    let engine = CypherEngine::new(fixture());\n    // `r` is bound by the first pattern, so the second one's map reads it from\n    // the seed row whichever side of the expansion it runs on. Only a name\n    // *this* hop produces can read differently after the move, so a name\n    // already bound must not be mistaken for one.\n    let prepared = engine\n        .prepare(\n            \"MATCH (s:Source {source_id: $source_id})<-[r:HAS_CHUNK]-(x:Chunk) \\\n             MATCH (c:Chunk {chunk_id: r.kind})-[r:HAS_CHUNK]->(s) \\\n             RETURN c.chunk_id AS chunk_id\",\n            &parameters(\"src-1\"),\n        )\n        .expect(\"prepare\");\n\n    // Anchored on `s`, the reused `r` is then checked between its endpoints\n    // rather than expanded again (see `repeated_binding`).\n    let explain = prepared.explain();\n    assert!(\n        explain.contains(\"BoundRelationshipExec(relationship=r, from=s, source_labels=[], types=[HAS_CHUNK], direction=incoming, to=c,\"),\n        \"an already-bound relationship must not block the rewrite: {explain}\"\n    );\n    assert!(\n        !explain.contains(\"VertexScan(provider=slatedb, access=property-presence, binding=c\"),\n        \"the Chunk scan is exactly what anchoring removes: {explain}\"\n    );\n}",
           "local_helper_sources": [
             {
               "name": "chunk",
@@ -7458,11 +7458,11 @@
       "disposition": "retained"
     },
     {
-      "key": "operator_profile::a_correlated_input_is_counted_once_per_outer_row",
+      "key": "operator_profile::an_independent_join_counts_the_right_input_once_per_outer_row",
       "package": "hydradb-cypher-engine",
       "target": "operator_profile",
       "source_path": "query-language/shared/tests/engine/operator_profile.rs",
-      "function": "a_correlated_input_is_counted_once_per_outer_row",
+      "function": "an_independent_join_counts_the_right_input_once_per_outer_row",
       "fixture": "Six Person vertices, four KNOWS edges; ProfilingStorage/Read hooks and optional overestimated statistics.",
       "dialect": "Cypher engine default dialect; see exact query text",
       "adapters": [
@@ -7474,9 +7474,16 @@
         "Execution"
       ],
       "assertion_contracts": [
-        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn a_correlated_input_is_counted_once_per_outer_row() {\n    let (profile, rows, _) = profile(\"MATCH (a:Person) MATCH (a)-[:KNOWS]->(b) RETURN a.entity_id AS a, b.entity_id AS b\").await;\n    assert_eq!(rows, 4);\n    assert_consistent(&profile, rows);\n    let join = by_name(&profile, \"NaturalJoinExec\");\n    let left = profile\n        .operators\n        .iter()\n        .find(|operator| operator.parent == Some(join.id))\n        .expect(\"join has a left input\");\n    let right = profile\n        .operators\n        .iter()\n        .rfind(|operator| operator.parent == Some(join.id))\n        .expect(\"join has a right input\");\n    assert_eq!(left.invocations, 1);\n    assert_eq!(left.rows_out, 6);\n    assert_eq!(right.invocations, 6, \"one correlated run per outer row\");\n}",
-        "Called helper contract:\nfn assert_consistent(profile: &ExecutionProfile, result_rows: usize) {\n    let root = &profile.operators[0];\n    assert_eq!(root.parent, None);\n    assert_eq!(root.invocations, 1);\n    assert_eq!(root.rows_out, result_rows as u64);\n    for operator in &profile.operators {\n        let children_out: u64 = profile\n            .operators\n            .iter()\n            .filter(|child| child.parent == Some(operator.id))\n            .map(|child| child.rows_out)\n            .sum();\n        assert_eq!(operator.rows_in, children_out, \"{operator:#?}\");\n        assert!(operator.self_elapsed <= operator.elapsed);\n        assert!(operator.storage_elapsed <= operator.self_elapsed);\n        assert!(operator.peak_retained_rows >= operator.rows_out / operator.invocations.max(1));\n    }\n}",
-        "Called helper contract:\nfn by_name<'a>(profile: &'a ExecutionProfile, operator: &str) -> &'a OperatorProfile {\n    profile\n        .operators\n        .iter()\n        .find(|profile| profile.operator == operator)\n        .unwrap_or_else(|| panic!(\"no {operator} in {profile:#?}\"))\n}"
+        {
+          "description": "An independent two-scan join remains a NaturalJoin: six Person inputs produce 36 rows, with one left invocation and six right invocations and consistent profiling counters.",
+          "test_source": "query-language/shared/tests/engine/operator_profile.rs::an_independent_join_counts_the_right_input_once_per_outer_row",
+          "local_helper_sources": [
+            "profile",
+            "assert_consistent",
+            "by_name"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
       ],
       "retained_bespoke": [
         "Operator profile attribution, metrics and scan routing."
@@ -7580,8 +7587,16 @@
         "Execution"
       ],
       "assertion_contracts": [
-        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn correlated_seed_reuse_is_not_reported_as_a_full_scan() {\n    let (profile, rows, _) = profile(\"MATCH (a:Person {entity_id: 'p1'}) MATCH (a)-[:KNOWS]->(b:Person) RETURN b.entity_id AS id\").await;\n    assert_eq!(rows, 2);\n    assert!(by_name(&profile, \"AllVertexScan\").invocations > 0);\n    assert!(!profile.ran_full_scan());\n}",
-        "Called helper contract:\nfn by_name<'a>(profile: &'a ExecutionProfile, operator: &str) -> &'a OperatorProfile {\n    profile\n        .operators\n        .iter()\n        .find(|profile| profile.operator == operator)\n        .unwrap_or_else(|| panic!(\"no {operator} in {profile:#?}\"))\n}"
+        {
+          "description": "A retained OPTIONAL MATCH executes the bound inventory access and returns two neighbors without reporting a full inventory scan.",
+          "test_source": "query-language/shared/tests/engine/operator_profile.rs::correlated_seed_reuse_is_not_reported_as_a_full_scan",
+          "local_helper_sources": [
+            "profile",
+            "assert_consistent",
+            "by_name"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
       ],
       "retained_bespoke": [
         "Operator profile attribution, metrics and scan routing."
@@ -9370,6 +9385,156 @@
       ],
       "assertion_contracts": [
         "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn the_path_continues_from_the_repeated_node() {\n    // a's only incoming R is from d, which has no self-loop.\n    let result = run(\"MATCH (n:Node {name: 'a'})<-[:R]-(m)-[:R]->(m) RETURN m.name AS name\").await;\n    assert!(table(&result).is_empty());\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::a_reused_relationship_is_checked_between_its_endpoints",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "a_reused_relationship_is_checked_between_its_endpoints",
+      "fixture": "common::compat::graph() with the Hub's weighted HAS edges, the Node diamond/cycle and R self-loop.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn a_reused_relationship_is_checked_between_its_endpoints() {\n    let query = format!(\"{BANANA}MATCH (h)-[r:HAS]->(x) RETURN x.name AS x\");\n    let plan = explain(&query);\n    assert!(\n        plan.contains(\"BoundRelationshipExec(relationship=r, from=h, source_labels=[], types=[HAS], direction=outgoing, to=x,\"),\n        \"{plan}\"\n    );\n    assert_eq!(\n        plan.matches(\"ExpandExec(\").count(),\n        1,\n        \"only the anchor expands; r is not expanded again: {plan}\"\n    );\n    let storage = graph();\n    let (rows, expansions, scans) = rows_and_extra_reads(&storage, BANANA, &query).await;\n    assert_eq!(rows, rows![[\"\\\"banana\\\"\"]]);\n    assert_eq!((expansions, scans), (0, 0), \"the reuse reads no adjacency and scans nothing\");\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::a_fallible_first_node_filter_keeps_its_scan_and_its_error",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "a_fallible_first_node_filter_keeps_its_scan_and_its_error",
+      "fixture": "common::compat::graph() with the Hub's weighted HAS edges, the Node diamond/cycle and R self-loop.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn a_fallible_first_node_filter_keeps_its_scan_and_its_error() {\n    for tail in [\n        \"MATCH (x:Hub {score: 1 / (size(x.name) - 3)})-[r:R]->(y) RETURN x.name AS x\",\n        \"MATCH (x:Hub WHERE 1 / (size(x.name) - 3) = 1)-[r:R]->(y) RETURN x.name AS x\",\n    ] {\n        let query = format!(\"{BANANA}{tail}\");\n        let plan = explain(&query);\n        assert!(plan.contains(\"binding=x, labels=[Hub]\"), \"the Hub scan stays: {plan}\");\n        assert!(plan.contains(\"BoundRelationshipExec(relationship=r, from=x, source_labels=[]\"), \"{plan}\");\n        let engine = CypherEngine::new(graph());\n        let prepared = engine.prepare(&query, &ParameterMap::new()).expect(\"prepare\");\n        let error = engine\n            .execute_prepared(&prepared)\n            .await\n            .expect_err(\"the written order divides by zero before the hop rejects r\");\n        assert!(error.to_string().to_lowercase().contains(\"zero\"), \"{tail}: {error}\");\n    }\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::a_reused_relationship_keeps_its_type_and_direction",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "a_reused_relationship_keeps_its_type_and_direction",
+      "fixture": "common::compat::graph() with the Hub's weighted HAS edges, the Node diamond/cycle and R self-loop.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn a_reused_relationship_keeps_its_type_and_direction() {\n    for (tail, expected) in [\n        // Reversed endpoints, another type, and an incoming spelling of the\n        // same edge.\n        (\"MATCH (i)-[r:HAS]->(h) RETURN i.name AS x\", vec![]),\n        (\"MATCH (h)-[r:R]->(i) RETURN i.name AS x\", vec![]),\n        (\"MATCH ()-[r:R]->() RETURN i.name AS x\", vec![]),\n        (\"MATCH (i)<-[r:HAS]-(h) RETURN i.name AS x\", vec![vec![\"\\\"banana\\\"\".to_string()]]),\n        (\"MATCH (x)<-[r]-(y:Hub) RETURN x.name AS x\", vec![vec![\"\\\"banana\\\"\".to_string()]]),\n        // An OPTIONAL reuse that does not fit keeps the row, its names\n        // still bound.\n        (\n            \"OPTIONAL MATCH (i)-[r:HAS]->(h) RETURN i.name AS x\",\n            vec![vec![\"\\\"banana\\\"\".to_string()]],\n        ),\n        (\"OPTIONAL MATCH (x)-[r:R]->(y) RETURN x.name AS x\", vec![vec![\"null\".to_string()]]),\n    ] {\n        let query = format!(\"{BANANA}{tail}\");\n        assert!(explain(&query).contains(\"BoundRelationshipExec(relationship=r\"), \"{query}\");\n        let storage = graph();\n        let (rows, expansions, scans) = rows_and_extra_reads(&storage, BANANA, &query).await;\n        assert_eq!(rows, expected, \"{tail}\");\n        assert_eq!((expansions, scans), (0, 0), \"{tail}\");\n    }\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::a_reused_relationship_binds_the_endpoints_its_pattern_left_free",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "a_reused_relationship_binds_the_endpoints_its_pattern_left_free",
+      "fixture": "common::compat::graph() with the Hub's weighted HAS edges, the Node diamond/cycle and R self-loop.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn a_reused_relationship_binds_the_endpoints_its_pattern_left_free() {\n    for (tail, expected) in [\n        // Neither end bound: the relationship binds both, with no scan of the\n        // first node's label or of the inventory.\n        (\n            \"WITH r MATCH (x)-[r]->(y) RETURN x.name AS x, y.name AS y\",\n            rows![[\"\\\"hub\\\"\", \"\\\"banana\\\"\"]],\n        ),\n        (\n            \"WITH r MATCH (x:Hub)-[r]->(y:Item) RETURN x.name AS x, y.name AS y\",\n            rows![[\"\\\"hub\\\"\", \"\\\"banana\\\"\"]],\n        ),\n        (\"WITH r MATCH (x:Item)-[r]->(y) RETURN x.name AS x, y.name AS y\", vec![]),\n        (\"WITH r MATCH (x)-[r]->(y:Hub) RETURN x.name AS x, y.name AS y\", vec![]),\n        // Undirected: either way round, so both rows when neither end is\n        // bound, and only the one that fits a bound end.\n        (\n            \"WITH r MATCH (x)-[r]-(y) RETURN x.name AS x, y.name AS y ORDER BY x\",\n            rows![[\"\\\"banana\\\"\", \"\\\"hub\\\"\"], [\"\\\"hub\\\"\", \"\\\"banana\\\"\"]],\n        ),\n        (\n            \"MATCH (i)-[r]-(y) RETURN i.name AS x, y.name AS y\",\n            rows![[\"\\\"banana\\\"\", \"\\\"hub\\\"\"]],\n        ),\n        // The path continues from the end the relationship bound.\n        (\n            \"WITH r MATCH (x)-[r]->(y) MATCH (y)<-[s:HAS]-(z) RETURN z.name AS x, y.name AS y\",\n            rows![[\"\\\"hub\\\"\", \"\\\"banana\\\"\"]],\n        ),\n    ] {\n        let query = format!(\"{BANANA}{tail}\");\n        let plan = explain(&query);\n        assert!(plan.contains(\"BoundRelationshipExec(relationship=r\"), \"{query}: {plan}\");\n        let storage = graph();\n        let (rows, _, scans) = rows_and_extra_reads(&storage, BANANA, &query).await;\n        assert_eq!(rows, expected, \"{tail}\");\n        assert_eq!(scans, 0, \"{tail}: the relationship, not a scan, binds the first node\");\n    }\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::an_undirected_reuse_of_a_self_loop_yields_one_row",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "an_undirected_reuse_of_a_self_loop_yields_one_row",
+      "fixture": "common::compat::graph() with the Hub's weighted HAS edges, the Node diamond/cycle and R self-loop.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn an_undirected_reuse_of_a_self_loop_yields_one_row() {\n    let anchor = \"MATCH (n:Node {name: 'loop'})-[r:R]->() \";\n    let storage = graph();\n    let (rows, expansions, _) = rows_and_extra_reads(\n        &storage,\n        anchor,\n        &format!(\"{anchor}WITH r MATCH (x)-[r]-(y) RETURN x.name AS x, y.name AS y\"),\n    )\n    .await;\n    assert_eq!(rows, rows![[\"\\\"loop\\\"\", \"\\\"loop\\\"\"]]);\n    assert_eq!(expansions, 0);\n    let (rows, _, _) = rows_and_extra_reads(&storage, anchor, &format!(\"{anchor}MATCH (n)-[r]->(n) RETURN n.name AS x\")).await;\n    assert_eq!(rows, rows![[\"\\\"loop\\\"\"]]);\n}"
+      ],
+      "retained_bespoke": [
+        "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "repeated_binding::reusing_a_hub_relationship_reads_none_of_the_hubs_edges",
+      "package": "hydradb-cypher-engine",
+      "target": "repeated_binding",
+      "source_path": "query-language/shared/tests/engine/repeated_binding.rs",
+      "function": "reusing_a_hub_relationship_reads_none_of_the_hubs_edges",
+      "fixture": "Bespoke MemoryStorage: one Entity hub with 60 outgoing RELATES edges.",
+      "dialect": "Cypher 25 (relationship variable reused across MATCH clauses)",
+      "adapters": [
+        "direct hydradb_cypher_engine::CypherEngine / MemoryStorage"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact original test contract, including all query text, loop cases, expected rows/errors and physical/storage assertions:\n#[tokio::test]\nasync fn reusing_a_hub_relationship_reads_none_of_the_hubs_edges() {\n    let mut vertices = vec![VertexRecord::new(1).with_label(\"Entity\")];\n    vertices.extend((100..160).map(|id| VertexRecord::new(id).with_label(\"Entity\")));\n    let storage = MemoryStorage::with_graph(vertices, (0..60).map(|k| RelationshipRecord::new(1000 + k, 1, 100 + k, \"RELATES\")));\n    let anchor = \"MATCH (a:Entity)-[r:RELATES]->(b) WHERE id(b) = 105 \";\n    let engine = CypherEngine::new(storage.clone());\n    let records = || *storage.expanded_relationship_records.lock().unwrap();\n    let query = |tail: &str| format!(\"{anchor}{tail}\");\n    let run = |query: String| {\n        let engine = &engine;\n        async move {\n            let prepared = engine\n                .prepare(&query, &ParameterMap::new())\n                .unwrap_or_else(|error| panic!(\"{query}: {error}\"));\n            table(\n                &engine\n                    .execute_prepared(&prepared)\n                    .await\n                    .unwrap_or_else(|error| panic!(\"{query}: {error}\")),\n            )\n        }\n    };\n    let before = records();\n    run(query(\"RETURN id(b) AS c\")).await;\n    let anchor_records = records() - before;\n    for (tail, expected) in [\n        (\"MATCH (a)-[r:RELATES]->(c) RETURN id(c) AS c\", rows![[\"105\"]]),\n        (\"MATCH (a)-[r:RELATES]-(c) RETURN id(c) AS c\", rows![[\"105\"]]),\n        (\"MATCH (c)-[r:RELATES]->(a) RETURN id(c) AS c\", vec![]),\n    ] {\n        let before = records();\n        assert_eq!(run(query(tail)).await, expected, \"{tail}\");\n        assert_eq!(\n            records() - before,\n            anchor_records,\n            \"{tail}: the reuse reads no relationship of the hub\"\n        );\n    }\n}"
       ],
       "retained_bespoke": [
         "Existing direct-engine test remains until exact query, fixture, result/error, phase and adapter equivalence is demonstrated."
@@ -11233,6 +11398,81 @@
       ],
       "assertion_contracts": [
         "Exact source assertion contract (including all query variants, loops, expected values and multiplicity):\n#[test]\nfn two_bounds_on_one_property_are_one_candidate() {\n    let plan = corpus_access(CORPUS[6], &example_scope());\n    let GraphPhysicalPlan::VertexPropertyRangeSeek {\n        lower,\n        upper,\n        estimated_rows,\n        ..\n    } = &plan\n    else {\n        panic!(\"expected a range seek, got {plan:?}\");\n    };\n    assert!(matches!(lower, Some((value, true)) if value.value == ScalarValue::Integer(10)));\n    assert!(matches!(upper, Some((value, false)) if value.value == ScalarValue::Integer(20)));\n    // 10/500 of 50,000, and no other type is walked between two numbers.\n    assert_eq!(*estimated_rows, 1_000);\n}"
+      ],
+      "retained_bespoke": [
+        "Retain original engine-specific test and every planner, statistics, profiling, storage-probe, resource-limit, identity, or regression assertion shown in source contract; declarative rows cannot establish those properties."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "statistics_access::an_unestimated_range_alone_walks_its_own_slice",
+      "package": "hydradb-cypher-engine",
+      "target": "statistics_access",
+      "source_path": "query-language/shared/tests/engine/statistics_access.rs",
+      "function": "an_unestimated_range_alone_walks_its_own_slice",
+      "fixture": "statistics_access.rs helpers: corpus_parameters/CORPUS and RankingStatistics or UnknownStatistics; execution tests use mixed_fixture, wide_fixture, tenant_sources or locally constructed MemoryStorage as specified in contract; same_rows_as_filter_only additionally asserts ranked range-seek versus unranked plan and row equality.",
+      "dialect": "Cypher (engine default; Neo4j CYPHER 25 reference where noted in source)",
+      "adapters": [
+        "direct hydradb-cypher-engine with MemoryStorage (current test; not production legacy/experimental adapters)"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact source assertion contract (including all query variants, loops, expected values and multiplicity):\n#[test]\nfn an_unestimated_range_alone_walks_its_own_slice() {\n    let statistics = RankingStatistics::default()\n        .label(\"Source\", 50_000)\n        .property(\"created_at\", 1_000, 900);\n    let query = \"MATCH (s:Source) WHERE s.created_at >= 'a' AND s.created_at < 'b' RETURN s\";\n    let plan = corpus_access(query, &statistics);\n    assert_eq!(vertex_scan(&plan).access_kind(), \"property-range\", \"{plan:?}\");\n    let explain = explain_physical_plan(&plan);\n    assert!(explain.contains(\"lower=inclusive 'a', upper=exclusive 'b'\"), \"{explain}\");\n    let unranked = corpus_access(query, &UnknownStatistics);\n    assert_ne!(vertex_scan(&unranked).access_kind(), \"property-range\", \"{unranked:?}\");\n    let unknown_property = RankingStatistics::default().label(\"Source\", 50_000);\n    assert_eq!(\n        explain_corpus(query, &unknown_property),\n        explain_corpus(query, &UnknownStatistics),\n        \"a property statistics do not know plans as without them\"\n    );\n    // A label smaller than the property is scanned, as it was: only a\n    // presence plan gains the bounded walk, and its fallback is that plan.\n    let small_label = RankingStatistics::default().label(\"Source\", 2).property(\"created_at\", 102, 102);\n    let plan = corpus_access(query, &small_label);\n    assert_eq!(vertex_scan(&plan).access_kind(), \"label-prefix\", \"{plan:?}\");\n}"
+      ],
+      "retained_bespoke": [
+        "Retain original engine-specific test and every planner, statistics, profiling, storage-probe, resource-limit, identity, or regression assertion shown in source contract; declarative rows cannot establish those properties."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "statistics_access::an_unestimated_string_range_keeps_the_filter_only_rows",
+      "package": "hydradb-cypher-engine",
+      "target": "statistics_access",
+      "source_path": "query-language/shared/tests/engine/statistics_access.rs",
+      "function": "an_unestimated_string_range_keeps_the_filter_only_rows",
+      "fixture": "statistics_access.rs helpers: corpus_parameters/CORPUS and RankingStatistics or UnknownStatistics; execution tests use mixed_fixture, wide_fixture, tenant_sources or locally constructed MemoryStorage as specified in contract; same_rows_as_filter_only additionally asserts ranked range-seek versus unranked plan and row equality.",
+      "dialect": "Cypher (engine default; Neo4j CYPHER 25 reference where noted in source)",
+      "adapters": [
+        "direct hydradb-cypher-engine with MemoryStorage (current test; not production legacy/experimental adapters)"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact source assertion contract (including all query variants, loops, expected values and multiplicity):\n#[tokio::test]\nasync fn an_unestimated_string_range_keeps_the_filter_only_rows() {\n    let storage = mixed_fixture();\n    let statistics = RankingStatistics::default()\n        .label(\"Source\", 50_000)\n        .property(\"created_at\", 1_000, 900);\n    let rows = same_rows_as_filter_only(\n        &storage,\n        \"MATCH (s:Source) WHERE s.created_at >= '0' AND s.created_at < '9' RETURN s\",\n        &statistics,\n    )\n    .await;\n    assert_eq!(rows, vec![11]);\n}"
+      ],
+      "retained_bespoke": [
+        "Retain original engine-specific test and every planner, statistics, profiling, storage-probe, resource-limit, identity, or regression assertion shown in source contract; declarative rows cannot establish those properties."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "statistics_access::a_fallible_residual_keeps_the_presence_plan_and_its_error",
+      "package": "hydradb-cypher-engine",
+      "target": "statistics_access",
+      "source_path": "query-language/shared/tests/engine/statistics_access.rs",
+      "function": "a_fallible_residual_keeps_the_presence_plan_and_its_error",
+      "fixture": "statistics_access.rs helpers: corpus_parameters/CORPUS and RankingStatistics or UnknownStatistics; execution tests use mixed_fixture, wide_fixture, tenant_sources or locally constructed MemoryStorage as specified in contract; same_rows_as_filter_only additionally asserts ranked range-seek versus unranked plan and row equality.",
+      "dialect": "Cypher (engine default; Neo4j CYPHER 25 reference where noted in source)",
+      "adapters": [
+        "direct hydradb-cypher-engine with MemoryStorage (current test; not production legacy/experimental adapters)"
+      ],
+      "required_layers": [
+        "Parser",
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        "Exact source assertion contract (including all query variants, loops, expected values and multiplicity):\n#[tokio::test]\nasync fn a_fallible_residual_keeps_the_presence_plan_and_its_error() {\n    let storage = MemoryStorage::with_vertices([source(1, Some(string(\"a\")))]);\n    let statistics = RankingStatistics::default().label(\"Source\", 50_000).property(\"created_at\", 1, 1);\n    let (parameters, lists) = corpus_parameters();\n    let query = \"MATCH (s:Source) WHERE s.created_at >= 'b' AND 1 / 0 = 0 RETURN s\";\n    for (name, provider) in [(\"ranked\", &statistics as &dyn StatisticsProvider), (\"unranked\", &UnknownStatistics)] {\n        let prepared = prepare(query, &parameters, &lists, provider);\n        assert!(\n            !prepared.explain().contains(\"access=property-range\"),\n            \"{name}: {}\",\n            prepared.explain()\n        );\n        let error = CypherEngine::new(storage.clone())\n            .execute_prepared(&prepared)\n            .await\n            .expect_err(\"the division raises on the row outside the range\");\n        assert!(error.to_string().to_lowercase().contains(\"zero\"), \"{name}: {error}\");\n    }\n    // A total residual beside the range is still narrowed.\n    let total = \"MATCH (s:Source) WHERE s.created_at >= 'b' AND s.created_at IS NOT NULL RETURN s\";\n    let prepared = prepare(total, &parameters, &lists, &statistics);\n    assert!(prepared.explain().contains(\"access=property-range\"), \"{}\", prepared.explain());\n}"
       ],
       "retained_bespoke": [
         "Retain original engine-specific test and every planner, statistics, profiling, storage-probe, resource-limit, identity, or regression assertion shown in source contract; declarative rows cannot establish those properties."
@@ -13824,13 +14064,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Preserve the exact seven-row multiset and encounter order, parent associations, parallel relationships and tenant/collection scope; expand each distinct source/direction once and reduce matching relationship work without combining source buffers.",
+          "description": "Preserve the seven-row multiset, parent associations, parallel relationships and tenant/collection scope against an explicitly unrewritten reference; issue one source batch and two batched orientations for the second hop.",
           "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::connected_matches_preserve_raw_bags_shared_parents_and_scope",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -13859,13 +14100,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Preserve global DISTINCT, deterministic ordering and caps including zero; duplicate list values do not multiply results.",
+          "description": "Preserve global DISTINCT, ordering and caps including zero against the unrewritten WITH reference; batching reduces relationship work without changing membership semantics.",
           "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::distinct_order_and_cap_apply_globally_after_batching",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -13929,13 +14171,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Preserve explicit direction, reciprocal and parallel relationship identities and self-loop deduplication.",
+          "description": "Preserve direction, reciprocal and parallel relationship identities and self-loop deduplication against an explicitly unrewritten reference, batching both source IDs into each orientation.",
           "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::incoming_outgoing_undirected_and_self_loops_keep_relationship_identity",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -13947,11 +14190,11 @@
       "disposition": "retained"
     },
     {
-      "key": "connected_match_batching::unsupported_boundaries_keep_scalar_expansions_and_answers",
+      "key": "connected_match_batching::required_match_pipelines_decorrelate_through_filters_paths_and_input_operators",
       "package": "hydradb-cypher-engine",
       "target": "connected_match_batching",
       "source_path": "query-language/shared/tests/engine/connected_match_batching.rs",
-      "function": "unsupported_boundaries_keep_scalar_expansions_and_answers",
+      "function": "required_match_pipelines_decorrelate_through_filters_paths_and_input_operators",
       "fixture": "Inline deterministic MemoryStorage fixture and benchmark_fixture; see source for shared chunks, sources, parallel edges and scope variants.",
       "dialect": "Cypher engine syntax; VALUE scalar-subquery case also covers the shared GQL expression",
       "adapters": [
@@ -13964,13 +14207,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Retain scalar frontier requests and exact answers for unrestricted scans, OPTIONAL, WITH, variable hops, windows, bound targets and unsafe filters.",
-          "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::unsupported_boundaries_keep_scalar_expansions_and_answers",
+          "description": "Remove required NaturalJoin operators and match unrewritten result multisets across filters, arithmetic, CASE, relationship properties, WITH/DISTINCT aliases, left-side UNWIND/windows, named paths, and variable hops; expansion must consume multiple sources.",
+          "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::required_match_pipelines_decorrelate_through_filters_paths_and_input_operators",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -14069,13 +14313,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Propagate typed cancellation at batch/input/anchor/retain/replay checkpoints and enforce the intermediate-row allowance.",
+          "description": "Propagate typed cancellation at the executing expansion input/relationship/output checkpoints and enforce the intermediate-row allowance.",
           "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::connected_expansion_propagates_cancellation_and_row_budget",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -14139,13 +14384,14 @@
       ],
       "assertion_contracts": [
         {
-          "description": "Explicit ignored benchmark: all ten executions return identical 1,000 ordered rows; batching strictly reduces calls, frontier IDs and matching relationship work, with timing reported rather than asserted.",
+          "description": "Explicit ignored benchmark: compare rewritten execution against an explicitly unrewritten WITH reference over ten executions; preserve 1,000 ordered results and reduce storage work, reporting timings without a latency threshold.",
           "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::benchmark_connected_match_batching",
           "local_helper_sources": [
             "fixture",
             "parameters",
-            "work",
-            "benchmark_fixture where applicable"
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "work"
           ],
           "shared_helper_reference": "query-language/shared/tests/engine/common/"
         }
@@ -14509,6 +14755,683 @@
       ],
       "retained_bespoke": [
         "Retain the exact assertions for source-layout semantics, internal identities versus user properties, and transport column-name parity; generic TCK fixtures do not select a collection layout."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "connected_match_batching::linear_expansion_rechecks_a_previously_bound_target",
+      "package": "hydradb-cypher-engine",
+      "target": "connected_match_batching",
+      "source_path": "query-language/shared/tests/engine/connected_match_batching.rs",
+      "function": "linear_expansion_rechecks_a_previously_bound_target",
+      "fixture": "Inline deterministic MemoryStorage fixture in connected_match_batching.rs, with source IDs 1, 2, 3 and a previously bound Chunk target.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Retain three matching rows while rechecking the bound target; an expansion request must batch source IDs [1, 2, 3].",
+          "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::linear_expansion_rechecks_a_previously_bound_target",
+          "local_helper_sources": [
+            "fixture",
+            "parameters",
+            "run",
+            "SEEDS"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "operator_profile::a_linear_connected_input_profiles_the_single_batched_expansion",
+      "package": "hydradb-cypher-engine",
+      "target": "operator_profile",
+      "source_path": "query-language/shared/tests/engine/operator_profile.rs",
+      "function": "a_linear_connected_input_profiles_the_single_batched_expansion",
+      "fixture": "Six Person vertices and four KNOWS edges, with ProfilingStorage/Read hooks in operator_profile.rs.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "The linear plan has no NaturalJoinExec; one ExpandExec invocation consumes six input rows and emits four rows, with consistent operator attribution.",
+          "test_source": "query-language/shared/tests/engine/operator_profile.rs::a_linear_connected_input_profiles_the_single_batched_expansion",
+          "local_helper_sources": [
+            "graph",
+            "profile",
+            "profile_with_statistics",
+            "by_name",
+            "assert_consistent"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::an_explicit_lookup_list_preserves_occurrences_with_an_existing_seed",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "an_explicit_lookup_list_preserves_occurrences_with_an_existing_seed",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs. Hand-built explicit lookup list [1021, 1020, 1020] under a seed binding a=1020.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Reject the incompatible first lookup before applying LIMIT 1; removing the window must expose both matching occurrences of vertex 1020.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::an_explicit_lookup_list_preserves_occurrences_with_an_existing_seed",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::connected_fixed_hops_are_linear_and_keep_prior_path_multiplicity",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "connected_fixed_hops_are_linear_and_keep_prior_path_multiplicity",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Duplicate IN membership does not multiply the source; two connected hops contain no NaturalJoin, preserve both paths to 1023, and batch [1021, 1022] into the second expansion.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::connected_fixed_hops_are_linear_and_keep_prior_path_multiplicity",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::id_stream_becomes_a_scan_preserving_order_duplicates_and_scalar_projection",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "id_stream_becomes_a_scan_preserving_order_duplicates_and_scalar_projection",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "UNWIND [1020, 1021, 1020, 9999] becomes an occurrence-preserving scan with no Unwind or NaturalJoin; exact row order, missing-ID behavior, column names, and scalar integer projection type remain unchanged, with one batched expansion for the two distinct matching source IDs.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::id_stream_becomes_a_scan_preserving_order_duplicates_and_scalar_projection",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::id_stream_parameters_rebind_every_time",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "id_stream_parameters_rebind_every_time",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs. One lowered template is rebound with duplicate, single-element, and empty ID lists.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Each binding produces a linear plan without Unwind or NaturalJoin and the current list produces respectively four, one, or zero rows; no previous lookup list leaks into the next preparation.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::id_stream_parameters_rebind_every_time",
+          "local_helper_sources": [
+            "list"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::id_stream_rewrite_does_not_substitute_across_rebinding_or_dropped_sources",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "id_stream_rewrite_does_not_substitute_across_rebinding_or_dropped_sources",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "WITH rebinding and dropped-source variants retain their exact scalar results after the local UNWIND/join collapse. Restoring the input binding at the scan must preserve later scope rules without substituting consumer expressions.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::id_stream_rewrite_does_not_substitute_across_rebinding_or_dropped_sources",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::id_streams_do_not_reinterpret_map_fields_or_stored_id_properties",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "id_streams_do_not_reinterpret_map_fields_or_stored_id_properties",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs. The BYOG preparation variant treats id as a stored property.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Scalar src.id and src.key remain field reads yielding no matches and retain Unwind; a BYOG stored-id predicate also retains Unwind instead of becoming an intrinsic-ID lookup.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::id_streams_do_not_reinterpret_map_fields_or_stored_id_properties",
+          "local_helper_sources": [
+            "list"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::id_streams_respect_scalar_and_reserved_parameter_precedence",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "id_streams_respect_scalar_and_reserved_parameter_precedence",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "A scalar parameter overrides the same-named list sidecar; reserved session-user and request-timestamp bindings cannot be replaced by lookup IDs. These cases retain Unwind and preserve their exact results.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::id_streams_respect_scalar_and_reserved_parameter_precedence",
+          "local_helper_sources": [
+            "list"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::repeated_id_occurrences_multiply_parallel_relationship_rows",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "repeated_id_occurrences_multiply_parallel_relationship_rows",
+      "fixture": "Inline MemoryStorage with vertices 1 and 2 and parallel relationships 100 and 101 from 1 to 2.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "UNWIND [1, 1] emits exactly four rows in encounter order: relationship IDs 100 and 101 for each occurrence of source 1.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::repeated_id_occurrences_multiply_parallel_relationship_rows",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::rewritten_streams_match_the_original_correlated_plan_across_windows_and_hops",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "rewritten_streams_match_the_original_correlated_plan_across_windows_and_hops",
+      "fixture": "common::compat::graph in query-language/shared/tests/engine/common/compat.rs. Each query is also planned directly with plan_physical to retain the original correlated baseline.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Compare exact columns and rows against the original correlated plan across repeated outer WHERE equalities, conjunctions, arithmetic, CASE, ordering/grouping/aggregates over the restored scalar, source properties, LIMIT, SKIP, DISTINCT, source labels, comma patterns, fixed hops, relationship uniqueness across MATCH scopes, and negative/null fallback inputs.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::rewritten_streams_match_the_original_correlated_plan_across_windows_and_hops",
+          "local_helper_sources": [],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "connected_match_batching::target_constraints_decorrelate_without_changing_result_bags",
+      "package": "hydradb-cypher-engine",
+      "target": "connected_match_batching",
+      "source_path": "query-language/shared/tests/engine/connected_match_batching.rs",
+      "function": "target_constraints_decorrelate_without_changing_result_bags",
+      "fixture": "Inline MemoryStorage fixture with Entity sources, shared Chunk targets, parallel relationships and wrong-label/tenant/subtenant targets.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Label-only, properties-only, combined labels/properties and clause-WHERE spellings remove NaturalJoin, preserve result multiplicity against an unrewritten reference, and issue one expansion request for sources [1, 2, 3].",
+          "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::target_constraints_decorrelate_without_changing_result_bags",
+          "local_helper_sources": [
+            "fixture",
+            "parameters",
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "integers"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "connected_match_batching::independent_joins_optional_matches_and_subqueries_keep_their_plans",
+      "package": "hydradb-cypher-engine",
+      "target": "connected_match_batching",
+      "source_path": "query-language/shared/tests/engine/connected_match_batching.rs",
+      "function": "independent_joins_optional_matches_and_subqueries_keep_their_plans",
+      "fixture": "Inline MemoryStorage Entity/Chunk/Source graph, queried through independent joins, OPTIONAL MATCH, VALUE and CALL scopes.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Independent joins, optional matches, scalar subqueries and CALL retain their exact original physical plans and expected result cardinalities.",
+          "test_source": "query-language/shared/tests/engine/connected_match_batching.rs::independent_joins_optional_matches_and_subqueries_keep_their_plans",
+          "local_helper_sources": [
+            "fixture",
+            "parameters",
+            "prepare_unrewritten",
+            "run_unrewritten",
+            "integers"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "unwind::scalar_id_unwind_rewrites_filtered_and_named_paths",
+      "package": "hydradb-cypher-engine",
+      "target": "unwind",
+      "source_path": "query-language/shared/tests/engine/unwind.rs",
+      "function": "scalar_id_unwind_rewrites_filtered_and_named_paths",
+      "fixture": "common::compat::graph: diamond a->{b,c}->d plus a cycle and self-loop, with repeated IDs and one missing ID.",
+      "dialect": "Cypher engine default dialect; explicit managed/BYOG identity policy where selected by the test.",
+      "adapters": [
+        "direct hydradb-cypher-engine preparation and MemoryStorage execution"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution",
+        "Diagnostics"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "Scalar-ID UNWIND independently becomes an occurrence-preserving scan through target properties/labels, named paths, variable hops and later connected MATCH. Compare complete typed result multisets to the original plan; preserve the scalar binding and two repeated matching occurrences with no Unwind or NaturalJoin.",
+          "test_source": "query-language/shared/tests/engine/unwind.rs::scalar_id_unwind_rewrites_filtered_and_named_paths",
+          "local_helper_sources": [
+            "list"
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/"
+        }
+      ],
+      "retained_bespoke": [
+        "The original engine test remains authoritative for its complete assertion contract; no declarative replacement or dual coverage is claimed."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::unwindowed_supersession_filters_in_bounded_batches_without_losing_matches",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "unwindowed_supersession_filters_in_bounded_batches_without_losing_matches",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "unwindowed supersession filters in bounded batches without losing matches",
+          "test_source": "async fn unwindowed_supersession_filters_in_bounded_batches_without_losing_matches() {\n    let mut storage = graph();\n    storage\n        .vertices\n        .get_mut(&1)\n        .unwrap()\n        .properties\n        .insert(\"description\".into(), ScalarValue::String(\"x\".repeat(32 * 1024).into()));\n    for r in &mut storage.relationships {\n        r.properties\n            .insert(\"relationship_id\".into(), ScalarValue::String(format!(\"r{}\", r.id).into()));\n        r.properties\n            .insert(\"canonical_relation\".into(), ScalarValue::String(\"old-fact\".into()));\n        // Missing timestamps, newer facts, and already-closed facts all\n        // exercise the production predicate's three-valued semantics.\n        if r.id % 3 != 0 {\n            r.properties.insert(\"timestamp\".into(), ScalarValue::Integer((r.id % 10).into()));\n        }\n        if r.id % 7 == 0 {\n            r.properties\n                .insert(\"superseded_by\".into(), ScalarValue::String(\"other-winner\".into()));\n        }\n    }\n    for predicate in [\"absent\", \"old-fact\"] {\n        let query = format!(\n            \"MATCH (src:Entity {{id: 1}})-[r:KNOWS]->() \\\n             WHERE r.canonical_relation = '{predicate}' AND r.superseded_by IS NULL \\\n             AND r.relationship_id <> 'r999999' AND (r.timestamp IS NULL OR r.timestamp < 5) \\\n             RETURN r.relationship_id AS relationship_id\"\n        );\n        let mut eager = storage.clone();\n        eager.without_neighbor_listing = true;\n        let expected = run(&eager, &query).await;\n        storage.hydration_requests.lock().unwrap().clear();\n        let actual = run(&storage, &query).await;\n        assert_eq!(actual, expected, \"{predicate}\");\n        if predicate == \"absent\" {\n            assert!(actual.is_empty());\n        } else {\n            assert!(actual.len() > 64, \"must return matches past the first batch\");\n        }\n        let largest = storage.hydration_requests.lock().unwrap().iter().map(Vec::len).max().unwrap();\n        assert!(largest <= 64, \"hydrated {largest} targets together instead of one batch\");\n    }\n}",
+          "local_helper_sources": [
+            {
+              "name": "graph",
+              "source": "fn graph() -> MemoryStorage {\n    let mut vertices = vec![\n        entity(1, \"Entity\", \"hub\"),\n        entity(2, \"Entity\", \"second\"),\n        entity(3, \"Entity\", \"third\"),\n    ];\n    let mut relationships = Vec::new();\n    let mut next_id = 1_000_000_u64;\n    let mut relationship = |source: VertexId, target: VertexId, weight: i128| {\n        next_id -= 1;\n        RelationshipRecord::new(next_id, source, target, \"KNOWS\")\n            .with_property(\"id\", ScalarValue::Integer(i128::from(next_id)))\n            .with_property(\"weight\", ScalarValue::Integer(weight))\n    };\n    for offset in (0..HUB_DEGREE).rev() {\n        let target = 1_000 + offset;\n        let label = if offset % 2 == 0 { \"Person\" } else { \"Robot\" };\n        vertices.push(\n            VertexRecord::new(target)\n                .with_label(label)\n                .with_property(\"n\", ScalarValue::Integer(i128::from(offset % 5))),\n        );\n        relationships.push(relationship(1, target, i128::from(offset)));\n        if offset % 7 == 0 {\n            relationships.push(relationship(1, target, i128::from(offset) + 1));\n        }\n    }\n    relationships.push(relationship(1, 1, -1));\n    relationships.push(relationship(1_001, 1, -2));\n    for target in [1_003, 1_002, 1_500] {\n        relationships.push(relationship(2, target, 7));\n        relationships.push(relationship(3, target, 8));\n    }\n    MemoryStorage::with_graph(vertices, relationships)\n}"
+            },
+            {
+              "name": "run",
+              "source": "async fn run(storage: &MemoryStorage, query: &str) -> Vec<QueryRow> {\n    let engine = CypherEngine::new(storage.clone());\n    engine\n        .execute(query, &ParameterMap::new())\n        .await\n        .unwrap_or_else(|error| panic!(\"{query:?} failed: {error}\"))\n        .rows\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::unwindowed_filtered_batches_preserve_direction_duplicates_and_bound_endpoints",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "unwindowed_filtered_batches_preserve_direction_duplicates_and_bound_endpoints",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "unwindowed filtered batches preserve direction duplicates and bound endpoints",
+          "test_source": "async fn unwindowed_filtered_batches_preserve_direction_duplicates_and_bound_endpoints() {\n    for query in [\n        \"UNWIND [1, 2, 1] AS id MATCH (a:Entity {id: id})-[r:KNOWS]->(b) WHERE r.weight >= 7 RETURN a.id, b.id, r.id\",\n        \"MATCH (a:Entity {id: 1})<-[r:KNOWS]-(b) WHERE r.weight < 10 RETURN a.id, b.id, r.id\",\n        \"MATCH (a:Entity {id: 1})-[r:KNOWS]-(b) WHERE r.weight < 500 RETURN a.id, b.id, r.id\",\n        \"MATCH (a:Entity {id: 1})-[r:KNOWS]->(b:Person) WHERE b.n = 3 AND r.weight > 100 RETURN b.id, r.id\",\n        \"MATCH (a:Entity {id: 1}), (b:Person {id: 1003}) MATCH (a)-[r:KNOWS]->(b) WHERE r.weight >= 0 RETURN b.id, r.id\",\n        \"MATCH (a:Entity {id: 1}) OPTIONAL MATCH (a)-[r:KNOWS]->(b) WHERE r.weight > 10000 RETURN a.id, b.id\",\n        \"MATCH (a:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.weight > 100 WITH a, b, r WHERE b.n = 3 RETURN b.id, r.id\",\n    ] {\n        let storage = graph();\n        let eager = MemoryStorage {\n            without_neighbor_listing: true,\n            ..graph()\n        };\n        assert_eq!(run(&storage, query).await, run(&eager, query).await, \"{query}\");\n    }\n}",
+          "local_helper_sources": [
+            {
+              "name": "graph",
+              "source": "fn graph() -> MemoryStorage {\n    let mut vertices = vec![\n        entity(1, \"Entity\", \"hub\"),\n        entity(2, \"Entity\", \"second\"),\n        entity(3, \"Entity\", \"third\"),\n    ];\n    let mut relationships = Vec::new();\n    let mut next_id = 1_000_000_u64;\n    let mut relationship = |source: VertexId, target: VertexId, weight: i128| {\n        next_id -= 1;\n        RelationshipRecord::new(next_id, source, target, \"KNOWS\")\n            .with_property(\"id\", ScalarValue::Integer(i128::from(next_id)))\n            .with_property(\"weight\", ScalarValue::Integer(weight))\n    };\n    for offset in (0..HUB_DEGREE).rev() {\n        let target = 1_000 + offset;\n        let label = if offset % 2 == 0 { \"Person\" } else { \"Robot\" };\n        vertices.push(\n            VertexRecord::new(target)\n                .with_label(label)\n                .with_property(\"n\", ScalarValue::Integer(i128::from(offset % 5))),\n        );\n        relationships.push(relationship(1, target, i128::from(offset)));\n        if offset % 7 == 0 {\n            relationships.push(relationship(1, target, i128::from(offset) + 1));\n        }\n    }\n    relationships.push(relationship(1, 1, -1));\n    relationships.push(relationship(1_001, 1, -2));\n    for target in [1_003, 1_002, 1_500] {\n        relationships.push(relationship(2, target, 7));\n        relationships.push(relationship(3, target, 8));\n    }\n    MemoryStorage::with_graph(vertices, relationships)\n}"
+            },
+            {
+              "name": "run",
+              "source": "async fn run(storage: &MemoryStorage, query: &str) -> Vec<QueryRow> {\n    let engine = CypherEngine::new(storage.clone());\n    engine\n        .execute(query, &ParameterMap::new())\n        .await\n        .unwrap_or_else(|error| panic!(\"{query:?} failed: {error}\"))\n        .rows\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::unwindowed_rejecting_filter_still_enforces_relationship_work_budget",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "unwindowed_rejecting_filter_still_enforces_relationship_work_budget",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "unwindowed rejecting filter still enforces relationship work budget",
+          "test_source": "async fn unwindowed_rejecting_filter_still_enforces_relationship_work_budget() {\n    let storage = MemoryStorage {\n        max_intermediate_rows: Some(100),\n        ..graph()\n    };\n    let error = CypherEngine::new(storage)\n        .execute(\n            \"MATCH (a:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.weight > 10000 RETURN r.id\",\n            &ParameterMap::new(),\n        )\n        .await\n        .expect_err(\"rejected rows must still consume the relationship work budget\");\n    assert!(error.to_string().contains(\"intermediate\"), \"{error}\");\n}",
+          "local_helper_sources": [
+            {
+              "name": "graph",
+              "source": "fn graph() -> MemoryStorage {\n    let mut vertices = vec![\n        entity(1, \"Entity\", \"hub\"),\n        entity(2, \"Entity\", \"second\"),\n        entity(3, \"Entity\", \"third\"),\n    ];\n    let mut relationships = Vec::new();\n    let mut next_id = 1_000_000_u64;\n    let mut relationship = |source: VertexId, target: VertexId, weight: i128| {\n        next_id -= 1;\n        RelationshipRecord::new(next_id, source, target, \"KNOWS\")\n            .with_property(\"id\", ScalarValue::Integer(i128::from(next_id)))\n            .with_property(\"weight\", ScalarValue::Integer(weight))\n    };\n    for offset in (0..HUB_DEGREE).rev() {\n        let target = 1_000 + offset;\n        let label = if offset % 2 == 0 { \"Person\" } else { \"Robot\" };\n        vertices.push(\n            VertexRecord::new(target)\n                .with_label(label)\n                .with_property(\"n\", ScalarValue::Integer(i128::from(offset % 5))),\n        );\n        relationships.push(relationship(1, target, i128::from(offset)));\n        if offset % 7 == 0 {\n            relationships.push(relationship(1, target, i128::from(offset) + 1));\n        }\n    }\n    relationships.push(relationship(1, 1, -1));\n    relationships.push(relationship(1_001, 1, -2));\n    for target in [1_003, 1_002, 1_500] {\n        relationships.push(relationship(2, target, 7));\n        relationships.push(relationship(3, target, 8));\n    }\n    MemoryStorage::with_graph(vertices, relationships)\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::incident_size_supersession_memory_probe",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "incident_size_supersession_memory_probe",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "incident size supersession memory probe",
+          "test_source": "async fn incident_size_supersession_memory_probe() {\n    const DEGREE: u64 = 217_574;\n    let source = entity(1, \"Entity\", \"hub\").with_property(\"description\", ScalarValue::String(\"x\".repeat(4 * 1024).into()));\n    let relationships: Vec<_> = (0..DEGREE)\n        .map(|id| {\n            RelationshipRecord::new(id + 1, 1, 2, \"RELATES\")\n                .with_property(\"relationship_id\", ScalarValue::String(format!(\"r{id}\").into()))\n                .with_property(\"canonical_relation\", ScalarValue::String(\"current\".into()))\n                .with_property(\"timestamp\", ScalarValue::Integer(10))\n        })\n        .collect();\n    let storage = MemoryStorage::with_graph(vec![source, entity(2, \"Entity\", \"target\")], relationships);\n    let query = \"MATCH (src:Entity {id: 1})-[r:RELATES]->() \\\n        WHERE r.canonical_relation = 'older' AND r.superseded_by IS NULL \\\n        AND r.relationship_id <> 'winner' AND (r.timestamp IS NULL OR r.timestamp < 5) \\\n        RETURN r.relationship_id AS relationship_id\";\n    let start = std::time::Instant::now();\n    let tasks = (0..2)\n        .map(|_| {\n            let storage = storage.clone();\n            tokio::spawn(async move { assert!(run(&storage, query).await.is_empty()) })\n        })\n        .collect::<Vec<_>>();\n    for task in tasks {\n        task.await.unwrap();\n    }\n    assert!(\n        records(&storage) >= 2 * DEGREE as usize,\n        \"both queries must visit the full neighbourhood\"\n    );\n    eprintln!(\"two concurrent {DEGREE}-relationship queries finished in {:?}\", start.elapsed());\n}",
+          "local_helper_sources": [
+            {
+              "name": "records",
+              "source": "fn records(storage: &MemoryStorage) -> usize {\n    *storage.expanded_relationship_records.lock().unwrap()\n}"
+            },
+            {
+              "name": "run",
+              "source": "async fn run(storage: &MemoryStorage, query: &str) -> Vec<QueryRow> {\n    let engine = CypherEngine::new(storage.clone());\n    engine\n        .execute(query, &ParameterMap::new())\n        .await\n        .unwrap_or_else(|error| panic!(\"{query:?} failed: {error}\"))\n        .rows\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::a_folded_false_filter_reads_no_relationships",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "a_folded_false_filter_reads_no_relationships",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "a folded false filter reads no relationships",
+          "test_source": "async fn a_folded_false_filter_reads_no_relationships() {\n    let storage = graph();\n    let rows = run(\n        &storage,\n        \"MATCH (src:Entity {id: 1})-[r:KNOWS]->(b) WHERE false FILTER b.n > 0 RETURN r.id AS id\",\n    )\n    .await;\n    assert!(rows.is_empty());\n    assert_eq!(records(&storage), 0, \"read relationship records under a constant false filter\");\n}",
+          "local_helper_sources": [
+            {
+              "name": "graph",
+              "source": "fn graph() -> MemoryStorage {\n    let mut vertices = vec![\n        entity(1, \"Entity\", \"hub\"),\n        entity(2, \"Entity\", \"second\"),\n        entity(3, \"Entity\", \"third\"),\n    ];\n    let mut relationships = Vec::new();\n    let mut next_id = 1_000_000_u64;\n    let mut relationship = |source: VertexId, target: VertexId, weight: i128| {\n        next_id -= 1;\n        RelationshipRecord::new(next_id, source, target, \"KNOWS\")\n            .with_property(\"id\", ScalarValue::Integer(i128::from(next_id)))\n            .with_property(\"weight\", ScalarValue::Integer(weight))\n    };\n    for offset in (0..HUB_DEGREE).rev() {\n        let target = 1_000 + offset;\n        let label = if offset % 2 == 0 { \"Person\" } else { \"Robot\" };\n        vertices.push(\n            VertexRecord::new(target)\n                .with_label(label)\n                .with_property(\"n\", ScalarValue::Integer(i128::from(offset % 5))),\n        );\n        relationships.push(relationship(1, target, i128::from(offset)));\n        if offset % 7 == 0 {\n            relationships.push(relationship(1, target, i128::from(offset) + 1));\n        }\n    }\n    relationships.push(relationship(1, 1, -1));\n    relationships.push(relationship(1_001, 1, -2));\n    for target in [1_003, 1_002, 1_500] {\n        relationships.push(relationship(2, target, 7));\n        relationships.push(relationship(3, target, 8));\n    }\n    MemoryStorage::with_graph(vertices, relationships)\n}"
+            },
+            {
+              "name": "records",
+              "source": "fn records(storage: &MemoryStorage) -> usize {\n    *storage.expanded_relationship_records.lock().unwrap()\n}"
+            },
+            {
+              "name": "run",
+              "source": "async fn run(storage: &MemoryStorage, query: &str) -> Vec<QueryRow> {\n    let engine = CypherEngine::new(storage.clone());\n    engine\n        .execute(query, &ParameterMap::new())\n        .await\n        .unwrap_or_else(|error| panic!(\"{query:?} failed: {error}\"))\n        .rows\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
+      ],
+      "provisional_replacements": [],
+      "disposition": "retained"
+    },
+    {
+      "key": "expand_limit::a_broad_relationship_seek_hydrates_its_targets_in_bounded_batches",
+      "package": "hydradb-cypher-engine",
+      "target": "expand_limit",
+      "source_path": "query-language/shared/tests/engine/expand_limit.rs",
+      "function": "a_broad_relationship_seek_hydrates_its_targets_in_bounded_batches",
+      "fixture": "Inline setup in test and locally referenced helpers; see exact source contract.",
+      "dialect": "Cypher engine syntax; hand-built plan tests do not parse a dialect",
+      "adapters": [
+        "existing direct hydradb-cypher-engine test path; not legacy/experimental production dispatch"
+      ],
+      "required_layers": [
+        "Semantics",
+        "Execution"
+      ],
+      "assertion_contracts": [
+        {
+          "description": "a broad relationship seek hydrates its targets in bounded batches",
+          "test_source": "async fn a_broad_relationship_seek_hydrates_its_targets_in_bounded_batches() {\n    let mut storage = graph();\n    for relationship in &mut storage.relationships {\n        relationship.properties.insert(\"chunk_id\".into(), ScalarValue::String(\"c\".into()));\n    }\n    let query = \"MATCH (src:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.chunk_id = 'c' AND b.n > 100 RETURN r.id AS id\";\n    let eager = MemoryStorage {\n        without_neighbor_listing: true,\n        ..storage.clone()\n    };\n    let expected = run(&eager, query).await;\n    storage.answers_relationship_probes = true;\n    let actual = run(&storage, query).await;\n    assert_eq!(actual, expected);\n    assert!(actual.is_empty());\n    assert!(\n        storage\n            .relationship_probe_requests\n            .lock()\n            .unwrap()\n            .contains(&\"source:KNOWS.chunk_id\".to_string()),\n        \"the hop must take the seek\"\n    );\n    let largest = storage.hydration_requests.lock().unwrap().iter().map(Vec::len).max().unwrap_or(0);\n    assert!(largest <= 64, \"hydrated {largest} seeked targets together instead of one batch\");\n}",
+          "local_helper_sources": [
+            {
+              "name": "graph",
+              "source": "fn graph() -> MemoryStorage {\n    let mut vertices = vec![\n        entity(1, \"Entity\", \"hub\"),\n        entity(2, \"Entity\", \"second\"),\n        entity(3, \"Entity\", \"third\"),\n    ];\n    let mut relationships = Vec::new();\n    let mut next_id = 1_000_000_u64;\n    let mut relationship = |source: VertexId, target: VertexId, weight: i128| {\n        next_id -= 1;\n        RelationshipRecord::new(next_id, source, target, \"KNOWS\")\n            .with_property(\"id\", ScalarValue::Integer(i128::from(next_id)))\n            .with_property(\"weight\", ScalarValue::Integer(weight))\n    };\n    for offset in (0..HUB_DEGREE).rev() {\n        let target = 1_000 + offset;\n        let label = if offset % 2 == 0 { \"Person\" } else { \"Robot\" };\n        vertices.push(\n            VertexRecord::new(target)\n                .with_label(label)\n                .with_property(\"n\", ScalarValue::Integer(i128::from(offset % 5))),\n        );\n        relationships.push(relationship(1, target, i128::from(offset)));\n        if offset % 7 == 0 {\n            relationships.push(relationship(1, target, i128::from(offset) + 1));\n        }\n    }\n    relationships.push(relationship(1, 1, -1));\n    relationships.push(relationship(1_001, 1, -2));\n    for target in [1_003, 1_002, 1_500] {\n        relationships.push(relationship(2, target, 7));\n        relationships.push(relationship(3, target, 8));\n    }\n    MemoryStorage::with_graph(vertices, relationships)\n}"
+            },
+            {
+              "name": "run",
+              "source": "async fn run(storage: &MemoryStorage, query: &str) -> Vec<QueryRow> {\n    let engine = CypherEngine::new(storage.clone());\n    engine\n        .execute(query, &ParameterMap::new())\n        .await\n        .unwrap_or_else(|error| panic!(\"{query:?} failed: {error}\"))\n        .rows\n}"
+            }
+          ],
+          "shared_helper_reference": "query-language/shared/tests/engine/common/ where applicable"
+        }
+      ],
+      "retained_bespoke": [
+        "Entire original test remains authoritative, including all assertions and any helper, plan, storage, profile, error or ordering contracts."
       ],
       "provisional_replacements": [],
       "disposition": "retained"

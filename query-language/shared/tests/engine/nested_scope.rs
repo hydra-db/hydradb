@@ -31,6 +31,7 @@ fn prepared(physical: GraphPhysicalPlan) -> PreparedQuery {
     PreparedQuery {
         ast: Arc::new(Document::new(CypherDialect::Neo4j(CypherVersion::V25), Vec::new())),
         logical: Arc::new(GraphLogicalPlan::NodeScan {
+            lookup_ids: None,
             binding: Symbol::from("e"),
             labels: Vec::new(),
         }),

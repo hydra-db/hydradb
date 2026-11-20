@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+### Added
+
+- **Owned relationship sets.** A native path for bounded relationship sets that
+  are replaced atomically, with endpoint equality enforced on native merges so a
+  set stays consistent with the vertices it connects.
+- **Write latency breakdown.** A Cypher write reports where its time goes, with
+  standalone writes and receipt commits charged to the apply phase.
+- **Stuck-write stage reporting.** A write stage that keeps waiting past a
+  threshold logs a warning carrying the trace id and scope, so a stalled
+  mutation names the stage it is blocked in instead of silently reaching the
+  runtime limit.
+
+### Changed
+
+- **Bound relationship expansion.** A bound or reused relationship is checked
+  between its endpoints rather than expanded again, an anchored expansion seeks
+  relationship equality by source, and the source seek carries the expansion's
+  work contract and declines values the indexes cannot hold.
+- **Ordered source rewrites.** The experimental Cypher engine normalizes
+  connected comma patterns on an UNWIND's right side and collapses ordered id
+  streams before physical planning, without reordering joins or hops.
+- **Filtered query budgets.** Filtered iterators charge look-ahead to the query
+  budget and preserve it across adaptive seeds, ordered windows prefilter
+  through property indexes, and budgets gate on backend eligibility.
+- **Write path.** Guarded delete discovery reads from the writer rather than a
+  trailing snapshot.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added
@@ -15,8 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside OpenCypher, sharing one engine and one storage path.
 - **Bolt proxy.** A standalone proxy routes Bolt 5.x traffic across query nodes
   without linking the native graph libraries.
-- **MCP server.** A Model Context Protocol server exposes graph queries to agent
-  clients.
 - **DataFusion execution.** A DataFusion-backed Cypher path, including list and
   map element access.
 - **FalkorDB import.** A dedicated path for importing a FalkorDB dump into an
@@ -116,7 +143,8 @@ the Quint specification models, the Typst/interactive textbook, CI workflows, an
 editor/agent tooling configuration. Full source and the three public-facing docs
 above are included.
 
-[Unreleased]: https://github.com/hydra-db/hydradb/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/hydra-db/hydradb/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hydra-db/hydradb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hydra-db/hydradb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hydra-db/hydradb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hydra-db/hydradb/releases/tag/v0.2.0

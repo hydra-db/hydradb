@@ -1,4 +1,4 @@
-//! Deterministic FalkorDB-to-Turbolay identity and scope resolver.
+//! Deterministic FalkorDB-to-HydraDB identity and scope resolver.
 //!
 //! This crate accepts only already-validated [`falkordb_rdb::GraphDump`] values.
 //! It contains no object-store writer, which keeps source anomaly handling
@@ -361,7 +361,7 @@ fn resolve_with_source_scope(graph: GraphDump, source_scope: Option<&Scope>) -> 
             }
             _ => {
                 // Its neighbours sit in several scopes and it declares none (a bare
-                // stub linked across sub-tenants): no one Turbolay cell can hold it,
+                // stub linked across sub-tenants): no one HydraDB cell can hold it,
                 // so it and its edges are quarantined below.
                 unscopable.insert(id);
                 continue;
@@ -815,7 +815,7 @@ fn canonicalize_relationship_ids(scope: &mut ResolvedScope) -> Result<()> {
             relationship.id = id;
             relationship.properties.insert("id", PropertyValue::Integer(id as i64));
             if relationship.edge_type == "BRIDGE" {
-                // A relationship's id can be matched but not read on Turbolay, so the
+                // A relationship's id can be matched but not read on HydraDB, so the
                 // bridge writers also store it as bridge_id, the key bridges are read by.
                 // A fallback bridge that already has one keeps it.
                 if !relationship.source_bridge_id {
@@ -946,7 +946,7 @@ fn relationship_identity(edge_type: &str, source: &NodeResolution, destination: 
                 relationship_id
             })
         }
-        // turbolayBridgeID: the endpoint entity ids in order, then the method.
+        // hydradbBridgeID: the endpoint entity ids in order, then the method.
         "BRIDGE" if source.label == "Entity" && destination.label == "Entity" => {
             let method = string_property(&entity.properties, "method")?;
             let (low, high) = if destination.identity < source.identity {

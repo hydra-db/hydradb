@@ -366,3 +366,177 @@ async fn a_window_stops_a_variable_length_walk_inside_a_depth() {
     .await;
     assert!(limited * 2 < unlimited, "read {limited}, unwindowed {unlimited}");
 }
+
+/// No LIMIT is allowed here: supersession must see *every* older current
+/// relationship. The old path hydrated the entire neighbourhood, cloned the
+/// source and target properties into every binding, and only then filtered.
+#[tokio::test]
+async fn unwindowed_supersession_filters_in_bounded_batches_without_losing_matches() {
+    let mut storage = graph();
+    storage
+        .vertices
+        .get_mut(&1)
+        .unwrap()
+        .properties
+        .insert("description".into(), ScalarValue::String("x".repeat(32 * 1024).into()));
+    for r in &mut storage.relationships {
+        r.properties
+            .insert("relationship_id".into(), ScalarValue::String(format!("r{}", r.id).into()));
+        r.properties
+            .insert("canonical_relation".into(), ScalarValue::String("old-fact".into()));
+        // Missing timestamps, newer facts, and already-closed facts all
+        // exercise the production predicate's three-valued semantics.
+        if r.id % 3 != 0 {
+            r.properties.insert("timestamp".into(), ScalarValue::Integer((r.id % 10).into()));
+        }
+        if r.id % 7 == 0 {
+            r.properties
+                .insert("superseded_by".into(), ScalarValue::String("other-winner".into()));
+        }
+    }
+    for predicate in ["absent", "old-fact"] {
+        let query = format!(
+            "MATCH (src:Entity {{id: 1}})-[r:KNOWS]->() \
+             WHERE r.canonical_relation = '{predicate}' AND r.superseded_by IS NULL \
+             AND r.relationship_id <> 'r999999' AND (r.timestamp IS NULL OR r.timestamp < 5) \
+             RETURN r.relationship_id AS relationship_id"
+        );
+        let mut eager = storage.clone();
+        eager.without_neighbor_listing = true;
+        let expected = run(&eager, &query).await;
+        storage.hydration_requests.lock().unwrap().clear();
+        let actual = run(&storage, &query).await;
+        assert_eq!(actual, expected, "{predicate}");
+        if predicate == "absent" {
+            assert!(actual.is_empty());
+        } else {
+            assert!(actual.len() > 64, "must return matches past the first batch");
+        }
+        let largest = storage.hydration_requests.lock().unwrap().iter().map(Vec::len).max().unwrap();
+        assert!(largest <= 64, "hydrated {largest} targets together instead of one batch");
+    }
+}
+
+#[tokio::test]
+async fn unwindowed_filtered_batches_preserve_direction_duplicates_and_bound_endpoints() {
+    for query in [
+        "UNWIND [1, 2, 1] AS id MATCH (a:Entity {id: id})-[r:KNOWS]->(b) WHERE r.weight >= 7 RETURN a.id, b.id, r.id",
+        "MATCH (a:Entity {id: 1})<-[r:KNOWS]-(b) WHERE r.weight < 10 RETURN a.id, b.id, r.id",
+        "MATCH (a:Entity {id: 1})-[r:KNOWS]-(b) WHERE r.weight < 500 RETURN a.id, b.id, r.id",
+        "MATCH (a:Entity {id: 1})-[r:KNOWS]->(b:Person) WHERE b.n = 3 AND r.weight > 100 RETURN b.id, r.id",
+        "MATCH (a:Entity {id: 1}), (b:Person {id: 1003}) MATCH (a)-[r:KNOWS]->(b) WHERE r.weight >= 0 RETURN b.id, r.id",
+        "MATCH (a:Entity {id: 1}) OPTIONAL MATCH (a)-[r:KNOWS]->(b) WHERE r.weight > 10000 RETURN a.id, b.id",
+        "MATCH (a:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.weight > 100 WITH a, b, r WHERE b.n = 3 RETURN b.id, r.id",
+    ] {
+        let storage = graph();
+        let eager = MemoryStorage {
+            without_neighbor_listing: true,
+            ..graph()
+        };
+        assert_eq!(run(&storage, query).await, run(&eager, query).await, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn unwindowed_rejecting_filter_still_enforces_relationship_work_budget() {
+    let storage = MemoryStorage {
+        max_intermediate_rows: Some(100),
+        ..graph()
+    };
+    let error = CypherEngine::new(storage)
+        .execute(
+            "MATCH (a:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.weight > 10000 RETURN r.id",
+            &ParameterMap::new(),
+        )
+        .await
+        .expect_err("rejected rows must still consume the relationship work budget");
+    assert!(error.to_string().contains("intermediate"), "{error}");
+}
+
+/// Reproduce the incident's 217,574-way fan-out without any live database.
+/// A wide source and many parallel relationships also cover the worst case
+/// for neighbour paging: all relationships belong to one target pair.
+/// Run in a separate process under /usr/bin/time to compare peak RSS with
+/// the parent revision. Kept out of the normal fast unit-test run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "full incident-size allocation probe; run explicitly with --ignored --exact"]
+async fn incident_size_supersession_memory_probe() {
+    const DEGREE: u64 = 217_574;
+    let source = entity(1, "Entity", "hub").with_property("description", ScalarValue::String("x".repeat(4 * 1024).into()));
+    let relationships: Vec<_> = (0..DEGREE)
+        .map(|id| {
+            RelationshipRecord::new(id + 1, 1, 2, "RELATES")
+                .with_property("relationship_id", ScalarValue::String(format!("r{id}").into()))
+                .with_property("canonical_relation", ScalarValue::String("current".into()))
+                .with_property("timestamp", ScalarValue::Integer(10))
+        })
+        .collect();
+    let storage = MemoryStorage::with_graph(vec![source, entity(2, "Entity", "target")], relationships);
+    let query = "MATCH (src:Entity {id: 1})-[r:RELATES]->() \
+        WHERE r.canonical_relation = 'older' AND r.superseded_by IS NULL \
+        AND r.relationship_id <> 'winner' AND (r.timestamp IS NULL OR r.timestamp < 5) \
+        RETURN r.relationship_id AS relationship_id";
+    let start = std::time::Instant::now();
+    let tasks = (0..2)
+        .map(|_| {
+            let storage = storage.clone();
+            tokio::spawn(async move { assert!(run(&storage, query).await.is_empty()) })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(
+        records(&storage) >= 2 * DEGREE as usize,
+        "both queries must visit the full neighbourhood"
+    );
+    eprintln!("two concurrent {DEGREE}-relationship queries finished in {:?}", start.elapsed());
+}
+
+/// A constant-false Filter folded under another one still ends the read
+/// before the hop: no row can pass it, so no relationship is read (Mira on
+/// #522). Unfolded, the Filter arm has always shortcut it.
+#[tokio::test]
+async fn a_folded_false_filter_reads_no_relationships() {
+    let storage = graph();
+    let rows = run(
+        &storage,
+        "MATCH (src:Entity {id: 1})-[r:KNOWS]->(b) WHERE false FILTER b.n > 0 RETURN r.id AS id",
+    )
+    .await;
+    assert!(rows.is_empty());
+    assert_eq!(records(&storage), 0, "read relationship records under a constant false filter");
+}
+
+/// A relationship equality seek answers with only the matching
+/// relationships, but a broad match -- here every one of the hub's 1,000
+/// targets -- must still be hydrated a batch at a time when another predicate
+/// rejects the rows: holding every matched target at once is the memory
+/// growth the batches bound (Mira on #522). The rows are the eager ones.
+#[tokio::test]
+async fn a_broad_relationship_seek_hydrates_its_targets_in_bounded_batches() {
+    let mut storage = graph();
+    for relationship in &mut storage.relationships {
+        relationship.properties.insert("chunk_id".into(), ScalarValue::String("c".into()));
+    }
+    let query = "MATCH (src:Entity {id: 1})-[r:KNOWS]->(b) WHERE r.chunk_id = 'c' AND b.n > 100 RETURN r.id AS id";
+    let eager = MemoryStorage {
+        without_neighbor_listing: true,
+        ..storage.clone()
+    };
+    let expected = run(&eager, query).await;
+    storage.answers_relationship_probes = true;
+    let actual = run(&storage, query).await;
+    assert_eq!(actual, expected);
+    assert!(actual.is_empty());
+    assert!(
+        storage
+            .relationship_probe_requests
+            .lock()
+            .unwrap()
+            .contains(&"source:KNOWS.chunk_id".to_string()),
+        "the hop must take the seek"
+    );
+    let largest = storage.hydration_requests.lock().unwrap().iter().map(Vec::len).max().unwrap_or(0);
+    assert!(largest <= 64, "hydrated {largest} seeked targets together instead of one batch");
+}

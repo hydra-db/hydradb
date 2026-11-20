@@ -1,6 +1,6 @@
 //! Bounds-checked decoder for FalkorDB per-key Redis `DUMP` payloads.
 //!
-//! The crate deliberately has no dependency on Turbolay. It validates every
+//! The crate deliberately has no dependency on HydraDB. It validates every
 //! envelope and matrix layer before exposing graph records, allowing import
 //! code to parallelize decoding without granting malformed input access to the
 //! destination object store.

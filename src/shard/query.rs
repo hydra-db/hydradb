@@ -67,6 +67,9 @@ pub(super) struct IndexedRelationshipBatch<'a> {
 pub(super) struct RelationshipPropertyEntries {
     pub structural_pairs: BTreeSet<(VertexId, VertexId)>,
     pub identified: Vec<(VertexId, VertexId, RelationshipId, String)>,
+    /// Index entries a bounded source walk read, the count its bound and its
+    /// charge are made in; 0 from the cell-wide scan, which charges as it reads.
+    pub entries_read: usize,
 }
 
 /// Cache only liveness and the absence of structural properties. The entry
@@ -136,6 +139,19 @@ pub(crate) struct RelationshipLowerBoundProbe<'a> {
     pub property: &'a str,
     pub lower: i128,
     pub read_epoch: StorageSequence,
+    pub budget: &'a QueryBudget,
+    pub max_entries: usize,
+}
+
+/// A source-specific relationship equality seek's index walk: see
+/// [`GraphShard::try_scan_source_relationship_property_entries_at`].
+#[cfg(feature = "experimental-cypher-engine")]
+pub(super) struct SourceRelationshipEqualityProbe<'a> {
+    pub cell_id: &'a str,
+    pub edge_type: &'a str,
+    pub property: &'a str,
+    pub value: &'a VertexPropertyValue,
+    pub source: VertexId,
     pub budget: &'a QueryBudget,
     pub max_entries: usize,
 }
@@ -2072,8 +2088,9 @@ impl GraphShard {
             // Persisting the completion receipt is part of finishing that write,
             // not another cancellable admission phase. In particular, the
             // multi-batch effects shield ends before reaching this wrapper.
-            QueryCancellationToken::shielded(crate::shard::datafusion_cypher::complete_legacy_statement_receipt(
-                self, lookup, &result,
+            QueryCancellationToken::shielded(crate::core::stage_watch::watched(
+                "receipt_complete",
+                crate::shard::datafusion_cypher::complete_legacy_statement_receipt(self, lookup, &result),
             ))
             .await?;
             return Ok(result);
@@ -2113,7 +2130,7 @@ impl GraphShard {
         // nothing is written and the whole statement re-runs on a new
         // snapshot, as if it had started after the other write.
         for _attempt in 0..STATEMENT_RACE_ATTEMPTS {
-            let snapshot = self.storage.snapshot().await?;
+            let snapshot = crate::core::stage_watch::watched("mutation_snapshot", self.storage.snapshot()).await?;
             let read_epoch = snapshot.seq();
             // Match through the same planner as reads, so a `WHERE` equality,
             // prefix or relationship-property predicate becomes an index seek
@@ -2125,11 +2142,20 @@ impl GraphShard {
                 predicate: query.predicate.clone(),
                 optional: false,
             };
-            let mut bindings = SlateGraphStore::scope_snapshot(snapshot, async {
-                self.ensure_cell_readable(&context.cell_id, "cypher_mutation").await?;
-                self.match_row_pattern_groups_limited(&context.cell_id, std::slice::from_ref(&group), read_epoch, &budget, query.row_limit)
+            let mut bindings = crate::core::stage_watch::watched(
+                "mutation_match",
+                SlateGraphStore::scope_snapshot(snapshot, async {
+                    self.ensure_cell_readable(&context.cell_id, "cypher_mutation").await?;
+                    self.match_row_pattern_groups_limited(
+                        &context.cell_id,
+                        std::slice::from_ref(&group),
+                        read_epoch,
+                        &budget,
+                        query.row_limit,
+                    )
                     .await
-            })
+                }),
+            )
             .await?;
             if let Some(limit) = query.row_limit {
                 bindings.truncate(limit);
@@ -2143,8 +2169,11 @@ impl GraphShard {
                 ..QueryMutationResult::default()
             };
             let mut effects = StatementEffects::default();
-            self.collect_statement_effects(&context.cell_id, read_epoch, &query.actions, &bindings, &budget, &mut effects)
-                .await?;
+            crate::core::stage_watch::watched(
+                "mutation_effects",
+                self.collect_statement_effects(&context.cell_id, read_epoch, &query.actions, &bindings, &budget, &mut effects),
+            )
+            .await?;
             effects.drop_noops(&mut result);
 
             // Every check against the deadline happens above: matching and effect
@@ -2153,7 +2182,7 @@ impl GraphShard {
             // transaction with one durable WAL commit, and a commit, once started,
             // is never raced against cancellation.
             budget.check("cypher_mutation_commit")?;
-            match self.apply_statement_effects(&context, effects, &mut result).await? {
+            match crate::core::stage_watch::watched("mutation_apply", self.apply_statement_effects(&context, effects, &mut result)).await? {
                 StatementApply::Applied => return Ok(result),
                 StatementApply::LostRace => continue,
             }
@@ -2204,33 +2233,36 @@ impl GraphShard {
         // The batch re-runs on a new snapshot when a record it updates
         // changed after its snapshot, as one statement does.
         for _attempt in 0..STATEMENT_RACE_ATTEMPTS {
-            let snapshot = self.storage.snapshot().await?;
+            let snapshot = crate::core::stage_watch::watched("mutation_snapshot", self.storage.snapshot()).await?;
             let read_epoch = snapshot.seq();
             let mut result = QueryMutationResult::default();
             let mut effects = StatementEffects::default();
-            SlateGraphStore::scope_snapshot(snapshot, async {
-                self.ensure_cell_readable(&context.cell_id, "cypher_unwind_mutation").await?;
-                for row in &rows {
-                    budget.check("cypher_unwind_mutation_row")?;
-                    let group = RowMatchGroup {
-                        patterns: row.patterns.clone(),
-                        predicate: row.predicate.clone(),
-                        optional: false,
-                    };
-                    let bindings = self
-                        .match_row_pattern_groups(&context.cell_id, std::slice::from_ref(&group), read_epoch, &budget)
-                        .await?;
-                    result.matched_rows = result.matched_rows.saturating_add(bindings.len() as u64);
-                    self.collect_statement_effects(&context.cell_id, read_epoch, &row.actions, &bindings, &budget, &mut effects)
-                        .await?;
-                }
-                Ok::<_, GraphError>(())
-            })
+            crate::core::stage_watch::watched(
+                "mutation_match",
+                SlateGraphStore::scope_snapshot(snapshot, async {
+                    self.ensure_cell_readable(&context.cell_id, "cypher_unwind_mutation").await?;
+                    for row in &rows {
+                        budget.check("cypher_unwind_mutation_row")?;
+                        let group = RowMatchGroup {
+                            patterns: row.patterns.clone(),
+                            predicate: row.predicate.clone(),
+                            optional: false,
+                        };
+                        let bindings = self
+                            .match_row_pattern_groups(&context.cell_id, std::slice::from_ref(&group), read_epoch, &budget)
+                            .await?;
+                        result.matched_rows = result.matched_rows.saturating_add(bindings.len() as u64);
+                        self.collect_statement_effects(&context.cell_id, read_epoch, &row.actions, &bindings, &budget, &mut effects)
+                            .await?;
+                    }
+                    Ok::<_, GraphError>(())
+                }),
+            )
             .await?;
             effects.drop_noops(&mut result);
 
             budget.check("cypher_unwind_mutation_commit")?;
-            match self.apply_statement_effects(&context, effects, &mut result).await? {
+            match crate::core::stage_watch::watched("mutation_apply", self.apply_statement_effects(&context, effects, &mut result)).await? {
                 StatementApply::Applied => return Ok(result),
                 StatementApply::LostRace => continue,
             }
@@ -4018,6 +4050,19 @@ impl GraphShard {
         max_probe_entries: usize,
         budget: &QueryBudget,
     ) -> Result<Option<(usize, Vec<VertexId>)>> {
+        self.probe_property_index_candidates_accounted(cell_id, candidates, max_probe_entries, budget, false)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn probe_property_index_candidates_accounted(
+        &self,
+        cell_id: &str,
+        candidates: &[(String, Vec<String>)],
+        max_probe_entries: usize,
+        budget: &QueryBudget,
+        charge_scan_work: bool,
+    ) -> Result<Option<(usize, Vec<VertexId>)>> {
         // Enforced here rather than trusted from the caller: this is where the
         // concurrent walks are started, and the experimental engine offers
         // every equality conjunct it found rather than a pre-trimmed list.
@@ -4073,6 +4118,11 @@ impl GraphShard {
                         else {
                             break;
                         };
+                        // Count the iterator read even when it only proves
+                        // overflow and the probe subsequently declines.
+                        if charge_scan_work {
+                            self.ensure_query_scan_edges("cypher_filtered_equality_probe", budget.add_scanned_edges(1))?;
+                        }
                         let Some(next) = remaining.checked_sub(1) else {
                             complete = false;
                             break 'keys;
@@ -4091,6 +4141,11 @@ impl GraphShard {
             .boxed();
         while let Some(probe) = probes.try_next().await? {
             if let Some((index, vertices)) = probe {
+                // A competing probe may already have crossed the shared limit
+                // before this winner was yielded. Do not hide its spent work.
+                if charge_scan_work {
+                    self.ensure_query_scan_edges("cypher_filtered_equality_probe", budget.add_scanned_edges(0))?;
+                }
                 tracing::Span::current().record("hydradb.query.runtime_property_index", candidates[index].0.as_str());
                 return Ok(Some((index, vertices)));
             }
@@ -6151,6 +6206,67 @@ impl GraphShard {
         Ok(Some(candidates.into_pairs()))
     }
 
+    /// One source's entries for an equality on `edge_type`.`property`, split by
+    /// kind as [`Self::scan_relationship_property_entries_at`] splits a cell's,
+    /// or `None` once more than `max_entries` index entries have been read.
+    ///
+    /// The source-specific seek is an optional access path: an anchored
+    /// expansion answers the same query without any index. So an index walk
+    /// that would pass its allowance declines instead of failing the query,
+    /// and the expansion runs and is charged for what it reads, as the range
+    /// and type probes decline.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(super) async fn try_scan_source_relationship_property_entries_at(
+        &self,
+        probe: SourceRelationshipEqualityProbe<'_>,
+    ) -> Result<Option<RelationshipPropertyEntries>> {
+        let SourceRelationshipEqualityProbe {
+            cell_id,
+            edge_type,
+            property,
+            value,
+            source,
+            budget,
+            max_entries,
+        } = probe;
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        let mut entries = RelationshipPropertyEntries::default();
+        let mut read = 0_usize;
+        for encoded in equivalent_property_index_keys(value) {
+            for identified in [false, true] {
+                let prefix = if identified {
+                    keys::relationship_property_index_source_prefix(cell_id, edge_type, property, &encoded, source)
+                } else {
+                    keys::edge_property_index_source_prefix(cell_id, edge_type, property, &encoded, source)
+                };
+                let mut iter = budget
+                    .read_only_io("cypher_relationship_source_seek_open", self.scan_remote_prefix(&prefix))
+                    .await?;
+                while let Some(kv) = budget
+                    .read_only_io("cypher_relationship_source_seek_read", async { Ok(iter.next().await?) })
+                    .await?
+                {
+                    read = read.saturating_add(1);
+                    if read > max_entries {
+                        return Ok(None);
+                    }
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    if identified {
+                        let (_, _, _, _, src, dst, relationship_id) = parse_relationship_property_index_key(&key)?;
+                        entries.identified.push((src, dst, relationship_id, encoded.clone()));
+                    } else {
+                        let (_, _, _, _, src, dst) = parse_edge_property_index_key(&key)?;
+                        entries.structural_pairs.insert((src, dst));
+                    }
+                }
+            }
+        }
+        entries.entries_read = read;
+        Ok(Some(entries))
+    }
+
     /// Enumerate one relationship type's live edges, or decline.
     ///
     /// `Some` is a complete answer for `read_epoch`: every live edge of the
@@ -7777,6 +7893,78 @@ impl GraphShard {
             .collect())
     }
 
+    /// [`Self::out_neighbors_batch_at_with_cancellation`] for a pattern
+    /// whose endpoints carry labels: a source without every one of
+    /// `source_labels` has no entry, and a destination without every one of
+    /// `destination_labels` is dropped from its source's neighbors. A vertex
+    /// with no record has no labels, so it never matches a label. Duplicate
+    /// sources keep one entry each, as in the unlabelled batch.
+    #[cfg(feature = "opencypher")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn labeled_out_neighbors_batch_at_with_cancellation(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        mut sources: Vec<VertexId>,
+        source_labels: &BTreeSet<String>,
+        destination_labels: &BTreeSet<String>,
+        read_epoch: StorageSequence,
+        cancellation_token: Option<QueryCancellationToken>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, "labeled_out_neighbors_batch").await?;
+        ensure_limit(
+            "out_neighbors_batch_sources",
+            sources.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token.clone());
+        if !source_labels.is_empty() {
+            let distinct: Vec<_> = sources.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+            let labelled = self.vertices_with_labels_at(cell_id, &distinct, source_labels, &budget).await?;
+            sources.retain(|source| labelled.contains(source));
+        }
+        let mut entries = self
+            .out_neighbors_batch_at_with_cancellation(cell_id, edge_type, sources, read_epoch, cancellation_token)
+            .await?;
+        if !destination_labels.is_empty() {
+            let distinct: Vec<_> = entries
+                .iter()
+                .flat_map(|entry| entry.neighbors.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let labelled = self
+                .vertices_with_labels_at(cell_id, &distinct, destination_labels, &budget)
+                .await?;
+            for entry in &mut entries {
+                entry.neighbors.retain(|destination| labelled.contains(destination));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Which of `vertex_ids` carry every one of `labels`.
+    ///
+    /// Labels live only in the vertex record; the write-back overlay holds
+    /// properties alone. So this reads the record without the overlay's
+    /// prefix scan. A vertex with no record is left out, so it never matches.
+    #[cfg(feature = "opencypher")]
+    async fn vertices_with_labels_at(
+        &self,
+        cell_id: &str,
+        vertex_ids: &[VertexId],
+        labels: &BTreeSet<String>,
+        budget: &QueryBudget,
+    ) -> Result<BTreeSet<VertexId>> {
+        Ok(self
+            .read_existing_vertices(cell_id, vertex_ids, budget, false)
+            .await?
+            .filter(|(_, metadata)| labels.is_subset(&metadata.labels))
+            .map(|(vertex_id, _)| vertex_id)
+            .collect())
+    }
+
     pub async fn in_neighbors_batch(
         &self,
         cell_id: &str,
@@ -8397,6 +8585,30 @@ impl QueryBudget {
         self.scanned_index_candidates
             .fetch_add(entries, Ordering::Relaxed)
             .saturating_add(entries)
+    }
+
+    /// Index entries the query has charged so far.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(crate) fn scanned_index_candidates(&self) -> u64 {
+        self.scanned_index_candidates.load(Ordering::Acquire)
+    }
+
+    /// Charge `entries` only if the query's total stays within `limit`; the
+    /// tally is unchanged otherwise. For an optional access path, which must
+    /// decline rather than fail and must leave nothing charged when it does.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(crate) fn try_add_scanned_index_candidates(&self, entries: u64, limit: u64) -> bool {
+        self.scanned_index_candidates
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(entries).filter(|total| *total <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Return `entries` an optional access path charged and then gave up.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(crate) fn release_scanned_index_candidates(&self, entries: u64) {
+        self.scanned_index_candidates.fetch_sub(entries, Ordering::AcqRel);
     }
 
     /// Only for cancellation-safe read I/O, never commits or native compute
@@ -10097,12 +10309,30 @@ fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Optio
                     return Ok(None);
                 }
             }
-            let Some(src) = constrain_row_node_pattern(&edge.src, row)? else {
+            let Some(mut src) = constrain_row_node_pattern(&edge.src, row)? else {
                 return Ok(None);
             };
-            let Some(dst) = constrain_row_node_pattern(&edge.dst, row)? else {
+            let Some(mut dst) = constrain_row_node_pattern(&edge.dst, row)? else {
                 return Ok(None);
             };
+            // A relationship the row already holds fixes both endpoints, named
+            // or not, so the pattern is checked between them instead of
+            // expanded from one: re-finding an index-seeded relationship by
+            // walking its source's adjacency costs that vertex's whole degree.
+            // An undirected pattern may match either orientation, so only a
+            // directed one is pinned.
+            if let Some(relationship) = edge.binding.as_ref().and_then(|binding| row.relationships.get(binding)) {
+                if edge.direction == EdgeDirection::Outbound && edge.hop_range.is_none() {
+                    if relationship.edge_type != edge.edge_type
+                        || src.id.is_some_and(|id| id != relationship.src)
+                        || dst.id.is_some_and(|id| id != relationship.dst)
+                    {
+                        return Ok(None);
+                    }
+                    src.id = Some(relationship.src);
+                    dst.id = Some(relationship.dst);
+                }
+            }
             RowPattern::Edge(RowEdgePattern {
                 binding: edge.binding.clone(),
                 edge_type: edge.edge_type.clone(),
@@ -10174,6 +10404,12 @@ fn relationship_metadata_matches(metadata: &EdgeMetadata, pattern: &RowEdgePatte
     })
 }
 
+/// The relationship `row` matched for `pattern`. A named pattern's is its
+/// binding's. An anonymous pattern has none, so it is the one relationship of
+/// the pattern's type the row carries between the row's endpoints: the
+/// relationship the matcher produced the row from, with its identity, never
+/// one rebuilt from the endpoints (that names the endpoint pair, whose
+/// metadata is not any one relationship's record).
 #[cfg(feature = "opencypher")]
 fn relationship_identity_for_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Result<BoundRelationship> {
     if let Some(binding) = &pattern.binding {
@@ -10183,18 +10419,13 @@ fn relationship_identity_for_pattern(row: &BindingRow, pattern: &RowEdgePattern)
             feature: format!("unbound relationship {binding}"),
         });
     }
-    if let (Some(src_binding), Some(dst_binding)) = (pattern.src.binding.as_deref(), pattern.dst.binding.as_deref()) {
-        return Ok(BoundRelationship {
-            edge_type: pattern.edge_type.clone(),
-            src: row.get(src_binding)?,
-            dst: row.get(dst_binding)?,
-            relationship_id: None,
-        });
-    }
-    let mut matches = row
-        .relationship_metadata
-        .keys()
-        .filter(|relationship| relationship.edge_type == pattern.edge_type);
+    let endpoint = |node: &RowNodePattern| node.binding.as_deref().map(|binding| row.get(binding)).transpose();
+    let (src, dst) = (endpoint(&pattern.src)?, endpoint(&pattern.dst)?);
+    let mut matches = row.relationship_metadata.keys().filter(|relationship| {
+        relationship.edge_type == pattern.edge_type
+            && src.is_none_or(|src| relationship.src == src)
+            && dst.is_none_or(|dst| relationship.dst == dst)
+    });
     let Some(relationship) = matches.next().cloned() else {
         return Err(GraphError::UnsupportedQuery {
             reason: QueryFailureReason::Other,

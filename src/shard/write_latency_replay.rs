@@ -372,28 +372,34 @@ async fn incident_discovery_reuses_immutable_blocks_within_cache_budget() {
     .await
     .unwrap();
     let guard = shard.acquire_local_write_guard("cell-0", "cache-reuse-test").await.unwrap();
-    let epoch = shard.current_epoch("cell-0").await.unwrap();
     let vertices = BTreeSet::from([1, 2, 3, 4]);
-    let before = store.reads();
+    // Count reads of immutable SSTs, not every GET and LIST. The reopened
+    // writer's garbage collector, compactor and manifest poller read the
+    // manifest, the GC boundaries and the directory listings on their own
+    // timers. Under a loaded suite one of those passes lands between the two
+    // discoveries, and counting it said nothing about block reuse. None of
+    // them reads an SST here: the fixture holds one L0, below the compactor's
+    // minimum of four sources, and the GC only lists.
+    let before = store.compacted_reads();
     let first = shard
-        .indexed_vertex_delete_incidents_at("cell-0", &vertices, None, epoch, &guard)
+        .indexed_vertex_delete_incidents_guarded("cell-0", &vertices, None, &guard)
         .await
         .unwrap();
-    let cold_reads = store.reads() - before;
-    let before = store.reads();
+    let cold_reads = store.compacted_reads() - before;
+    let before = store.compacted_reads();
     let second = shard
-        .indexed_vertex_delete_incidents_at("cell-0", &vertices, None, epoch, &guard)
+        .indexed_vertex_delete_incidents_guarded("cell-0", &vertices, None, &guard)
         .await
         .unwrap();
-    let repeat_reads = store.reads() - before;
+    let repeat_reads = store.compacted_reads() - before;
     assert_eq!(first, second);
     assert_eq!(first.len(), 16);
     guard.release().await.unwrap();
     shard.close().await.unwrap();
-    assert!(cold_reads > 0, "fixture must exercise storage reads");
+    assert!(cold_reads > 0, "fixture must read the cold SST");
     assert_eq!(
         repeat_reads, 0,
-        "repeated discovery reread {repeat_reads} immutable objects after {cold_reads} cold reads"
+        "repeated discovery reread {repeat_reads} SST ranges after {cold_reads} cold reads"
     );
 }
 
@@ -1162,6 +1168,158 @@ async fn delete_preparation_uses_retained_xlog_for_unrelated_topology_changes() 
     shard.close().await.unwrap();
 }
 
+/// A cleanup whose target keeps gaining edges between preparation and the
+/// writer must not re-prepare until retries run out: after one stale
+/// preparation it discovers under the writer guard, where the racing writer
+/// cannot reach, and detaches every edge committed before it.
+#[tokio::test]
+async fn stale_delete_preparation_falls_back_to_guarded_discovery() {
+    let shard = GraphShard::open_standalone_writer(
+        "prepared-delete-guarded-fallback",
+        Arc::new(slatedb::object_store::memory::InMemory::new()),
+    )
+    .await
+    .unwrap();
+    shard
+        .set_vertex_metadata("cell-0", 1, VertexMetadata::default().with_label("Entity"))
+        .await
+        .unwrap();
+    // Seed the edge type so each race reads as a changed target, not a new type.
+    shard.write_edges_batch("cell-0", "TYPE", [(1, 50)], "seed").await.unwrap();
+
+    let (prepared_tx, mut prepared_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, tokio::sync::oneshot::Sender<()>)>();
+    *shard.delete_after_prepare.lock().unwrap() = Some(Arc::new(move |attempt| {
+        let prepared_tx = prepared_tx.clone();
+        Box::pin(async move {
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            if prepared_tx.send((attempt, resume)).is_ok() {
+                let _ = resumed.await;
+            }
+        })
+    }));
+
+    let deletions = vec![(1, "cleanup".into(), true, VertexMetadata::default())];
+    let delete = shard.delete_vertex_mutation_requests_batch_with_mode("cell-0", deletions, VertexDeleteBatchMode::DetachAndIsolated);
+    tokio::pin!(delete);
+    // Race every preparation the delete makes with a new edge on its target,
+    // the shape of an ingest that keeps merging onto a vertex being cleaned up.
+    let mut prepared_attempts = Vec::new();
+    let result = loop {
+        tokio::select! {
+            result = &mut delete => break result,
+            Some((attempt, resume)) = prepared_rx.recv() => {
+                prepared_attempts.push(attempt);
+                let dst = 100 + attempt as VertexId;
+                shard
+                    .write_edges_batch("cell-0", "TYPE", [(1, dst)], &format!("race-{attempt}"))
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+            }
+        }
+    };
+    *shard.delete_after_prepare.lock().unwrap() = None;
+
+    let result = result.unwrap();
+    assert!(result[0].vertex_deleted);
+    assert_eq!(
+        prepared_attempts,
+        vec![0],
+        "only the first attempt prepares outside the writer; the retry discovers under the guard"
+    );
+    assert_eq!(
+        shard.out_degree("cell-0", "TYPE", 1).await.unwrap(),
+        0,
+        "the edge committed during the stale preparation must be detached too"
+    );
+    shard.close().await.unwrap();
+}
+
+/// The guarded discovery must read the cell as the writer holds it under the
+/// guard. It used to ask `storage.snapshot()` for the transaction's epoch, and
+/// that snapshot trails the writer: a Cypher `DETACH DELETE` runs with the
+/// statement's read snapshot pinned for the task, and every commit made after
+/// the statement began is past it. The request failed with `SnapshotAhead`,
+/// which clients see as `BookmarkTimeout`. Covered for both discovery paths,
+/// the reverse index and the full scan. Each case also checks that the
+/// discovery sees edges committed after the pinned snapshot: a delete that
+/// missed them would leave dangling edges.
+#[tokio::test]
+async fn guarded_delete_discovery_reads_the_writer_not_the_pinned_snapshot() {
+    for index_policy in [GraphIndexPolicy::Full, GraphIndexPolicy::OutboundOnly] {
+        let case = format!("index policy {index_policy:?}");
+        let shard = GraphShard::open_standalone_writer_with_options(
+            format!("guarded-delete-pinned-{index_policy:?}").as_str(),
+            Arc::new(slatedb::object_store::memory::InMemory::new()),
+            GraphOpenOptions {
+                index_policy,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        shard
+            .set_vertex_metadata("cell-0", 1, VertexMetadata::default().with_label("Entity"))
+            .await
+            .unwrap();
+        shard.write_edges_batch("cell-0", "TYPE", [(1, 50)], "seed").await.unwrap();
+
+        // The statement pins its read snapshot, then other writers commit.
+        let pinned = shard.storage.snapshot().await.unwrap();
+        shard.write_edges_batch("cell-0", "OTHER", [(2, 60)], "unrelated").await.unwrap();
+        shard.write_edges_batch("cell-0", "TYPE", [(1, 70)], "late").await.unwrap();
+
+        let (prepared_tx, mut prepared_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, tokio::sync::oneshot::Sender<()>)>();
+        *shard.delete_after_prepare.lock().unwrap() = Some(Arc::new(move |attempt| {
+            let prepared_tx = prepared_tx.clone();
+            Box::pin(async move {
+                let (resume, resumed) = tokio::sync::oneshot::channel();
+                if prepared_tx.send((attempt, resume)).is_ok() {
+                    let _ = resumed.await;
+                }
+            })
+        }));
+
+        let deletions = vec![(1, "cleanup".into(), true, VertexMetadata::default())];
+        let delete = crate::SlateGraphStore::scope_snapshot(
+            pinned,
+            shard.delete_vertex_mutation_requests_batch_with_mode("cell-0", deletions, VertexDeleteBatchMode::DetachAndIsolated),
+        );
+        tokio::pin!(delete);
+        // With the reverse index, one racing edge makes the first
+        // preparation stale so the retry takes the guarded path. Without
+        // it there is no preparation and every attempt is guarded.
+        let result = loop {
+            tokio::select! {
+                result = &mut delete => break result,
+                Some((attempt, resume)) = prepared_rx.recv() => {
+                    let dst = 100 + attempt as VertexId;
+                    shard
+                        .write_edges_batch("cell-0", "TYPE", [(1, dst)], &format!("race-{attempt}"))
+                        .await
+                        .unwrap();
+                    resume.send(()).unwrap();
+                }
+            }
+        };
+        *shard.delete_after_prepare.lock().unwrap() = None;
+
+        let result = result.unwrap_or_else(|error| panic!("{case}: the guarded delete failed: {error:?}"));
+        assert!(result[0].vertex_deleted, "{case}");
+        assert_eq!(
+            shard.out_degree("cell-0", "TYPE", 1).await.unwrap(),
+            0,
+            "{case}: the discovery must detach edges committed after the pinned snapshot"
+        );
+        assert_eq!(
+            shard.out_degree("cell-0", "OTHER", 2).await.unwrap(),
+            1,
+            "{case}: unrelated edges stay"
+        );
+        shard.close().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn delete_preparation_validation_overlaps_types_and_reuses_bounded_xlog_blocks() {
     let store = crate::tests::ReadCountingObjectStore::new();
@@ -1336,6 +1494,7 @@ async fn cleanup_storage_wait_does_not_hold_writer_gate() {
 fn merge_import_options() -> RelationshipImportOptions<'static> {
     RelationshipImportOptions {
         endpoint_labels: Some(("Entity", "Chunk")),
+        endpoint_constraints: None,
         create_always: false,
         update_existing_metadata: true,
         merge_policy: None,

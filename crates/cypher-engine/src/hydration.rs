@@ -335,6 +335,18 @@ impl GraphRead for HydrationIdentityMap<'_> {
         Ok(page)
     }
 
+    async fn scan_vertices_by_property_ordered_filtered(
+        &mut self,
+        request: &OrderedPropertyScanRequest,
+        equalities: &[PropertyEqualityCandidate],
+    ) -> StorageResult<OrderedPropertyScanPage> {
+        let page = self.inner.scan_vertices_by_property_ordered_filtered(request, equalities).await?;
+        for vertex in &page.vertices {
+            self.admit(vertex.id, Some(vertex.clone()));
+        }
+        Ok(page)
+    }
+
     /// Forwarded: an entry page carries no record to seed the map with, and
     /// the trait default would walk the records through this map instead.
     async fn scan_vertex_entries_by_property_ordered(
@@ -402,6 +414,19 @@ impl GraphRead for HydrationIdentityMap<'_> {
             .await
     }
 
+    /// Forwarded for the same reason as the range probe below.
+    async fn seek_outgoing_relationships_by_property_values(
+        &mut self,
+        relationship_type: &str,
+        sources: &[VertexId],
+        property: &str,
+        values: &[ScalarValue],
+    ) -> StorageResult<Option<Vec<RelationshipRecord>>> {
+        self.inner
+            .seek_outgoing_relationships_by_property_values(relationship_type, sources, property, values)
+            .await
+    }
+
     /// Forwarded rather than left to the trait default, which declines: a
     /// plan that also expands is wrapped in this map, and a probe that always
     /// declined there would silently cost such a plan its probed access path.
@@ -453,6 +478,11 @@ impl GraphRead for HydrationIdentityMap<'_> {
         self.inner.expand_relationships_between(direction, neighbors).await
     }
 
+    // Transient batches share the read snapshot but do not populate the map.
+    async fn hydrate_vertices_transient(&mut self, vertex_ids: &[VertexId]) -> StorageResult<Vec<VertexRecord>> {
+        self.inner.hydrate_vertices_transient(vertex_ids).await
+    }
+
     /// Hits come from the map; every miss is fetched in one batch. Like the
     /// backends it wraps, the result is unordered and holds each existing
     /// vertex once.
@@ -498,6 +528,22 @@ impl GraphRead for HydrationIdentityMap<'_> {
         let ids = self.inner.probe_selective_equality(candidates).await?;
         self.admit_lookup(key, ids.as_deref());
         Ok(ids)
+    }
+
+    fn supports_ordered_equality_prefilter(&self, candidates: &[PropertyEqualityCandidate]) -> bool {
+        self.inner.supports_ordered_equality_prefilter(candidates)
+    }
+
+    async fn probe_selective_equality_with_scan_budget(
+        &mut self,
+        candidates: &[PropertyEqualityCandidate],
+    ) -> StorageResult<Option<Vec<VertexId>>> {
+        // Do not reuse an unaccounted probe result across accounting modes.
+        self.inner.probe_selective_equality_with_scan_budget(candidates).await
+    }
+
+    fn charge_ordered_filtered_candidates(&self, count: usize) -> StorageResult<()> {
+        self.inner.charge_ordered_filtered_candidates(count)
     }
 
     fn operator_started(&mut self, plan: &GraphPhysicalPlan) {

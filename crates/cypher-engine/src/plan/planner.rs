@@ -127,9 +127,17 @@ fn plan_physical_operation(
             requires_list: *requires_list,
             position: position.clone(),
         }),
-        GraphLogicalPlan::NodeScan { binding, labels } => Ok(GraphPhysicalPlan::VertexScan {
-            scan: provider.prepare_vertex_scan(VertexScanRequest::new(binding.clone(), labels.clone())),
-        }),
+        GraphLogicalPlan::NodeScan {
+            binding,
+            labels,
+            lookup_ids,
+        } => {
+            let mut request = VertexScanRequest::new(binding.clone(), labels.clone());
+            request.lookup_ids = lookup_ids.clone();
+            Ok(GraphPhysicalPlan::VertexScan {
+                scan: provider.prepare_vertex_scan(request),
+            })
+        }
         GraphLogicalPlan::Expand {
             input,
             from,
@@ -147,6 +155,25 @@ fn plan_physical_operation(
             to,
             target_labels,
         )),
+        GraphLogicalPlan::BoundRelationship {
+            input,
+            from,
+            source_labels,
+            relationship,
+            relationship_types,
+            direction,
+            to,
+            target_labels,
+        } => Ok(GraphPhysicalPlan::BoundRelationship {
+            input: Box::new(plan_physical_with_provider(input, context, provider)?),
+            from: from.clone(),
+            source_labels: source_labels.clone(),
+            relationship: relationship.clone(),
+            relationship_types: relationship_types.clone(),
+            direction: *direction,
+            to: to.clone(),
+            target_labels: target_labels.clone(),
+        }),
         GraphLogicalPlan::VariableExpand {
             input,
             from,
@@ -358,7 +385,12 @@ fn plan_ordered_window(
         };
         return plan_ordered_relationship_window(scanned, &predicate, items, skip, limit, context);
     }
-    let GraphLogicalPlan::NodeScan { binding, labels } = scanned else {
+    let GraphLogicalPlan::NodeScan {
+        binding,
+        labels,
+        lookup_ids: None,
+    } = scanned
+    else {
         return Ok(None);
     };
 
@@ -380,6 +412,7 @@ fn plan_ordered_window(
         return Ok(None);
     };
     let scan = provider.prepare_vertex_scan(VertexScanRequest {
+        lookup_ids: None,
         binding: binding.clone(),
         labels: labels.clone(),
         predicates,
@@ -442,6 +475,7 @@ fn plan_ordered_relationship_window(
         return Ok(None);
     }
     let GraphLogicalPlan::NodeScan {
+        lookup_ids: None,
         binding: source_binding,
         labels: source_labels,
     } = source.as_ref()
@@ -565,6 +599,7 @@ fn plan_filter(
             Some(relationship),
             [relationship_type],
             GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: source_binding,
                 labels: source_labels,
             },
@@ -629,6 +664,7 @@ fn plan_filter(
             Some(relationship),
             [relationship_type],
             GraphLogicalPlan::NodeScan {
+                lookup_ids: None,
                 binding: source_binding,
                 labels: source_labels,
             },
@@ -689,10 +725,16 @@ fn plan_filter(
     // Do not do the symmetric left rewrite: an empty left point set could
     // suppress fallible work in the right branch.
     if let GraphLogicalPlan::NaturalJoin { left, right, optional } = input {
-        if let GraphLogicalPlan::NodeScan { binding, labels } = right.as_ref() {
+        if let GraphLogicalPlan::NodeScan {
+            binding,
+            labels,
+            lookup_ids: None,
+        } = right.as_ref()
+        {
             let bindings = expression_bindings(predicate);
             if total_condition(&bound_predicate) && !bindings.is_empty() && bindings.iter().all(|candidate| *candidate == binding) {
                 let scan = provider.prepare_vertex_scan(VertexScanRequest {
+                    lookup_ids: None,
                     binding: binding.clone(),
                     labels: labels.clone(),
                     predicates: vec![bound_predicate.clone()],
@@ -717,8 +759,13 @@ fn plan_filter(
     }
 
     let access = match input {
-        GraphLogicalPlan::NodeScan { binding, labels } => GraphPhysicalPlan::VertexScan {
+        GraphLogicalPlan::NodeScan {
+            binding,
+            labels,
+            lookup_ids: None,
+        } => GraphPhysicalPlan::VertexScan {
             scan: provider.prepare_vertex_scan(VertexScanRequest {
+                lookup_ids: None,
                 binding: binding.clone(),
                 labels: labels.clone(),
                 predicates: vec![bound_predicate.clone()],
@@ -751,7 +798,12 @@ fn plan_vertex_filter_stack(
         layers.push((predicate, *operation));
         scanned = input.as_ref();
     }
-    let GraphLogicalPlan::NodeScan { binding, labels } = scanned else {
+    let GraphLogicalPlan::NodeScan {
+        binding,
+        labels,
+        lookup_ids,
+    } = scanned
+    else {
         return Ok(None);
     };
     // Bound outermost first, the order the unranked planner binds them in, so
@@ -768,6 +820,7 @@ fn plan_vertex_filter_stack(
     let peeled = 1 + bound[1..].iter().take_while(|(layer, _)| total_condition(layer)).count();
     let access = GraphPhysicalPlan::VertexScan {
         scan: provider.prepare_vertex_scan(VertexScanRequest {
+            lookup_ids: lookup_ids.clone(),
             binding: binding.clone(),
             labels: labels.clone(),
             predicates: bound[..peeled].iter().map(|(layer, _)| layer.clone()).collect(),
@@ -1371,6 +1424,9 @@ fn estimate_rows(plan: &GraphLogicalPlan, context: &PhysicalPlanningContext, sta
                 _ => Some(input_rows),
             }
         }
+        GraphLogicalPlan::NodeScan {
+            lookup_ids: Some(values), ..
+        } => Some(values.len() as u64),
         GraphLogicalPlan::NodeScan { labels, .. } => best_vertex_count(labels, statistics),
         GraphLogicalPlan::Filter {
             operation: _,
@@ -1405,6 +1461,16 @@ fn estimate_rows(plan: &GraphLogicalPlan, context: &PhysicalPlanningContext, sta
             target_labels,
             ..
         } => estimate_expand_rows(input, relationship_types, *direction, target_labels, context, statistics),
+        // ExpandInto's cost: the relationship is already in the row, so a row
+        // in is at most one row out, or two for an undirected hop that may
+        // read it either way round. No adjacency enters into it.
+        GraphLogicalPlan::BoundRelationship { input, direction, .. } => {
+            let rows = estimate_rows(input, context, statistics)?;
+            Some(match direction {
+                PatternDirection::Undirected => rows.saturating_mul(2),
+                PatternDirection::Outgoing | PatternDirection::Incoming => rows,
+            })
+        }
         GraphLogicalPlan::VariableExpand {
             input,
             relationship_types,
@@ -1470,7 +1536,12 @@ fn estimate_filter_rows(
     input_rows: Option<u64>,
     statistics: &dyn StatisticsProvider,
 ) -> Option<u64> {
-    if let GraphLogicalPlan::NodeScan { binding, labels } = input {
+    if let GraphLogicalPlan::NodeScan {
+        binding,
+        labels,
+        lookup_ids: None,
+    } = input
+    {
         if let Some((constraint_binding, property, values)) = equality_constraint(predicate) {
             if constraint_binding == *binding {
                 if let Some(rows) = property_values_estimate(labels, &property, &values, statistics) {

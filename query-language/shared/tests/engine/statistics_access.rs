@@ -338,6 +338,36 @@ fn a_string_bound_is_not_a_range_candidate() {
     assert_ne!(vertex_scan(&plan).access_kind(), "property-range", "{plan:?}");
 }
 
+/// A string range statistics cannot estimate is never ranked against an
+/// estimated access (above), but when nothing else is offered and statistics
+/// know the property, it walks its own slice of the index rather than
+/// reading every entry the property holds. The plan without statistics, and
+/// the plan for a property statistics do not know, are unchanged.
+#[test]
+fn an_unestimated_range_alone_walks_its_own_slice() {
+    let statistics = RankingStatistics::default()
+        .label("Source", 50_000)
+        .property("created_at", 1_000, 900);
+    let query = "MATCH (s:Source) WHERE s.created_at >= 'a' AND s.created_at < 'b' RETURN s";
+    let plan = corpus_access(query, &statistics);
+    assert_eq!(vertex_scan(&plan).access_kind(), "property-range", "{plan:?}");
+    let explain = explain_physical_plan(&plan);
+    assert!(explain.contains("lower=inclusive 'a', upper=exclusive 'b'"), "{explain}");
+    let unranked = corpus_access(query, &UnknownStatistics);
+    assert_ne!(vertex_scan(&unranked).access_kind(), "property-range", "{unranked:?}");
+    let unknown_property = RankingStatistics::default().label("Source", 50_000);
+    assert_eq!(
+        explain_corpus(query, &unknown_property),
+        explain_corpus(query, &UnknownStatistics),
+        "a property statistics do not know plans as without them"
+    );
+    // A label smaller than the property is scanned, as it was: only a
+    // presence plan gains the bounded walk, and its fallback is that plan.
+    let small_label = RankingStatistics::default().label("Source", 2).property("created_at", 102, 102);
+    let plan = corpus_access(query, &small_label);
+    assert_eq!(vertex_scan(&plan).access_kind(), "label-prefix", "{plan:?}");
+}
+
 #[test]
 fn two_bounds_on_one_property_are_one_candidate() {
     let plan = corpus_access(CORPUS[6], &example_scope());
@@ -617,6 +647,53 @@ async fn a_range_spanning_integers_and_floats() {
     )
     .await;
     assert!(rows.contains(&13) && rows.contains(&14), "{rows:?}");
+}
+
+/// The unestimated string range keeps the rows the plan without statistics
+/// returns: only strings fall inside string bounds, beside numbers, booleans
+/// and absent values.
+#[tokio::test]
+async fn an_unestimated_string_range_keeps_the_filter_only_rows() {
+    let storage = mixed_fixture();
+    let statistics = RankingStatistics::default()
+        .label("Source", 50_000)
+        .property("created_at", 1_000, 900);
+    let rows = same_rows_as_filter_only(
+        &storage,
+        "MATCH (s:Source) WHERE s.created_at >= '0' AND s.created_at < '9' RETURN s",
+        &statistics,
+    )
+    .await;
+    assert_eq!(rows, vec![11]);
+}
+
+/// A fallible conjunct beside a string range keeps the presence plan, so the
+/// filter still evaluates it on every entry and raises as it does without
+/// statistics, rather than the bounded walk skipping the rows it would
+/// raise on.
+#[tokio::test]
+async fn a_fallible_residual_keeps_the_presence_plan_and_its_error() {
+    let storage = MemoryStorage::with_vertices([source(1, Some(string("a")))]);
+    let statistics = RankingStatistics::default().label("Source", 50_000).property("created_at", 1, 1);
+    let (parameters, lists) = corpus_parameters();
+    let query = "MATCH (s:Source) WHERE s.created_at >= 'b' AND 1 / 0 = 0 RETURN s";
+    for (name, provider) in [("ranked", &statistics as &dyn StatisticsProvider), ("unranked", &UnknownStatistics)] {
+        let prepared = prepare(query, &parameters, &lists, provider);
+        assert!(
+            !prepared.explain().contains("access=property-range"),
+            "{name}: {}",
+            prepared.explain()
+        );
+        let error = CypherEngine::new(storage.clone())
+            .execute_prepared(&prepared)
+            .await
+            .expect_err("the division raises on the row outside the range");
+        assert!(error.to_string().to_lowercase().contains("zero"), "{name}: {error}");
+    }
+    // A total residual beside the range is still narrowed.
+    let total = "MATCH (s:Source) WHERE s.created_at >= 'b' AND s.created_at IS NOT NULL RETURN s";
+    let prepared = prepare(total, &parameters, &lists, &statistics);
+    assert!(prepared.explain().contains("access=property-range"), "{}", prepared.explain());
 }
 
 #[tokio::test]

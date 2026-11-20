@@ -55,11 +55,11 @@ impl Default for NativePathPageCursorStore {
 /// What one causal-consistency bookmark wait actually did.
 ///
 /// The wait is the read-your-writes cost, and until change 4 of
-/// the cell-affine read routing design nothing measured it: the
+/// `docs/plans/2026-08-21-cell-affine-read-routing.md` nothing measured it: the
 /// `query.bookmark_wait` span timed it for a trace, and no counter, log or
 /// metric could answer "did this read land on the cell's owner, and did it pay
-/// the epoch wait?" without re-running a week-long
-/// investigation.
+/// the epoch wait?" without re-running the week-long investigation in
+/// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
 ///
 /// Both facts are known only inside
 /// [`GraphShard::wait_for_storage_sequence_observed`] and both are needed one

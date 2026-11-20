@@ -396,6 +396,19 @@ pub enum GraphPhysicalPlan {
         to: Symbol,
         target_labels: Vec<Symbol>,
     },
+    /// See [`crate::GraphLogicalPlan::BoundRelationship`]: the hop over an
+    /// already-bound relationship, checked between its endpoints with no
+    /// adjacency read.
+    BoundRelationship {
+        input: Box<GraphPhysicalPlan>,
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
+        relationship_types: Vec<Symbol>,
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+    },
     VariableExpand {
         input: Box<GraphPhysicalPlan>,
         from: Symbol,
@@ -546,6 +559,7 @@ impl GraphPhysicalPlan {
             | Self::RelationshipPropertyRangeProbe { .. }
             | Self::RelationshipTypeProbe { .. }
             | Self::Expand { .. }
+            | Self::BoundRelationship { .. }
             | Self::VariableExpand { .. }
             | Self::SelectPaths { .. }
             | Self::BindPath { .. }

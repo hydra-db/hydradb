@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use common::MemoryStorage;
 use hydradb_cypher_engine::{
-    CypherEngine, EngineResult, ExpandDirection, ListParameterMap, ParameterMap, QueryResult, QueryRow, QueryValue, RelationshipRecord,
-    ScalarValue, StorageError, VertexRecord,
+    plan_physical, CypherEngine, EngineResult, ExpandDirection, ListParameterMap, ParameterMap, PreparedQuery, QueryResult, QueryRow,
+    QueryValue, RelationshipRecord, ScalarValue, StorageError, VertexRecord,
 };
 
 const SEEDS: &str = "MATCH (e:Entity {tenant_id: $tenant, sub_tenant_id: $sub}) WHERE e.entity_id IN $ids";
@@ -106,6 +106,23 @@ async fn execute(storage: &MemoryStorage, source: &str, params: &Parameters) -> 
     engine.execute_prepared(&prepared).await
 }
 
+// WITH is no longer a decorrelation barrier. Plan directly when a test needs
+// the original correlated reference rather than the rewritten pipeline.
+fn prepare_unrewritten(engine: &CypherEngine<MemoryStorage>, source: &str, params: &Parameters) -> EngineResult<PreparedQuery> {
+    let lowered = engine.lower_with_lists(source, &params.scalars, &params.lists)?;
+    Ok(PreparedQuery {
+        ast: lowered.ast.clone(),
+        logical: lowered.logical.clone(),
+        physical: plan_physical(&lowered.logical, lowered.planning_context())?,
+    })
+}
+
+async fn run_unrewritten(storage: &MemoryStorage, source: &str, params: &Parameters) -> Vec<QueryRow> {
+    let engine = CypherEngine::new(storage.clone());
+    let prepared = prepare_unrewritten(&engine, source, params).unwrap();
+    engine.execute_prepared(&prepared).await.unwrap().rows
+}
+
 async fn run(storage: &MemoryStorage, source: &str, params: &Parameters) -> Vec<QueryRow> {
     execute(storage, source, params)
         .await
@@ -186,7 +203,10 @@ async fn connected_matches_preserve_raw_bags_shared_parents_and_scope() {
         ]
     );
     let baseline = fixture();
-    assert_eq!(rows, run(&baseline, &query(true, RAW), &params).await);
+    assert_eq!(
+        integers(&rows),
+        integers(&run_unrewritten(&baseline, &query(true, RAW), &params).await)
+    );
     let batched = work(&storage);
     let scalar = work(&baseline);
     assert!(batched.input_ids < scalar.input_ids, "{batched:?} vs {scalar:?}");
@@ -199,15 +219,9 @@ async fn connected_matches_preserve_raw_bags_shared_parents_and_scope() {
         "{batched:?} vs {scalar:?}"
     );
     let requests = storage.expand_requests.lock().unwrap();
-    assert_eq!(requests.len(), 7, "one read per distinct source and direction");
-    let mut seen = std::collections::BTreeSet::new();
-    for request in requests.iter() {
-        assert_eq!(request.input_vertex_ids.len(), 1, "retain per-source row allowances");
-        assert!(
-            seen.insert(format!("{request:?}")),
-            "a shared source was expanded twice: {request:?}"
-        );
-    }
+    assert_eq!(requests.len(), 3, "one source batch and both orientations of the next hop");
+    assert_eq!(requests[0].input_vertex_ids, [1, 2, 3]);
+    assert!(requests[1..].iter().all(|request| request.input_vertex_ids == [10, 11]));
 }
 
 #[tokio::test]
@@ -216,7 +230,7 @@ async fn distinct_order_and_cap_apply_globally_after_batching() {
         let params = parameters(&[2, 1, 2, 4, 5], cap);
         let storage = fixture();
         let rows = run(&storage, &query(false, GLOBAL), &params).await;
-        assert_eq!(rows, run(&fixture(), &query(true, GLOBAL), &params).await);
+        assert_eq!(rows, run_unrewritten(&fixture(), &query(true, GLOBAL), &params).await);
         let expected = [("0001", "0020"), ("0001", "0021"), ("0002", "0020"), ("0002", "0021")];
         let expected = expected
             .into_iter()
@@ -231,7 +245,7 @@ async fn distinct_order_and_cap_apply_globally_after_batching() {
         assert_eq!(rows.iter().map(|row| row.values.clone()).collect::<Vec<_>>(), expected);
         if cap > 0 {
             let baseline = fixture();
-            run(&baseline, &query(true, GLOBAL), &params).await;
+            run_unrewritten(&baseline, &query(true, GLOBAL), &params).await;
             assert!(work(&storage).matching_relationships < work(&baseline).matching_relationships);
         }
     }
@@ -290,24 +304,18 @@ async fn incoming_outgoing_undirected_and_self_loops_keep_relationship_identity(
         let rows = run(&storage, &source, &params).await;
         assert_eq!(integers(&rows), expected, "{source}");
         let scalar = format!("{SEEDS} WITH e MATCH {pattern} RETURN e.n AS e, t.n AS t, r.edge AS r");
-        assert_eq!(integers(&rows), integers(&run(&graph(), &scalar, &params).await));
+        assert_eq!(integers(&rows), integers(&run_unrewritten(&graph(), &scalar, &params).await));
         let requests = storage.expand_requests.lock().unwrap();
-        assert_eq!(requests.len(), if pattern == "(e)-[r:LINK]-(t)" { 4 } else { 2 });
-        assert!(requests.iter().all(|request| request.input_vertex_ids.len() == 1));
+        assert_eq!(requests.len(), if pattern == "(e)-[r:LINK]-(t)" { 2 } else { 1 });
+        assert!(requests.iter().all(|request| request.input_vertex_ids == [1, 2]));
     }
 }
 
 #[tokio::test]
-async fn unsupported_boundaries_keep_scalar_expansions_and_answers() {
+async fn required_match_pipelines_decorrelate_through_filters_paths_and_input_operators() {
     for (source, expected_rows) in [
         (format!("MATCH (e:Entity) {PRESENT} RETURN e.n AS e, c.n AS c"), 6),
         (format!("{SEEDS} WITH e {PRESENT} RETURN e.n AS e, c.n AS c"), 4),
-        (
-            format!(
-                "{SEEDS} OPTIONAL MATCH (e)-[:PRESENT_IN]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n AS e, c.n AS c"
-            ),
-            5,
-        ),
         (
             format!(
                 "{SEEDS} MATCH (e)-[:PRESENT_IN*1..1]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n AS e, c.n AS c"
@@ -320,24 +328,104 @@ async fn unsupported_boundaries_keep_scalar_expansions_and_answers() {
         ),
         (format!("{SEEDS} {PRESENT} RETURN e.n AS e, c.n AS c LIMIT 2"), 2),
         (
-            format!("{SEEDS} MATCH (c:Chunk {{n: 10}}) MATCH (e)-[:PRESENT_IN]->(c) RETURN e.n AS e, c.n AS c"),
-            3,
-        ),
-        (
             format!("{SEEDS} MATCH (e)-[:PRESENT_IN]->(c:Chunk {{n: 10 / e.n}}) RETURN e.n AS e, c.n AS c"),
             2,
         ),
         (format!("{SEEDS} AND 100 / e.n > 0 {PRESENT} RETURN e.n AS e, c.n AS c"), 4),
+        (
+            format!("{SEEDS} WITH DISTINCT e AS src MATCH (src)-[:PRESENT_IN]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN src.n,c.n"),
+            4,
+        ),
+        (
+            format!("{SEEDS} UNWIND [$tenant] AS wanted MATCH (e)-[:PRESENT_IN]->(c:Chunk {{tenant_id: wanted}}) RETURN e.n,c.n,wanted"),
+            5,
+        ),
+        (
+            format!("{SEEDS} MATCH path=(e)-[:PRESENT_IN]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n,c.n,path"),
+            4,
+        ),
+        (
+            format!("{SEEDS} MATCH (e)-[:PRESENT_IN*0..2]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n,c.n"),
+            4,
+        ),
+        (
+            format!("{SEEDS} MATCH (e)-[p:PRESENT_IN {{edge: 100}}]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n,c.n,id(p)"),
+            1,
+        ),
+        (
+            format!("{SEEDS} MATCH (e)-[:PRESENT_IN]->(c:Chunk WHERE CASE WHEN c.tenant_id = $tenant THEN c.sub_tenant_id ELSE '' END = $sub) RETURN e.n,c.n"),
+            4,
+        ),
     ] {
         let storage = fixture();
-        let rows = run(&storage, &source, &parameters(&[1, 2, 3], 100)).await;
+        let params = parameters(&[1, 2, 3], 100);
+        let engine = CypherEngine::new(storage.clone());
+        let prepared = engine.prepare_with_lists(&source, &params.scalars, &params.lists).unwrap();
+        assert!(!prepared.explain().contains("NaturalJoin"), "{source}: {}", prepared.explain());
+        let result = engine.execute_prepared(&prepared).await.unwrap();
+        let mut rows = result.rows;
         assert_eq!(rows.len(), expected_rows, "{source}: {rows:?}");
+        let mut reference = run_unrewritten(&fixture(), &source, &params).await;
+        rows.sort_by_cached_key(|row| format!("{row:?}"));
+        reference.sort_by_cached_key(|row| format!("{row:?}"));
+        assert_eq!(rows, reference, "{source}");
         let requests = storage.expand_requests.lock().unwrap();
-        assert!(!requests.is_empty(), "{source}");
-        assert!(
-            requests.iter().all(|request| request.input_vertex_ids.len() <= 1),
-            "{source}: {requests:?}"
+        assert!(requests.iter().any(|request| request.input_vertex_ids.len() > 1), "{source}: {requests:?}");
+    }
+}
+
+#[tokio::test]
+async fn target_constraints_decorrelate_without_changing_result_bags() {
+    let params = parameters(&[1, 2, 3], 100);
+    for (pattern, count) in [
+        ("(c:Chunk)", 6),
+        ("(c {tenant_id: $tenant, sub_tenant_id: $sub})", 5),
+        ("(c:Chunk {tenant_id: $tenant, sub_tenant_id: $sub})", 4),
+        ("(c) WHERE c:Chunk AND c.tenant_id = $tenant AND c.sub_tenant_id = $sub", 4),
+    ] {
+        let storage = fixture();
+        let engine = CypherEngine::new(storage.clone());
+        let source = format!("{SEEDS} MATCH (e)-[:PRESENT_IN]->{pattern} RETURN e.n AS e,c.n AS c");
+        let prepared = engine.prepare_with_lists(&source, &params.scalars, &params.lists).unwrap();
+        assert!(!prepared.explain().contains("NaturalJoin"), "{}", prepared.explain());
+        let rows = engine.execute_prepared(&prepared).await.unwrap().rows;
+        assert_eq!(rows.len(), count, "{source}");
+        assert_eq!(
+            integers(&rows),
+            integers(&run_unrewritten(&fixture(), &source, &params).await),
+            "{source}"
         );
+        let requests = storage.expand_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{source}");
+        assert_eq!(requests[0].input_vertex_ids, [1, 2, 3], "{source}");
+    }
+}
+
+#[tokio::test]
+async fn independent_joins_optional_matches_and_subqueries_keep_their_plans() {
+    let params = parameters(&[1, 2, 3], 100);
+    for (source, count) in [
+        (format!("{SEEDS} MATCH (c:Chunk) RETURN e.n,c.n"), 12),
+        (
+            format!("{SEEDS} OPTIONAL MATCH (e)-[:PRESENT_IN]->(c:Chunk {{tenant_id: $tenant, sub_tenant_id: $sub}}) RETURN e.n,c.n"),
+            5,
+        ),
+        (
+            format!(
+                "{SEEDS} RETURN e.n,VALUE {{ MATCH (e)-[:PRESENT_IN]->(c:Chunk) MATCH (c)-[:HAS_CHUNK]->(s) RETURN count(s) AS n }} AS n"
+            ),
+            3,
+        ),
+        (
+            format!("{SEEDS} CALL (e) {{ MATCH (e)-[:PRESENT_IN]->(c:Chunk) RETURN count(c) AS n }} RETURN e.n,n"),
+            3,
+        ),
+    ] {
+        let engine = CypherEngine::new(fixture());
+        let original = prepare_unrewritten(&engine, &source, &params).unwrap();
+        let prepared = engine.prepare_with_lists(&source, &params.scalars, &params.lists).unwrap();
+        assert_eq!(prepared.physical, original.physical, "{source}");
+        assert_eq!(engine.execute_prepared(&prepared).await.unwrap().rows.len(), count, "{source}");
     }
 }
 
@@ -371,13 +459,7 @@ struct Cancelled;
 
 #[tokio::test]
 async fn connected_expansion_propagates_cancellation_and_row_budget() {
-    for target in [
-        "cypher_connected_match_batch",
-        "cypher_connected_match_inputs",
-        "cypher_connected_match_anchor",
-        "cypher_connected_match_retain",
-        "cypher_connected_match_replay",
-    ] {
+    for target in ["cypher_expand_inputs", "cypher_expand_relationships", "cypher_expand_output_rows"] {
         let observed = Arc::new(Mutex::new(0));
         let seen = Arc::clone(&observed);
         let storage = MemoryStorage {
@@ -455,9 +537,12 @@ async fn benchmark_connected_match_batching() {
         for barriers in if repetition % 2 == 0 { [false, true] } else { [true, false] } {
             let storage = benchmark_fixture();
             let engine = CypherEngine::new(storage.clone());
-            let prepared = engine
-                .prepare_with_lists(&query(barriers, GLOBAL), &params.scalars, &params.lists)
-                .expect("prepare benchmark");
+            let prepared = if barriers {
+                prepare_unrewritten(&engine, &query(true, GLOBAL), &params)
+            } else {
+                engine.prepare_with_lists(&query(false, GLOBAL), &params.scalars, &params.lists)
+            }
+            .expect("prepare benchmark");
             let start = Instant::now();
             let rows = engine.execute_prepared(&prepared).await.expect("execute benchmark").rows;
             let elapsed = start.elapsed();
@@ -503,4 +588,18 @@ async fn benchmark_connected_match_batching() {
         median(&batched_times),
         median(&scalar_times)
     );
+}
+
+#[tokio::test]
+async fn linear_expansion_rechecks_a_previously_bound_target() {
+    let storage = fixture();
+    let source = format!("{SEEDS} MATCH (c:Chunk {{n: 10}}) MATCH (e)-[:PRESENT_IN]->(c) RETURN e.n AS e, c.n AS c");
+    let rows = run(&storage, &source, &parameters(&[1, 2, 3], 100)).await;
+    assert_eq!(rows.len(), 3);
+    assert!(storage
+        .expand_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.input_vertex_ids == [1, 2, 3]));
 }

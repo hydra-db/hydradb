@@ -185,7 +185,7 @@ pub struct GraphCacheConfig {
     pub object_store_cache_max_open_file_handles: usize,
     pub object_store_cache_puts: bool,
     pub preload_sst_on_startup: bool,
-    /// Opt-in bounded cache measurement (ENG-3466). Off by default; when
+    /// Opt-in bounded cache measurement. Off by default; when
     /// off, no observer exists and the per-op cost is one `Option` check.
     pub slatedb_cache_observe: bool,
     pub slatedb_cache_observe_max_resident_records: usize,

@@ -10,4 +10,6 @@ pub(crate) mod gds_procedure;
 #[cfg(feature = "opencypher")]
 pub(crate) mod opencypher;
 #[cfg(feature = "opencypher")]
+pub(crate) mod owned_relationships;
+#[cfg(feature = "opencypher")]
 pub(crate) mod path_procedure;

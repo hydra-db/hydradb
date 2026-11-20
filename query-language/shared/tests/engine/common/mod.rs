@@ -387,6 +387,39 @@ impl GraphRead for MemoryRead<'_> {
         Ok(relationships)
     }
 
+    /// The sources' relationships holding any of `values`, as a backend
+    /// with source-ordered relationship indexes answers; a decline unless
+    /// `answers_relationship_probes`.
+    async fn seek_outgoing_relationships_by_property_values(
+        &mut self,
+        relationship_type: &str,
+        sources: &[VertexId],
+        property: &str,
+        values: &[ScalarValue],
+    ) -> StorageResult<Option<Vec<RelationshipRecord>>> {
+        if !self.answers_relationship_probes {
+            return Ok(None);
+        }
+        self.relationship_probe_requests
+            .lock()
+            .unwrap()
+            .push(format!("source:{relationship_type}.{property}"));
+        Ok(Some(
+            self.relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship.relationship_type == relationship_type
+                        && sources.contains(&relationship.source)
+                        && relationship
+                            .properties
+                            .get(property)
+                            .is_some_and(|stored| values.iter().any(|value| scalar_values_equal(stored, value)))
+                })
+                .cloned()
+                .collect(),
+        ))
+    }
+
     /// The whole type when it fits `max_index_entries`, else a decline.
     async fn probe_relationships_by_type(
         &mut self,

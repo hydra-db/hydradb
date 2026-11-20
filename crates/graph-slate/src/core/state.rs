@@ -130,7 +130,7 @@ pub struct SlateGraphStore {
 
 /// How long a listing that found no manifest newer than the writer's lets the
 /// strong-read check rely on a single successor read. Must stay well below the
-/// manifest garbage collector's minimum age (SlateDB's default, 300 s; Turbolay
+/// manifest garbage collector's minimum age (SlateDB's default, 300 s; HydraDB
 /// sets no override); see `SlateGraphStore::check_writer_not_superseded`.
 const MANIFEST_LIST_CONFIRM_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1532,7 +1532,7 @@ impl SlateGraphStore {
     /// That alone is not sound once garbage collection is involved, which may
     /// delete `n + 1` while keeping a later `n + 2`. But it never deletes a
     /// manifest younger than its minimum age: SlateDB's default of 300 s,
-    /// which Turbolay does not override. So the check lists the manifests
+    /// which HydraDB does not override. So the check lists the manifests
     /// after the writer's at least every [`MANIFEST_LIST_CONFIRM_INTERVAL`]
     /// (60 s): a listing that finds none proves nothing newer existed then,
     /// and everything created since is younger than 60 s, so it is all still

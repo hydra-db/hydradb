@@ -311,7 +311,7 @@ proxy:
       cpu: "4"
       memory: 1Gi
   service:
-    # Defaults to <fullname>-proxy, i.e. turbolay-<env>-proxy.
+    # Defaults to <fullname>-proxy, i.e. hydradb-<env>-proxy.
     name: ""
     type: ClusterIP
     annotations: {}

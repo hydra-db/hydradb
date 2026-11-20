@@ -742,9 +742,11 @@ async fn a_relationship_an_earlier_pattern_bound_does_not_block_anchoring() {
         )
         .expect("prepare");
 
+    // Anchored on `s`, the reused `r` is then checked between its endpoints
+    // rather than expanded again (see `repeated_binding`).
     let explain = prepared.explain();
     assert!(
-        explain.contains("ExpandExec(from=s, relationship=r, types=[HAS_CHUNK], direction=incoming, to=c,"),
+        explain.contains("BoundRelationshipExec(relationship=r, from=s, source_labels=[], types=[HAS_CHUNK], direction=incoming, to=c,"),
         "an already-bound relationship must not block the rewrite: {explain}"
     );
     assert!(

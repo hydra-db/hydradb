@@ -372,6 +372,7 @@ fn public_planning_boundary_normalizes_manual_identity_or_plans() {
     let logical = GraphLogicalPlan::Filter {
         operation: hydradb_cypher_ast::operation::MATCH,
         input: Box::new(GraphLogicalPlan::NodeScan {
+            lookup_ids: None,
             binding: Symbol::from("e"),
             labels: vec![Symbol::from("Entity")],
         }),

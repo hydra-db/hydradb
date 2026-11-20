@@ -642,7 +642,7 @@ impl GraphShard {
     /// does not — and both return the same number. [`BookmarkWait`] carries the
     /// difference out to the client, which is the only layer that knows which
     /// request paid for it. Change 4 of
-    /// the cell-affine read routing design.
+    /// `docs/plans/2026-08-21-cell-affine-read-routing.md`.
     ///
     /// Nothing here allocates, locks or reaches the store that did not already:
     /// the writer flag falls out of the branch `durable_sequence` took anyway,
@@ -670,7 +670,7 @@ impl GraphShard {
         // that race and so was almost never observed in production. Bounding
         // the wait separately makes it lose to nothing: it degrades into a
         // clear, Bolt-retriable error with the rest of the budget intact.
-        // Change 3 of the cell-affine read routing design.
+        // Change 3 of `docs/plans/2026-08-21-cell-affine-read-routing.md`.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.limits.max_bookmark_wait_ms);
         // With a peer's buddy WAL feed vouching for this cell's writer, the
         // reader's follower replays each flush as the writer reports it, so the
@@ -727,6 +727,27 @@ impl GraphShard {
             shard: self,
             cell_id: cell_id.to_string(),
             read_epoch,
+            storage_snapshot,
+        })
+    }
+
+    /// The writer's state as of now, for a write that holds the cell's local
+    /// write guard and has to read under it.
+    ///
+    /// `snapshot_at` cannot serve that read. It compares against
+    /// `storage.snapshot()`, which is the statement's pinned read snapshot when
+    /// the task has one and the writer's durable snapshot otherwise. Both trail
+    /// the writer's own commits, so asking either for the transaction's epoch
+    /// fails with `SnapshotAhead`, which clients see as `BookmarkTimeout`. The
+    /// guard keeps every other writer off the cell, so the writer's current
+    /// snapshot holds the cell exactly as the transaction does.
+    pub(crate) async fn guarded_writer_snapshot(&self, cell_id: &str, _lock: &LocalWriteGuard) -> Result<GraphSnapshot<'_>> {
+        validate_component("cell_id", cell_id)?;
+        let storage_snapshot = self.storage.writer_snapshot().await?;
+        Ok(GraphSnapshot {
+            shard: self,
+            cell_id: cell_id.to_string(),
+            read_epoch: storage_snapshot.seq(),
             storage_snapshot,
         })
     }

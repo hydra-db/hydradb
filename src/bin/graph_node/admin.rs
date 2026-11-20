@@ -1746,7 +1746,7 @@ fn append_slatedb_cache_metrics(output: &mut String, cache: hydradb::SlateDbCach
     append_cache_observe_metrics(output, &cache.observe);
 }
 
-/// Bounded observer series (ENG-3466). Kind and reason label sets are
+/// Bounded observer series. Kind and reason label sets are
 /// closed enums, so series count is fixed regardless of traffic. When
 /// observation is disabled only the `observe_enabled` gauge is emitted;
 /// enabling it later adds the bounded families below, never per-key series.
@@ -2648,5 +2648,3 @@ fn admin_io_error(error: std::io::Error) -> hydradb::GraphError {
         reason: error.to_string(),
     }
 }
-
-// weave: run 'weave explain src/bin/graph_node/admin.rs' for per-hunk detail, 'weave check' to verify your resolution

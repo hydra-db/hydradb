@@ -21,7 +21,6 @@ members = [
     "crates/falkordb-rdb",
     "crates/falkor-dump-import",
     "crates/object-publication",
-    "crates/mcp",
     "crates/query-telemetry",
     "crates/usage-report",
     "crates/placement",
@@ -131,7 +130,6 @@ pingora-http = "0.9.0"
 pingora-proxy = { version = "0.9.0", default-features = false }
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
 rmp-serde = "1"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -155,7 +153,7 @@ unicode-normalization = "0.1.25"
 
 [package]
 name = "hydradb"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Object-store-native distributed graph database"

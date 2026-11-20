@@ -52,7 +52,7 @@ use std::time::Duration;
 /// - **30 s** is both `DEFAULT_MAX_QUERY_RUNTIME_MS` and
 ///   `DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS`, so it stays as the rung where a
 ///   deployment left on the defaults reads its timeouts off.
-/// - **120 s** is the raised `GRAPH_MAX_QUERY_RUNTIME_MS` staging runs with. The
+/// - **120 s** is a common raised `GRAPH_MAX_QUERY_RUNTIME_MS`. The
 ///   top rung is **300 s** rather than 120 s so that the overflow bucket keeps
 ///   meaning "past every budget anyone configures" instead of collapsing
 ///   "timed out at 120 s" together with "took 45 s and succeeded" — and so

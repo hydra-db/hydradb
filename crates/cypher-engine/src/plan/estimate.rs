@@ -14,7 +14,7 @@
 //! - a join multiplies its inputs;
 //! - a window clamps its input.
 
-use crate::{BoundValue, GraphPhysicalPlan, PropertyStatistics, ScalarValue, StatisticsProvider};
+use crate::{BoundValue, GraphPhysicalPlan, PatternDirection, PropertyStatistics, ScalarValue, StatisticsProvider};
 
 /// Estimates for every operator of `plan`, in pre-order (the order
 /// [`GraphPhysicalPlan::children`] walks). `None` where statistics give no
@@ -97,6 +97,11 @@ fn estimate_into(plan: &GraphPhysicalPlan, statistics: &dyn StatisticsProvider, 
             direction,
             ..
         } => expand_rows(input, source, relationship_types, *direction, statistics),
+        // See the logical estimate: ExpandInto's cost, never a fan-out.
+        GraphPhysicalPlan::BoundRelationship { direction, .. } => match direction {
+            PatternDirection::Undirected => input.map(|rows| rows.saturating_mul(2)),
+            PatternDirection::Outgoing | PatternDirection::Incoming => input,
+        },
         GraphPhysicalPlan::VariableExpand {
             input: source,
             relationship_types,

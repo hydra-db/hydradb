@@ -211,6 +211,7 @@ fn logical_binding_plan(plan: &GraphLogicalPlan) -> ShapeResult {
         GraphLogicalPlan::SingleRow | GraphLogicalPlan::NodeScan { .. } => Ok(()),
         GraphLogicalPlan::Unwind { input, .. } => logical_binding_plan(input),
         GraphLogicalPlan::Expand { input, .. }
+        | GraphLogicalPlan::BoundRelationship { input, .. }
         | GraphLogicalPlan::Filter { input, .. }
         | GraphLogicalPlan::Sort { input, .. }
         | GraphLogicalPlan::Skip { input, .. }
@@ -313,6 +314,9 @@ fn physical_binding_plan(plan: &GraphPhysicalPlan) -> ShapeResult {
             expand_source_is_bindable(input, from)?;
             physical_binding_plan(input)
         }
+        // Reads no source of its own: the relationship it checks names both
+        // endpoints, and the hop binds whichever its input has not.
+        GraphPhysicalPlan::BoundRelationship { input, .. } => physical_binding_plan(input),
         GraphPhysicalPlan::SingleRow
         | GraphPhysicalPlan::VertexScan { .. }
         | GraphPhysicalPlan::RelationshipPropertySeek { .. }
@@ -446,6 +450,18 @@ fn collect_produced_symbols(plan: &GraphPhysicalPlan, symbols: &mut BTreeSet<Sym
             if let Some(relationship) = relationship {
                 symbols.insert(relationship.clone());
             }
+            symbols.insert(to.clone());
+        }
+        GraphPhysicalPlan::BoundRelationship {
+            input,
+            from,
+            relationship,
+            to,
+            ..
+        } => {
+            collect_produced_symbols(input, symbols);
+            symbols.insert(from.clone());
+            symbols.insert(relationship.clone());
             symbols.insert(to.clone());
         }
         GraphPhysicalPlan::VariableExpand {

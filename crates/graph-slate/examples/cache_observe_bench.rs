@@ -1,4 +1,4 @@
-//! Off/on overhead measurement for the ENG-3466 cache observer.
+//! Off/on overhead measurement for the cache observer.
 //!
 //! Workload: a fixed dataset of `keys` keys (each `value_bytes` long) is
 //! written and flushed once, then read through a `DbReader` backed by a

@@ -227,6 +227,25 @@ fn render_plan(plan: &GraphPhysicalPlan, depth: usize, output: &mut String) {
             );
             render_plan(input, depth + 1, output);
         }
+        GraphPhysicalPlan::BoundRelationship {
+            input,
+            from,
+            source_labels,
+            relationship,
+            relationship_types,
+            direction,
+            to,
+            target_labels,
+        } => {
+            let _ = writeln!(
+                output,
+                "{indent}BoundRelationshipExec(relationship={relationship}, from={from}, source_labels={}, types={}, direction={direction}, to={to}, target_labels={})",
+                render_symbols(source_labels),
+                render_symbols(relationship_types),
+                render_symbols(target_labels)
+            );
+            render_plan(input, depth + 1, output);
+        }
         GraphPhysicalPlan::VariableExpand {
             input,
             from,

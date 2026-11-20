@@ -1031,6 +1031,8 @@ pub enum GraphLogicalPlan {
         conjunction: QueryConjunction,
     },
     NodeScan {
+        /// An ordered stream of lookup occurrences, supplied by the ID-only UNWIND rewrite.
+        lookup_ids: Option<Vec<crate::BoundValue>>,
         binding: Symbol,
         labels: Vec<Symbol>,
     },
@@ -1038,6 +1040,28 @@ pub enum GraphLogicalPlan {
         input: Box<GraphLogicalPlan>,
         from: Symbol,
         relationship: Option<Symbol>,
+        relationship_types: Vec<Symbol>,
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+    },
+    /// A fixed-length hop over a relationship an earlier pattern or clause
+    /// already bound: `MATCH (a)-[r]->(b) MATCH (a)-[r]->(c)`. The
+    /// relationship names its own endpoints, so the hop reads no adjacency:
+    /// each input row's `relationship` is checked against the hop's types and
+    /// direction, and `from` and `to` are held to its endpoints, bound to
+    /// them where the row has not bound them yet. A hub's degree never
+    /// enters into it.
+    ///
+    /// `source_labels` holds `from` to the labels its node pattern wrote when
+    /// this hop, not a scan, binds it: the path then starts here, from the
+    /// seed row, instead of scanning `from`'s label for a node the
+    /// relationship already names.
+    BoundRelationship {
+        input: Box<GraphLogicalPlan>,
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
         relationship_types: Vec<Symbol>,
         direction: PatternDirection,
         to: Symbol,
@@ -1190,6 +1214,7 @@ impl GraphLogicalPlan {
             Self::CallProcedure { .. } => operation::CALL_PROCEDURE,
             Self::NodeScan { .. }
             | Self::Expand { .. }
+            | Self::BoundRelationship { .. }
             | Self::VariableExpand { .. }
             | Self::NaturalJoin { .. }
             | Self::BindPath { .. }

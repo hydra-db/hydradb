@@ -647,6 +647,7 @@ nodes = [{"id": i, "name": names[i]} for i in {x for e in edges for x in (e["src
 - `algo.SPpaths` — bounded paths between one source and one target
 - `algo.SSpaths` — bounded paths from one source
 - `algo.MSpaths` — many sources and targets resolved in one request
+- `algo.degree` — rank vertices of one label by relationship degree
 
 ```cypher
 CALL algo.SPpaths({
@@ -773,6 +774,47 @@ names came from parameters (so the names themselves are ground truth):
 
 Treat the inputs as untrusted when you do this — inlining is exactly the
 injection surface parameters exist to avoid.
+
+### Degree ranking
+
+`algo.degree` ranks the vertices of one label by relationship degree from the
+same compiled topology, without expanding relationships through Cypher:
+
+```cypher
+CALL algo.degree({
+  label: 'Entity',
+  relTypes: ['RELATES'],
+  relDirection: 'both',    // 'outgoing' | 'incoming' | 'both' (default) | 'undirected'
+  neighborLabel: 'Entity', // optional: count only relationships to this label
+  minDegree: 50,           // default 0
+  limit: 100               // default and maximum: max_query_result_vertices
+})
+YIELD node, degree
+RETURN node.entity_id AS entity_id, node.name AS name, degree
+```
+
+It matches `MATCH (n:Entity)-[r:RELATES]->() RETURN count(r)` plus its incoming
+mirror: each parallel relationship counts, and a self-loop counts twice under
+`both`; `undirected` counts every relationship touching the vertex once. Rows
+are ordered by degree descending, then vertex id. `minDegree`, `limit`, `label`,
+`neighborLabel`, and `relDirection` accept `$parameters`.
+
+## Query engines
+
+`GRAPH_CYPHER_ENGINE=legacy|experimental|datafusion` selects the engine at
+node startup, not a storage backend; all three share the same SlateDB graph, so
+switching needs no migration. The default is `legacy`. This is an operator knob,
+but it affects which queries succeed, so an application running against a
+`datafusion` node should know its limits:
+
+- A binary built without the `datafusion-cypher-engine` feature rejects
+  `datafusion` at startup.
+- DataFusion does not yet support every shape: `DETACH DELETE` and multi-row
+  mutations that need clause-major execution are rejected before any durable
+  effect, rather than falling back mid-statement.
+- `GRAPH_CYPHER_MUTATION_ATOMICITY=legacy_chunked|statement` (default
+  `legacy_chunked`) selects mutation atomicity. Earlier chunk checkpoints can
+  survive a failed statement and must be resumed on their originating engine.
 
 ## Read consistency
 

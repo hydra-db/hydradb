@@ -1572,7 +1572,7 @@ pub trait QueryCellClient: Send + Sync {
     /// for everyone who cannot — `None`, meaning "no observation", which the
     /// client records as neither owner nor non-owner rather than guessing.
     ///
-    /// Change 4 of the cell-affine read routing design. See
+    /// Change 4 of `docs/plans/2026-08-21-cell-affine-read-routing.md`. See
     /// [`crate::BookmarkWait`] for what the two facts are worth.
     async fn wait_for_storage_sequence_observed(
         &self,
@@ -3010,6 +3010,24 @@ impl QueryCellClient for RoutedGraphCluster {
         // storage APIs do not pass through this Cypher batch interface.
         shard.ensure_managed_cypher_layout().await?;
         match operation {
+            crate::QueryBatchOperation::ReplaceOwnedRelationshipSet { request } => {
+                request.validate()?;
+                self.ensure_local_writer(&context.cell_id).await?;
+                let result = shard.replace_owned_relationship_set(&context, &request).await?;
+                Ok(QueryResultSet::new(
+                    ["applied", "version", "created", "deleted"]
+                        .into_iter()
+                        .map(QueryColumn::new)
+                        .collect(),
+                    vec![crate::QueryRow::new(vec![
+                        crate::QueryValue::Bool(result.applied),
+                        crate::QueryValue::Count(result.version as u64),
+                        crate::QueryValue::Count(result.created),
+                        crate::QueryValue::Count(result.deleted),
+                    ])],
+                )
+                .with_storage_sequence(result.storage_sequence))
+            }
             crate::QueryBatchOperation::MatchMutation {
                 query,
                 alias,
@@ -3042,28 +3060,71 @@ impl QueryCellClient for RoutedGraphCluster {
                     })
                 }
             }
-            crate::QueryBatchOperation::OutNeighbors {
-                edge_type,
-                sources,
-                source_column,
-                destination_column,
-            } => {
+            operation @ (crate::QueryBatchOperation::OutNeighbors { .. } | crate::QueryBatchOperation::LabeledOutNeighbors { .. }) => {
+                let (edge_type, sources, labels, source_column, destination_column) = match operation {
+                    crate::QueryBatchOperation::OutNeighbors {
+                        edge_type,
+                        sources,
+                        source_column,
+                        destination_column,
+                    } => (edge_type, sources, None, source_column, destination_column),
+                    crate::QueryBatchOperation::LabeledOutNeighbors {
+                        edge_type,
+                        sources,
+                        source_labels,
+                        destination_labels,
+                        source_column,
+                        destination_column,
+                    } => (
+                        edge_type,
+                        sources,
+                        Some((source_labels, destination_labels)),
+                        source_column,
+                        destination_column,
+                    ),
+                    _ => unreachable!("matched as an out-neighbors batch above"),
+                };
                 let snapshot = match context.read_epoch {
                     Some(read_epoch) => shard.snapshot_at(&context.cell_id, read_epoch).await?,
                     None => shard.snapshot_for_query(&context.cell_id, context.uses_refreshed_reader()).await?,
                 };
                 let read_epoch = snapshot.read_epoch();
                 let storage_sequence = snapshot.storage_sequence().expect("all graph snapshots pin a SlateDB sequence");
-                let entries = crate::SlateGraphStore::scope_snapshot(
-                    Arc::clone(&snapshot.storage_snapshot),
-                    shard.out_neighbors_batch_at_with_cancellation(
-                        &context.cell_id,
-                        &edge_type,
-                        sources,
-                        read_epoch,
-                        context.cancellation_token.clone(),
-                    ),
-                )
+                let entries = crate::SlateGraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async {
+                    match &labels {
+                        None => {
+                            shard
+                                .out_neighbors_batch_at_with_cancellation(
+                                    &context.cell_id,
+                                    &edge_type,
+                                    sources,
+                                    read_epoch,
+                                    context.cancellation_token.clone(),
+                                )
+                                .await
+                        }
+                        #[cfg(feature = "opencypher")]
+                        Some((source_labels, destination_labels)) => {
+                            shard
+                                .labeled_out_neighbors_batch_at_with_cancellation(
+                                    &context.cell_id,
+                                    &edge_type,
+                                    sources,
+                                    source_labels,
+                                    destination_labels,
+                                    read_epoch,
+                                    context.cancellation_token.clone(),
+                                )
+                                .await
+                        }
+                        #[cfg(not(feature = "opencypher"))]
+                        Some(_) => Err(GraphError::UnsupportedQuery {
+                            reason: crate::QueryFailureReason::Unwind,
+                            dialect: "OpenCypher",
+                            feature: "labelled UNWIND batch reads require the opencypher feature".to_string(),
+                        }),
+                    }
+                })
                 .await?;
                 let row_count = entries.iter().map(|entry| entry.neighbors.len()).sum::<usize>();
                 crate::codec::ensure_limit(
@@ -3261,6 +3322,32 @@ impl QueryCellClient for RoutedGraphCluster {
                 } else {
                     QueryResultSet::new(Vec::new(), Vec::new())
                 })
+            }
+            crate::QueryBatchOperation::ConstrainedMergeRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                merge_policy,
+            } => {
+                if relationships.len() > 1 {
+                    return Err(crate::query::owned_relationships::invalid(
+                        "constrained relationship MERGE supports at most one row",
+                    ));
+                }
+                self.ensure_local_writer(&context.cell_id).await?;
+                let mut output = QueryResultSet::new(Vec::new(), Vec::new());
+                for row in relationships {
+                    let result = shard
+                        .merge_relationship_with_endpoint_constraints(
+                            &context.cell_id,
+                            &edge_type,
+                            row,
+                            &format!("{}.constrained-relationship-merge", context.idempotency_key),
+                            merge_policy.as_ref(),
+                        )
+                        .await?;
+                    output = output.with_storage_sequence(result.end_epoch);
+                }
+                Ok(output)
             }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
                 self.ensure_local_writer(&context.cell_id).await?;
@@ -3486,9 +3573,14 @@ impl QueryCellClient for RoutedGraphCluster {
 impl QueryCellClient for crate::ScopedRoutedGraphCluster {
     #[cfg(feature = "datafusion-cypher-engine")]
     async fn resolve_datafusion_statement_receipt(&self, context: QueryContext, query: &str) -> Result<Option<QueryResultSet>> {
+        use crate::core::stage_watch::watched;
         let _scope_capacity_release = self.scope_capacity_release_guard();
-        let cluster = self.cluster_for_scope_wait(&context.scope).await?;
-        QueryCellClient::resolve_datafusion_statement_receipt(cluster.as_ref(), context, query).await
+        let cluster = watched("receipt_scope_open", self.cluster_for_scope_wait(&context.scope)).await?;
+        watched(
+            "receipt_lookup",
+            QueryCellClient::resolve_datafusion_statement_receipt(cluster.as_ref(), context, query),
+        )
+        .await
     }
 
     async fn prepare_datafusion_cypher(&self, context: QueryContext, query: &str) -> Result<PreparedCypherQuery> {
@@ -3581,12 +3673,15 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
                 let cluster = Arc::clone(&cluster);
                 let query = query.to_string();
                 let release = self.scope_capacity_release_guard();
-                crate::engine::run_write_to_completion(async move {
-                    let _release = release;
-                    let result = RoutedGraphCluster::execute_cypher(cluster.as_ref(), context, &query).await;
-                    drop(cluster);
-                    result
-                })
+                crate::core::stage_watch::watched(
+                    "write_task",
+                    crate::engine::run_write_to_completion(async move {
+                        let _release = release;
+                        let result = RoutedGraphCluster::execute_cypher(cluster.as_ref(), context, &query).await;
+                        drop(cluster);
+                        result
+                    }),
+                )
                 .await?
             };
             let (sequence, rows) = match output {

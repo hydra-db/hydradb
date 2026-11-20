@@ -26,6 +26,20 @@ use super::*;
 use crate::shard::query::{parse_vertex_property_index_key, QUERY_METADATA_HYDRATION_CONCURRENCY};
 use crate::QueryFailureReason;
 
+const MEMBERSHIP_CONJUNCTS: usize = 16;
+const MEMBERSHIP_ALTERNATIVES: usize = 8;
+const FILTERED_PAGE_ENTRIES: usize = 4096;
+
+/// One eligibility rule for capability reporting and membership construction.
+/// Never partially accept an OR: that would silently omit matching vertices.
+pub(super) fn ordered_string_memberships(equalities: &[PropertyEqualityCandidate]) -> impl Iterator<Item = &PropertyEqualityCandidate> {
+    equalities.iter().take(MEMBERSHIP_CONJUNCTS).filter(|equality| {
+        !equality.values.is_empty()
+            && equality.values.len() <= MEMBERSHIP_ALTERNATIVES
+            && equality.values.iter().all(|value| matches!(value, ScalarValue::String(_)))
+    })
+}
+
 /// Rows of one ordered page, in index order, and where to continue from.
 /// `R` is what each row carries beside its vertex id: the record, or the
 /// entry's value alone for a caller that reads nothing else (see
@@ -368,7 +382,44 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<OrderedVertexPropertyPage<VertexMetadata>> {
-        self.walk_ordered_vertex_property_page_at(cell_id, request, read_epoch, budget)
+        self.walk_ordered_vertex_property_page_at(cell_id, request, &[], read_epoch, budget)
+            .await
+    }
+
+    /// Check string equality membership before fetching a full vertex record.
+    /// The complete predicate is still evaluated by the executor. Unsupported
+    /// scalars and oversized disjunctions are left to that predicate, never
+    /// truncated into a narrower (incorrect) condition.
+    pub(in crate::shard) async fn scan_ordered_vertex_property_filtered_page_at(
+        &self,
+        cell_id: &str,
+        request: &OrderedPropertyScanRequest,
+        equalities: &[PropertyEqualityCandidate],
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<OrderedVertexPropertyPage<VertexMetadata>> {
+        if equalities.is_empty() {
+            return self
+                .scan_ordered_vertex_property_page_at(cell_id, request, read_epoch, budget)
+                .await;
+        }
+        let mut memberships = Vec::new();
+        for equality in ordered_string_memberships(equalities) {
+            let encoded = equality
+                .values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::String(value) => Some(encode_vertex_property_value_key(&VertexPropertyValue::String(value.to_string()))),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(encoded) = encoded {
+                validate_component("property", &equality.property)?;
+                let prefix = self.vertex_property_index_prefix_at(cell_id, &equality.property, budget).await?;
+                memberships.push((prefix, encoded));
+            }
+        }
+        self.walk_ordered_vertex_property_page_at(cell_id, request, &memberships, read_epoch, budget)
             .await
     }
 
@@ -382,7 +433,7 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<OrderedVertexPropertyPage<ScalarValue>> {
-        self.walk_ordered_vertex_property_page_at(cell_id, request, read_epoch, budget)
+        self.walk_ordered_vertex_property_page_at(cell_id, request, &[], read_epoch, budget)
             .await
     }
 
@@ -410,7 +461,7 @@ impl GraphShard {
             &bounded
         };
         let page = self
-            .walk_ordered_vertex_property_page_at::<CountedEntry>(cell_id, request, read_epoch, budget)
+            .walk_ordered_vertex_property_page_at::<CountedEntry>(cell_id, request, &[], read_epoch, budget)
             .await?;
         self.ensure_query_scan_edges(
             "experimental_ordered_vertex_count_entries",
@@ -428,6 +479,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         request: &OrderedPropertyScanRequest,
+        memberships: &[(String, Vec<String>)],
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<OrderedVertexPropertyPage<R>> {
@@ -550,7 +602,9 @@ impl GraphShard {
                             )
                             .await?;
                         let mut stream = OpenStream { iter, head: None };
-                        stream.advance(property, budget, &mut index_entries).await?;
+                        stream
+                            .advance(property, budget, &mut index_entries, (!memberships.is_empty()).then_some(self))
+                            .await?;
                         open.push(stream);
                     }
                     continue;
@@ -577,7 +631,9 @@ impl GraphShard {
                 }
                 let stream = &mut open[best.expect("a stream has a head")];
                 let entry = stream.head.take().expect("selected head");
-                stream.advance(property, budget, &mut index_entries).await?;
+                stream
+                    .advance(property, budget, &mut index_entries, (!memberships.is_empty()).then_some(self))
+                    .await?;
                 budget.check("experimental_ordered_vertex_property_index")?;
 
                 if let Some((resume_value, resume_id)) = &resume {
@@ -605,7 +661,12 @@ impl GraphShard {
                 // An entry-bounded page ends here without claiming the index is
                 // spent; like the stop above, before `last` moves, so the next
                 // page resumes at this entry.
-                if request.max_index_entries.is_some_and(|max| judged >= max) {
+                // Membership can reject a whole page. Yield a cursor after a
+                // bounded amount of index work so the executor can still probe
+                // sparse/absent predicates instead of scanning to admission.
+                if request.max_index_entries.is_some_and(|max| judged >= max)
+                    || (!memberships.is_empty() && judged >= FILTERED_PAGE_ENTRIES)
+                {
                     stop = true;
                     break;
                 }
@@ -632,7 +693,9 @@ impl GraphShard {
                 // and like the probe it must leave the fallback the allowance
                 // the fallback has without it -- entries charged here would
                 // stay on the tally after the decline.
-                if request.max_index_entries.is_none() {
+                // Filtered index reads are charged in OpenStream::advance,
+                // including look-ahead and entries rejected before this point.
+                if memberships.is_empty() && request.max_index_entries.is_none() {
                     self.charge_query_index_candidates("experimental_ordered_vertex_property_candidates", budget, 1)?;
                 }
                 if !request.accepts(&entry.value) {
@@ -652,6 +715,41 @@ impl GraphShard {
             }
             if !candidates.is_empty() {
                 let hydrate_started = std::time::Instant::now();
+                let candidates = if memberships.is_empty() {
+                    candidates
+                } else {
+                    stream::iter(candidates)
+                        .map(|entry| async move {
+                            for (prefix, alternatives) in memberships {
+                                let mut matched = false;
+                                for encoded in alternatives {
+                                    self.ensure_query_scan_edges("experimental_ordered_equality_membership", budget.add_scanned_edges(1))?;
+                                    let key = format!("{prefix}{}", keys::vertex_property_index_entry_suffix(encoded, entry.vertex_id));
+                                    if budget
+                                        .read_only_io("experimental_ordered_equality_membership", self.read_remote(&key))
+                                        .await?
+                                        .is_some()
+                                    {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                                if !matched {
+                                    return Ok(None);
+                                }
+                            }
+                            // Seed entry caps bound the walk, not record hydration.
+                            // Keep record admission cumulative across that transition.
+                            self.charge_query_index_candidates("experimental_ordered_filtered_candidates", budget, 1)?;
+                            Ok::<_, GraphError>(Some(entry))
+                        })
+                        .buffered(QUERY_METADATA_HYDRATION_CONCURRENCY)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                };
                 let verified = R::verify(self, cell_id, request, candidates, read_epoch, budget).await?;
                 hydrate_us = hydrate_us.saturating_add(u64::try_from(hydrate_started.elapsed().as_micros()).unwrap_or(u64::MAX));
                 for (entry, detail) in verified {
@@ -740,7 +838,13 @@ struct OpenStream {
 }
 
 impl OpenStream {
-    async fn advance(&mut self, property: &str, budget: &QueryBudget, index_entries: &mut u64) -> Result<()> {
+    async fn advance(
+        &mut self,
+        property: &str,
+        budget: &QueryBudget,
+        index_entries: &mut u64,
+        filtered_shard: Option<&GraphShard>,
+    ) -> Result<()> {
         loop {
             let Some(kv) = budget
                 .read_only_io("experimental_ordered_vertex_index_next", async {
@@ -752,6 +856,12 @@ impl OpenStream {
                 return Ok(());
             };
             *index_entries += 1;
+            // Charge actual iterator entries, including look-ahead retained in
+            // head and keys rejected during parsing/range checks. The shared
+            // budget survives page boundaries; membership gets are additional.
+            if let Some(shard) = filtered_shard {
+                shard.ensure_query_scan_edges("experimental_ordered_filtered_index_entries", budget.add_scanned_edges(1))?;
+            }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (_cell, indexed_property, encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
             // A property whose name extends this one shares the byte prefix.

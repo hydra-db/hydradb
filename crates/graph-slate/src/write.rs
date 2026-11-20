@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const RELATIONSHIP_IMPORT_READ_CONCURRENCY: usize = 32;
+pub const OWNED_RELATIONSHIP_HEAD_PREFIX: &str = "__hydradb_owned_rel_set_";
 
 /// The error every write path returns for a list longer than
 /// [`MAX_PROPERTY_LIST_ELEMENTS`], so both engines and every client route
@@ -219,6 +220,18 @@ pub async fn apply_vertex_metadata_update_txn(
     _epoch: StorageSequence,
     generations: &mut WriteBackGenerations,
 ) -> Result<(u64, u64)> {
+    let mut protected = None;
+    if let Some(previous) = previous {
+        for (key, value) in &previous.properties {
+            if key.starts_with(OWNED_RELATIONSHIP_HEAD_PREFIX) && next.properties.get(key) != Some(value) {
+                protected
+                    .get_or_insert_with(|| next.clone())
+                    .properties
+                    .insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let next = protected.as_ref().unwrap_or(next);
     validate_vertex_metadata(next)?;
     if previous.is_none() {
         clear_write_back_values_of_new_vertex_txn(txn, cell_id, vertex_id, generations).await?;
