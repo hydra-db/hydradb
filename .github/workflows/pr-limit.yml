@@ -22,7 +22,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request_target' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@v9
         with:
           script: |
             const MAX = parseInt(process.env.MAX_OPEN, 10);
@@ -73,7 +73,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@v9
         with:
           script: |
             const MAX = parseInt(process.env.MAX_OPEN, 10);
