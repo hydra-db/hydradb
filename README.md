@@ -77,10 +77,51 @@ visible WAL tail is applied to the indexed base. See
 
 ## Getting Started
 
+### Run with Docker
+
+The published image needs no Rust toolchain or native libraries. Each release
+pushes `ghcr.io/hydra-db/hydradb` for `linux/amd64` and `linux/arm64`, tagged
+`latest`, the version (`0.5.0`, `0.5`, `0`), and `sha-<commit>`. Its entrypoint
+is `graph-node`. A single plaintext development node on a local directory:
+
+```bash
+mkdir -p .hydradb/store
+printf '%s\n' 'local-development-token-32-bytes' > .hydradb/auth-token
+
+docker run -d --name hydradb -p 7687:7687 -p 8443:8443 -p 9090:9090 \
+  -v "$PWD/.hydradb/store:/data" \
+  -v "$PWD/.hydradb/auth-token:/run/secrets/auth-token:ro" \
+  -e CLOUD_PROVIDER=local -e LOCAL_PATH=/data \
+  -e GRAPH_NAMESPACE=default -e GRAPH_ID=default \
+  -e GRAPH_CELL_ID=cell-0 -e GRAPH_CELLS=cell-0 -e GRAPH_NODE_ID=node-0 \
+  -e GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:7687 \
+  -e GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:7687 \
+  -e GRAPH_AUTH_TOKEN_FILE=/run/secrets/auth-token -e GRAPH_ALLOW_PLAINTEXT=true \
+  ghcr.io/hydra-db/hydradb:latest
+
+curl -fsS http://127.0.0.1:9090/readyz && echo READY
+```
+
+Ports, token, and namespace match [Run a local node](#run-a-local-node), so its
+`curl` examples work unchanged. Bolt clients use any non-empty username and the
+token as the password. The graph persists in `.hydradb/store` across
+`docker rm`; delete the directory to start over.
+
+The container runs as uid `10001`. Docker Desktop maps bind-mount ownership for
+you; on Linux, run `sudo chown 10001:10001 .hydradb/store` first. Don't use
+`--user` instead: the image's cache directory is owned by `10001`, and the node
+exits with `Permission denied`. Change `GRAPH_ADVERTISED_BOLT_ADDR` and
+`GRAPH_BOLT_NODE_ADDRESSES` if clients reach the node by another address.
+
+The image also ships `graph-indexer` and `falkor-dump-import` (use
+`--entrypoint`), and is built with the DataFusion engine and OTLP export. For
+production, use the [Helm chart](#kubernetes), which defaults to this image.
+
 ### Prerequisites
 
-Rust 1.99+, a C/C++ toolchain, `libcypher-parser`, and SuiteSparse GraphBLAS.
-[`just`](https://github.com/casey/just) runs the recipes. On Ubuntu or WSL:
+Building from source needs Rust 1.99+, a C/C++ toolchain, `libcypher-parser`,
+and SuiteSparse GraphBLAS. [`just`](https://github.com/casey/just) runs the
+recipes. On Ubuntu or WSL:
 
 ```bash
 sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config \
