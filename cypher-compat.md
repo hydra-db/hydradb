@@ -256,8 +256,8 @@ ids are integers, carrying a string mirror of the id as a separate property and
 pointing `sourceProperty` at that is one way to address nodes here.
 
 The two value lists must also be written as literals. Supplying them through a
-query parameter is rejected with `composite parameter $name is only supported as
-an UNWIND input`, so they are inlined into the statement text.
+query parameter is rejected with `sourceValues must be a list of strings`, so
+they are inlined into the statement text.
 
 `relDirection` accepts `'incoming'`, `'outgoing'` and `'both'`, case-insensitively;
 other spellings such as `'in'` are rejected.
