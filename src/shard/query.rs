@@ -763,6 +763,9 @@ impl GraphShard {
                 let result = Box::pin(self.execute_parsed_opencypher_mutation_with_receipt(context, query, parsed)).await?;
                 return Ok(QueryOutput::Mutation(result));
             }
+            if crate::query::opencypher::opencypher_statement_is_explain(query) {
+                return self.explain_opencypher_result_set(context, query).await.map(QueryOutput::Rows);
+            }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
                 .await?;
@@ -790,6 +793,9 @@ impl GraphShard {
                 crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
             {
                 return Box::pin(self.execute_native_procedure_rows(context, procedure)).await;
+            }
+            if crate::query::opencypher::opencypher_statement_is_explain(query) {
+                return self.explain_opencypher_result_set(context, query).await;
             }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
@@ -823,6 +829,10 @@ impl GraphShard {
                 crate::query::path_procedure::parse_native_procedure(query, &context.parameters, self.limits.max_traversal_hops)?
             {
                 return Box::pin(self.execute_native_path_rows_page(context, query, procedure, cursor, page_size)).await;
+            }
+            if crate::query::opencypher::opencypher_statement_is_explain(query) {
+                let plan = self.explain_opencypher_result_set(context, query).await?;
+                return Ok(QueryResultPage::new(plan.columns, plan.rows, None));
             }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters, &context.list_parameters)
@@ -978,6 +988,23 @@ impl GraphShard {
         let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
         let read_epoch = self.query_read_epoch(&context).await?;
         self.explain_row_query_plan_with_stats(&context.cell_id, read_epoch, &parsed).await
+    }
+
+    /// Answer an `EXPLAIN` read on the legacy engine: plan it, never run it,
+    /// and return the plan as one `plan` row, the same shape the experimental
+    /// engine returns. Before #348 the legacy engine ignored `EXPLAIN` and ran
+    /// the statement.
+    #[cfg(feature = "opencypher")]
+    async fn explain_opencypher_result_set(&self, context: QueryContext, query: &str) -> Result<QueryResultSet> {
+        let plan = self.explain_opencypher_rows(context, query).await?;
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("plan")],
+            vec![QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                plan.render(),
+            ))])],
+        )
+        .with_read_epoch(plan.read_epoch)
+        .with_storage_sequence(plan.read_epoch))
     }
 
     #[cfg(feature = "opencypher")]

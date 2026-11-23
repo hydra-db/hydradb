@@ -639,6 +639,16 @@ fn starts_with_non_unwind_clause(query: &str) -> bool {
 /// so a write it cannot read stays the parse error it was, and the legacy
 /// engine, which still parses with libcypher, refuses such a read as before.
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    let classified = classify_without_explain_guard(query);
+    // `query_access` refuses an EXPLAIN of a write it parses itself. This also
+    // covers the writes recognised before parsing: procedure calls.
+    if matches!(classified, Ok(OpenCypherQueryAccess::Write)) && opencypher_statement_is_explain(query) {
+        return refuse_explain_of_write();
+    }
+    classified
+}
+
+fn classify_without_explain_guard(query: &str) -> Result<OpenCypherQueryAccess> {
     if super::owned_relationships::is_owned_relationship_set_call(query)? {
         return Ok(OpenCypherQueryAccess::Write);
     }
@@ -1297,6 +1307,20 @@ impl ParsedCypher {
         }
     }
 
+    /// Whether the single statement this parse holds is an `EXPLAIN`.
+    fn statement_explains(&self) -> Result<bool> {
+        unsafe {
+            if sys::cypher_parse_result_ndirectives(self.result) != 1 {
+                return Ok(false);
+            }
+            let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
+            if !is_instance(statement, AstKind::Statement) {
+                return Ok(false);
+            }
+            statement_has_explain(statement)
+        }
+    }
+
     fn query_access(&self) -> Result<OpenCypherQueryAccess> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
@@ -1338,6 +1362,11 @@ impl ParsedCypher {
                 {
                     has_unknown_clause = true;
                 }
+            }
+            // Classified as a write, an EXPLAIN would be dispatched to the
+            // mutation path and committed.
+            if has_write_clause && statement_has_explain(statement)? {
+                return refuse_explain_of_write();
             }
             if has_unknown_clause {
                 return unsupported(
@@ -1408,6 +1437,14 @@ impl ParsedCypher {
             let unwind = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
             if !is_instance(unwind, AstKind::Unwind) {
                 return Ok(None);
+            }
+            // A batch runs as soon as it is lowered, and there is no batch plan
+            // to describe instead, so EXPLAIN of one is refused (#348).
+            if statement_has_explain(statement)? {
+                return unsupported(
+                    QueryFailureReason::Unwind,
+                    "EXPLAIN of an UNWIND batch is refused: EXPLAIN never executes a statement, and batches have no plan to show",
+                );
             }
             let expression = checked_node(sys::cypher_ast_unwind_get_expression(unwind))?;
             if !is_instance(expression, AstKind::Parameter) {
@@ -1757,7 +1794,13 @@ impl ParsedCypher {
             ensure_instance(statement, AstKind::Statement, "statement")?;
             let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
             ensure_instance(body, AstKind::Query, "query")?;
-            self.lower_mutation_query_body(body, parameters, lists)
+            let lowered = self.lower_mutation_query_body(body, parameters, lists)?;
+            // Reads lower to `None` here and go on to be planned; only a
+            // statement that would execute as a mutation is refused.
+            if lowered.is_some() && statement_has_explain(statement)? {
+                return refuse_explain_of_write();
+            }
+            Ok(lowered)
         }
     }
 
@@ -2653,6 +2696,9 @@ pub(crate) fn lower_unwind_match_mutation_rows(
     let parameters = bind_native_list_parameters(parameters, lists);
     with_parsed_cypher(query, |parsed| unsafe {
         let statement = checked_node(sys::cypher_parse_result_get_directive(parsed.result, 0))?;
+        if statement_has_explain(statement)? {
+            return refuse_explain_of_write();
+        }
         let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
         ensure_instance(body, AstKind::Query, "query")?;
         let mut lowered = Vec::with_capacity(rows.len());
@@ -5426,6 +5472,46 @@ fn unsupported<T>(reason: QueryFailureReason, feature: impl Into<String>) -> Res
     Err(unsupported_value(reason, feature))
 }
 
+/// `EXPLAIN` promises to describe a statement without running it, and tools
+/// rely on that to vet untrusted Cypher. The legacy engine has no plan to show
+/// for a write, so it refuses the statement instead of executing it (#348).
+fn refuse_explain_of_write<T>() -> Result<T> {
+    unsupported(
+        QueryFailureReason::Mutation,
+        "EXPLAIN of a write statement is refused: EXPLAIN never executes a statement, and writes have no plan to show",
+    )
+}
+
+/// Whether `statement` carries an `EXPLAIN` option. libcypher parses
+/// `EXPLAIN` and `PROFILE` as options of the statement, beside its body, so
+/// code that only reads the body never sees them.
+///
+/// # Safety
+///
+/// `statement` must be a live `CYPHER_AST_STATEMENT` node.
+unsafe fn statement_has_explain(statement: *const AstNode) -> Result<bool> {
+    unsafe {
+        for index in 0..sys::cypher_ast_statement_noptions(statement) {
+            let option = checked_node(sys::cypher_ast_statement_get_option(statement, index))?;
+            if is_instance(option, AstKind::ExplainOption) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `query` is an `EXPLAIN` statement, read from the leading keyword
+/// so that it also answers for text the parser handles in pieces, such as
+/// `UNION` arms, and for the procedure calls matched before parsing.
+pub(crate) fn opencypher_statement_is_explain(query: &str) -> bool {
+    let leading = query
+        .split_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("EXPLAIN"));
+    leading || with_parsed_cypher(query, ParsedCypher::statement_explains).unwrap_or(false)
+}
+
 fn unsupported_value(reason: QueryFailureReason, feature: impl Into<String>) -> GraphError {
     GraphError::UnsupportedQuery {
         dialect: "OpenCypher",
@@ -5438,5 +5524,96 @@ fn parse_error(reason: impl Into<String>) -> GraphError {
     GraphError::QueryParse {
         dialect: "OpenCypher",
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    const WRITES: &[&str] = &[
+        "EXPLAIN CREATE (a:A {id: 1})-[:LINK]->(b:B {id: 2})",
+        "explain MERGE (a {id: 1})-[:LINK]->(b {id: 2})",
+        "EXPLAIN MATCH (a:A {id: 1}) SET a.name = 'changed'",
+        "EXPLAIN MATCH (a:A {id: 1}) REMOVE a.name",
+        "EXPLAIN MATCH (a:A {id: 1}) DETACH DELETE a",
+        "EXPLAIN UNWIND $rows AS row CREATE (a {id: row.src})-[:LINK]->(b {id: row.dst})",
+    ];
+
+    fn is_explain_refusal(result: &Result<impl std::fmt::Debug>) -> bool {
+        matches!(result, Err(GraphError::UnsupportedQuery { feature, .. }) if feature.contains("EXPLAIN"))
+    }
+
+    /// Every client request is authorized from this classification, so an
+    /// `EXPLAIN` that reaches the write path here is executed as a write.
+    #[test]
+    fn classification_refuses_explain_of_a_write() {
+        for query in WRITES {
+            let classified = classify_opencypher_query_access(query);
+            assert!(
+                is_explain_refusal(&classified),
+                "{query}: expected an EXPLAIN refusal, got {classified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_keeps_explain_of_a_read_a_read() {
+        for query in [
+            "EXPLAIN MATCH (n:A {id: 1}) RETURN n.id AS id",
+            "explain MATCH (a:A)-[:LINK]->(b) RETURN b.id",
+        ] {
+            assert_eq!(
+                classify_opencypher_query_access(query).ok(),
+                Some(OpenCypherQueryAccess::Read),
+                "{query}"
+            );
+        }
+    }
+
+    /// Callers that skip classification and lower directly, such as the
+    /// embedded shard API, must not get an executable mutation either.
+    #[test]
+    fn preparation_and_mutation_lowering_refuse_explain_of_a_write() {
+        let mut lists = ListParameters::new();
+        lists.insert("rows".to_string(), Vec::new());
+        for query in WRITES {
+            let prepared = prepare_opencypher_query_with_parameters(query, &BTreeMap::new(), &lists);
+            assert!(is_explain_refusal(&prepared), "{query}: prepare should refuse, got {prepared:?}");
+            // `Ok(None)` is "not a mutation this lowering owns" (UNWIND batches
+            // lower elsewhere); what must never come back is an executable one.
+            let lowered = parse_opencypher_mutation_query_with_list_parameters(query, &BTreeMap::new(), &lists);
+            assert!(
+                !matches!(lowered, Ok(Some(_))),
+                "{query}: mutation lowering must not yield a mutation, got {lowered:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn unwind_batch_lowering_never_yields_a_batch_for_explain() {
+        let batch = parse_opencypher_unwind_batch("EXPLAIN UNWIND $rows AS row CREATE (a {id: row.src})-[:LINK]->(b {id: row.dst})");
+        assert!(
+            !matches!(batch, Ok(Some(_))),
+            "EXPLAIN must not lower to an executable batch, got {batch:?}"
+        );
+    }
+
+    #[test]
+    fn statements_without_explain_are_unaffected() {
+        assert_eq!(
+            classify_opencypher_query_access("CREATE (a:A {id: 1})-[:LINK]->(b:B {id: 2})").ok(),
+            Some(OpenCypherQueryAccess::Write)
+        );
+        assert_eq!(
+            classify_opencypher_query_access("MATCH (n:A {id: 1}) RETURN n.id AS id").ok(),
+            Some(OpenCypherQueryAccess::Read)
+        );
+        // A property or label merely named "explain" is not the statement option.
+        assert_eq!(
+            classify_opencypher_query_access("MATCH (n:A {explain: 1}) RETURN n.explain AS explain").ok(),
+            Some(OpenCypherQueryAccess::Read)
+        );
     }
 }

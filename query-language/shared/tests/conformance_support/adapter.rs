@@ -190,11 +190,14 @@ impl Adapter for HydraAdapter {
             CypherEngineMode::DataFusion => Err(datafusion_adapter_not_supported()),
             CypherEngineMode::Legacy => validate_opencypher_syntax(query).map_err(syntax_diagnostic),
             CypherEngineMode::Experimental => {
-                if matches!(
-                    prepare_opencypher_query_with_parameters(query, &BTreeMap::new(), &BTreeMap::new()),
-                    Ok(PreparedOpenCypherQuery::Write(_))
-                ) {
-                    return validate_opencypher_syntax(query).map_err(syntax_diagnostic);
+                match prepare_opencypher_query_with_parameters(query, &BTreeMap::new(), &BTreeMap::new()) {
+                    Ok(PreparedOpenCypherQuery::Write(_)) => return validate_opencypher_syntax(query).map_err(syntax_diagnostic),
+                    // Production classification refuses an EXPLAIN of a write
+                    // before the Cypher 25 parser sees it (#348).
+                    Err(error @ GraphError::UnsupportedQuery { .. }) if is_explain_refusal(&error) => {
+                        return Err(preparation_diagnostic(error));
+                    }
+                    _ => {}
                 }
                 parse_cypher25_syntax(query).map(|_| ()).map_err(|error| Diagnostic {
                     phase: "compile time".into(),
@@ -913,6 +916,10 @@ fn syntax_diagnostic(error: GraphError) -> Diagnostic {
     diagnostic.error_type = "SyntaxError".into();
     diagnostic.stage = "parser".into();
     diagnostic
+}
+
+fn is_explain_refusal(error: &GraphError) -> bool {
+    matches!(error, GraphError::UnsupportedQuery { feature, .. } if feature.starts_with("EXPLAIN of"))
 }
 
 fn preparation_diagnostic(error: GraphError) -> Diagnostic {

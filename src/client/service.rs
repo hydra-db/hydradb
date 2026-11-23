@@ -2330,6 +2330,11 @@ impl ClientQueryService {
                 match action {
                     QueryTransportAction::Read => match parse_native_procedure_columns(&request.query)? {
                         Some(columns) => columns,
+                        // Bolt announces fields before any row: an EXPLAIN
+                        // returns its plan, not the statement's columns.
+                        None if crate::query::opencypher::opencypher_statement_is_explain(&request.query) => {
+                            vec![QueryColumn::new("plan")]
+                        }
                         None => {
                             parse_opencypher_row_query_with_list_parameters(&request.query, &scalar_parameters, &list_parameters)?.columns
                         }
