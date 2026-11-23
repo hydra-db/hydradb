@@ -87,8 +87,10 @@ is `graph-node`. A single plaintext development node on a local directory:
 ```bash
 mkdir -p .hydradb/store
 printf '%s\n' 'local-development-token-32-bytes' > .hydradb/auth-token
+chmod 600 .hydradb/auth-token
 
-docker run -d --name hydradb -p 7687:7687 -p 8443:8443 -p 9090:9090 \
+docker run -d --name hydradb \
+  -p 127.0.0.1:7687:7687 -p 127.0.0.1:8443:8443 -p 127.0.0.1:9090:9090 \
   -v "$PWD/.hydradb/store:/data" \
   -v "$PWD/.hydradb/auth-token:/run/secrets/auth-token:ro" \
   -e CLOUD_PROVIDER=local -e LOCAL_PATH=/data \
@@ -107,11 +109,24 @@ Ports, token, and namespace match [Run a local node](#run-a-local-node), so its
 token as the password. The graph persists in `.hydradb/store` across
 `docker rm`; delete the directory to start over.
 
+The token is readable only by its owner, and the ports are published on
+loopback only, so nothing outside this machine can reach the node. This recipe
+is for local development. For production, treat the token as a real secret:
+generate a unique random value, keep it out of docs and shell history, deliver
+it through a secret manager (the [Helm chart](#kubernetes) mounts it from a
+Kubernetes Secret), and turn TLS back on by dropping `GRAPH_ALLOW_PLAINTEXT`.
+
 The container runs as uid `10001`. Docker Desktop maps bind-mount ownership for
-you; on Linux, run `sudo chown 10001:10001 .hydradb/store` first. Don't use
-`--user` instead: the image's cache directory is owned by `10001`, and the node
-exits with `Permission denied`. Change `GRAPH_ADVERTISED_BOLT_ADDR` and
-`GRAPH_BOLT_NODE_ADDRESSES` if clients reach the node by another address.
+you. On Linux, hand both mounts to that uid first, or the node exits with
+`Permission denied` on the store or the `0600` token:
+
+```bash
+sudo chown -R 10001:10001 .hydradb/store .hydradb/auth-token
+```
+
+Don't use `--user` instead: the image's cache directory is owned by `10001`,
+and the node exits with `Permission denied`. Change `GRAPH_ADVERTISED_BOLT_ADDR`
+and `GRAPH_BOLT_NODE_ADDRESSES` if clients reach the node by another address.
 
 The image also ships `graph-indexer` and `falkor-dump-import` (use
 `--entrypoint`), and is built with the DataFusion engine and OTLP export. For
