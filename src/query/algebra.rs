@@ -983,6 +983,52 @@ pub struct RowQueryPlan {
     pub union_arms: Vec<RowQueryPlan>,
 }
 
+impl RowQueryPlan {
+    /// The plan as indented text, one operator per line: the single `plan`
+    /// value an `EXPLAIN` returns, matching the experimental engine's shape.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out, 0);
+        out
+    }
+
+    fn render_into(&self, out: &mut String, depth: usize) {
+        use std::fmt::Write as _;
+        let indent = "  ".repeat(depth);
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "{indent}RowQuery(columns=[{columns}], read_epoch={})", self.read_epoch);
+        for group in &self.groups {
+            let _ = writeln!(
+                out,
+                "{indent}  Group(optional={}, predicate={}, estimated_rows={}, passes={:?})",
+                group.optional, group.has_predicate, group.estimated_cardinality, group.optimizer_passes
+            );
+            for pattern in &group.patterns {
+                let _ = writeln!(
+                    out,
+                    "{indent}    Pattern#{} {:?} bindings=[{}] estimated_rows={} passes={:?}",
+                    pattern.original_index,
+                    pattern.access,
+                    pattern.bindings.join(", "),
+                    pattern.estimated_cardinality,
+                    pattern.optimizer_passes
+                );
+            }
+        }
+        if !self.union_arms.is_empty() {
+            let _ = writeln!(out, "{indent}  {}", if self.union_all { "UnionAll" } else { "Union" });
+            for arm in &self.union_arms {
+                arm.render_into(out, depth + 2);
+            }
+        }
+    }
+}
+
 #[cfg_attr(feature = "query-transport", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlanGroup {

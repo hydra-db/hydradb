@@ -49,3 +49,67 @@ Feature: HydraDB local Cypher contracts
     Then the result should be, in any order:
       | source | target |
       | 1      | 2      |
+
+  Scenario: EXPLAIN of CREATE is refused and writes nothing
+    Given an empty graph
+    When executing query:
+      """
+      EXPLAIN CREATE (a:A {id: 1})-[:LINK]->(b:B {id: 2})
+      """
+    Then an UnsupportedQuery should be raised at any time: *
+    When executing control query:
+      """
+      MATCH (a:A)-[:LINK]->(b:B) RETURN a.id AS source
+      """
+    Then the result should be empty
+
+  Scenario: Lowercase explain of MERGE is refused and writes nothing
+    Given an empty graph
+    When executing query:
+      """
+      explain MERGE (a:A {id: 1})-[:LINK]->(b:B {id: 2})
+      """
+    Then an UnsupportedQuery should be raised at any time: *
+    When executing control query:
+      """
+      MATCH (a:A)-[:LINK]->(b:B) RETURN a.id AS source
+      """
+    Then the result should be empty
+
+  Scenario: EXPLAIN of SET is refused and leaves the property unchanged
+    Given an empty graph
+    And having executed:
+      """
+      CREATE (a:A {id: 1, name: 'original'})-[:LINK]->(b:B {id: 2})
+      """
+    When executing query:
+      """
+      EXPLAIN MATCH (a:A {id: 1}) SET a.name = 'changed'
+      """
+    Then an UnsupportedQuery should be raised at any time: *
+    When executing control query:
+      """
+      MATCH (a:A {id: 1}) RETURN a.name AS name
+      """
+    Then the result should be, in any order:
+      | name       |
+      | 'original' |
+
+  Scenario: EXPLAIN of DETACH DELETE is refused and keeps the node
+    Given an empty graph
+    And having executed:
+      """
+      CREATE (a:A {id: 1})-[:LINK]->(b:B {id: 2})
+      """
+    When executing query:
+      """
+      EXPLAIN MATCH (a:A {id: 1}) DETACH DELETE a
+      """
+    Then an UnsupportedQuery should be raised at any time: *
+    When executing control query:
+      """
+      MATCH (a:A)-[:LINK]->(b:B) RETURN a.id AS source, b.id AS target
+      """
+    Then the result should be, in any order:
+      | source | target |
+      | 1      | 2      |

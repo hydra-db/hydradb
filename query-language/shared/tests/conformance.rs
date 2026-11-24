@@ -139,6 +139,45 @@ async fn production_adapters_execute_reads_and_shared_transactional_writes() {
     }
 }
 
+/// `EXPLAIN` describes a read without running it: one `plan` column holding
+/// one rendered plan, never the rows the query would have returned. Tooling
+/// such as LangChain's text-to-Cypher validation relies on that.
+#[tokio::test]
+async fn explain_of_a_read_returns_a_plan_and_not_its_rows() {
+    let corpus = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("query-language/cypher/tck/upstream");
+    for (engine, adapter) in [
+        ("legacy", legacy::adapter(&corpus)),
+        ("experimental", experimental::adapter(&corpus)),
+    ] {
+        let mut session = adapter.create().await.expect("create isolated graph");
+        adapter.fixture(&mut session, &Kind::EmptyGraph).await.expect("empty fixture");
+        adapter.parameters(&mut session, &BTreeMap::new()).await.expect("empty parameters");
+
+        let create = "CREATE (a:A {id: 1})-[:LINK]->(b:B {id: 2})";
+        adapter.prepare(&mut session, create).await.expect("create preparation");
+        adapter.execute(&mut session, create, 1).await.expect("create execution");
+
+        for explain in [
+            "EXPLAIN MATCH (n:A {id: 1}) RETURN n.id AS id",
+            "explain MATCH (a:A)-[:LINK]->(b:B) RETURN b.id AS id",
+        ] {
+            let observed = adapter.execute(&mut session, explain, 2).await.expect("explain execution");
+            match observed.outcome {
+                QueryOutcome::Rows { columns, rows } => {
+                    assert_eq!(columns, ["plan"], "{engine}: {explain} returned data columns instead of a plan");
+                    assert_eq!(rows.len(), 1, "{engine}: {explain} should return exactly one plan row");
+                    assert!(
+                        matches!(rows[0].as_slice(), [Value::String(plan)] if !plan.is_empty()),
+                        "{engine}: {explain} plan row should be one non-empty string, got {rows:?}"
+                    );
+                }
+                QueryOutcome::Error(error) => panic!("{engine}: {explain} returned diagnostic: {error:?}"),
+            }
+        }
+        adapter.close(session).await.expect("close graph");
+    }
+}
+
 #[tokio::test]
 async fn named_graph_fixture_resolves_extensionless_pinned_scripts() {
     let corpus = tempfile::tempdir().expect("create corpus directory");
@@ -165,8 +204,8 @@ fn local_declarative_cases_run_through_both_production_adapters() {
     let corpus = repository.join("query-language/cypher/cases");
     let upstream = repository.join("query-language/cypher/tck/upstream");
     let (defined, cases) = import_corpus(&corpus, "hydradb-local-v1", "hydradb-local");
-    assert_eq!(defined, 3);
-    assert_eq!(cases.len(), 3);
+    assert_eq!(defined, 7);
+    assert_eq!(cases.len(), 7);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
