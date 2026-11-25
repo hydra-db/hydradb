@@ -48,6 +48,17 @@ MATCH ()-[e:FOLLOWS {weight: 7}]->() RETURN count(*)
 Nodes match on `id`, optionally with a label and inline properties. A node
 carrying labels or non-id properties has to be named.
 
+A `MATCH` of a node on its own needs something to select on — an id, a label, or
+a property. There is no bounded set of vertices to scan without one, so the
+otherwise obvious `MATCH (n) RETURN count(*)` is refused:
+
+```
+node-only MATCH requires an id, label, or property predicate
+```
+
+This one is raised when the query runs rather than when it parses, so it is
+reported against real data rather than by a syntax check.
+
 ### Variable-length paths
 
 ```cypher
@@ -61,6 +72,38 @@ exactly three long.
 The maximum is required. `*1..` and `*` are rejected, because an unbounded
 traversal on a large graph has no predictable cost. The minimum defaults to 1
 when omitted, and must not exceed the maximum.
+
+#### The source node needs an id
+
+A variable-length pattern starts from a node whose `id` the pattern supplies,
+and walks the arrow away from it. The id may be a literal or a parameter, but it
+has to sit in that node's inline property map:
+
+```cypher
+MATCH (u {id: 1})-[:CHAIN*1..3]->(v) RETURN v.id
+MATCH (u {id: $start})-[:CHAIN*1..3]->(v) RETURN v.id
+```
+
+Without it the query is refused when it runs:
+
+```
+variable-length MATCH requires a fixed source id
+```
+
+This makes direction load-bearing in a way a fixed-length pattern does not. An
+inbound spelling puts the id on the destination and leaves the *source* unbound,
+so no arrangement of the same pattern satisfies the requirement:
+
+```cypher
+// refused: the source is (x), and (x) is the node being searched for
+MATCH (c {id: 5})<-[:DEPENDS_ON*1..2]-(x) RETURN x.name
+```
+
+So "everything reachable from X" is expressible and "everything that reaches X"
+is not, unless the graph also carries the reverse relationship type. For the
+same reason a transitive closure over a whole relation — every
+`(a)-[:MANAGES*1..6]->(b)` pair, with no bound endpoint — has to be driven from
+the client, one start node at a time.
 
 ### WHERE
 
@@ -268,6 +311,12 @@ Rejected at parse time, with the reason in the error:
 - Nested unions, mixed `UNION` and `UNION ALL`, and unions containing writes
 - Variable-length relationships in `CREATE` and `MERGE`
 - More than one statement per request
+
+Two are refused when the query runs instead, so they parse cleanly and are only
+reported once a statement reaches data:
+
+- A node-only `MATCH` carrying no id, label, or property predicate
+- A variable-length `MATCH` whose source node has no `id`
 
 ## Checking a query without running it
 
