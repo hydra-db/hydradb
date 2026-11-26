@@ -6,7 +6,9 @@
 //! from one index generation, so a cache would have to be keyed on it.
 //!
 //! PageRank is one `LAGr_PageRank` call, which handles sinks so scores sum to
-//! 1, and which has no result to give when `itermax` passes unconverged.
+//! 1, and which has no result to give when `itermax` passes unconverged. That
+//! call has no teleport vector, so a personalized run repeats the same
+//! iteration in Rust over the ordinal pairs; see [`personalized_pagerank`].
 //! Betweenness is `LAGr_Betweenness`, one batch of sources at a time.
 
 use std::ffi::{c_char, c_void, CStr};
@@ -188,6 +190,143 @@ pub(crate) fn pagerank(edges: &OrdinalEdges, damping: f32, tolerance: f32, max_i
     }
     check_lagraph(info, "LAGr_PageRank", &msg)?;
     Ok(Some((dense_fp32(&centrality, n)?, u32::try_from(iterations).unwrap_or(0))))
+}
+
+/// Personalized PageRank: [`pagerank`]'s iteration with the teleport mass
+/// spread over `source_ordinals` instead of every vertex. With every vertex as
+/// a source it converges to the same scores at the same damping and tolerance.
+///
+/// Sources must be distinct and below `edges.vertices`. `None` when
+/// `max_iterations` pass first; `check_budget` runs before every iteration and
+/// at every multiple of 4096 rows of the adjacency build.
+pub(crate) fn personalized_pagerank(
+    edges: &OrdinalEdges,
+    source_ordinals: &[u64],
+    damping: f32,
+    tolerance: f32,
+    max_iterations: u32,
+    mut check_budget: impl FnMut() -> Result<()>,
+) -> Result<Option<(Vec<f32>, u32)>> {
+    if source_ordinals.is_empty() {
+        return Err(GraphError::SparseKernel {
+            backend: "power-iteration",
+            reason: "personalized pagerank needs at least one source node".to_string(),
+        });
+    }
+    let n = usize::try_from(edges.vertices).unwrap_or(usize::MAX);
+    if let Some(source) = source_ordinals.iter().find(|source| **source >= edges.vertices) {
+        return Err(GraphError::SparseKernel {
+            backend: "power-iteration",
+            reason: format!("personalized pagerank source ordinal {source} is outside the {n}-vertex graph"),
+        });
+    }
+    if n == 0 {
+        return Ok(Some((Vec::new(), 0)));
+    }
+    let (offsets, targets) = deduplicated_adjacency(edges, &mut check_budget)?;
+    let source_share = 1.0_f32 / source_ordinals.len() as f32;
+    let mut teleport = vec![0.0_f32; n];
+    for &source in source_ordinals {
+        teleport[source as usize] = source_share;
+    }
+    // `LAGr_PageRank` starts from the uniform distribution rather than from
+    // the teleport vector; the fixed point is the same from either.
+    let mut rank = vec![1.0_f32 / n as f32; n];
+    let mut next = vec![0.0_f32; n];
+    for iteration in 1..=max_iterations {
+        check_budget()?;
+        let sink_mass = rank
+            .iter()
+            .enumerate()
+            .filter(|(vertex, _)| offsets[*vertex] == offsets[*vertex + 1])
+            .map(|(_, score)| *score)
+            .sum::<f32>();
+        let base = (1.0 - damping) + damping * sink_mass;
+        for (value, teleport) in next.iter_mut().zip(&teleport) {
+            *value = base * teleport;
+        }
+        for source in 0..n {
+            let start = offsets[source];
+            let end = offsets[source + 1];
+            if start == end {
+                continue;
+            }
+            let flow = damping * rank[source] / (end - start) as f32;
+            for &target in &targets[start..end] {
+                next[target as usize] += flow;
+            }
+        }
+        // Rounding drifts the total every iteration; the kernels promise a
+        // distribution, so restore it before comparing.
+        let total = next.iter().sum::<f32>();
+        if total > 0.0 {
+            let inverse = 1.0 / total;
+            for value in &mut next {
+                *value *= inverse;
+            }
+        }
+        let delta = next.iter().zip(&rank).map(|(next, rank)| (next - rank).abs()).sum::<f32>();
+        std::mem::swap(&mut rank, &mut next);
+        if delta <= tolerance {
+            return Ok(Some((rank, iteration)));
+        }
+    }
+    Ok(None)
+}
+
+/// The pairs as a CSR adjacency: `offsets[vertex]..offsets[vertex + 1]` holds
+/// that vertex's distinct targets, ascending. Parallel pairs collapse to one
+/// edge, since counting one twice would change an out-degree and every score.
+///
+/// `check_budget` runs at each row index that is a multiple of 4096 (row 0
+/// included), so a large build is interruptible like the iteration itself.
+fn deduplicated_adjacency(edges: &OrdinalEdges, check_budget: &mut impl FnMut() -> Result<()>) -> Result<(Vec<usize>, Vec<u64>)> {
+    let n = usize::try_from(edges.vertices).unwrap_or(usize::MAX);
+    let mut offsets = vec![0_usize; n + 1];
+    for &source in &edges.sources {
+        offsets[source as usize + 1] += 1;
+    }
+    for vertex in 1..=n {
+        offsets[vertex] += offsets[vertex - 1];
+    }
+    let mut targets = vec![0_u64; edges.len()];
+    let mut cursor = offsets.clone();
+    for (&source, &target) in edges.sources.iter().zip(&edges.targets) {
+        let slot = &mut cursor[source as usize];
+        targets[*slot] = target;
+        *slot += 1;
+    }
+    drop(cursor);
+    // Rows are visited in vertex order and a row never grows, so each
+    // deduplicated row can be copied into the space the earlier rows left.
+    let mut deduplicated = Vec::with_capacity(n + 1);
+    deduplicated.push(0);
+    let mut written = 0_usize;
+    for source in 0..n {
+        if source.is_multiple_of(4_096) {
+            check_budget()?;
+        }
+        let start = offsets[source];
+        let end = offsets[source + 1];
+        let row = &mut targets[start..end];
+        row.sort_unstable();
+        let mut length = 0;
+        let mut index = 0;
+        while index < row.len() {
+            let value = row[index];
+            row[length] = value;
+            length += 1;
+            index += 1;
+            while index < row.len() && row[index] == value {
+                index += 1;
+            }
+        }
+        targets.copy_within(start..start + length, written);
+        written += length;
+        deduplicated.push(written);
+    }
+    targets.truncate(written);
+    Ok((deduplicated, targets))
 }
 
 /// Betweenness centrality summed over `sources`, counting each ordered
@@ -456,4 +595,140 @@ fn message(msg: &[c_char; LAGRAPH_MSG_LEN]) -> String {
     let mut terminated = *msg;
     terminated[LAGRAPH_MSG_LEN - 1] = 0;
     unsafe { CStr::from_ptr(terminated.as_ptr()) }.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edges(vertices: u64, pairs: &[(u64, u64)]) -> OrdinalEdges {
+        let mut edges = OrdinalEdges::new(vertices);
+        for &(source, target) in pairs {
+            edges.push(source, target);
+        }
+        edges
+    }
+
+    fn personalized(edges: &OrdinalEdges, sources: &[u64]) -> Vec<f32> {
+        personalized_pagerank(edges, sources, 0.85, 1e-5, 500, || Ok(()))
+            .expect("the power iteration failed")
+            .expect("the power iteration did not converge")
+            .0
+    }
+
+    fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
+        assert_eq!(left.len(), right.len());
+        for (index, (left, right)) in left.iter().zip(right).enumerate() {
+            assert!((left - right).abs() <= tolerance, "score {index} differs: {left} against {right}");
+        }
+    }
+
+    fn assert_distribution(scores: &[f32]) {
+        let total: f32 = scores.iter().sum();
+        assert!((total - 1.0).abs() <= 1e-5, "scores sum to {total}, not 1");
+    }
+
+    /// The free equivalence test: every vertex a source is the unpersonalized
+    /// algorithm, so the two kernels must agree on the same topology.
+    #[test]
+    fn a_uniform_source_nodes_list_matches_lagraph_pagerank() {
+        let graphs = [
+            edges(4, &[(0, 1), (1, 2), (2, 3), (3, 0)]),
+            // A sink: 3 has no outgoing edge.
+            edges(4, &[(0, 1), (1, 2), (2, 3)]),
+            // Two disconnected components.
+            edges(4, &[(0, 1), (2, 3)]),
+            // A parallel pair that the matrix build collapses to one edge.
+            edges(3, &[(0, 1), (0, 1), (1, 2), (2, 0)]),
+            // A self-loop.
+            edges(3, &[(0, 0), (0, 1), (1, 2)]),
+        ];
+        for edges in graphs {
+            let uniform = (0..edges.vertices).collect::<Vec<_>>();
+            // Both runs stop once their own L1 change is below the tolerance,
+            // so the tighter the tolerance the smaller the gap the comparison
+            // has to absorb.
+            let expected = pagerank(&edges, 0.85, 1e-6, 500)
+                .expect("LAGraph failed")
+                .expect("LAGraph did not converge")
+                .0;
+            let personalized = personalized_pagerank(&edges, &uniform, 0.85, 1e-6, 500, || Ok(()))
+                .expect("the power iteration failed")
+                .expect("the power iteration did not converge")
+                .0;
+            assert_close(&personalized, &expected, 1e-4);
+        }
+    }
+
+    #[test]
+    fn a_personalized_run_keeps_its_mass_near_the_source() {
+        let edges = edges(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+        let scores = personalized(&edges, &[0]);
+        assert_distribution(&scores);
+        assert!(scores[0] > scores[1], "source {scores:?}");
+        assert!(scores[1] > scores[2], "hop 1 {scores:?}");
+        assert!(scores[2] > scores[3], "hop 2 {scores:?}");
+        assert!(scores[3] > scores[4], "hop 3 {scores:?}");
+    }
+
+    #[test]
+    fn a_sink_that_is_reachable_keeps_a_score() {
+        let edges = edges(3, &[(0, 1), (1, 2)]);
+        let scores = personalized(&edges, &[0]);
+        assert_distribution(&scores);
+        assert!(scores[2] > 0.0, "the sink's score is {scores:?}");
+    }
+
+    #[test]
+    fn several_sources_split_the_teleport_mass() {
+        // No edges at all: every vertex is a sink, so the whole distribution
+        // is the teleport vector.
+        let scores = personalized(&edges(4, &[]), &[0, 2]);
+        assert_close(&scores, &[0.5, 0.0, 0.5, 0.0], 1e-6);
+        assert_distribution(&scores);
+    }
+
+    #[test]
+    fn duplicate_pairs_count_once() {
+        let duplicated = edges(3, &[(0, 1), (0, 1), (1, 2), (2, 0)]);
+        let distinct = edges(3, &[(0, 1), (1, 2), (2, 0)]);
+        assert_eq!(personalized(&duplicated, &[0]), personalized(&distinct, &[0]));
+    }
+
+    #[test]
+    fn every_vertex_a_source_equals_the_uniform_teleport_vector() {
+        let edges = edges(3, &[(0, 1), (1, 2), (2, 0)]);
+        let scores = personalized(&edges, &[0, 1, 2]);
+        assert_distribution(&scores);
+        // Uniform teleport over a symmetric cycle is the uniform distribution.
+        assert_close(&scores, &[1.0 / 3.0; 3], 1e-5);
+    }
+
+    #[test]
+    fn the_budget_is_checked_before_the_first_iteration() {
+        let edges = edges(3, &[(0, 1), (1, 2)]);
+        let mut calls = 0;
+        let result = personalized_pagerank(&edges, &[0], 0.85, 1e-5, 500, || {
+            calls += 1;
+            Err(GraphError::SparseKernel {
+                backend: "test",
+                reason: "cancelled".to_string(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "the build checked the budget before iterating");
+    }
+
+    #[test]
+    fn a_run_that_does_not_converge_returns_none() {
+        let edges = edges(3, &[(0, 1), (1, 2)]);
+        assert_eq!(personalized_pagerank(&edges, &[0], 0.85, 0.0, 1, || Ok(())).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_sources_are_refused() {
+        let edges = edges(3, &[(0, 1)]);
+        assert!(personalized_pagerank(&edges, &[], 0.85, 1e-5, 10, || Ok(())).is_err());
+        assert!(personalized_pagerank(&edges, &[3], 0.85, 1e-5, 10, || Ok(())).is_err());
+    }
 }

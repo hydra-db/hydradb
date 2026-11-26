@@ -421,4 +421,4 @@ mod graphblas;
 mod lagraph;
 
 #[cfg(feature = "opencypher")]
-pub(crate) use lagraph::{betweenness, betweenness_batch, pagerank, OrdinalEdges};
+pub(crate) use lagraph::{betweenness, betweenness_batch, pagerank, personalized_pagerank, OrdinalEdges};

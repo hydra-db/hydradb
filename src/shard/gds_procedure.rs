@@ -634,16 +634,34 @@ impl GraphShard {
                 let config = config.clone();
                 let graph = Arc::clone(&graph);
                 run_graph_compute(Arc::clone(&self.operation_metrics), "gds_page_rank", move || {
-                    // One library call: the iteration limit bounds it, not
-                    // the deadline, which is checked only before it starts.
                     compute_budget.check("gds_page_rank")?;
-                    let Some((scores, iterations)) = crate::sparse_kernel::pagerank(
-                        &graph.edges,
-                        config.damping_factor as f32,
-                        config.tolerance as f32,
-                        config.max_iterations,
-                    )?
-                    else {
+                    let sources = config
+                        .source_nodes
+                        .as_deref()
+                        .map(|nodes| source_ordinals(&graph, nodes, &graph_name))
+                        .transpose()?;
+                    let result = match sources {
+                        // One library call: the iteration limit bounds it, not
+                        // the deadline, which is checked only before it starts.
+                        None => crate::sparse_kernel::pagerank(
+                            &graph.edges,
+                            config.damping_factor as f32,
+                            config.tolerance as f32,
+                            config.max_iterations,
+                        ),
+                        // The power iteration checks the deadline between
+                        // iterations, so a large personalized run stops when
+                        // the query is cancelled or times out.
+                        Some(sources) => crate::sparse_kernel::personalized_pagerank(
+                            &graph.edges,
+                            &sources,
+                            config.damping_factor as f32,
+                            config.tolerance as f32,
+                            config.max_iterations,
+                            || compute_budget.check("gds_page_rank"),
+                        ),
+                    };
+                    let Some((scores, iterations)) = result? else {
                         // GDS would return these scores with didConverge
                         // false; LAGraph frees them, so there is nothing to
                         // return but the reason.
@@ -718,11 +736,19 @@ impl GraphShard {
                 ("deletedPairsDropped", QueryValue::Count(deleted_pairs)),
             ];
             match &procedure.call {
-                GdsCall::PageRank { config, .. } => configuration.extend([
-                    ("maxIterations", QueryValue::Count(u64::from(config.max_iterations))),
-                    ("dampingFactor", QueryValue::Float(QueryFloat(config.damping_factor))),
-                    ("tolerance", QueryValue::Float(QueryFloat(config.tolerance))),
-                ]),
+                GdsCall::PageRank { config, .. } => {
+                    configuration.extend([
+                        ("maxIterations", QueryValue::Count(u64::from(config.max_iterations))),
+                        ("dampingFactor", QueryValue::Float(QueryFloat(config.damping_factor))),
+                        ("tolerance", QueryValue::Float(QueryFloat(config.tolerance))),
+                    ]);
+                    if let Some(nodes) = &config.source_nodes {
+                        configuration.push((
+                            "sourceNodes",
+                            QueryValue::List(nodes.iter().copied().map(QueryValue::VertexId).collect()),
+                        ));
+                    }
+                }
                 _ => configuration.extend([
                     ("samplingSize", QueryValue::Count(sampling.0)),
                     (
@@ -1087,6 +1113,56 @@ impl GraphShard {
     }
 }
 
+/// Returns the position of each `sourceNodes` id within `graph.vertices`, in
+/// the same order. The kernel addresses vertices by position, not by id.
+///
+/// Label projections keep `vertices` sorted, so each id is a binary search.
+/// `'*'` keeps them in first-encounter order, so one pass finds them all,
+/// using a map of only the requested ids. A missing id is an error.
+fn source_ordinals(graph: &GdsProjectedGraph, nodes: &[VertexId], graph_name: &str) -> Result<Vec<u64>> {
+    let unknown = |node: VertexId| {
+        gds_refusal(format!(
+            "sourceNodes node {node} is not a vertex of graph '{graph_name}'; project the node or drop it from sourceNodes"
+        ))
+    };
+    let ascending = graph.vertices.is_sorted();
+    if ascending {
+        return nodes
+            .iter()
+            .map(|node| {
+                graph
+                    .vertices
+                    .binary_search(node)
+                    .map(|ordinal| ordinal as u64)
+                    .map_err(|_| unknown(*node))
+            })
+            .collect();
+    }
+    let mut wanted = HashMap::with_capacity(nodes.len());
+    for (position, node) in nodes.iter().enumerate() {
+        wanted.entry(*node).or_insert(position);
+    }
+    let mut ordinals = vec![u64::MAX; nodes.len()];
+    let mut missing = nodes.len();
+    for (ordinal, vertex) in graph.vertices.iter().enumerate() {
+        let Some(&position) = wanted.get(vertex) else {
+            continue;
+        };
+        if ordinals[position] == u64::MAX {
+            ordinals[position] = ordinal as u64;
+            missing -= 1;
+            if missing == 0 {
+                break;
+            }
+        }
+    }
+    if missing > 0 {
+        let position = ordinals.iter().position(|ordinal| *ordinal == u64::MAX).unwrap_or_default();
+        return Err(unknown(nodes[position]));
+    }
+    Ok(ordinals)
+}
+
 /// The edge walk of [`GraphShard::gds_projected_graph`]. With labels,
 /// `members` are the vertices, in ascending id order, isolated ones
 /// included, and an edge is kept only when both ends are members. With
@@ -1419,4 +1495,45 @@ fn dense_sample_is_smaller(vertices: u64, size: u64) -> bool {
         _ => (size.saturating_mul(8) / 7).next_power_of_two(),
     };
     vertices.saturating_mul(8) <= buckets.saturating_mul(17).saturating_add(size.saturating_mul(8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projected_graph(vertices: Vec<VertexId>) -> GdsProjectedGraph {
+        let mut edges = OrdinalEdges::new(vertices.len() as u64);
+        if vertices.len() >= 2 {
+            edges.push(0, 1);
+        }
+        GdsProjectedGraph {
+            vertices,
+            edges,
+            deleted_pairs_dropped: 0,
+            distinct_pairs: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn a_sorted_projection_resolves_by_binary_search() {
+        let graph = projected_graph(vec![2, 4, 8]);
+        assert_eq!(source_ordinals(&graph, &[8, 2], "g").unwrap(), vec![2, 0]);
+        assert_eq!(source_ordinals(&graph, &[4], "g").unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn an_unsorted_projection_resolves_by_map() {
+        let graph = projected_graph(vec![8, 2, 4]);
+        assert_eq!(source_ordinals(&graph, &[2, 4], "g").unwrap(), vec![1, 2]);
+        assert_eq!(source_ordinals(&graph, &[8], "g").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn a_node_outside_the_projection_is_refused() {
+        for vertices in [vec![2, 4, 8], vec![8, 2, 4]] {
+            let graph = projected_graph(vertices);
+            let error = source_ordinals(&graph, &[3], "g").unwrap_err();
+            assert!(error.to_string().contains("sourceNodes node 3"), "{error}");
+        }
+    }
 }

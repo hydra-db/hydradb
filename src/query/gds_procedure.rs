@@ -11,10 +11,10 @@
 //! every option that would change the answer and is not implemented is
 //! refused by name rather than ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::path_procedure::{lex, Token};
-use crate::{GraphError, QueryColumn, QueryFailureReason, Result, VertexPropertyValue};
+use crate::{GraphError, QueryColumn, QueryFailureReason, Result, VertexId, VertexPropertyValue};
 
 /// The GDS release whose procedure signatures this surface answers. The
 /// client compares it with the oldest server version it supports.
@@ -284,6 +284,10 @@ pub(crate) struct GdsPageRankConfig {
     pub(crate) tolerance: f64,
     /// The `.write` mode's `writeProperty`; `None` is `.stream`.
     pub(crate) write_property: Option<String>,
+    /// `sourceNodes`: the vertices the teleport mass is spread over, in the
+    /// order given. `None` spreads it over every vertex, which is the
+    /// unpersonalized algorithm.
+    pub(crate) source_nodes: Option<Vec<VertexId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -717,6 +721,7 @@ fn page_rank_config(name: &str, config: Option<&GdsValue>) -> Result<GdsPageRank
         damping_factor: PAGE_RANK_DAMPING_FACTOR,
         tolerance: PAGE_RANK_TOLERANCE,
         write_property: None,
+        source_nodes: None,
     };
     let entries = match config {
         Some(config) => configuration(name, config)?.iter().collect(),
@@ -748,16 +753,35 @@ fn page_rank_config(name: &str, config: Option<&GdsValue>) -> Result<GdsPageRank
             "scaler" if is_no_scaler(value) => {}
             "scaler" => return unsupported(format!("{name} scaler is not supported; scores are returned unscaled")),
             "sourceNodes" if *value == GdsValue::Null => {}
-            "sourceNodes" => {
-                return unsupported(format!(
-                    "{name} sourceNodes is not supported; personalised PageRank is not implemented"
-                ))
-            }
+            "sourceNodes" => result.source_nodes = Some(source_nodes(name, value)?),
             key => algorithm_option(name, key, value)?,
         }
     }
     require_write_property(name, &result.write_property)?;
     Ok(result)
+}
+
+fn source_nodes(name: &str, value: &GdsValue) -> Result<Vec<VertexId>> {
+    let GdsValue::List(values) = value else {
+        return unsupported(format!("{name} sourceNodes must be a list of node ids, not {}", value.kind()));
+    };
+    if values.is_empty() {
+        return unsupported(format!("{name} sourceNodes must not be empty"));
+    }
+    let mut nodes = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let GdsValue::Integer(id) = value else {
+            return unsupported(format!("{name} sourceNodes must hold node ids, not {}", value.kind()));
+        };
+        let id = u64::try_from(*id)
+            .map_err(|_| procedure_error(format!("{name} sourceNodes node id {id} is negative; node ids are unsigned")))?;
+        if !seen.insert(id) {
+            return unsupported(format!("{name} sourceNodes lists node id {id} more than once"));
+        }
+        nodes.push(id);
+    }
+    Ok(nodes)
 }
 
 fn betweenness_config(name: &str, config: Option<&GdsValue>) -> Result<GdsBetweennessConfig> {
@@ -1136,6 +1160,9 @@ impl GdsProcedure {
                     ("dampingFactor".to_string(), float(config.damping_factor)),
                     ("tolerance".to_string(), float(config.tolerance)),
                 ];
+                if let Some(nodes) = &config.source_nodes {
+                    entries.push(("sourceNodes".to_string(), list(nodes.iter().map(|node| node.to_string()))));
+                }
                 if let Some(property) = &config.write_property {
                     entries.push(("writeProperty".to_string(), quote_string(property)));
                 }
@@ -1211,4 +1238,55 @@ fn map(entries: impl IntoIterator<Item = (String, String)>) -> String {
         .map(|(key, value)| format!("{}: {value}", quote_name(&key)))
         .collect::<Vec<_>>();
     format!("{{{}}}", entries.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(query: &str) -> GdsProcedure {
+        parse_gds_procedure(query, &BTreeMap::new()).unwrap_or_else(|error| panic!("{query} was refused: {error}"))
+    }
+
+    fn page_rank(query: &str) -> GdsPageRankConfig {
+        match parse(query).call {
+            GdsCall::PageRank { config, .. } => config,
+            call => panic!("{query} parsed as {call:?}"),
+        }
+    }
+
+    #[test]
+    fn source_nodes_parse_in_stream_and_write() {
+        let config = page_rank("CALL gds.pageRank.stream('g', {sourceNodes: [4, 2]}) YIELD nodeId, score");
+        assert_eq!(config.source_nodes, Some(vec![4, 2]));
+        assert_eq!(config.write_property, None);
+        let config = page_rank("CALL gds.pageRank.write('g', {sourceNodes: [4], writeProperty: 'ppr'})");
+        assert_eq!(config.source_nodes, Some(vec![4]));
+        assert_eq!(config.write_property.as_deref(), Some("ppr"));
+    }
+
+    #[test]
+    fn a_null_source_nodes_is_the_unpersonalized_algorithm() {
+        let config = page_rank("CALL gds.pageRank.stream('g', {sourceNodes: null}) YIELD nodeId, score");
+        assert_eq!(config.source_nodes, None);
+    }
+
+    #[test]
+    fn source_nodes_round_trip_through_the_printed_call() {
+        let procedure = parse("CALL gds.pageRank.stream('g', {sourceNodes: [4, 2], dampingFactor: 0.5}) YIELD nodeId, score");
+        assert_eq!(parse(&procedure.to_cypher()), procedure);
+    }
+
+    #[test]
+    fn source_nodes_are_refused_when_empty_duplicated_or_not_ids() {
+        for query in [
+            "CALL gds.pageRank.stream('g', {sourceNodes: []}) YIELD nodeId, score",
+            "CALL gds.pageRank.stream('g', {sourceNodes: [1, 1]}) YIELD nodeId, score",
+            "CALL gds.pageRank.stream('g', {sourceNodes: [1, -1]}) YIELD nodeId, score",
+            "CALL gds.pageRank.stream('g', {sourceNodes: [1.5]}) YIELD nodeId, score",
+            "CALL gds.pageRank.stream('g', {sourceNodes: 'n'}) YIELD nodeId, score",
+        ] {
+            assert!(parse_gds_procedure(query, &BTreeMap::new()).is_err(), "{query} was accepted");
+        }
+    }
 }
