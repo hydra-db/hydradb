@@ -203,6 +203,15 @@ service:
     port: 443
     annotations: {}
     loadBalancerSourceRanges: []
+    # HTTP result cursors and running queries are held in the memory of the
+    # node that served the first request. With node.replicaCount > 1 and the
+    # proxy off, set ClientIP so a client's next page and its cancel reach that
+    # node. ClientIP keys on the source address this Service sees, so clients
+    # behind one NAT or ingress share a node. Behind the proxy this Service is
+    # not on the client path; see proxy.readRouting.
+    sessionAffinity: None
+    # Used only with ClientIP. 10800 (3 hours) is the Kubernetes default.
+    sessionAffinityTimeoutSeconds: 10800
   adminPort: 9090
 
 runtime:
@@ -279,6 +288,9 @@ proxy:
     pullPolicy: IfNotPresent
   # The env's read policy, the same knob graph-node reads. Behind the proxy the
   # nodes' own setting does nothing, since the proxy answers ROUTE.
+  # Under fleet, each HTTP page request is routed again, so the next page or a
+  # cancel can reach a node that does not hold the cursor or the query. Use
+  # owner if clients page HTTP results or cancel reads.
   readRouting: fleet
   # Concurrent units per graph-node across all proxy replicas; each replica
   # holds nodeBudget / replicas.

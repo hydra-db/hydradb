@@ -64,6 +64,12 @@ spec:
     - name: https
       port: {{ .Values.service.https.port }}
       targetPort: https
+  {{- if eq (.Values.service.https.sessionAffinity | default "None") "ClientIP" }}
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .Values.service.https.sessionAffinityTimeoutSeconds | default 10800 }}
+  {{- end }}
   {{- with .Values.service.https.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
     {{- toYaml . | nindent 4 }}

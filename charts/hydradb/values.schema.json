@@ -201,7 +201,17 @@
       "properties": {
         "advertisedBoltAddress": { "type": "string" },
         "bolt": { "$ref": "#/definitions/service" },
-        "https": { "$ref": "#/definitions/service" },
+        "https": {
+          "allOf": [
+            { "$ref": "#/definitions/service" },
+            {
+              "properties": {
+                "sessionAffinity": { "enum": ["None", "ClientIP"] },
+                "sessionAffinityTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+              }
+            }
+          ]
+        },
         "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
     },

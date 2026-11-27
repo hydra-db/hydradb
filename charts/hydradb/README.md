@@ -39,6 +39,17 @@ storage. Query nodes discover generations asynchronously and never perform a
 full topology build on a request thread. Scale `node.replicaCount` for query
 capacity and `indexer.replicaCount` for background indexing capacity.
 
+HTTP result cursors and running queries are held in the memory of the node that
+served the first request, so the next page of a paged result and a cancel must
+reach that same node. With `node.replicaCount` above 1:
+
+- Proxy off: set `service.https.sessionAffinity: ClientIP` so the `-https`
+  Service keeps each client on one node. Clients behind one NAT or ingress
+  share a node.
+- Proxy on: the default `proxy.readRouting: fleet` routes every page request
+  again. Set `proxy.readRouting: owner` if clients page HTTP results or cancel
+  reads.
+
 ## Image Publication
 
 `.github/workflows/container.yml` builds the production Dockerfile on pull

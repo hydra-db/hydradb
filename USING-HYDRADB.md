@@ -919,9 +919,17 @@ no meaning across scans.
 empty page to fetch.
 
 **A drained or dead cursor fails with yet another message**:
-`result cursor is unknown or expired`. You will see it if you keep a cursor
+`result cursor is unknown or expired on this node`. You will see it if you keep a cursor
 after its scan completed — including when a dropped `page_size` silently drained
 the scan in one response (see below).
+
+**A cursor lives on one node.** The remaining rows are held in the memory of
+the node that served page one, so every later page must reach that node. With
+more than one node, a load balancer that spreads requests sends some pages
+elsewhere, and they fail with the same `unknown or expired on this node` error.
+In the Helm chart, set `service.https.sessionAffinity: ClientIP` when the proxy
+is off, or `proxy.readRouting: owner` when it is on. Running queries work the
+same way: a cancel must reach the node that runs the query.
 
 Paged reads stay pinned to one storage snapshot, so rows do not shift underneath
 a long pagination.
@@ -950,7 +958,9 @@ may mean a budget was hit, not that the data is missing.**
   `POST /v1/graphs/{graph_id}/queries/{query_id}/cancel`, using the `query_id`
   from the response. It only affects a query that is still running; against a
   finished or unknown id it returns **400** with
-  `no active query with id … was cancelled`.
+  `no active query with id … was cancelled on this node`. The cancel must reach
+  the node that runs the query; see [Pagination](#pagination) for the chart
+  settings that keep a client on one node.
 
 ## Transactions
 

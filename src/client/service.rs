@@ -2493,7 +2493,9 @@ impl ClientQueryService {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
-                feature: "result cursor is unknown or expired".to_string(),
+                feature: "result cursor is unknown or expired on this node; a cursor lives only on the node that \
+                          served the first page, so send every page of a scan to that node"
+                    .to_string(),
             });
         };
         if cursor.owner != expected_owner
@@ -2591,7 +2593,10 @@ impl ClientQueryService {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
-                feature: format!("no active query with id {query_id} was cancelled"),
+                feature: format!(
+                    "no active query with id {query_id} was cancelled on this node; a query can only be \
+                     cancelled on the node that runs it"
+                ),
             });
         };
         active.cancellation_token.cancel();
